@@ -1,14 +1,14 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! Shielded Transport Pigeon: encrypted, optionally reliable UDP.
+//!
+//! Extracted unchanged from Tenderlink. Tenderlink and New Network call this
+//! crate. The Nym backend in `nym_sockets` is a stub; the previous implementation
+//! is commented out in that file.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+#![allow(non_snake_case, non_upper_case_globals)]
+#![allow(dead_code, unused_variables, unused_mut, unused_imports, unused_assignments, unused_unsafe)]
+#![allow(deprecated)]
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub mod helpers;
+pub mod native_sockets;
+pub mod nym_sockets;
+pub mod stp;
