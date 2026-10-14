@@ -1651,6 +1651,11 @@ pub struct CongestionControlOptions {
     pub time_pg: f64,
     pub time_gs: f64,
     pub loss_threshold: u64,
+    /// Also require this fraction of a commanded-rate RTT's packets to be lost.
+    /// Zero preserves the two-loss legacy detector; nonzero can tolerate radio noise.
+    pub loss_fraction_ppm: u32,
+    /// Age-based declaration, not sequence gaps: additional reorder/jitter tolerance.
+    pub loss_timeout_rtts: f64,
     pub event_guard_rtts: f64,
     /// Millionths of a packet per second (100_000_000 = 100 pps).
     pub rate_floor_upps: u64,
@@ -1671,7 +1676,7 @@ impl CongestionControlOptions {
     pub const fn legacy() -> Self {
         Self { beta: CUBIC_BETA, recovery_rtts: CUBIC_K_RTT_MULTIPLIER,
             rate_rp: RATE_RP, rate_pg: RATE_PG, rate_gs: RATE_GS, time_pg: TIME_PG, time_gs: TIME_GS,
-            loss_threshold: 2, event_guard_rtts: 0.5, rate_floor_upps: RATE_FLOOR_UPPS, initial_rate_upps: RATE_FLOOR_UPPS,
+            loss_threshold: 2, loss_fraction_ppm: 0, loss_timeout_rtts: 2.0, event_guard_rtts: 0.5, rate_floor_upps: RATE_FLOOR_UPPS, initial_rate_upps: RATE_FLOOR_UPPS,
             min_growth_uppsps: CUBIC_MIN_GROWTH_UPPSPS, max_growth_uppsps: CUBIC_MAX_RATE_UPPS_PER_SEC,
             friendly_growth_alpha: 0.0, relative_growth_per_rtt: 0.0, bound_recovery_growth: false, record_loss_episodes: false }
     }
@@ -1691,6 +1696,7 @@ impl CongestionControlOptions {
         if !(1..=10000).contains(&self.loss_threshold) { return Err("CC loss threshold must be in 1..=10000"); }
         if !(self.rate_floor_upps > 0 && self.initial_rate_upps >= self.rate_floor_upps && self.initial_rate_upps <= 1_000_000_000_000 && self.min_growth_uppsps >= 0.0 && self.min_growth_uppsps.is_finite() && self.max_growth_uppsps > self.min_growth_uppsps && self.max_growth_uppsps <= 1e15) { return Err("invalid CC floor, initial rate or growth limits"); }
         if !(0.0..=100.0).contains(&self.friendly_growth_alpha) || !(0.0..=10.0).contains(&self.relative_growth_per_rtt) { return Err("invalid CC RTT-scaled growth envelope"); }
+        if self.loss_fraction_ppm > 500_000 || !(2.0..=10.0).contains(&self.loss_timeout_rtts) { return Err("invalid CC loss episode/reorder tolerance"); }
         Ok(())
     }
 }
@@ -2772,7 +2778,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                         // NOTE(Sam): We may experience black holes if RTT suddenly increases since
                         // there is a cyclic dependency beteen RTT and measuring RTT because of drop.
                         
-                        let time_to_considered_dropped = (state.RTT_mean as u64 * 100_000 * 2).max((2*(current_time_now_ns - state.last_ack_received_time)).min(1_000_000_000));
+                        let time_to_considered_dropped = ((state.RTT_mean as f64 * 100_000.0 * cc.loss_timeout_rtts) as u64).max((2*(current_time_now_ns - state.last_ack_received_time)).min(1_000_000_000));
                         
                         // every send site (data loop, tu probe, keepalive, both ack paths) gates on ring space, so head never laps tail
                         assert!(state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY);
@@ -2803,7 +2809,12 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     // Covered losses still enter loss/FEC statistics below, but
                                     // cannot prime the threshold for a subsequent congestion cut.
                                     let eligible = send_time > state.congestion_event_time_ns + (rtt_ns as f64 * cc.event_guard_rtts) as u64;
-                                    let trigger = count_congestion_loss(&mut state.loss_count_in_window, eligible, cc.loss_threshold);
+                                    let threshold = if cc.loss_fraction_ppm == 0 { cc.loss_threshold } else {
+                                        let send_dt = send_time.saturating_sub(state.congestion_event_time_ns);
+                                        let rate = local_rate_limit(cubic_rate(send_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery).0.max(cc.rate_floor_upps), max_pps);
+                                        congestion_loss_threshold(rate, rtt_ns, &cc)
+                                    };
+                                    let trigger = count_congestion_loss(&mut state.loss_count_in_window, eligible, threshold);
 
                                     if trigger {
                                         let send_dt = send_time - state.congestion_event_time_ns;
@@ -3253,6 +3264,12 @@ fn local_rate_limit(rate: u64, max_pps: Option<u64>) -> u64 {
     max_pps.map_or(rate, |limit| rate.min(limit.saturating_mul(1_000_000).max(1)))
 }
 
+fn congestion_loss_threshold(rate_upps: u64, rtt_ns: u64, cc: &CongestionControlOptions) -> u64 {
+    // Detection uses only the commanded rate and packet loss, never ACK/delivery rate.
+    let fraction = (rate_upps as u128 * rtt_ns as u128 * cc.loss_fraction_ppm as u128).div_ceil(1_000_000_000_000_000_000_000);
+    cc.loss_threshold.max(fraction.min(u64::MAX as u128) as u64)
+}
+
 fn count_congestion_loss(count: &mut u64, eligible: bool, threshold: u64) -> bool {
     if !eligible { return false; }
     *count = count.saturating_add(1);
@@ -3307,6 +3324,21 @@ mod congestion_tests {
         assert_eq!(stats.max_rtt_loss_window_packets, 100);
         assert_eq!(std::mem::size_of::<LossEpisodes>(), 104);
         assert_eq!(stats.packets_lost, 0); // Meter never alters actual loss/CC accounting.
+    }
+
+    #[test]
+    fn radio_threshold_counts_loss_episodes_not_isolated_noise() {
+        let mut cc = CongestionControlOptions::legacy();
+        assert_eq!(congestion_loss_threshold(1_000_000_000, 200_000_000, &cc), 2);
+        cc.loss_fraction_ppm = 50_000;
+        assert_eq!(congestion_loss_threshold(1_000_000_000, 200_000_000, &cc), 10);
+        assert_eq!(congestion_loss_threshold(10_000_000_000, 200_000_000, &cc), 100);
+        let mut count = 0;
+        for _ in 0..4 { assert!(!count_congestion_loss(&mut count, true, 10)); }
+        for _ in 4..9 { assert!(!count_congestion_loss(&mut count, true, 10)); }
+        assert!(count_congestion_loss(&mut count, true, 10));
+        cc.loss_timeout_rtts = 1.0;
+        assert!(cc.validate().is_err());
     }
 
     #[test]
