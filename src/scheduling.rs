@@ -354,6 +354,7 @@ pub const CONTROLLER_HORIZON_NS: u64 = 500_000_000;
 pub enum StopReason {
     QueueEmpty,
     InFlight,
+    CpuLate,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StopPoint {
@@ -506,6 +507,28 @@ impl CurvePacer {
                 now,
             );
         }
+    }
+    /// Drop accumulated execution debt, just like queue starvation. The inverse
+    /// of the last completed count closes the rising piece; the following flat
+    /// ends at now and begin() resumes from (now, sequence). A time-domain
+    /// tolerance works across variable pps and never allocates per-packet state.
+    pub fn stop_if_late(&mut self, now: u64, sequence: u64, tolerance_ns: u64) -> bool {
+        if self.stop.is_some() {
+            return false;
+        }
+        let count = (sequence - self.base_sequence) as f64 - self.count_offset;
+        let completed_ns = self.origin_ns + self.schedule.inverse(count.max(0.0)).unwrap_or(0);
+        if now.saturating_sub(completed_ns) <= tolerance_ns {
+            return false;
+        }
+        self.stop = Some(StopPoint {
+            time_ns: completed_ns,
+            completed: sequence,
+            reason: StopReason::CpuLate,
+        });
+        self.flat_until(now);
+        self.last_tick_ns = now;
+        true
     }
     pub fn begin(
         &mut self,
@@ -735,6 +758,50 @@ mod tests {
         assert_eq!(s.inverse(2.0), Some(1_000_000_000));
         assert_eq!(s.inverse(3.0), Some(2_500_000_000));
         assert_eq!(s.rate(1_500_000_000), 0.0);
+    }
+    #[test]
+    fn cpu_debt_stops_at_completed_count_and_resumes_at_now() {
+        let mut p = CurvePacer::new(0, 0);
+        let schedule = |_| PacketSchedule::constant(1000.0, CONTROLLER_HORIZON_NS).unwrap();
+        let key = (1, 1, 1, false);
+        p.begin(0, 0, true, key, schedule);
+        p.finish(0, 0, None);
+        assert_eq!(p.begin(2_000_000, 0, true, key, schedule), 2);
+        p.finish(2_500_000, 2, None);
+        assert!(!p.stop_if_late(4_000_000, 2, 4_000_000));
+        // CPU stalls 18 ms. Never send the 18-packet catch-up burst.
+        assert!(p.stop_if_late(20_000_000, 2, 4_000_000));
+        assert_eq!(
+            p.stop.unwrap(),
+            StopPoint {
+                time_ns: 2_000_000,
+                completed: 2,
+                reason: StopReason::CpuLate,
+            }
+        );
+        assert_eq!(p.history.lookup(1), Some(2_000_000));
+        assert_eq!(p.begin(20_000_000, 2, true, key, schedule), 0);
+        p.finish(20_000_000, 2, None);
+        assert_eq!(p.begin(22_000_000, 2, true, key, schedule), 2);
+        p.observe_send(2, 22_000_000);
+        p.observe_send(3, 22_500_000);
+        p.finish(22_500_000, 4, None);
+        assert_eq!(p.history.lookup(2), Some(21_000_000));
+        assert_eq!(p.error_max_ns, 1_000_000);
+        assert!(
+            p.history
+                .records()
+                .iter()
+                .any(|r| r.stop == Some(StopReason::CpuLate)
+                    && r.start_ns == 2_000_000
+                    && r.end_ns == 20_000_000)
+        );
+        // A partial CPU-budgeted execution truncates the curve too.
+        assert_eq!(p.begin(24_000_000, 4, true, key, schedule), 2);
+        p.finish(26_000_000, 5, Some(StopReason::CpuLate));
+        assert_eq!(p.stop.unwrap().time_ns, 23_000_000);
+        assert_eq!(p.history.lookup(4), Some(23_000_000));
+        assert_eq!(p.begin(26_000_000, 5, true, key, schedule), 0);
     }
     #[test]
     fn controller_derivative_matches_pps_across_phases_caps_floor() {

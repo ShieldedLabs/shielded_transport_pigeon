@@ -2969,9 +2969,16 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                         }
                         let has_work = connection_tracking_data.unreliable_send_buffer.has_unsent_data()
                             || state.control_work_due(current_time_now_ns, time_between_sends_ns);
+                        let curve_tick_ns = if curve_cadence_ns.is_some() { monotonic_clock_ns() } else { current_time_now_ns };
+                        let mut curve_cpu_late = false;
                         if let Some(p) = &mut state.curve_pacer {
+                            let cadence = curve_cadence_ns.unwrap();
+                            // Permit one normal tick plus wake/work jitter, never
+                            // an unbounded CPU catch-up burst of stale credit.
+                            p.stop_if_late(curve_tick_ns, state.send_sequence_number, cadence * 2);
+                            state.curve_next_tick_ns = curve_tick_ns + cadence;
                             let key = (state.congestion_event_time_ns, state.congestion_event_rate_upps, time_to_bandwidth_recovery, state.is_app_limited);
-                            packet_send_allowance_now = p.begin(current_time_now_ns, state.send_sequence_number, has_work, key, |origin| {
+                            packet_send_allowance_now = p.begin(curve_tick_ns, state.send_sequence_number, has_work, key, |origin| {
                                 if state.is_app_limited {
                                     crate::scheduling::PacketSchedule::constant(allowed_bandwidth_upps as f64 / 1e6, crate::scheduling::CONTROLLER_HORIZON_NS).unwrap()
                                 } else {
@@ -3063,6 +3070,11 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             if record_fec_messages && buf.fec_record.is_none() { buf.fec_record = Some(Vec::new()); }
                         }
                         while state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY - 1 && packet_send_allowance_now > 0 && state.packets_in_flight < allowed_packets_in_flight && {
+                            // Bound work within a burst as well as debt between
+                            // ticks. Test BEFORE removing a fragment from its queue.
+                            curve_cpu_late = curve_cadence_ns.is_some_and(|cadence| monotonic_clock_ns() >= curve_tick_ns + cadence);
+                            !curve_cpu_late
+                        } && {
                             connection_tracking_data.unreliable_send_buffer.next_packet_seq = state.send_sequence_number;
                             fill_packet_payload_with_unreliable_fragments(&mut packet_memory_send[0..payload_size], &mut connection_tracking_data.unreliable_send_buffer)
                         } {
@@ -3115,9 +3127,14 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                         let has_work = has_data || state.control_work_due(current_time_now_ns, time_between_sends_ns);
                         if let Some(p) = &mut state.curve_pacer {
                             let reason = if !has_work { Some(crate::scheduling::StopReason::QueueEmpty) }
+                                else if curve_cpu_late { Some(crate::scheduling::StopReason::CpuLate) }
                                 else if packet_send_allowance_now > 0 { Some(crate::scheduling::StopReason::InFlight) }
                                 else { None };
-                            p.finish(current_time_now_ns, state.send_sequence_number, reason);
+                            let finish_ns = monotonic_clock_ns();
+                            p.finish(if reason.is_some() { finish_ns } else { curve_tick_ns }, state.send_sequence_number, reason);
+                            // An OS deschedule can happen within the final send;
+                            // do not carry that execution debt into another tick.
+                            p.stop_if_late(finish_ns, state.send_sequence_number, curve_cadence_ns.unwrap() * 2);
                             state.stats.pacing_error_samples = p.error_samples;
                             state.stats.pacing_error_abs_sum_ns = p.error_abs_sum_ns;
                             state.stats.pacing_error_max_ns = p.error_max_ns;
