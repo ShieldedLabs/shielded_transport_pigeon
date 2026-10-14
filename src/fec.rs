@@ -28,7 +28,9 @@ pub fn decoder_memory_limit(len: usize, block_bytes: usize) -> Option<usize> {
 
 /// Both ingress levels include queue slots as well as payload allocations.
 pub fn ingress_slots(bytes: usize, block_bytes: usize) -> usize {
-    (bytes / (block_bytes + std::mem::size_of::<(u32, Vec<u8>)>())).max(1)
+    // Include the channel's per-slot stamp/alignment and allocator metadata too.
+    // The current std array channel uses less; 128 bytes leaves conservative slack.
+    (bytes / (block_bytes + std::mem::size_of::<(u32, Vec<u8>)>() + 128)).max(1)
 }
 
 pub fn receive_memory_charge(layout: MessageLayout, worker: bool, ingress_bytes: usize) -> Option<usize> {

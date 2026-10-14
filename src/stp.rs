@@ -995,7 +995,9 @@ impl ReceiveQueue {
     fn push_reserved(&mut self, key: ConnectionKey, mut buf: Vec<u8>, cap_bytes: usize, mut reservation: Option<crate::receive_memory::Reservation>) {
         // Reassembly grows the buffer by doubling, so a big message can carry up to 2x its size
         // in capacity; give that back before it is counted against the cap.
-        buf.shrink_to_fit();
+        // A budgeted buffer already has admitted capacity: reallocating to shrink
+        // could temporarily keep both allocations alive outside that reservation.
+        if reservation.is_none() { buf.shrink_to_fit(); }
         self.bytes += Self::entry_bytes(&buf);
         if let Some(r) = &mut reservation { r.shrink(Self::entry_bytes(&buf) + 128); }
         self.reservations.push_back(reservation);
