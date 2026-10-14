@@ -19,7 +19,10 @@ impl LossTrace {
         while let Some((word, plain_header)) = crate::stp::read_fragment_header(&payload[cursor..]) {
             let fec = word & 1 != 0;
             let len = ((word >> 18) & 0x3fff) as usize;
-            let header = if fec { 16 } else { plain_header };
+            let header = if fec {
+                let Some(size) = crate::stp::fec_fragment_header_size(&payload[cursor..]) else { break; };
+                size
+            } else { plain_header };
             if cursor + header + len > payload.len() { break; }
             writeln!(self.0, "F,{connection},{seq},{time},{len},0,{},{},{}", (word >> 2) & 0xffff, word >> 32, fec as u8).expect("write loss trace");
             cursor += header + len;
