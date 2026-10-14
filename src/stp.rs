@@ -934,6 +934,11 @@ pub struct ConnectionStateConnected {
 
     pub ack_field: AckField,
     pub ack_timer: u64,
+    pub ack_receiver: crate::ack::AckReceiver,
+    /// Highest positively acknowledged peer receipt; holes are NOT declarations of loss.
+    pub highest_peer_acked: Option<u64>,
+    pub peer_ack_delay_us: u32,
+    pub peer_ce_count: u32,
 
     // Note(Sam): HARD ASSUMPTION that no link ever has a greater RTT than 4.295 seconds.
     pub send_time_band: [u64; 1024], // 1024 buckets of 4.194 ms giving 4.295 seconds of tracking.
@@ -991,6 +996,10 @@ pub fn new_connection_state_connected(cipher: Option<ConnectionCipherTriplet>, m
         max_in_flight_since_last_print: 0,
         ack_field: Default::default(),
         ack_timer: u64::MAX,
+        ack_receiver: Default::default(),
+        highest_peer_acked: None,
+        peer_ack_delay_us: 0,
+        peer_ce_count: 0,
         send_time_band: [0; 1024],
         send_time_band_head_index: 0,
         RTT_sample_sums: [0; 16],
@@ -1046,6 +1055,12 @@ pub struct ConnectionStats {
     /// handshake packets and transmission-unit probes are not counted.
     pub packets_sent: u64,
     pub bytes_sent: u64,
+    /// ACK UDP datagrams and UDP payload bytes (prefix and authentication tag included).
+    pub ack_packets_sent: u64,
+    pub ack_bytes_sent: u64,
+    pub ack_packets_received: u64,
+    pub ack_delay_us_max: u32,
+    pub rtt_samples: u64,
     /// Sequenced packets declared lost (never acked in time).
     pub packets_lost: u64,
     /// Adaptive FEC only (else 0): the floored loss estimate new messages are sized for, and the
@@ -1736,6 +1751,8 @@ impl Default for CongestionControlOptions {
 #[derive(Debug, Clone, Default)]
 pub struct NetworkThreadOptions {
     pub congestion_control: CongestionControlOptions,
+    /// ACK format and receive-side delay; use Legacy for pre-upgrade peers.
+    pub acknowledgements: crate::ack::AckOptions,
     /// See `new_network_thread_with_bind`.
     pub bind_ip: Option<std::net::IpAddr>,
     /// Sender-side forward error correction for unreliable messages of 2+ packets: extra
@@ -1773,6 +1790,7 @@ impl NetworkThreadHandle {
 pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_pps: Option<u64>, send_buffer_params: (u32, u32, u32), options: NetworkThreadOptions) -> NetworkThreadHandle {
     let bind_ip = options.bind_ip;
     let cc = options.congestion_control;
+    let ack_options = options.acknowledgements;
     cc.validate().expect("invalid congestion controller configuration");
     let cubic_rate = move |t, r, k| cubic_rate_with_options(t, r, k, &cc);
 
@@ -2270,23 +2288,37 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             // Ground truth: every authenticated sequenced packet the peer sent.
                             state.rx_tracker.on_packet(nonce as u64, &mut state.stats);
                             
-                            if payload.len() < 516 {
+                            if payload.len() < 516 && payload.len() != crate::ack::ACK_PAYLOAD_LEN {
                                 if OVERLY_VERBOSE { println!("Dropping from {connection_key:?}, payload < 516."); }
                                 break 'conn;
                             }
 
-                            if payload.len() == 516 { // This is an ack packet.
-                                let ack = unsafe { &*(payload.as_ptr() as *const AckField) };
+                            // ACKs remain identified ONLY by exact decrypted packet size.
+                            if payload.len() == 516 || payload.len() == crate::ack::ACK_PAYLOAD_LEN {
+                                let legacy_ack = if payload.len() == 516 { Some(unsafe { &*(payload.as_ptr() as *const AckField) }) } else { None };
+                                let bitmap_ack = if payload.len() == crate::ack::ACK_PAYLOAD_LEN {
+                                    let Some(a) = crate::ack::BitmapAck::decode(payload) else { break 'conn; };
+                                    if a.highest >= state.send_sequence_number { break 'conn; }
+                                    state.peer_ack_delay_us = a.delay_us;
+                                    Some(a)
+                                } else { None };
+                                state.stats.ack_packets_received += 1;
 
                                 let mut RTT_acc = 0u64;
                                 let mut RTT_count = 0u64;
                                 
                                 let mut oldest_newly_acked_send_time: u64 = u64::MAX;
-                                let field_base = ack.field_base as u64;
-                                for index in field_base..field_base+4096 {
-                                    let bit_index = (index-field_base);
-                                    let acked = 0 != (1u64 << (bit_index % 64)) & ack.field[bit_index as usize / 64];
-                                    if acked && index >= state.packets_waiting_ack_tail && index < state.send_sequence_number {
+                                let legacy_indices = legacy_ack.into_iter().flat_map(|ack| {
+                                    let base = ack.field_base as u64;
+                                    (base..base+4096).filter(move |&seq| ack.field[((seq-base)/64) as usize] & (1 << ((seq-base)%64)) != 0)
+                                });
+                                let relevant_ack = bitmap_ack.as_ref().map(|a| a.relevant(&state.packets_waiting_ack_field, &state.declared_lost_field[..]));
+                                let indices = legacy_indices.chain(relevant_ack.iter().flat_map(crate::ack::BitmapAck::acknowledged));
+                                for index in indices {
+                                    if index < state.send_sequence_number {
+                                        state.highest_peer_acked = Some(state.highest_peer_acked.unwrap_or(index).max(index));
+                                    }
+                                    if index >= state.packets_waiting_ack_tail && index < state.send_sequence_number {
                                         let bit_index = index % PACKETS_WAITING_ACK_CAPACITY;
                                         if state.packets_waiting_ack_field[(bit_index / 64) as usize] & (1u64 << (bit_index % 64)) != 0 {
                                             state.packets_waiting_ack_field[(bit_index / 64) as usize] &= !(1u64 << (bit_index % 64));
@@ -2295,9 +2327,17 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
 
                                             let send_time_of_latest_ns = get_send_time_for_sequence_number(index, &state.send_time_band, state.send_time_band_head_index);
                                             if send_time_of_latest_ns != 0 && send_time_of_latest_ns != u64::MAX {
-                                                RTT_acc += ((timestamp_ns - send_time_of_latest_ns) / 100_000);
-                                                RTT_count += 1;
                                                 oldest_newly_acked_send_time = oldest_newly_acked_send_time.min(send_time_of_latest_ns);
+                                                // One truthful sample per new-format ACK. Its delay belongs only
+                                                // to sample_seq, not every packet repeated in the bitmap.
+                                                if bitmap_ack.as_ref().is_none_or(|a| index == a.sample_seq) {
+                                                    let delay = bitmap_ack.as_ref().map_or(0, |a| a.delay_us as u64 * 1000);
+                                                    let raw = timestamp_ns.saturating_sub(send_time_of_latest_ns);
+                                                    if delay < raw {
+                                                        RTT_acc += (raw - delay).max(100_000) / 100_000;
+                                                        RTT_count += 1;
+                                                    }
+                                                }
                                             }
                                             
                                             if index == state.tu_probe_sequence_number {
@@ -2314,7 +2354,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                             
                                         }
                                     }
-                                    else if acked && index < state.packets_waiting_ack_tail && index + PACKETS_WAITING_ACK_CAPACITY >= state.packets_waiting_ack_tail {
+                                    else if index < state.packets_waiting_ack_tail && index + PACKETS_WAITING_ACK_CAPACITY >= state.packets_waiting_ack_tail {
                                         // Acked after it was declared lost: the declaration was spurious.
                                         let bit_index = index % PACKETS_WAITING_ACK_CAPACITY;
                                         let w = &mut state.declared_lost_field[(bit_index / 64) as usize];
@@ -2326,12 +2366,20 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     }
                                 }
 
-                                if ecn_marked && oldest_newly_acked_send_time != u64::MAX {
-                                    state.ecn_congestion_received = true;
-                                    state.ecn_oldest_send_time = oldest_newly_acked_send_time;
+                                let ce_feedback = bitmap_ack.as_ref().is_some_and(|a| crate::ack::update_ce_count(&mut state.peer_ce_count, a.ce_count));
+                                if ecn_marked || ce_feedback {
+                                    // A reordered ACK can advance CE even when all its packets were
+                                    // acknowledged already. Do not consume that cumulative event silently.
+                                    let anchor = if oldest_newly_acked_send_time != u64::MAX { oldest_newly_acked_send_time }
+                                        else { bitmap_ack.as_ref().map_or(0, |a| get_send_time_for_sequence_number(a.sample_seq, &state.send_time_band, state.send_time_band_head_index)) };
+                                    if anchor != 0 && anchor != u64::MAX {
+                                        state.ecn_congestion_received = true;
+                                        state.ecn_oldest_send_time = anchor;
+                                    }
                                 }
 
                                 if RTT_count > 0 {
+                                    state.stats.rtt_samples += RTT_count;
                                     let slot = (state.RTT_sample_cursor % 16) as usize;
                                     state.RTT_sample_sums[slot] = RTT_acc as u32;
                                     state.RTT_sample_counts[slot] = RTT_count as u16;
@@ -2376,6 +2424,9 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             }
                             // This is not an ack packet.
 
+                            if !matches!(ack_options, crate::ack::AckOptions::Legacy) {
+                                if !state.ack_receiver.receive_with_rtt(nonce as u64, timestamp_ns, ecn_marked, ack_options, &mut state.ack_timer, state.stats.rtt_us, buf_len) { break 'conn; }
+                            } else {
                             if nonce < state.ack_field.field_base {
                                 if OVERLY_VERBOSE { println!("Dropping from {connection_key:?}, nonce too old."); }
                                 break 'conn;
@@ -2412,6 +2463,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     state.ecn_congestion_received = false;
                                     if let Some(ns) = &existing_connection.nym_sock { nym_udp_send_with_congestion_and_dscp(ns, existing_connection.other_ip, existing_connection.other_port, &packet_memory_send[..o], Dscp::Af21, ack_ecn); }
                                     else { udp_send_with_congestion_and_dscp(socket, existing_connection.other_ip, existing_connection.other_port, &packet_memory_send[..o], Dscp::Af21, ack_ecn); }
+                                    state.stats.ack_packets_sent += 1;
+                                    state.stats.ack_bytes_sent += o as u64;
                                     state.ack_timer = u64::MAX;
                                 }
 
@@ -2433,6 +2486,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             state.ack_field.field[bit_index as usize / 64] |= 1u64 << (bit_index % 64);
                             if ecn_marked { state.ecn_congestion_received = true; }
                             if state.ack_timer == u64::MAX { state.ack_timer = timestamp_ns + ACK_BUFFER_TIME_NS; }
+
+                            }
 
                             // A legitimate data packet could never this state because to be all zeroes the
                             // first fragment would have to be package_id=0 and frag_len=0. If so that is
@@ -2704,10 +2759,23 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     state.send_sequence_number += 1;
                                 }
                                 
-                                if let Some(cipher) = &mut state.cipher { o += cipher.current.write_message(virtual_nonce, state.ack_field.as_bytes(), &mut packet_memory_send[o..]).unwrap(); }
-                                else { o += state.ack_field.as_bytes().write_to(&mut packet_memory_send[o..]); }
-                                let ack_ecn = state.ecn_congestion_received;
-                                state.ecn_congestion_received = false;
+                                let encoded;
+                                let ack_payload = match ack_options {
+                                    crate::ack::AckOptions::Legacy => state.ack_field.as_bytes(),
+                                    crate::ack::AckOptions::LowLatency { .. } | crate::ack::AckOptions::Adaptive { .. } => {
+                                        let a = state.ack_receiver.ack(current_time_now_ns);
+                                        state.stats.ack_delay_us_max = state.stats.ack_delay_us_max.max(a.delay_us);
+                                        encoded = a.encode();
+                                        &encoded[..]
+                                    }
+                                };
+                                if let Some(cipher) = &mut state.cipher { o += cipher.current.write_message(virtual_nonce, ack_payload, &mut packet_memory_send[o..]).unwrap(); }
+                                else { o += ack_payload.write_to(&mut packet_memory_send[o..]); }
+                                let ack_ecn = matches!(ack_options, crate::ack::AckOptions::Legacy) && state.ecn_congestion_received;
+                                if matches!(ack_options, crate::ack::AckOptions::Legacy) { state.ecn_congestion_received = false; }
+                                state.ack_receiver.sent(current_time_now_ns);
+                                state.stats.ack_packets_sent += 1;
+                                state.stats.ack_bytes_sent += o as u64;
                                 if let Some(ns) = &connection_tracking_data.nym_sock { nym_udp_send_with_congestion_and_dscp(ns, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_send[..o], Dscp::Af21, ack_ecn); }
                                 else { udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_send[..o], Dscp::Af21, ack_ecn); }
                                 state.ack_timer = u64::MAX;
