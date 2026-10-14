@@ -2692,7 +2692,9 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     total_sum += state.RTT_sample_sums[i] as u64;
                                     total_count += state.RTT_sample_counts[i] as u64;
                                 }
-                                state.RTT_mean = (total_sum / total_count) as u16;
+                                // RTT is quantized to 0.1 ms: sub-tick paths still need a nonzero
+                                // recovery period and finite loss timeout.
+                                state.RTT_mean = quantized_rtt_mean(total_sum, total_count);
                                 state.stats.rtt_us = state.RTT_mean as u64 * 100;
                             }
 
@@ -3218,9 +3220,23 @@ use crate::helpers::*;
 use crate::native_sockets::*;
 use crate::nym_sockets::*;
 
+fn quantized_rtt_mean(sum: u64, count: u64) -> u16 {
+    (sum / count.max(1)).clamp(1, u16::MAX as u64) as u16
+}
+
 #[cfg(test)]
 mod congestion_tests {
     use super::*;
+
+    #[test]
+    fn sub_tick_rtt_cannot_freeze_recovery() {
+        assert_eq!(quantized_rtt_mean(0, 16), 1);
+        assert_eq!(quantized_rtt_mean(30, 16), 1);
+        assert_eq!(quantized_rtt_mean(1830 * 16, 16), 1830);
+        let k = CongestionControlOptions::legacy().recovery_rtts * quantized_rtt_mean(0, 16) as u64 * 100_000;
+        assert!(k > 0);
+        assert!(cubic_rate(20 * k, 100_000_000, k).0 > cubic_rate(0, 100_000_000, k).0);
+    }
 
     #[test]
     fn legacy_transition_rates() {
