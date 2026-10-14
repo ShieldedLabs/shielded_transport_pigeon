@@ -974,6 +974,7 @@ pub struct ConnectionStateConnected {
     pub stats: ConnectionStats,
     pub loss_window_start_ns: u64,
     pub loss_count_in_window: u64,
+    loss_episodes: LossEpisodes,
     pub is_app_limited: bool,
     pub app_limit_time_offset: u64,
     pub ecn_congestion_received: bool,
@@ -1032,6 +1033,7 @@ pub fn new_connection_state_connected(cipher: Option<ConnectionCipherTriplet>, m
         stats: ConnectionStats::default(),
         loss_window_start_ns: 0,
         loss_count_in_window: 0,
+        loss_episodes: LossEpisodes::default(),
         is_app_limited: false,
         app_limit_time_offset: 0,
         ecn_congestion_received: false,
@@ -1083,6 +1085,10 @@ pub struct ConnectionStats {
     pub rtt_samples: u64,
     /// Sequenced packets declared lost (never acked in time).
     pub packets_lost: u64,
+    /// Largest declared-loss fraction over four staggered approximately-RTT send-time
+    /// windows (all sequenced packets; TU-probe losses excluded). Instrumentation only.
+    pub max_rtt_loss_ppm: u32,
+    pub max_rtt_loss_window_packets: u64,
     /// Adaptive FEC only (else 0): the floored loss estimate new messages are sized for, and the
     /// latest short-term loss sample it was built from.
     pub fec_loss_estimate: f64,
@@ -1767,19 +1773,37 @@ pub struct CongestionControlOptions {
     pub time_pg: f64,
     pub time_gs: f64,
     pub loss_threshold: u64,
+    /// Also require this fraction of a commanded-rate RTT's packets to be lost.
+    /// Zero preserves the two-loss legacy detector; nonzero can tolerate radio noise.
+    pub loss_fraction_ppm: u32,
+    /// Age-based declaration, not sequence gaps: additional reorder/jitter tolerance.
+    pub loss_timeout_rtts: f64,
     pub event_guard_rtts: f64,
     /// Millionths of a packet per second (100_000_000 = 100 pps).
     pub rate_floor_upps: u64,
     pub initial_rate_upps: u64,
     pub min_growth_uppsps: f64,
     pub max_growth_uppsps: f64,
+    /// Optional Reno-friendly additive floor: alpha / RTT_seconds^2 pps/s (0 disables).
+    pub friendly_growth_alpha: f64,
+    /// Optional growth ceiling as a fraction of the anchor rate per RTT (0 disables).
+    /// The additive floor remains available even at low anchor rates.
+    pub relative_growth_per_rtt: f64,
+    /// Apply the growth envelope to R as well as P/G/S, bounding regrowth after cuts.
+    pub bound_recovery_growth: bool,
+    /// Compound the relative ceiling with elapsed RTTs instead of freezing its
+    /// slope at the event anchor. Pure time/rate curve; no ACK/delivery estimate.
+    pub compound_growth: bool,
+    /// Opt-in fixed-memory congestion-episode instrumentation, never alters the rate.
+    pub record_loss_episodes: bool,
 }
 impl CongestionControlOptions {
     pub const fn legacy() -> Self {
         Self { beta: CUBIC_BETA, recovery_rtts: CUBIC_K_RTT_MULTIPLIER,
             rate_rp: RATE_RP, rate_pg: RATE_PG, rate_gs: RATE_GS, time_pg: TIME_PG, time_gs: TIME_GS,
-            loss_threshold: 2, event_guard_rtts: 0.5, rate_floor_upps: RATE_FLOOR_UPPS, initial_rate_upps: RATE_FLOOR_UPPS,
-            min_growth_uppsps: CUBIC_MIN_GROWTH_UPPSPS, max_growth_uppsps: CUBIC_MAX_RATE_UPPS_PER_SEC }
+            loss_threshold: 2, loss_fraction_ppm: 0, loss_timeout_rtts: 2.0, event_guard_rtts: 0.5, rate_floor_upps: RATE_FLOOR_UPPS, initial_rate_upps: RATE_FLOOR_UPPS,
+            min_growth_uppsps: CUBIC_MIN_GROWTH_UPPSPS, max_growth_uppsps: CUBIC_MAX_RATE_UPPS_PER_SEC,
+            friendly_growth_alpha: 0.0, relative_growth_per_rtt: 0.0, bound_recovery_growth: false, compound_growth: false, record_loss_episodes: false }
     }
     /// Shorter probe plateau and stronger existing additive term; same R/P/G/S curve.
     pub const fn balanced() -> Self {
@@ -1796,6 +1820,8 @@ impl CongestionControlOptions {
         if !(0.0..=10.0).contains(&self.event_guard_rtts) { return Err("invalid CC guard"); }
         if !(1..=10000).contains(&self.loss_threshold) { return Err("CC loss threshold must be in 1..=10000"); }
         if !(self.rate_floor_upps > 0 && self.initial_rate_upps >= self.rate_floor_upps && self.initial_rate_upps <= 1_000_000_000_000 && self.min_growth_uppsps >= 0.0 && self.min_growth_uppsps.is_finite() && self.max_growth_uppsps > self.min_growth_uppsps && self.max_growth_uppsps <= 1e15) { return Err("invalid CC floor, initial rate or growth limits"); }
+        if !(0.0..=100.0).contains(&self.friendly_growth_alpha) || !(0.0..=10.0).contains(&self.relative_growth_per_rtt) { return Err("invalid CC RTT-scaled growth envelope"); }
+        if self.loss_fraction_ppm > 500_000 || !(2.0..=10.0).contains(&self.loss_timeout_rtts) { return Err("invalid CC loss episode/reorder tolerance"); }
         Ok(())
     }
 }
@@ -2940,7 +2966,9 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     total_sum += state.RTT_sample_sums[i] as u64;
                                     total_count += state.RTT_sample_counts[i] as u64;
                                 }
-                                state.RTT_mean = (total_sum / total_count) as u16;
+                                // RTT is quantized to 0.1 ms: sub-tick paths still need a nonzero
+                                // recovery period and finite loss timeout.
+                                state.RTT_mean = quantized_rtt_mean(total_sum, total_count);
                                 state.stats.rtt_us = state.RTT_mean as u64 * 100;
                             }
 
@@ -2979,22 +3007,6 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
 
                         let time_to_bandwidth_recovery = cc.recovery_rtts * (state.RTT_mean as u64 * 100_000);
 
-                        // Local Limit congestion event
-                        if let Some(max_pps) = max_pps && max_pps*1_000_000 < cubic_rate(current_time_now_ns - state.congestion_event_time_ns, state.congestion_event_rate_upps, time_to_bandwidth_recovery).0 && current_time_now_ns > state.congestion_event_time_ns + (state.RTT_mean as f64 * 100_000.0 * cc.event_guard_rtts) as u64 {
-                            let send_dt = current_time_now_ns - state.congestion_event_time_ns;
-                            let send_t_factor = send_dt as f64 / time_to_bandwidth_recovery as f64;
-                            let (_, send_mode) = cubic_rate(send_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery);
-                            let discover_dt = if send_mode == 'P' { (time_to_bandwidth_recovery + send_dt) / 2 } else { send_dt };
-                            let mut discovered = cubic_rate(discover_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery).0;
-                            if send_mode == 'G' || send_mode == 'S' {
-                                let r_pg = (state.congestion_event_rate_upps as f64 * cc.rate_pg) as u64;
-                                discovered = r_pg + ((discovered.saturating_sub(r_pg)) as f64 * 0.5) as u64;
-                            }
-                            state.congestion_event_rate_upps = max_pps*1_000_000;
-                            state.congestion_event_time_ns = current_time_now_ns;
-                            state.app_limit_time_offset = 0;
-                            println!("local limit congestion ...  rate \"discovered\": {} pps  sent:{send_mode}@{send_t_factor:.2}", state.congestion_event_rate_upps as f64 / 1000000.0);
-                        }
 
                         // ECN congestion event: the receiver saw CE-marked packets and relayed it via the ack's IP header
                         if state.ecn_congestion_received && state.ecn_oldest_send_time > state.congestion_event_time_ns + (state.RTT_mean as f64 * 100_000.0 * cc.event_guard_rtts) as u64 {
@@ -3008,7 +3020,9 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 let r_pg = (state.congestion_event_rate_upps as f64 * cc.rate_pg) as u64;
                                 discovered = r_pg + ((discovered.saturating_sub(r_pg)) as f64 * 0.5) as u64;
                             }
-                            state.congestion_event_rate_upps = discovered;
+                            // Discovery must reflect a locally capped sender as well: otherwise
+                            // a loss above a stale curve anchor would not lower actual pacing.
+                            state.congestion_event_rate_upps = local_rate_limit(discovered, max_pps);
                             state.congestion_event_time_ns = current_time_now_ns;
                             state.app_limit_time_offset = 0;
                             println!("congestion event ECN CE ...  rate discovered: {} pps  sent:{send_mode}@{send_t_factor:.2}", state.congestion_event_rate_upps as f64 / 1000000.0);
@@ -3017,7 +3031,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                         // NOTE(Sam): We may experience black holes if RTT suddenly increases since
                         // there is a cyclic dependency beteen RTT and measuring RTT because of drop.
                         
-                        let time_to_considered_dropped = (state.RTT_mean as u64 * 100_000 * 2).max((2*(current_time_now_ns - state.last_ack_received_time)).min(1_000_000_000)) + curve_cadence_ns.unwrap_or(0);
+                        let time_to_considered_dropped = ((state.RTT_mean as f64 * 100_000.0 * cc.loss_timeout_rtts) as u64).max((2*(current_time_now_ns - state.last_ack_received_time)).min(1_000_000_000)) + curve_cadence_ns.unwrap_or(0);
                         
                         // every send site (data loop, tu probe, keepalive, both ack paths) gates on ring space, so head never laps tail
                         assert!(state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY);
@@ -3048,9 +3062,17 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                         state.loss_window_start_ns = current_time_now_ns;
                                         state.loss_count_in_window = 0;
                                     }
-                                    state.loss_count_in_window += 1;
+                                    // Covered losses still enter loss/FEC statistics below, but
+                                    // cannot prime the threshold for a subsequent congestion cut.
+                                    let eligible = send_time > state.congestion_event_time_ns + (rtt_ns as f64 * cc.event_guard_rtts) as u64;
+                                    let threshold = if cc.loss_fraction_ppm == 0 { cc.loss_threshold } else {
+                                        let send_dt = send_time.saturating_sub(state.congestion_event_time_ns);
+                                        let rate = local_rate_limit(cubic_rate(send_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery).0.max(cc.rate_floor_upps), max_pps);
+                                        congestion_loss_threshold(rate, rtt_ns, &cc)
+                                    };
+                                    let trigger = count_congestion_loss(&mut state.loss_count_in_window, eligible, threshold);
 
-                                    if state.loss_count_in_window >= cc.loss_threshold && send_time > state.congestion_event_time_ns + (state.RTT_mean as f64 * 100_000.0 * cc.event_guard_rtts) as u64 {
+                                    if trigger {
                                         let send_dt = send_time - state.congestion_event_time_ns;
                                         let send_t_factor = send_dt as f64 / time_to_bandwidth_recovery as f64;
                                         let (_, send_mode) = cubic_rate(send_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery);
@@ -3064,7 +3086,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                             let boundary = (state.congestion_event_rate_upps as f64 * cc.rate_rp) as u64;
                                             discovered = (discovered + boundary) / 2;
                                         }
-                                        state.congestion_event_rate_upps = discovered;
+                                        state.congestion_event_rate_upps = local_rate_limit(discovered, max_pps);
                                         state.congestion_event_time_ns = current_time_now_ns;
                                         state.app_limit_time_offset = 0;
                                         state.loss_count_in_window = 0;
@@ -3077,6 +3099,13 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     if let Some(t) = &mut loss_trace { t.outcome('L', connection_tracking_data.two_byte_send_prefix, state.packets_waiting_ack_tail, current_time_now_ns); }
                                     state.declared_lost_field[(bit_index / 64) as usize] |= 1u64 << (bit_index % 64);
                                     connection_tracking_data.unreliable_send_buffer.fec_on_packet_lost(state.packets_waiting_ack_tail);
+                                }
+                            }
+                            if cc.record_loss_episodes {
+                                let sent_ns = get_send_time_for_sequence_number(state.packets_waiting_ack_tail, &state.send_time_band, state.send_time_band_head_index);
+                                let lost = state.declared_lost_field[(bit_index / 64) as usize] & (1u64 << (bit_index % 64)) != 0;
+                                if sent_ns != 0 && sent_ns != u64::MAX {
+                                    state.loss_episodes.on_packet(sent_ns, lost, state.RTT_mean as u64 * 100_000, &mut state.stats);
                                 }
                             }
                             state.packets_waiting_ack_field[(bit_index / 64) as usize] &= !(1u64 << (bit_index % 64));
@@ -3096,7 +3125,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                         } else {
                             cubic_rate(current_time_now_ns - state.congestion_event_time_ns, state.congestion_event_rate_upps, time_to_bandwidth_recovery)
                         };
-                        let allowed_bandwidth_upps = allowed_bandwidth_upps.max(cc.rate_floor_upps);
+                        // A local pacing ceiling is not evidence of network congestion.
+                        let allowed_bandwidth_upps = local_rate_limit(allowed_bandwidth_upps.max(cc.rate_floor_upps), max_pps);
                         // pps * 10^-6 * rtt * 10^-4 = p * 10^10
                         // BDP + sawtooth: pipe is full (BDP) plus ack batching excess (ack_pace_estimate is in 0.1ms units)
                         let bdp = allowed_bandwidth_upps * state.RTT_mean as u64 / 10_000;
@@ -3425,8 +3455,25 @@ pub fn cubic_rate_with_options(t_ns: u64, r_max: u64, k_ns: u64, cc: &Congestion
     let r = r_max as f64;
     let k = k_ns as f64;
     let drop = r * (1.0 - cc.beta);
-    let min_growth = cc.min_growth_uppsps / 1e9 * t;
-    let linear_cap_slope = cc.max_growth_uppsps / 1e9;
+    let rtt_seconds = k / (cc.recovery_rtts as f64 * 1e9);
+    let floor = if cc.friendly_growth_alpha > 0.0 {
+        cc.min_growth_uppsps.max(cc.friendly_growth_alpha * 1e6 / (rtt_seconds * rtt_seconds)).min(cc.max_growth_uppsps)
+    } else { cc.min_growth_uppsps };
+    let ceiling = if cc.relative_growth_per_rtt > 0.0 && !cc.compound_growth {
+        cc.max_growth_uppsps.min(r * cc.relative_growth_per_rtt / rtt_seconds)
+    } else { cc.max_growth_uppsps };
+    let min_growth = floor / 1e9 * t;
+    let linear_cap_slope = ceiling / 1e9;
+    let finish = |rate: u64, mode| {
+        if cc.bound_recovery_growth {
+            let absolute = r * cc.beta + (floor + ceiling) / 1e9 * t;
+            let envelope = if cc.compound_growth && cc.relative_growth_per_rtt > 0.0 {
+                let relative = r * cc.beta * (cc.relative_growth_per_rtt * t / (rtt_seconds * 1e9)).exp() + min_growth;
+                relative.min(absolute)
+            } else { absolute };
+            (rate.min(envelope as u64), mode)
+        } else { (rate, mode) }
+    };
 
     // R: p^2 recovery from r*BETA up to r*cc.rate_rp
     let r_rp = r * cc.rate_rp; // rate at R→P
@@ -3434,7 +3481,7 @@ pub fn cubic_rate_with_options(t_ns: u64, r_max: u64, k_ns: u64, cc: &Congestion
     if t <= k {
         let p = 1.0 - t / k;
         let rate = r_rp - r_drop * p * p + min_growth;
-        return ((rate.max(r * cc.beta)) as u64, 'R');
+        return finish((rate.max(r * cc.beta)) as u64, 'R');
     }
 
     let dt = t - k;
@@ -3452,7 +3499,7 @@ pub fn cubic_rate_with_options(t_ns: u64, r_max: u64, k_ns: u64, cc: &Congestion
         let capped = r_rp + linear_cap_slope * dt + min_growth;
         let rate = rate.min(capped);
         let rate = if rate.is_finite() { rate } else { r };
-        return (rate as u64, 'P');
+        return finish(rate as u64, 'P');
     }
 
     // G: quadratic from (t_pg, r_pg), entry derivative = p_slope
@@ -3467,7 +3514,7 @@ pub fn cubic_rate_with_options(t_ns: u64, r_max: u64, k_ns: u64, cc: &Congestion
         let capped = r + linear_cap_slope * dt + min_growth;
         let rate = rate.min(capped);
         let rate = if rate.is_finite() { rate } else { r };
-        return (rate as u64, 'G');
+        return finish(rate as u64, 'G');
     }
 
     // S: p^10 explosive ramp from G→S point
@@ -3488,7 +3535,7 @@ pub fn cubic_rate_with_options(t_ns: u64, r_max: u64, k_ns: u64, cc: &Congestion
     let rate = rate.min(capped);
     let rate = if rate.is_finite() { rate } else { r };
     let mode = if uncapped > capped { 'L' } else { 'S' };
-    (rate as u64, mode)
+    finish(rate as u64, mode)
 }
 
 
@@ -3553,9 +3600,196 @@ use crate::helpers::*;
 use crate::native_sockets::*;
 use crate::nym_sockets::*;
 
+fn quantized_rtt_mean(sum: u64, count: u64) -> u16 {
+    (sum / count.max(1)).clamp(1, u16::MAX as u64) as u16
+}
+
+fn local_rate_limit(rate: u64, max_pps: Option<u64>) -> u64 {
+    max_pps.map_or(rate, |limit| rate.min(limit.saturating_mul(1_000_000).max(1)))
+}
+
+fn congestion_loss_threshold(rate_upps: u64, rtt_ns: u64, cc: &CongestionControlOptions) -> u64 {
+    // Detection uses only the commanded rate and packet loss, never ACK/delivery rate.
+    let fraction = (rate_upps as u128 * rtt_ns as u128 * cc.loss_fraction_ppm as u128).div_ceil(1_000_000_000_000_000_000_000);
+    cc.loss_threshold.max(fraction.min(u64::MAX as u128) as u64)
+}
+
+fn count_congestion_loss(count: &mut u64, eligible: bool, threshold: u64) -> bool {
+    if !eligible { return false; }
+    *count = count.saturating_add(1);
+    *count >= threshold
+}
+
+#[derive(Debug, Default)]
+struct LossEpisodeBucket { start_ns: u64, packets: u64, lost: u64 }
+#[derive(Debug, Default)]
+struct LossEpisodes { buckets: [LossEpisodeBucket; 4], initialized: bool }
+impl LossEpisodes {
+    // Four staggered tumbling windows approximate a sliding RTT window without
+    // retaining packet records. Storage is 104 bytes, independent of bandwidth.
+    fn on_packet(&mut self, sent_ns: u64, lost: bool, rtt_ns: u64, stats: &mut ConnectionStats) {
+        let rtt_ns = rtt_ns.max(100_000);
+        if !self.initialized {
+            for (i, b) in self.buckets.iter_mut().enumerate() { b.start_ns = sent_ns + i as u64 * rtt_ns / 4; }
+            self.initialized = true;
+        }
+        for b in &mut self.buckets {
+            if sent_ns < b.start_ns { continue; }
+            if sent_ns - b.start_ns >= rtt_ns {
+                if b.packets >= 8 {
+                    let ppm = (b.lost * 1_000_000 / b.packets) as u32;
+                    if ppm > stats.max_rtt_loss_ppm {
+                        stats.max_rtt_loss_ppm = ppm;
+                        stats.max_rtt_loss_window_packets = b.packets;
+                    }
+                }
+                b.start_ns += ((sent_ns - b.start_ns) / rtt_ns) * rtt_ns;
+                b.packets = 0;
+                b.lost = 0;
+            }
+            b.packets += 1;
+            b.lost += u64::from(lost);
+        }
+    }
+}
+
 #[cfg(test)]
 mod congestion_tests {
     use super::*;
+
+    #[test]
+    fn fixed_memory_episode_meter_finds_short_loss_bursts() {
+        let mut meter = LossEpisodes::default();
+        let mut stats = ConnectionStats::default();
+        for i in 0..1000u64 {
+            meter.on_packet(i * 1_000_000 + 1, (200..250).contains(&i), 100_000_000, &mut stats);
+        }
+        assert_eq!(stats.max_rtt_loss_ppm, 500_000);
+        assert_eq!(stats.max_rtt_loss_window_packets, 100);
+        assert_eq!(std::mem::size_of::<LossEpisodes>(), 104);
+        assert_eq!(stats.packets_lost, 0); // Meter never alters actual loss/CC accounting.
+    }
+
+    #[test]
+    fn radio_threshold_counts_loss_episodes_not_isolated_noise() {
+        let mut cc = CongestionControlOptions::legacy();
+        assert_eq!(congestion_loss_threshold(1_000_000_000, 200_000_000, &cc), 2);
+        cc.loss_fraction_ppm = 50_000;
+        assert_eq!(congestion_loss_threshold(1_000_000_000, 200_000_000, &cc), 10);
+        assert_eq!(congestion_loss_threshold(10_000_000_000, 200_000_000, &cc), 100);
+        let mut count = 0;
+        for _ in 0..4 { assert!(!count_congestion_loss(&mut count, true, 10)); }
+        for _ in 4..9 { assert!(!count_congestion_loss(&mut count, true, 10)); }
+        assert!(count_congestion_loss(&mut count, true, 10));
+        cc.loss_timeout_rtts = 1.0;
+        assert!(cc.validate().is_err());
+    }
+
+    #[test]
+    fn congestion_after_local_ceiling_still_cuts_actual_pacing() {
+        let (r, k) = (1_000_000_000, 900_000_000);
+        let stale_discovery = cubic_rate(20 * k, r, k).0;
+        assert!(stale_discovery > r);
+        // An uncapped discovery could leave actual pacing stuck at the local cap
+        // even after genuine loss. Cap the new anchor, not only the final output.
+        let anchor = local_rate_limit(stale_discovery, Some(1000));
+        assert_eq!(anchor, r);
+        assert_eq!(local_rate_limit(cubic_rate(0, anchor, k).0, Some(1000)), 670_000_000);
+    }
+
+    #[test]
+    fn compounded_growth_remains_bounded_without_delivery_sampling() {
+        let mut cc = CongestionControlOptions::balanced();
+        cc.max_growth_uppsps = 500e6;
+        cc.relative_growth_per_rtt = 0.01;
+        cc.bound_recovery_growth = true;
+        let (r, k) = (1_000_000_000, 1_800_000_000);
+        let linear = cubic_rate_with_options(60_000_000_000, r, k, &cc).0;
+        cc.compound_growth = true;
+        assert!(cubic_rate_with_options(60_000_000_000, r, k, &cc).0 > linear);
+        let mut prev = 0;
+        for t in (0..100*k).step_by((k/1000) as usize) {
+            let rate = cubic_rate_with_options(t, r, k, &cc).0;
+            assert!(rate >= prev);
+            assert!(rate <= (r as f64 * cc.beta + 525e6 * t as f64 / 1e9) as u64);
+            prev = rate;
+        }
+    }
+
+    #[test]
+    fn bounded_recovery_cannot_bypass_relative_growth_limit() {
+        let mut cc = CongestionControlOptions::balanced();
+        cc.max_growth_uppsps = 500e6;
+        cc.relative_growth_per_rtt = 0.02;
+        let (r, k) = (1_000_000_000, 1_800_000_000);
+        assert_eq!(cubic_rate_with_options(k, r, k, &cc).0, 1_025_000_000);
+        cc.bound_recovery_growth = true;
+        assert_eq!(cubic_rate_with_options(k, r, k, &cc).0, 895_000_000);
+        let mut prev = 0;
+        for t in (0..100*k).step_by((k/1000) as usize) {
+            let rate = cubic_rate_with_options(t, r, k, &cc).0;
+            assert!(rate >= prev);
+            assert!(rate <= (r as f64 * cc.beta + 125e6 * t as f64 / 1e9) as u64);
+            prev = rate;
+        }
+    }
+
+    #[test]
+    fn rtt_growth_envelope_is_rate_based_and_option_gated() {
+        let mut cc = CongestionControlOptions::balanced();
+        cc.max_growth_uppsps = 500e6;
+        let k = 1_800_000_000;
+        let base = cubic_rate_with_options(20 * k, 1_000_000_000, k, &cc).0;
+        cc.relative_growth_per_rtt = 0.02;
+        let slow = cubic_rate_with_options(20 * k, 1_000_000_000, k, &cc).0;
+        assert!(slow < base);
+        cc.relative_growth_per_rtt = 0.0;
+        assert_eq!(cubic_rate_with_options(20 * k, 1_000_000_000, k, &cc).0, base);
+        cc.friendly_growth_alpha = 4.0;
+        assert!(cubic_rate_with_options(k, 1_000_000_000, k, &cc).0 > cubic_rate_with_options(k, 1_000_000_000, k, &CongestionControlOptions::balanced()).0);
+        for rtt in [100_000, 30_000_000, 200_000_000] {
+            let k = cc.recovery_rtts * rtt;
+            let mut prev = 0;
+            for t in (0..50*k).step_by((k/100).max(1) as usize) {
+                let rate = cubic_rate_with_options(t, 1_000_000_000, k, &cc).0;
+                assert!(rate >= prev);
+                prev = rate;
+            }
+        }
+        cc.friendly_growth_alpha = f64::NAN;
+        assert!(cc.validate().is_err());
+    }
+
+    #[test]
+    fn guarded_losses_do_not_prime_the_next_event() {
+        let mut count = 0;
+        for _ in 0..100 { assert!(!count_congestion_loss(&mut count, false, 2)); }
+        assert_eq!(count, 0);
+        assert!(!count_congestion_loss(&mut count, true, 2));
+        assert!(count_congestion_loss(&mut count, true, 2));
+    }
+
+    #[test]
+    fn local_ceiling_does_not_create_recovery_sawtooth() {
+        let (r, k) = (1_000_000_000, 900_000_000);
+        // The old local event restarted R at 0.67 * r on every cap crossing.
+        assert_eq!(cubic_rate(0, r, k).0, 670_000_000);
+        for t in (20 * k..40 * k).step_by(10_000_000) {
+            assert_eq!(local_rate_limit(cubic_rate(t, r, k).0, Some(1000)), r);
+        }
+        assert_eq!(local_rate_limit(100_000_000, Some(10)), 10_000_000);
+        assert_eq!(local_rate_limit(r, None), r);
+    }
+
+    #[test]
+    fn sub_tick_rtt_cannot_freeze_recovery() {
+        assert_eq!(quantized_rtt_mean(0, 16), 1);
+        assert_eq!(quantized_rtt_mean(30, 16), 1);
+        assert_eq!(quantized_rtt_mean(1830 * 16, 16), 1830);
+        let k = CongestionControlOptions::legacy().recovery_rtts * quantized_rtt_mean(0, 16) as u64 * 100_000;
+        assert!(k > 0);
+        assert!(cubic_rate(20 * k, 100_000_000, k).0 > cubic_rate(0, 100_000_000, k).0);
+    }
 
     #[test]
     fn legacy_transition_rates() {
