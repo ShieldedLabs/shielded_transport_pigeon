@@ -1,5 +1,5 @@
 //! Optional bounded-memory sender trace. CSV is an event stream, not a final packet table:
-//! S=sent, F=fragment association, L=declared lost, A=ACK (including late ACK).
+//! S=sent, F=fragment association, L=timeout loss, N=NACK loss, D=injected drop, C=loss CC event, E=CE CC event, A=ACK (including late ACK).
 //! Join by (connection,seq); a late A after L cancels that loss. Pending sends are censored.
 use std::io::{BufWriter, Write};
 
@@ -11,7 +11,7 @@ impl LossTrace {
         Ok(Self(w))
     }
     pub fn outcome(&mut self, event: char, connection: u16, seq: u64, time: u64) {
-        writeln!(self.0, "{event},{connection},{seq},{time},0,{},-1,-1,0", (event == 'L') as u8).expect("write loss trace");
+        writeln!(self.0, "{event},{connection},{seq},{time},0,{},-1,-1,0", matches!(event, 'L' | 'N' | 'D') as u8).expect("write loss trace");
     }
     pub fn sent(&mut self, connection: u16, seq: u64, time: u64, payload: &[u8]) {
         writeln!(self.0, "S,{connection},{seq},{time},{},0,-1,-1,0", payload.len()).expect("write loss trace");

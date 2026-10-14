@@ -2623,10 +2623,14 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
 
                                 if let Some(a) = &nack_ack {
                                     for seq in a.lost() {
+                                        let cuts_before = state.stats.congestion_loss_events;
                                         if declare_packet_lost(state, seq, timestamp_ns, &cc, max_pps) {
                                             state.stats.losses_by_nack += 1;
                                             existing_connection.unreliable_send_buffer.fec_on_packet_lost(seq);
-                                            if let Some(t) = &mut loss_trace { t.outcome('N', existing_connection.two_byte_send_prefix, seq, timestamp_ns); }
+                                            if let Some(t) = &mut loss_trace {
+                                                t.outcome('N', existing_connection.two_byte_send_prefix, seq, timestamp_ns);
+                                                if state.stats.congestion_loss_events > cuts_before { t.outcome('C', existing_connection.two_byte_send_prefix, seq, timestamp_ns); }
+                                            }
                                         }
                                     }
                                 }
@@ -3188,6 +3192,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             state.app_limit_time_offset = 0;
                             state.cc_startup_done = true;
                             state.stats.congestion_ecn_events += 1;
+                            if let Some(t) = &mut loss_trace { t.outcome('E', connection_tracking_data.two_byte_send_prefix, u64::MAX, current_time_now_ns); }
                             println!("congestion event ECN CE ...  rate discovered: {} pps  sent:{send_mode}@{send_t_factor:.2}", state.congestion_event_rate_upps as f64 / 1000000.0);
                         }
 
@@ -3212,9 +3217,13 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 }
                                 
                                 let seq = state.packets_waiting_ack_tail;
+                                let cuts_before = state.stats.congestion_loss_events;
                                 if declare_packet_lost(state, seq, current_time_now_ns, &cc, max_pps) {
                                     state.stats.losses_by_timeout += 1;
-                                    if let Some(t) = &mut loss_trace { t.outcome('L', connection_tracking_data.two_byte_send_prefix, seq, current_time_now_ns); }
+                                    if let Some(t) = &mut loss_trace {
+                                        t.outcome('L', connection_tracking_data.two_byte_send_prefix, seq, current_time_now_ns);
+                                        if state.stats.congestion_loss_events > cuts_before { t.outcome('C', connection_tracking_data.two_byte_send_prefix, seq, current_time_now_ns); }
+                                    }
                                     connection_tracking_data.unreliable_send_buffer.fec_on_packet_lost(seq);
                                 }
                             }
@@ -3412,7 +3421,10 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             let send_time_ns = if test_drop { monotonic_clock_ns() }
                             else { udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::BestEffort, false) };
                             state.account_send(send_time_ns);
-                            if let Some(t) = &mut loss_trace { t.sent(connection_tracking_data.two_byte_send_prefix, virtual_nonce, send_time_ns, &packet_memory_send[..payload_size]); }
+                            if let Some(t) = &mut loss_trace {
+                                t.sent(connection_tracking_data.two_byte_send_prefix, virtual_nonce, send_time_ns, &packet_memory_send[..unreliable_payload_size]);
+                                if test_drop { t.outcome('D', connection_tracking_data.two_byte_send_prefix, virtual_nonce, send_time_ns); }
+                            }
                             if let Some(a) = &mut connection_tracking_data.unreliable_send_buffer.fec_adaptive {
                                 a.on_data_sent(virtual_nonce);
                             }

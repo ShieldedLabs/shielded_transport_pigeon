@@ -25,7 +25,7 @@
 //! Pacer: --pacer precise|poly1|poly2|poly5|poly10, or --pacer poly --cadence-ms 2.
 //! Startup/proportional growth automatically use precise pacing even if poly is requested.
 //! --burst-budget-ms 0 disables the polynomial burst wall-time budget (re-anchor only).
-//! ACK: --ack legacy|bitmap|adaptive (default legacy), on both endpoints.
+//! ACK: --ack legacy|bitmap|adaptive|nack (default legacy), on both endpoints.
 //! Bitmap: --ack-every 8 --ack-delay-us 1000; Adaptive defaults to 8/10000 us.
 //! --duration S: saturated measurement for S seconds; requests receiver status while sending.
 //! --send-on-ms N --send-off-ms N: application submission duty cycle (queued packets drain normally).
@@ -139,9 +139,12 @@ impl RxReport {
         v.extend_from_slice(&[s.fec_decode_last_tail_ns, s.fec_decode_max_tail_ns, s.fec_ingress_dropped_blocks, s.udp_payload_tu]);
         v.extend_from_slice(&[s.ack_packets_sent, s.ack_bytes_sent, s.ack_packets_received, s.ack_delay_us_max as u64, s.rtt_samples]);
         v.extend_from_slice(&[s.fec_decode_admission_refusals, s.fec_decode_timeouts, s.fec_decode_preemptions]);
+        v.extend_from_slice(&[s.nack_packets_sent, s.nack_packets_received, s.losses_by_nack, s.losses_by_timeout,
+            s.nack_losses_declared, s.false_nacks, s.nack_ranges_expired, s.nack_reorder_us as u64,
+            s.congestion_loss_events, s.congestion_ecn_events]);
         v
     }
-    const WORDS: usize = 40;
+    const WORDS: usize = 50;
     fn from_words(w: &[u64]) -> Option<RxReport> {
         if w.len() < 37 { return None; }
         let mut st = ConnectionStats { rx_packets: w[0], rx_seq_span: w[1], rx_lost: w[2], rx_reordered: w[3], rx_late_beyond_window: w[4], rx_duplicates: w[5], rx_bursts: w[6], ..Default::default() };
@@ -157,6 +160,16 @@ impl RxReport {
         st.fec_decode_admission_refusals = w.get(37).copied().unwrap_or(0);
         st.fec_decode_timeouts = w.get(38).copied().unwrap_or(0);
         st.fec_decode_preemptions = w.get(39).copied().unwrap_or(0);
+        st.nack_packets_sent = w.get(40).copied().unwrap_or(0);
+        st.nack_packets_received = w.get(41).copied().unwrap_or(0);
+        st.losses_by_nack = w.get(42).copied().unwrap_or(0);
+        st.losses_by_timeout = w.get(43).copied().unwrap_or(0);
+        st.nack_losses_declared = w.get(44).copied().unwrap_or(0);
+        st.false_nacks = w.get(45).copied().unwrap_or(0);
+        st.nack_ranges_expired = w.get(46).copied().unwrap_or(0);
+        st.nack_reorder_us = w.get(47).copied().unwrap_or(0) as u32;
+        st.congestion_loss_events = w.get(48).copied().unwrap_or(0);
+        st.congestion_ecn_events = w.get(49).copied().unwrap_or(0);
         Some(RxReport { st, th, cpu_user_us: w[21], cpu_sys_us: w[22] })
     }
 }
@@ -897,10 +910,35 @@ fn send(a: &Args) {
         stats.udp_payload_tu, rx.st.fec_decode_last_tail_ns as f64 / 1e6, rx.st.fec_decode_max_tail_ns as f64 / 1e6, rx.st.fec_ingress_dropped_blocks));
     json.insert_str(json.len() - 2, &format!(",\"receiver_fec_decode_admission_refusals\":{},\"receiver_fec_decode_timeouts\":{},\"receiver_fec_decode_preemptions\":{}",
         rx.st.fec_decode_admission_refusals, rx.st.fec_decode_timeouts, rx.st.fec_decode_preemptions));
+    json.insert_str(json.len() - 2, &format!(concat!(
+        ",\"nack_packets_sent\":{},\"nack_packets_received\":{},\"losses_by_nack\":{},\"losses_by_timeout\":{},",
+        "\"congestion_loss_events\":{},\"congestion_ecn_events\":{},",
+        "\"receiver_nack_packets_sent\":{},\"receiver_nack_losses_declared\":{},\"receiver_false_nacks\":{},",
+        "\"receiver_nack_ranges_expired\":{},\"receiver_nack_reorder_us\":{}"),
+        stats.nack_packets_sent, stats.nack_packets_received, stats.losses_by_nack, stats.losses_by_timeout,
+        stats.congestion_loss_events, stats.congestion_ecn_events,
+        rx.st.nack_packets_sent, rx.st.nack_losses_declared, rx.st.false_nacks, rx.st.nack_ranges_expired, rx.st.nack_reorder_us));
+    let submitted = first_submit_ns.iter().filter(|s| s.is_some()).count();
+    json.insert_str(json.len() - 2, &format!(",\"messages_submission_attempted\":{submitted}"));
     println!("UDP TU {}B | FEC blocks {{{block_sizes}}}B | receiver FEC last/max decode tail {:.3}/{:.3}ms | ingress erased {} blocks",
         stats.udp_payload_tu, rx.st.fec_decode_last_tail_ns as f64 / 1e6, rx.st.fec_decode_max_tail_ns as f64 / 1e6, rx.st.fec_ingress_dropped_blocks);
     std::fs::write(&out, json).unwrap_or_else(|e| die(&format!("writing {out}: {e}")));
     println!("report written to {out}");
     drop(handle); // A traced run joins the network thread and flushes its event CSV.
     std::process::exit(if delivered == count as u64 { 0 } else { 1 });
+}
+
+#[test]
+fn receiver_nack_counters_round_trip() {
+    let mut r = RxReport::default();
+    r.st.nack_packets_sent = 101;
+    r.st.nack_losses_declared = 20;
+    r.st.false_nacks = 3;
+    r.st.nack_reorder_us = 12345;
+    let w = r.to_words(); assert_eq!(w.len(), RxReport::WORDS);
+    let got = RxReport::from_words(&w).unwrap();
+    assert_eq!(got.st.nack_packets_sent, 101);
+    assert_eq!(got.st.nack_losses_declared, 20);
+    assert_eq!(got.st.false_nacks, 3);
+    assert_eq!(got.st.nack_reorder_us, 12345);
 }
