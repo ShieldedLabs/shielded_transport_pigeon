@@ -1318,6 +1318,46 @@ impl TestDropSchedule {
     }
 }
 
+/// Measurement-only erasure rule; package/block identity, never RNG or clock.
+/// Dropping a physical packet can also erase a packed neighboring fragment.
+fn test_drop_fec_package(payload: &[u8], ids: &[u16]) -> bool {
+    let mut cursor = 0;
+    while cursor + 8 <= payload.len() {
+        let word = load_u64(&payload[cursor..cursor + 8]);
+        if word == u64::MAX { break; }
+        let len = ((word >> 18) & 0x3fff) as usize;
+        let fec = word & 1 != 0;
+        let header = if fec { 16 } else { 8 };
+        if cursor + header + len > payload.len() { break; }
+        if fec && ids.contains(&(((word >> 2) & 0xffff) as u16)) {
+            let shape = load_u64(&payload[cursor + 8..cursor + 16]);
+            let message_len = (shape & 0xffff_ffff) as usize;
+            let block_bytes = ((shape >> 32) & 0xffff) as usize;
+            if let Some(layout) = crate::fec::MessageLayout::new(message_len, block_bytes) {
+                if (word >> 32) as usize >= layout.k - 1 { return true; }
+            }
+        }
+        cursor += header + len;
+    }
+    false
+}
+
+#[test]
+fn deterministic_fec_drop_targets_only_last_source_and_repairs() {
+    let mut payload = [0u8; 48];
+    let shape = 160u64 | (32u64 << 32) | (STP_EXT_KIND_FEC << 48);
+    payload[8..16].copy_from_slice(&shape.to_le_bytes());
+    for package in [78u16, 79] {
+        for block in 0..10u64 {
+            let word = 1 | ((package as u64) << 2) | (32 << 18) | (block << 32);
+            payload[..8].copy_from_slice(&word.to_le_bytes());
+            assert_eq!(test_drop_fec_package(&payload, &[78]), package == 78 && block >= 4);
+            assert!(!test_drop_fec_package(&payload, &[]));
+        }
+    }
+    assert!(!test_drop_fec_package(&payload[..15], &[79]));
+}
+
 pub fn get_send_time_for_sequence_number(sequence_number: u64, send_time_band: &[u64; 1024], send_time_band_head_index: u64) -> u64 {
     if sequence_number >= send_time_band[(send_time_band_head_index % 1024) as usize] { return u64::MAX; }
     
@@ -2028,6 +2068,14 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
         // schedule with period T s. STP_TEST_DROP_BURST=n: drops come in runs of n packets (the
         // run start rate is divided by n, so the average stays the scheduled rate).
         let test_drop_schedule = TestDropSchedule::from_env();
+        // Deterministically leave selected FEC packages one source short: preserve
+        // all earlier sources, erase the last source and every repair. Test only.
+        let test_fec_drop_packages = std::env::var("STP_TEST_DROP_FEC_PACKAGES").ok().map(|v| {
+            let ids = v.split(',').map(|id| id.trim().parse::<u16>().expect("bad STP_TEST_DROP_FEC_PACKAGES")).collect::<Vec<_>>();
+            assert!(ids.len() <= 1024, "too many test-drop package IDs");
+            println!("STP port {my_port}: STP_TEST_DROP_FEC_PACKAGES={v} (test only)");
+            ids
+        });
         if let Some(sch) = &test_drop_schedule { println!("STP port {my_port}: STP_TEST_DROP_SCHEDULE: {sch:?} (test only)"); }
         let test_drop_burst: u64 = std::env::var("STP_TEST_DROP_BURST").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1).max(1);
         let mut test_drop_burst_left = 0u64;
@@ -3352,7 +3400,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             }
 
                             should_sleep = false;
-                            let test_drop = if test_drop_burst_left > 0 { test_drop_burst_left -= 1; true } else {
+                            let test_drop = test_fec_drop_packages.as_ref().is_some_and(|ids| test_drop_fec_package(&packet_memory_send[..unreliable_payload_size], ids)) || if test_drop_burst_left > 0 { test_drop_burst_left -= 1; true } else {
                                 test_drop_ppm != 0 && {
                                     test_drop_rng ^= test_drop_rng << 13; test_drop_rng ^= test_drop_rng >> 7; test_drop_rng ^= test_drop_rng << 17;
                                     test_drop_rng % 1_000_000 < test_drop_ppm / test_drop_burst

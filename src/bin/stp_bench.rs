@@ -858,7 +858,7 @@ fn send(a: &Args) {
         "\"commanded_packets\":{},\"error_samples\":{},\"error_abs_sum_ns\":{},\"error_max_ns\":{},\"history_records\":{},",
         "\"network_cpu_user_us\":{},\"network_cpu_sys_us\":{},\"process_cpu_user_us\":{},\"process_cpu_sys_us\":{},\"load_start\":[{}],\"load_end\":[{}]}}}}\n"),
         to, seed, min, max, sbp.0, sbp.1, sbp.2, fec_pct, fec_mode, fec_adaptive.map(|c| format!("{c:?}")).unwrap_or_default(),
-        std::env::var("STP_TEST_DROP_SCHEDULE").unwrap_or_else(|_| std::env::var("STP_TEST_DROP_PPM").map(|v| format!("ppm={v}")).unwrap_or_default()),
+        std::env::var("STP_TEST_DROP_FEC_PACKAGES").map(|v| format!("fec-packages={v}")).unwrap_or_else(|_| std::env::var("STP_TEST_DROP_SCHEDULE").unwrap_or_else(|_| std::env::var("STP_TEST_DROP_PPM").map(|v| format!("ppm={v}")).unwrap_or_default())),
         count, total_bytes, delivered, delivered_bytes, corrupt, lost, stop_reason,
         unix_epoch_s + start_ns as f64 / 1e9, wall_s, confirm_s, goodput_mbs, goodput_mbs * 8.0,
         rtt_min_ns as f64 / 1e6, rtt_median_ns as f64 / 1e6, rejected_total, generator_wait_ns as f64 / 1e9,
