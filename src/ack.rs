@@ -8,10 +8,12 @@ pub enum AckOptions {
     /// Original 516-byte bitmap and 50 ms timer; for old peers and comparisons.
     Legacy,
     /// ACK at this packet count or delay, whichever comes first. Gaps, reordering,
-    /// duplicates and CE schedule an immediate ACK (coalesced within a receive batch).
+    /// duplicates and CE schedule an immediate ACK.
     LowLatency { every_packets: u16, max_delay_us: u32 },
     /// Rate/RTT-scaled batching. Packet threshold grows up to64, targeting1000 ACK/s;
     /// deadline uses RTT/8 plus a packet-budget floor, bounded by max_delay_us.
+    /// Gaps mature after max(1ms,RTT/16) or16 later packets. Urgent gap/CE feedback
+    /// is paced at least by that interval and the normal packet-budget interval.
     Adaptive { every_packets: u16, max_delay_us: u32 },
 }
 impl Default for AckOptions {
@@ -99,9 +101,12 @@ pub struct AckReceiver {
     pending: u16,
     last_arrival_ns: Option<u64>,
     mean_gap_ns: u64,
+    gap_seq: Option<u64>,
+    gap_since_ns: u64,
+    last_ack_ns: Option<u64>,
 }
 impl Default for AckReceiver {
-    fn default() -> Self { Self { history: [0; 64], highest: None, sample_seq: 0, sample_time_ns: 0, ce_count: 0, pending: 0, last_arrival_ns: None, mean_gap_ns: 1_000_000 } }
+    fn default() -> Self { Self { history: [0; 64], highest: None, sample_seq: 0, sample_time_ns: 0, ce_count: 0, pending: 0, last_arrival_ns: None, mean_gap_ns: 1_000_000, gap_seq: None, gap_since_ns: 0, last_ack_ns: None } }
 }
 impl AckReceiver {
     /// Returns false for duplicate/too-old data; duplicates still refresh ACK feedback.
@@ -120,7 +125,12 @@ impl AckReceiver {
         }
         let word = &mut self.history[(seq % HISTORY_BITS / 64) as usize];
         let mask = 1 << (seq % 64);
-        if *word & mask != 0 { *timer = (*timer).min(now); return false; }
+        if *word & mask != 0 {
+            let deadline = if matches!(options, AckOptions::Adaptive { .. }) {
+                self.last_ack_ns.map_or(now, |last| last.saturating_add((rtt_us * 1000 / 16).max(1_000_000)))
+            } else { now };
+            *timer = (*timer).min(deadline); return false;
+        }
         *word |= mask;
         self.highest = Some(old_highest.unwrap_or(seq).max(seq));
         self.sample_seq = seq;
@@ -133,8 +143,35 @@ impl AckReceiver {
         self.last_arrival_ns = Some(now);
         let (every_packets, max_delay_us) = self.policy(options, rtt_us, wire_bytes);
         self.pending = self.pending.saturating_add(1);
-        let urgent = ce || old_highest.is_none_or(|h| seq != h + 1) || self.pending >= every_packets.max(1);
-        *timer = (*timer).min(now.saturating_add(if urgent { 0 } else { max_delay_us as u64 * 1000 }));
+        let deadline = if matches!(options, AckOptions::Adaptive { .. }) {
+            let highest = self.highest.unwrap();
+            if old_highest.is_some_and(|h| seq > h + 1) && self.gap_seq.is_none() {
+                self.gap_seq = Some(old_highest.unwrap()+1); self.gap_since_ns = now;
+            }
+            if let Some(mut gap) = self.gap_seq {
+                gap = gap.max(highest.saturating_sub(HISTORY_BITS-1));
+                while gap <= highest && self.history[(gap%HISTORY_BITS/64) as usize] & (1 << (gap%64)) != 0 { gap += 1; }
+                self.gap_seq = (gap <= highest).then_some(gap);
+            }
+            let mut due = if old_highest.is_none() || self.pending >= every_packets.max(1) { now }
+                else { now.saturating_add(max_delay_us as u64 * 1000) };
+            // Reordering is not a new loss event for each arrival. Wait for a persistent
+            // gap (or16 later packets), then pace urgent feedback. Shared nonce-space ACK
+            // gaps can persist forever; this guard bounds their cost as well.
+            let reorder_ns = (rtt_us * 1000 / 16).max(1_000_000);
+            if ce || self.gap_seq.is_some() {
+                let matured = if ce || self.gap_seq.is_some_and(|gap| highest.saturating_sub(gap) >= 16) { now }
+                    else { self.gap_since_ns.saturating_add(reorder_ns).max(now) };
+                let guard_ns = reorder_ns.max((every_packets as u64 * self.mean_gap_ns).min(max_delay_us as u64 * 1000));
+                let earliest = self.last_ack_ns.map_or(matured, |last| matured.max(last.saturating_add(guard_ns)));
+                due = due.min(earliest);
+            }
+            due
+        } else {
+            let urgent = ce || old_highest.is_none_or(|h| seq != h + 1) || self.pending >= every_packets.max(1);
+            now.saturating_add(if urgent { 0 } else { max_delay_us as u64 * 1000 })
+        };
+        *timer = (*timer).min(deadline);
         true
     }
     fn policy(&self, options: AckOptions, rtt_us: u64, wire_bytes: usize) -> (u16, u32) {
@@ -174,7 +211,7 @@ impl AckReceiver {
             delay_us: (now.saturating_sub(self.sample_time_ns)/1000).min(u32::MAX as u64) as u32,
             ce_count: self.ce_count, bitmap }
     }
-    pub fn sent(&mut self) { self.pending = 0; }
+    pub fn sent(&mut self, now: u64) { self.pending = 0; self.last_ack_ns = Some(now); }
 }
 
 /// Cumulative feedback is idempotent under ACK loss, duplication and reordering.
@@ -224,7 +261,7 @@ mod tests {
     fn count_timer_duplicates_and_ce_are_idempotent() {
         let mut r = AckReceiver::default(); let mut timer = u64::MAX;
         r.receive(0, 0, false, AckOptions::default(), &mut timer);
-        r.sent(); timer = u64::MAX;
+        r.sent(0); timer = u64::MAX;
         for s in 1..8 { assert!(r.receive(s, s*100, false, AckOptions::default(), &mut timer)); }
         assert_eq!(timer, 1_000_100);
         r.receive(8, 800, false, AckOptions::default(), &mut timer);
@@ -300,6 +337,25 @@ mod tests {
         assert_eq!(r.policy(opts, 200000, 539), (64, 10000));
         r.mean_gap_ns = 1_000_000;
         assert_eq!(r.policy(opts, 10000, 539), (17, 10000)); // deadline cap wins; budget cannot be met
+    }
+    #[test]
+    fn adaptive_waits_for_reordering_and_rate_limits_ce() {
+        let mut r = AckReceiver::default();
+        let options = AckOptions::Adaptive { every_packets: 8, max_delay_us: 10000 };
+        let mut timer = u64::MAX;
+        assert!(r.receive_with_rtt(0, 0, false, options, &mut timer, 40000, 1472));
+        r.sent(0); timer = u64::MAX;
+        assert!(r.receive_with_rtt(2, 100_000, false, options, &mut timer, 40000, 1472));
+        assert!(timer >= 2_500_000); // no immediate ACK for a transient gap
+        assert!(r.receive_with_rtt(1, 200_000, false, options, &mut timer, 40000, 1472));
+        assert!(r.gap_seq.is_none());
+        r.sent(300_000); timer = u64::MAX;
+        r.receive_with_rtt(3, 400_000, true, options, &mut timer, 40000, 1472);
+        assert!(timer > 400_000); // CE burst shares the bounded urgent-feedback budget
+        r.sent(400_000); timer = u64::MAX;
+        r.receive_with_rtt(4, 20_000_000, true, options, &mut timer, 40000, 1472);
+        assert_eq!(timer, 20_000_000); // first CE after the guard is immediate
+        assert_eq!(r.ack(20_000_000).ce_count, 2);
     }
     #[test]
     fn hello_sizes_are_not_ack_sizes() {

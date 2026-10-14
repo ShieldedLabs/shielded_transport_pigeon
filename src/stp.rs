@@ -2704,7 +2704,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 else { o += ack_payload.write_to(&mut packet_memory_send[o..]); }
                                 let ack_ecn = matches!(ack_options, crate::ack::AckOptions::Legacy) && state.ecn_congestion_received;
                                 if matches!(ack_options, crate::ack::AckOptions::Legacy) { state.ecn_congestion_received = false; }
-                                state.ack_receiver.sent();
+                                state.ack_receiver.sent(current_time_now_ns);
                                 state.stats.ack_packets_sent += 1;
                                 state.stats.ack_bytes_sent += o as u64;
                                 if let Some(ns) = &connection_tracking_data.nym_sock { nym_udp_send_with_congestion_and_dscp(ns, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_send[..o], Dscp::Af21, ack_ecn); }
