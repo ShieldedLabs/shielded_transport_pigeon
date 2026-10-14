@@ -4,7 +4,7 @@
 
 STP is a fledgling🐦 transport layer built to support [Zebra](https://z.cash/ecosystem/zebrad/)'s and [Crosslink](https://github.com/ShieldedLabs/zebra-crosslink-staging)'s networking requirements with minimal code size and infrastructure dependencies.
 
-STP is intended to make "small-and-frequent" P2P gossip and "high-bandwidth serial beaming" both viable, even over high-RTT connections like the Nym mixnet.
+STP is intended to make "small-and-frequent" P2P gossip and "high-bandwidth serial beaming" both viable, even over high-RTT connections (satellite, radio, intercontinental fibre).
 
 ## Overview
 
@@ -48,7 +48,6 @@ STP is intended to make "small-and-frequent" P2P gossip and "high-bandwidth seri
 - Packet Relay for peers with no path
 
 ### Why Not QUIC?
-- No Nym
 - TLS
 - Certificates - *boo hiss boo*
     - Centralized authorities

@@ -891,8 +891,6 @@ pub struct ConnectionTrackingData {
     pub unreliable_send_buffer: UnreliableSendBuffer,
     pub unreliable_reassembly: Vec<ReassemblySlot>,
     pub unreliable_fec: Vec<FecRecvSlot>,
-    
-    pub nym_sock: Option<NymSockHandle>,
 }
 impl ConnectionTrackingData {
     pub fn address(&self) -> STPAddress {
@@ -1453,7 +1451,6 @@ pub fn connect_to_endpoint(
     connections_map: &mut HashMap::<ConnectionKey, ConnectionTrackingData>,
     my_connect_keypair: &IdentityKeyPair,
     endpoint: &STPAddress,
-    nym_sock: Option<NymSockHandle>,
     send_buffer_params: (u32, u32, u32),
 ) {
     assert!(my_connect_keypair.magic1 == endpoint.magic1);
@@ -1482,7 +1479,6 @@ pub fn connect_to_endpoint(
                 unreliable_send_buffer: UnreliableSendBuffer::new(send_buffer_params.0, send_buffer_params.1, send_buffer_params.2),
                 unreliable_reassembly: ReassemblySlot::new_ring(1024),
                 unreliable_fec: FecRecvSlot::new_ring(1024),
-                nym_sock,
             },
         );
     }
@@ -1516,7 +1512,6 @@ pub fn connect_to_endpoint(
                 unreliable_send_buffer: UnreliableSendBuffer::new(send_buffer_params.0, send_buffer_params.1, send_buffer_params.2),
                 unreliable_reassembly: ReassemblySlot::new_ring(1024),
                 unreliable_fec: FecRecvSlot::new_ring(1024),
-                nym_sock,
             },
         );
     }
@@ -2034,9 +2029,6 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
     monotonic_clock_setup();
 
     let socket = setup_and_bind_udp_socket_on(my_port, bind_ip).expect("Failed to bind socket, try again.");
-    
-    // Nym setup
-    let nym_handle = nym_setup();
 
     let inner = std::sync::Arc::new(NetworkThreadInner {
         state: std::sync::atomic::AtomicUsize::new(0),
@@ -2085,7 +2077,6 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
         let mut network_cpu = (0u64, 0u64);
 
         let mut connections_map = HashMap::<ConnectionKey, ConnectionTrackingData>::new();
-        let mut server_nym_sockets: Vec<NymSockHandle> = Vec::new();
 
         loop {
             if thread_inner.stop.load(std::sync::atomic::Ordering::Acquire) {
@@ -2137,8 +2128,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                     }
                     for keypair in &my_keypairs {
                         if w.magic1 == keypair.magic1 {
-                            //connect_to_endpoint(&mut connections_map, keypair, w, Some(new_nym_sock(&nym_handle)));
-                            connect_to_endpoint(&mut connections_map, keypair, w, None, send_buffer_params);
+                            connect_to_endpoint(&mut connections_map, keypair, w, send_buffer_params);
                             break;
                         }
                     }
@@ -2237,31 +2227,12 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                 let mut should_sleep = true;
                 
 //////// BEGIN RECEIVE ////////////////////////////////////////////////////////////////////////
-                // Gather and deduplicate all nym sockets (server + per-connection)
-                let mut nym_recv_sockets: Vec<NymSockHandle> = Vec::new();
-                for s in &server_nym_sockets {
-                    nym_recv_sockets.push(s.clone());
-                }
-                for (_, ctd) in &connections_map {
-                    if let Some(ns) = &ctd.nym_sock {
-                        if !nym_recv_sockets.iter().any(|existing| std::sync::Arc::ptr_eq(&existing.shared, &ns.shared)) {
-                            nym_recv_sockets.push(ns.clone());
-                        }
-                    }
-                }
-
-                for recv_source_i in 0..1 + nym_recv_sockets.len() {
-                    let (buf_len, other_ip_addr, other_port, ecn_marked, ecn_enabled, service_class, timestamp_ns) = if recv_source_i == 0 {
+                for _recv_round in 0..1 { // single-iteration loop: `continue` below skips the rest of this packet
+                    let (buf_len, other_ip_addr, other_port, ecn_marked, ecn_enabled, service_class, timestamp_ns) =
                         match udp_recv_with_congestion_and_dscp(socket, &mut packet_memory_encrypted[..]) {
                             Ok(r) => r,
                             Err(_) => continue,
-                        }
-                    } else {
-                        match nym_udp_recv_with_congestion_and_dscp(&nym_recv_sockets[recv_source_i - 1], &mut packet_memory_encrypted[..]) {
-                            Ok(r) => r,
-                            Err(_) => continue,
-                        }
-                    };
+                        };
                     if buf_len < 6 { continue; }
                     
                     should_sleep = false;
@@ -2328,7 +2299,6 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                                     unreliable_send_buffer: UnreliableSendBuffer::new(send_buffer_params.0, send_buffer_params.1, send_buffer_params.2),
                                                     unreliable_reassembly: ReassemblySlot::new_ring(1024),
                                                     unreliable_fec: FecRecvSlot::new_ring(1024),
-                                                    nym_sock: None,
                                                 },
                                             );
                                             if OVERLY_VERBOSE { println!("Transitioned connection {} to SendingServerHelloPlaintext.", connection_key.key_15_bits); }
@@ -2410,7 +2380,6 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                                         unreliable_send_buffer: UnreliableSendBuffer::new(send_buffer_params.0, send_buffer_params.1, send_buffer_params.2),
                                                         unreliable_reassembly: ReassemblySlot::new_ring(1024),
                                                         unreliable_fec: FecRecvSlot::new_ring(1024),
-                                                        nym_sock: None,
                                                     },
                                                 );
         
@@ -2712,8 +2681,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     if let Some(cipher) = &mut state.cipher { o += cipher.current.write_message(virtual_nonce, state.ack_field.as_bytes(), &mut packet_memory_send[o..]).unwrap(); }
                                     else { o += state.ack_field.as_bytes().write_to(&mut packet_memory_send[o..]); }
                                     let ack_ecn = take_ecn_echo(state);
-                                    if let Some(ns) = &existing_connection.nym_sock { nym_udp_send_with_congestion_and_dscp(ns, existing_connection.other_ip, existing_connection.other_port, &packet_memory_send[..o], Dscp::Af21, ack_ecn); }
-                                    else { udp_send_with_congestion_and_dscp(socket, existing_connection.other_ip, existing_connection.other_port, &packet_memory_send[..o], Dscp::Af21, ack_ecn); }
+                                    udp_send_with_congestion_and_dscp(socket, existing_connection.other_ip, existing_connection.other_port, &packet_memory_send[..o], Dscp::Af21, ack_ecn);
                                     state.stats.ack_packets_sent += 1;
                                     state.stats.ack_bytes_sent += o as u64;
                                     state.ack_timer = u64::MAX;
@@ -2953,8 +2921,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                 connections_map.retain(|connection_key, connection_tracking_data| {match &mut connection_tracking_data.connection_state {
                     ConnectionState::SendingClientHelloPlaintext { last_sent_time_ns, hello_packet_payload } => {
                         if *last_sent_time_ns + 2_500_000_000 < current_time_now_ns {
-                            if let Some(ns) = &connection_tracking_data.nym_sock { nym_udp_send_with_congestion_and_dscp(ns, connection_tracking_data.other_ip, connection_tracking_data.other_port, &hello_packet_payload, Dscp::Af21, false); }
-                            else { udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &hello_packet_payload, Dscp::Af21, false); }
+                            udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &hello_packet_payload, Dscp::Af21, false);
                             if *last_sent_time_ns == 0 { // cheeky optimization
                                 *last_sent_time_ns = current_time_now_ns - 2_500_000_000 + 10_000_000;
                             } else {
@@ -2968,8 +2935,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                     }
                     ConnectionState::SendingClientHello { magic1, last_sent_time_ns, hello_packet_payload, handshake } => {
                         if *last_sent_time_ns + 2_500_000_000 < current_time_now_ns {
-                            if let Some(ns) = &connection_tracking_data.nym_sock { nym_udp_send_with_congestion_and_dscp(ns, connection_tracking_data.other_ip, connection_tracking_data.other_port, &hello_packet_payload, Dscp::Af21, false); }
-                            else { udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &hello_packet_payload, Dscp::Af21, false); }
+                            udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &hello_packet_payload, Dscp::Af21, false);
                             if *last_sent_time_ns == 0 { // cheeky optimization
                                 *last_sent_time_ns = current_time_now_ns - 2_500_000_000 + 10_000_000;
                             } else {
@@ -2983,8 +2949,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                     }
                     ConnectionState::SendingServerHelloPlaintext { magic2: _, last_sent_time_ns, hello_packet_payload } => {
                         if *last_sent_time_ns + 2_500_000_000 < current_time_now_ns {
-                            if let Some(ns) = &connection_tracking_data.nym_sock { nym_udp_send_with_congestion_and_dscp(ns, connection_tracking_data.other_ip, connection_tracking_data.other_port, &hello_packet_payload, Dscp::Af21, false); }
-                            else { udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &hello_packet_payload, Dscp::Af21, false); }
+                            udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &hello_packet_payload, Dscp::Af21, false);
                             if *last_sent_time_ns == 0 { // cheeky optimization
                                 *last_sent_time_ns = current_time_now_ns - 2_500_000_000 + 10_000_000;
                             } else {
@@ -2998,8 +2963,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                     }
                     ConnectionState::SendingServerHello { magic1, magic2: _, cipher, last_sent_time_ns, hello_packet_payload } => {
                         if *last_sent_time_ns + 2_500_000_000 < current_time_now_ns {
-                            if let Some(ns) = &connection_tracking_data.nym_sock { nym_udp_send_with_congestion_and_dscp(ns, connection_tracking_data.other_ip, connection_tracking_data.other_port, &hello_packet_payload, Dscp::Af21, false); }
-                            else { udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &hello_packet_payload, Dscp::Af21, false); }
+                            udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &hello_packet_payload, Dscp::Af21, false);
                             if *last_sent_time_ns == 0 { // cheeky optimization
                                 *last_sent_time_ns = current_time_now_ns - 2_500_000_000 + 10_000_000;
                             } else {
@@ -3049,8 +3013,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 state.ack_receiver.sent(current_time_now_ns);
                                 state.stats.ack_packets_sent += 1;
                                 state.stats.ack_bytes_sent += o as u64;
-                                if let Some(ns) = &connection_tracking_data.nym_sock { nym_udp_send_with_congestion_and_dscp(ns, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_send[..o], Dscp::Af21, ack_ecn); }
-                                else { udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_send[..o], Dscp::Af21, ack_ecn); }
+                                udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_send[..o], Dscp::Af21, ack_ecn);
                                 state.ack_timer = u64::MAX;
                             }
                         }
@@ -3335,8 +3298,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 packet_len = payload_size;
                             }
 
-                            let send_time_ns = if let Some(ns) = &connection_tracking_data.nym_sock { nym_udp_send_with_congestion_and_dscp(ns, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::Af21, false) }
-                            else { udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::Af21, false) };
+                            let send_time_ns = udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::Af21, false);
                             connection_tracking_data.unreliable_send_buffer.fec_prepare_packet(state.send_sequence_number);
                             state.account_send(send_time_ns);
                             state.last_sent_tu_probe_time_ns = send_time_ns;
@@ -3362,8 +3324,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 packet_len = payload_size;
                             }
 
-                            let send_time_ns = if let Some(ns) = &connection_tracking_data.nym_sock { nym_udp_send_with_congestion_and_dscp(ns, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::Af21, false) }
-                            else { udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::Af21, false) };
+                            let send_time_ns = udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::Af21, false);
                             connection_tracking_data.unreliable_send_buffer.fec_prepare_packet(state.send_sequence_number);
                             state.account_send(send_time_ns);
                             state.last_sent_data_packet = current_time_now_ns; // We use the older time here so the pacer skips less packets.
@@ -3425,7 +3386,6 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             };
                             if test_drop { state.stats.test_dropped += 1; }
                             let send_time_ns = if test_drop { monotonic_clock_ns() }
-                            else if let Some(ns) = &connection_tracking_data.nym_sock { nym_udp_send_with_congestion_and_dscp(ns, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::BestEffort, false) }
                             else { udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::BestEffort, false) };
                             state.account_send(send_time_ns);
                             if let Some(t) = &mut loss_trace { t.sent(connection_tracking_data.two_byte_send_prefix, virtual_nonce, send_time_ns, &packet_memory_send[..payload_size]); }
@@ -3732,7 +3692,6 @@ pub fn get_handshake_hash(handshake: &snow::HandshakeState) -> [u8; 64] {
 
 use crate::helpers::*;
 use crate::native_sockets::*;
-use crate::nym_sockets::*;
 
 fn take_ecn_echo(state: &mut ConnectionStateConnected) -> bool {
     std::mem::take(&mut state.ecn_echo_pending)

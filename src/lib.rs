@@ -1,8 +1,7 @@
 //! Shielded Transport Pigeon: encrypted, optionally reliable UDP.
 //!
 //! Extracted unchanged from Tenderlink. Tenderlink and New Network call this
-//! crate. The Nym backend in `nym_sockets` is a stub; the previous implementation
-//! is commented out in that file.
+//! crate. Nym mixnet support has been removed; STP targets ordinary networks.
 
 #![allow(non_snake_case, non_upper_case_globals)]
 #![allow(dead_code, unused_variables, unused_mut, unused_imports, unused_assignments, unused_unsafe)]
@@ -14,6 +13,5 @@ pub mod fec_adapt;
 mod loss_trace;
 pub mod helpers;
 pub mod native_sockets;
-pub mod nym_sockets;
 pub mod stp;
 pub mod scheduling;
