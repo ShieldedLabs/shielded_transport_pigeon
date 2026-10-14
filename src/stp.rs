@@ -3290,7 +3290,15 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 }
                                 if ack_latency_ns != 0 { state.loss_timer.observe(ack_latency_ns); }
                                 if data_ack_progress {
+                                    let before = state.congestion_event_time_ns;
+                                    let cut_trace = loss_trace.as_ref().and_then(|_| state.ack_hole.candidate.map(|(seq, _)|
+                                        (seq, state.send_time(seq), cc_trace_context(state, timestamp_ns, &cc, max_pps))));
                                     observe_ack_hole(state, timestamp_ns, &cc, max_pps);
+                                    if state.congestion_event_time_ns != before {
+                                        if let (Some(t), Some((seq, sent, context))) = (&mut loss_trace, cut_trace) {
+                                            t.cut(existing_connection.two_byte_send_prefix, seq, timestamp_ns, sent, "early", context);
+                                        }
+                                    }
                                 }
 
                                 let ce_feedback = bitmap_ack.as_ref().is_some_and(|a| crate::ack::update_ce_count(&mut state.peer_ce_count, a.ce_count));
@@ -3848,7 +3856,15 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                         let trigger = count_congestion_loss(&mut state.loss_count_in_window, eligible, cc.loss_threshold);
 
                                     if trigger {
+                                        let before = state.congestion_event_time_ns;
+                                        let context = loss_trace.as_ref().map(|_| cc_trace_context(state, current_time_now_ns, &cc, max_pps));
                                         apply_loss_congestion(state, send_time, current_time_now_ns, &cc, max_pps);
+                                        if state.congestion_event_time_ns != before {
+                                            if let (Some(t), Some(context)) = (&mut loss_trace, context) {
+                                                t.cut(connection_tracking_data.two_byte_send_prefix, state.packets_waiting_ack_tail,
+                                                    current_time_now_ns, send_time, "timeout", context);
+                                            }
+                                        }
                                     }
                                     assert!(state.packets_in_flight > 0, "packets_in_flight underflow");
                                     state.packets_in_flight -= 1;
@@ -3889,6 +3905,11 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                         // A local pacing ceiling is not evidence of network congestion.
                         let allowed_bandwidth_upps = local_rate_limit(allowed_bandwidth_upps.max(cc.rate_floor_upps), max_pps);
                         state.stats.cc_rate_upps = allowed_bandwidth_upps;
+                        if let Some(t) = &mut loss_trace {
+                            let mut context = cc_trace_context(state, current_time_now_ns, &cc, max_pps);
+                            context.pps = allowed_bandwidth_upps as f64 / 1_000_000.0;
+                            t.set_cc(connection_tracking_data.two_byte_send_prefix, context);
+                        }
                         // pps * 10^-6 * rtt * 10^-4 = p * 10^10
                         // BDP + sawtooth: pipe is full (BDP) plus ack batching excess (ack_pace_estimate is in 0.1ms units)
                         let bdp = allowed_bandwidth_upps * state.RTT_mean as u64 / 10_000;
@@ -4438,6 +4459,24 @@ fn connection_rate(t_ns: u64, anchor_upps: u64, k_ns: u64, cc: &CongestionPolicy
     } else { cubic_rate_with_options(t_ns, anchor_upps, k_ns, cc) }
 }
 
+// Trace-only context: evaluate the same curve and local cap used by the pacer.
+// A 1 ms right derivative is uniform across all curve phases, not a startup rule.
+fn cc_trace_context(state: &ConnectionStateConnected, now: u64, cc: &CongestionPolicy, max_pps: Option<u64>) -> crate::loss_trace::CcContext {
+    let rtt_ns = state.RTT_mean as u64 * 100_000;
+    let k = cc.recovery_rtts * rtt_ns;
+    let age = if state.is_app_limited { state.app_limit_time_offset }
+        else { now.saturating_sub(state.congestion_event_time_ns) };
+    let (rate, mode) = connection_rate(age, state.congestion_event_rate_upps, k, cc, state.cc_startup_done);
+    let capped = |r: u64| local_rate_limit(r.max(cc.rate_floor_upps), max_pps);
+    let rate = capped(rate);
+    let next = capped(connection_rate(age.saturating_add(1_000_000), state.congestion_event_rate_upps, k, cc, state.cc_startup_done).0);
+    crate::loss_trace::CcContext { pps: rate as f64 / 1_000_000.0,
+        slope_ppsps: if state.is_app_limited { 0.0 } else { next.saturating_sub(rate) as f64 / 1000.0 },
+        rtt_ns, feedback_ns: rtt_ns.saturating_add((rtt_ns / 16).max(1_000_000))
+            .saturating_add(crate::ship::ACK.max_delay_us as u64 * 1000),
+        mode: if state.is_app_limited { 'A' } else { mode } }
+}
+
 fn quantized_rtt_mean(sum: u64, count: u64) -> u16 {
     (sum / count.max(1)).clamp(1, u16::MAX as u64) as u16
 }
@@ -4699,6 +4738,36 @@ mod congestion_tests {
         let sent = s.send_time(0);
         assert!(1_110_000_000 - sent < timeout); // not eligible for final loss yet
         assert!(sent + timeout >= 1_200_000_000); // unchanged conservative deadline
+    }
+
+    #[test]
+    fn cc_trace_uses_pacer_curve_derivative_and_freezes_at_caps_or_starvation() {
+        let mut s = hole_state();
+        let cc = crate::ship::CC;
+        s.congestion_event_time_ns = 0;
+        s.congestion_event_rate_upps = 2_000_000_000;
+        let k = cc.recovery_rtts * s.RTT_mean as u64 * 100_000;
+        for done in [false, true] {
+            s.cc_startup_done = done;
+            for age in [0, k / 2, k, 2 * k, 4 * k] {
+                let c = cc_trace_context(&s, age, &cc, None);
+                let a = connection_rate(age, s.congestion_event_rate_upps, k, &cc, done).0.max(cc.rate_floor_upps);
+                let b = connection_rate(age + 1_000_000, s.congestion_event_rate_upps, k, &cc, done).0.max(cc.rate_floor_upps);
+                assert_eq!(c.pps, a as f64 / 1_000_000.0);
+                assert_eq!(c.slope_ppsps, b.saturating_sub(a) as f64 / 1000.0);
+                assert_eq!(c.rtt_ns, s.RTT_mean as u64 * 100_000);
+                assert_eq!(c.feedback_ns, c.rtt_ns + (c.rtt_ns / 16).max(1_000_000) + 10_000_000);
+            }
+        }
+        let capped = cc_trace_context(&s, 4 * k, &cc, Some(100));
+        assert_eq!(capped.pps, 100.0);
+        assert_eq!(capped.slope_ppsps, 0.0);
+        s.is_app_limited = true;
+        s.app_limit_time_offset = k;
+        let idle = cc_trace_context(&s, 20 * k, &cc, None);
+        assert_eq!(idle.mode, 'A');
+        assert_eq!(idle.slope_ppsps, 0.0);
+        assert_eq!(idle.pps, connection_rate(k, s.congestion_event_rate_upps, k, &cc, true).0 as f64 / 1_000_000.0);
     }
 
     #[test]
