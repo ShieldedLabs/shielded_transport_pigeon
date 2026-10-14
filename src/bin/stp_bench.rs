@@ -3,6 +3,9 @@
 //!   stp_bench serve --port P [--bind IP] [--advertise IP] [--seed-key HEX64]
 //!   stp_bench send  --to STPADDR [--seed N] [--count N] [--min 100] [--max 50000000]
 //!                   [--timeout 600] [--idle 10] [--out report.json] [--fec-pct 0]
+//!                   [--giant 256M|1G] (one whole framed message, binary units; use FEC)
+//! Giant demo: send --to STPADDR --giant 1G --fec-pct 3 --timeout 600 --idle 30.
+//! Both endpoints must support extended FEC kind 2 for messages above 64000 source blocks.
 //!
 //! Both: [--queue-us 1000000] [--queue-min 4194304] [--queue-max 67108864] [--max-pps N]
 //! (the send_buffer_params and max_pps given to the STP network thread).
@@ -312,6 +315,19 @@ fn pct(sorted: &[f64], p: f64) -> Option<f64> {
 
 fn jnum(v: Option<f64>) -> String { v.map(|x| format!("{x:.3}")).unwrap_or("null".into()) }
 
+/// Demo sizes are whole framed messages, not an extra 40-byte header on top.
+fn giant_size(s: &str) -> Option<usize> {
+    let (number, scale) = match s.strip_suffix('G').or_else(|| s.strip_suffix("GiB")) {
+        Some(n) => (n, 1usize << 30),
+        None => match s.strip_suffix('M').or_else(|| s.strip_suffix("MiB")) {
+            Some(n) => (n, 1usize << 20),
+            None => (s, 1),
+        },
+    };
+    let bytes = number.parse::<usize>().ok()?.checked_mul(scale)?;
+    (HEADER..=MAX_JUMBOGRAM_LEN).contains(&bytes).then_some(bytes)
+}
+
 type Outbox = Vec<(ConnectionKey, Vec<u8>)>;
 type Wanted = Vec<(STPAddress, [u8; 64])>;
 
@@ -325,9 +341,10 @@ fn poll(handle: &NetworkThreadHandle, outbox: &mut Outbox, wanted: &mut Wanted) 
 fn send(a: &Args) {
     let to = STPAddress::parse(a.str("to").unwrap_or_else(|| die("send needs --to STPADDR"))).unwrap_or_else(|| die("bad --to address"));
     let seed: u64 = a.num("seed", 1);
-    let count: u32 = a.num("count", 60);
-    let mut min: usize = a.num("min", 100);
-    let max: usize = a.num("max", 50_000_000);
+    let giant = a.str("giant").map(|s| giant_size(s).unwrap_or_else(|| die("--giant needs a byte count, 256M or 1G (binary units, whole framed message)")));
+    let count: u32 = if giant.is_some() { 1 } else { a.num("count", 60) };
+    let mut min: usize = giant.unwrap_or_else(|| a.num("min", 100));
+    let max: usize = giant.unwrap_or_else(|| a.num("max", 50_000_000));
     let timeout = Duration::from_secs(a.num("duration", a.num("timeout", 600)));
     let idle = Duration::from_secs(a.num("idle", 10));
     let out = a.str("out").unwrap_or("stp_bench_report.json").to_string();
@@ -369,7 +386,8 @@ fn send(a: &Args) {
     // Sizes are log-uniform in [min, max] (whole framed message), deterministic from the seed;
     // the send order is a seeded shuffle of the ids.
     let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(seed);
-    let classes: Option<Vec<(usize, u32)>> = match a.str("mix").unwrap_or("loguniform") {
+    let classes: Option<Vec<(usize, u32)>> = match if giant.is_some() { "giant" } else { a.str("mix").unwrap_or("loguniform") } {
+        "giant" => Some(vec![(giant.unwrap(), 1)]),
         "loguniform" => None,
         "classes" => Some(a.str("classes").unwrap_or("1000:200,65536:200,1048576:50,5242880:20,52428800:5").split(',').map(|c| {
             let (sz, n) = c.split_once(':').unwrap_or_else(|| die("bad --classes"));
