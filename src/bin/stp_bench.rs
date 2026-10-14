@@ -2,47 +2,24 @@
 //!
 //!   stp_bench serve --port P [--bind IP] [--advertise IP] [--seed-key HEX64]
 //!   stp_bench send  --to STPADDR [--seed N] [--count N] [--min 100] [--max 50000000]
-//!                   [--timeout 600] [--idle 10] [--out report.json] [--fec-pct 0]
-//!                   [--giant 256M|1G] (one whole framed message, binary units; use FEC)
+//!                   [--timeout 600] [--idle 10] [--out report.json]
+//!                   [--giant 256M|1G] (one whole framed message, binary units)
 //!                   [--giant-warmup S] (wait up to S seconds for TU stabilization; giant default 5)
 //! Report: udp_payload_tu, fec_block_bytes_by_id, receiver_fec_decode_last_tail_ms.
 //! Decode tail uses the receiver clock: last accepted FEC block to delivery, excludes surplus repairs.
-//! Giant demo: send --to STPADDR --giant 1G --fec-pct 3 --timeout 600 --idle 30.
+//! Giant demo: send --to STPADDR --giant 1G --timeout 600 --idle 30.
 //! Both endpoints must support extended FEC kind 2 for messages above 64000 source blocks.
 //!                   [--loss-trace events.csv] (S/F/L/A sender event CSV; see loss_trace.rs)
 //!
 //! Both: [--queue-us 1000000] [--queue-min 4194304] [--queue-max 67108864] [--max-pps N]
-//! (the send_buffer_params and max_pps given to the STP network thread).
-//! CC: --cc legacy|balanced, with overrides --cc-beta, --cc-recovery-rtts, --cc-time-pg,
-//! --cc-time-gs, --cc-rate-rp, --cc-rate-pg, --cc-rate-gs, --cc-loss-threshold,
-//! --cc-floor-pps, --cc-start-pps, --cc-min-growth-ppsps, --cc-max-growth-ppsps,
-//! --cc-guard-rtts.
-//! CC2 (opt-in): --cc-startup-multiplier 1.01..2, --cc-startup-backoff-rtts 0..4,
-//! --cc-proportional-growth 0|1, --cc-ecn-guard-rtts 0..10, --cc-loss-response-pct 0..50.
-//! Defaults disable new modes; startup backoff defaults to 1 RTT, ECN guard 0 inherits loss guard.
-//! Proportional growth requires --cc-bound-recovery-growth 1 --cc-compound-growth 1
-//! and a positive --cc-relative-growth.
-//! Pacer: --pacer precise|poly1|poly2|poly5|poly10, or --pacer poly --cadence-ms 2.
-//! Startup/proportional growth automatically use precise pacing even if poly is requested.
-//! --burst-budget-ms 0 disables the polynomial burst wall-time budget (re-anchor only).
-//! ACK: --ack legacy|bitmap|adaptive (default legacy), on both endpoints.
-//! Bitmap: --ack-every 8 --ack-delay-us 1000; Adaptive defaults to 8/10000 us.
+//! (the pre-existing send_buffer_params and max_pps resource limits).
+//! Transport policy is fixed: slow110 loss/ECN packet-rate control, precise pacing,
+//! adaptive bitmap ACKs and grouped Wirehair span-tail FEC with closed-loop top-up.
+//! There are no CC, ACK, FEC or pacer tuning flags.
 //! --duration S: saturated measurement for S seconds; requests receiver status while sending.
 //! --send-on-ms N --send-off-ms N: application submission duty cycle (queued packets drain normally).
-//! estimator_series rows: [seconds, FEC estimate, sample, sent packets, losses, UDP bytes, RTT us, CC pps, app-limited entries].
-//! --fec-pct X (send only): forward error correction redundancy in percent (float); messages of
-//! 2+ packets get X% extra Wirehair-coded blocks. The server needs no flag: it decodes either.
-//! --fec adaptive:v1|v2|v3|span (send only): adaptive redundancy from the connection's own loss
-//! estimate (v1 tiered max-hold, v2 peak with decay, v3 high quantile; see fec_adapt), with
-//! [--fec-eps 1e-6] [--fec-time-scale 1.0] (scales hold/half-life/window) [--fec-min-packets 500]
-//! span targets packet_loss*sqrt(min(1,64/K)); --fec-eps optionally caps it (span default .5).
-//! [--fec-min-loss .005] [--fec-initial-loss .01]: explicit IID prior/floor, independent of span tails.
-//! [--fec-topup 0|1] (grow the message being sent when its own packets are declared lost).
-//! [--fec-span-floor none|real|legacy|robust]: opt-in measured safety floor, not a guarantee.
-//! [--fec-closed-loop 0|1]: span+topup only; own losses plus margin on the unresolved tail;
-//! full-message prior during cold start, minimum 12 repairs, no feedback wait/retransmission.
-//! [--fec-loss-signal declared|net:MS] (estimator input: raw declared loss, or declared minus
-//! spurious declarations with the counters delayed MS ms; default net:1000).
+//! --loss-episodes 1: record loss episode diagnostics without changing control behaviour.
+//! estimator_series: [seconds, FEC estimate, sample, sent, lost, UDP bytes, RTT us, CC pps, app-limited entries].
 //! --mix classes [--classes "SIZE:COUNT,..."] sends fixed counts per size class (default
 //! 1000:200,65536:200,1048576:50,5242880:20,52428800:5), shuffled by --seed; the report then
 //! groups by class instead of size bucket. Per class: delivery, mean redundancy actually sent.
@@ -106,12 +83,20 @@ fn u32_at(b: &[u8], o: usize) -> u32 { u32::from_le_bytes(b[o..o + 4].try_into()
 
 struct Args(HashMap<String, String>);
 impl Args {
+    fn allowed(k: &str) -> bool {
+        matches!(k, "port" | "bind" | "advertise" | "seed-key" | "to" | "seed" |
+            "count" | "min" | "max" | "timeout" | "idle" | "out" | "giant" |
+            "giant-warmup" | "queue-us" | "queue-min" | "queue-max" | "max-pps" |
+            "duration" | "send-on-ms" | "send-off-ms" | "mix" | "classes" |
+            "loss-trace" | "loss-episodes")
+    }
     fn parse(it: impl Iterator<Item = String>) -> Args {
         let mut m = HashMap::new();
         let v: Vec<String> = it.collect();
         let mut i = 0;
         while i < v.len() {
             let Some(k) = v[i].strip_prefix("--") else { die(&format!("unexpected argument {}", v[i])) };
+            if !Self::allowed(k) { die(&format!("unknown flag --{k}; transport tuning is not supported")); }
             let Some(val) = v.get(i + 1) else { die(&format!("--{k} needs a value")) };
             m.insert(k.to_string(), val.clone());
             i += 2;
@@ -177,97 +162,9 @@ fn send_buffer_params(a: &Args) -> (u32, u32, u32) {
 
 fn max_pps(a: &Args) -> Option<u64> { a.str("max-pps").map(|s| s.parse().unwrap_or_else(|_| die("bad --max-pps"))) }
 
-#[test]
-fn ack_default_and_explicit_modes() {
-    use shielded_transport_pigeon::ack::AckOptions;
-    let args = |flags: &[&str]| Args::parse(flags.iter().map(|s| (*s).to_owned()));
-    assert!(matches!(ack_options(&args(&[])), AckOptions::Legacy));
-    assert!(matches!(ack_options(&args(&["--ack", "adaptive"])),
-        AckOptions::Adaptive { every_packets: 8, max_delay_us: 10000 }));
-    assert!(matches!(ack_options(&args(&["--ack", "bitmap"])),
-        AckOptions::LowLatency { every_packets: 8, max_delay_us: 1000 }));
-}
-
-fn ack_options(a: &Args) -> shielded_transport_pigeon::ack::AckOptions {
-    use shielded_transport_pigeon::ack::AckOptions;
-    match a.str("ack").unwrap_or("legacy") {
-        "legacy" => AckOptions::Legacy,
-        "bitmap" => AckOptions::LowLatency { every_packets: a.num("ack-every", 8), max_delay_us: a.num("ack-delay-us", 1000) },
-        "adaptive" => AckOptions::Adaptive { every_packets: a.num("ack-every", 8), max_delay_us: a.num("ack-delay-us", 10000) },
-        _ => die("--ack needs legacy, bitmap or adaptive"),
-    }
-}
-#[test]
-fn polynomial_pacer_shorthands() {
-    for cadence_ms in [1, 2, 5, 10] {
-        let a = Args::parse(["--pacer".to_owned(), format!("poly{cadence_ms}")].into_iter());
-        assert!(matches!(pacing_options(&a), PacingOptions::Polynomial { cadence_ms: n } if n == cadence_ms));
-    }
-    let a = Args::parse(["--pacer", "poly", "--cadence-ms", "2"].into_iter().map(str::to_owned));
-    assert!(matches!(pacing_options(&a), PacingOptions::Polynomial { cadence_ms: 2 }));
-}
-
-fn pacing_options(a: &Args) -> PacingOptions {
-    match a.str("pacer").unwrap_or("precise") {
-        "precise" => PacingOptions::Precise,
-        "poly" | "polynomial" => {
-            let cadence_ms = a.num("cadence-ms", 5);
-            if ![1,2,5,10].contains(&cadence_ms) { die("--cadence-ms must be 1, 2, 5 or 10"); }
-            PacingOptions::Polynomial { cadence_ms }
-        },
-        "poly1" => PacingOptions::Polynomial { cadence_ms: 1 },
-        "poly2" => PacingOptions::Polynomial { cadence_ms: 2 },
-        "poly5" => PacingOptions::Polynomial { cadence_ms: 5 },
-        "poly10" => PacingOptions::Polynomial { cadence_ms: 10 },
-        _ => die("--pacer needs precise, poly or poly{1,2,5,10}"),
-    }
-}
-fn pacing_burst_budget_ns(a: &Args) -> Option<u64> {
-    a.str("burst-budget-ms").map(|_| a.num::<u64>("burst-budget-ms", 0)
-        .checked_mul(1_000_000).unwrap_or_else(|| die("--burst-budget-ms overflows")))
-}
 fn load_average() -> String {
     std::fs::read_to_string("/proc/loadavg").unwrap_or_default().split_whitespace()
         .take(3).collect::<Vec<_>>().join(",")
-}
-
-fn cc_options(a: &Args) -> CongestionControlOptions {
-    let mut cc = match a.str("cc").unwrap_or("legacy") {
-        "legacy" => CongestionControlOptions::legacy(),
-        "balanced" => CongestionControlOptions::balanced(),
-        _ => die("--cc needs legacy or balanced (override parameters with --cc-*)"),
-    };
-    cc.beta = a.num("cc-beta", cc.beta);
-    cc.recovery_rtts = a.num("cc-recovery-rtts", cc.recovery_rtts);
-    cc.rate_rp = a.num("cc-rate-rp", cc.rate_rp);
-    cc.rate_pg = a.num("cc-rate-pg", cc.rate_pg);
-    cc.rate_gs = a.num("cc-rate-gs", cc.rate_gs);
-    cc.time_pg = a.num("cc-time-pg", cc.time_pg);
-    cc.time_gs = a.num("cc-time-gs", cc.time_gs);
-    cc.loss_threshold = a.num("cc-loss-threshold", cc.loss_threshold);
-    let loss_fraction_pct = a.num::<f64>("cc-loss-fraction-pct", cc.loss_fraction_ppm as f64 / 10_000.0);
-    if !(0.0..=50.0).contains(&loss_fraction_pct) { die("invalid --cc-loss-fraction-pct"); }
-    cc.loss_fraction_ppm = (loss_fraction_pct * 10_000.0).round() as u32;
-    let response_pct = a.num::<f64>("cc-loss-response-pct", cc.loss_response_fraction_ppm as f64 / 10_000.0);
-    if !(0.0..=50.0).contains(&response_pct) { die("invalid --cc-loss-response-pct"); }
-    cc.loss_response_fraction_ppm = (response_pct * 10_000.0).round() as u32;
-    cc.loss_timeout_rtts = a.num("cc-loss-timeout-rtts", cc.loss_timeout_rtts);
-    cc.event_guard_rtts = a.num("cc-guard-rtts", cc.event_guard_rtts);
-    cc.ecn_event_guard_rtts = a.num("cc-ecn-guard-rtts", cc.ecn_event_guard_rtts);
-    cc.rate_floor_upps = a.num::<u64>("cc-floor-pps", cc.rate_floor_upps / 1_000_000).checked_mul(1_000_000).unwrap_or_else(|| die("CC floor overflows"));
-    cc.initial_rate_upps = a.num::<u64>("cc-start-pps", cc.initial_rate_upps / 1_000_000).checked_mul(1_000_000).unwrap_or_else(|| die("CC start overflows"));
-    cc.min_growth_uppsps = a.num("cc-min-growth-ppsps", cc.min_growth_uppsps / 1e6) * 1e6;
-    cc.max_growth_uppsps = a.num("cc-max-growth-ppsps", cc.max_growth_uppsps / 1e6) * 1e6;
-    cc.friendly_growth_alpha = a.num("cc-friendly-alpha", cc.friendly_growth_alpha);
-    cc.relative_growth_per_rtt = a.num("cc-relative-growth", cc.relative_growth_per_rtt);
-    cc.bound_recovery_growth = a.num::<u8>("cc-bound-recovery-growth", u8::from(cc.bound_recovery_growth)) != 0;
-    cc.compound_growth = a.num::<u8>("cc-compound-growth", u8::from(cc.compound_growth)) != 0;
-    cc.proportional_growth = a.num::<u8>("cc-proportional-growth", u8::from(cc.proportional_growth)) != 0;
-    cc.startup_multiplier = a.num("cc-startup-multiplier", cc.startup_multiplier);
-    cc.startup_backoff_rtts = a.num("cc-startup-backoff-rtts", cc.startup_backoff_rtts);
-    cc.record_loss_episodes = a.num::<u8>("cc-record-loss-episodes", u8::from(cc.record_loss_episodes)) != 0;
-    if let Err(e) = cc.validate() { die(e); }
-    cc
 }
 
 fn to_v6(ip: std::net::IpAddr) -> std::net::Ipv6Addr {
@@ -281,7 +178,7 @@ fn main() {
     match mode.as_str() {
         "serve" => serve(&args),
         "send" => send(&args),
-        _ => die("usage: stp_bench serve --port P [--bind IP] [--advertise IP] [--seed-key HEX64] | stp_bench send --to STPADDR [--seed N] [--count N] [--min B] [--max B] [--timeout S] [--idle S] [--out FILE] [--fec-pct X]"),
+        _ => die("usage: stp_bench serve --port P [--bind IP] [--advertise IP] [--seed-key HEX64] | stp_bench send --to STPADDR [--seed N] [--count N] [--min B] [--max B] [--timeout S] [--idle S] [--out FILE]"),
     }
 }
 
@@ -320,7 +217,7 @@ fn serve(a: &Args) {
     let kp = new_keypair_from_connect_magic1_with_seed(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, seed).unwrap();
     let addr = STPAddress::from(to_v6(advertise), port, &kp);
 
-    let handle = new_network_thread_with_options(vec![kp], port, max_pps(a), send_buffer_params(a), NetworkThreadOptions { bind_ip: bind, congestion_control: cc_options(a), acknowledgements: ack_options(a), pacing: pacing_options(a), polynomial_burst_budget_ns: pacing_burst_budget_ns(a), pacing_diagnostics: a.num::<u32>("pacing-diagnostics", 0) != 0, ..Default::default() });
+    let handle = new_network_thread_with_options(vec![kp], port, max_pps(a), send_buffer_params(a), NetworkThreadOptions { bind_ip: bind, ..Default::default() });
     println!("stp_bench serve: bound {}:{port}", bind.map(|b| b.to_string()).unwrap_or("[::]".into()));
     println!("STP address: {:?}", addr);
 
@@ -481,47 +378,7 @@ fn send(a: &Args) {
     let off_ns = a.num::<u64>("send-off-ms", 0).saturating_mul(1_000_000);
     if on_ns == 0 || on_ns.checked_add(off_ns).is_none() { die("invalid send duty cycle"); }
     let out = a.str("out").unwrap_or("stp_bench_report.json").to_string();
-    let fec_pct: f64 = a.str("fec-pct").map(|s| s.parse().unwrap_or_else(|_| die("bad --fec-pct"))).unwrap_or(0.0);
-    if !(0.0..=100.0).contains(&fec_pct) { die("--fec-pct must be in 0..=100"); }
-    let fec_ppm = (fec_pct * 10_000.0).round() as u32;
-    let fec_mode = a.str("fec").unwrap_or("fixed").to_string();
-    let fec_adaptive = match fec_mode.as_str() {
-        "fixed" => None,
-        m => {
-            use shielded_transport_pigeon::fec_adapt::*;
-            let kind = match m.strip_prefix("adaptive:") {
-                Some("v1") => LossEstimatorKind::TieredMaxHold,
-                Some("v2") => LossEstimatorKind::PeakDecay,
-                Some("v3") => LossEstimatorKind::Quantile,
-                Some("span") => LossEstimatorKind::SpanTail,
-                _ => die("--fec must be fixed or adaptive:v1|v2|v3|span"),
-            };
-            let cfg = AdaptiveFecConfig { kind, eps: a.num("fec-eps", if kind == LossEstimatorKind::SpanTail { 0.5 } else { 1e-6 }), min_loss: a.num("fec-min-loss", 0.005), initial_loss: a.num("fec-initial-loss", 0.01), min_packets: a.num("fec-min-packets", 500), topup: a.num::<u32>("fec-topup", 0) != 0,
-                closed_loop: a.num::<u32>("fec-closed-loop", 0) != 0,
-                span_floor: match a.str("fec-span-floor").unwrap_or("none") {
-                    "none" => SpanFloorKind::None, "real" => SpanFloorKind::Real,
-                    "legacy" => SpanFloorKind::Legacy, "robust" => SpanFloorKind::Robust,
-                    _ => die("--fec-span-floor must be none|real|legacy|robust"),
-                },
-                loss_signal: match a.str("fec-loss-signal") {
-                    None => AdaptiveFecConfig::default().loss_signal,
-                    Some("declared") => LossSignal::Declared,
-                    Some(x) => match x.strip_prefix("net:").and_then(|ms| ms.parse::<u64>().ok()) {
-                        Some(ms) if ms <= 3000 => LossSignal::NetOfSpurious { delay_ns: ms * 1_000_000 },
-                        _ => die("--fec-loss-signal must be declared or net:MS (MS <= 3000)"),
-                    },
-                },
-                ..Default::default() };
-            if cfg.closed_loop && (kind != LossEstimatorKind::SpanTail || !cfg.topup) {
-                die("--fec-closed-loop 1 requires --fec adaptive:span --fec-topup 1");
-            }
-            Some(cfg.scale_time(a.num("fec-time-scale", 1.0)))
-        }
-    };
-    match &fec_adaptive {
-        None => println!("FEC redundancy: {fec_pct}% ({fec_ppm} ppm){}", if fec_ppm == 0 { " (off)" } else { "" }),
-        Some(c) => println!("FEC adaptive: {c:?}"),
-    }
+    let fec_mode = "adaptive:span";
     if min < HEADER { eprintln!("--min raised to the {HEADER}-byte header size"); min = HEADER; }
     if max < min || max > MAX_JUMBOGRAM_LEN { die(&format!("need --min <= --max <= {MAX_JUMBOGRAM_LEN}")); }
     if count == 0 || count >= CTRL_BASE { die("bad --count"); }
@@ -570,7 +427,7 @@ fn send(a: &Args) {
     }
 
     let kp = new_keypair_from_connect_magic1(to.magic1).unwrap_or_else(|| die("unsupported crypto in --to"));
-    let handle = new_network_thread_with_options(vec![kp], 0, max_pps(a), send_buffer_params(a), NetworkThreadOptions { bind_ip: None, congestion_control: cc_options(a), acknowledgements: ack_options(a), pacing: pacing_options(a), polynomial_burst_budget_ns: pacing_burst_budget_ns(a), pacing_diagnostics: a.num::<u32>("pacing-diagnostics", 0) != 0, fec_redundancy_ppm: fec_ppm, fec_adaptive, record_fec_messages: true, loss_trace: a.str("loss-trace").map(std::path::PathBuf::from) });
+    let handle = new_network_thread_with_options(vec![kp], 0, max_pps(a), send_buffer_params(a), NetworkThreadOptions { bind_ip: None, record_loss_episodes: a.num::<u8>("loss-episodes", 0) != 0, record_fec_messages: true, loss_trace: a.str("loss-trace").map(std::path::PathBuf::from) });
     // Per data id: (k, blocks sent, blocks planned, loss estimate) of its FEC coding, if coded.
     let mut fec_info: HashMap<u32, (u32, u32, u32, f64)> = HashMap::new();
     // One sample per second, with the CC command and queue-empty transition count.
@@ -792,7 +649,7 @@ fn send(a: &Args) {
     println!("\n=== stp_bench report ===");
     println!("messages: {count} ({:.3} MB) | delivered+verified: {delivered} ({:.3} MB) | corrupt: {corrupt} | lost: {lost}{}",
         total_bytes as f64 / 1e6, delivered_bytes as f64 / 1e6, format!(" | stopped: {stop_reason}"));
-    println!("FEC: {}", if fec_adaptive.is_some() { fec_mode.clone() } else { format!("fixed {fec_pct}%") });
+    println!("FEC: adaptive span-tail, closed-loop fountain top-up, real-trace floor");
     println!("wall clock: {wall_s:.3} s (status confirmed at {confirm_s:.3} s) | goodput: {goodput_mbs:.2} MB/s = {:.2} Mbit/s", goodput_mbs * 8.0);
     println!("idle RTT: min {:.3} ms, median {:.3} ms | rejected submissions (back pressure): {rejected_total} | sender waited on generator: {:.3} s",
         rtt_min_ns as f64 / 1e6, rtt_median_ns as f64 / 1e6, generator_wait_ns as f64 / 1e9);
@@ -845,7 +702,7 @@ fn send(a: &Args) {
 
     let sbp = send_buffer_params(a);
     let (sender_cpu_user_us, sender_cpu_sys_us) = cpu_us();
-    let mut json = format!(concat!("{{\"to\":\"{:?}\",\"seed\":{},\"min\":{},\"max\":{},\"send_buffer_params\":[{},{},{}],\"fec_pct\":{},\"fec_mode\":\"{}\",\"fec_adaptive\":\"{}\",\"drop_schedule\":\"{}\",",
+    let mut json = format!(concat!("{{\"to\":\"{:?}\",\"seed\":{},\"min\":{},\"max\":{},\"send_buffer_params\":[{},{},{}],\"fec_pct\":null,\"fec_mode\":\"{}\",\"fec_adaptive\":\"{}\",\"drop_schedule\":\"{}\",",
         "\"total_messages\":{},\"total_bytes\":{},\"delivered\":{},\"delivered_bytes\":{},\"corrupt\":{},\"lost\":{},\"stop_reason\":\"{}\",",
         "\"data_start_unix_seconds\":{:.6},\"wall_seconds\":{:.6},\"status_confirmed_seconds\":{:.6},\"goodput_MBps\":{:.3},\"goodput_Mbitps\":{:.3},",
         "\"rtt_ms_min\":{:.3},\"rtt_ms_median\":{:.3},\"rejected_submissions\":{},\"generator_wait_seconds\":{:.6},",
@@ -859,13 +716,13 @@ fn send(a: &Args) {
         "\"bursts\":{},\"mean_burst_len\":{:.3},\"burst_hist\":{{{}}},\"kernel_rx_drops\":{},\"max_loop_gap_ms\":{:.3},\"loop_gaps_over_1ms\":{},\"loop_gaps_over_10ms\":{},\"loop_gaps_over_100ms\":{},",
         "\"recv_queue_dropped_messages\":{},\"server_cpu_user_s\":{:.3},\"server_cpu_sys_s\":{:.3},",
         "\"messages_completed\":{},\"partials_evicted\":{},\"partials_evicted_bytes\":{},\"insert_failures\":{},\"stale_fragments\":{}}},",
-        "\"buckets\":[{}],\"estimator_series\":[{}],\"congestion_control\":\"{:?}\",",
-        "\"ack_options\":\"{:?}\",\"ack_packets_sent\":{},\"ack_bytes_sent\":{},\"ack_packets_received\":{},\"ack_delay_us_max\":{},\"rtt_samples\":{},",
+        "\"buckets\":[{}],\"estimator_series\":[{}],\"congestion_control\":\"{}\",",
+        "\"ack_options\":\"{}\",\"ack_packets_sent\":{},\"ack_bytes_sent\":{},\"ack_packets_received\":{},\"ack_delay_us_max\":{},\"rtt_samples\":{},",
         "\"receiver_ack_packets_sent\":{},\"receiver_ack_bytes_sent\":{},\"receiver_ack_delay_us_max\":{},\"sender_cpu_user_s\":{:.6},\"sender_cpu_sys_s\":{:.6},\"sender_rtt_us\":{},",
-        "\"sender_pacing\":{{\"mode\":\"{:?}\",\"diagnostics\":{},\"burst_budget_ms\":{},\"batches\":{},\"packets\":{},\"max_burst\":{},\"burst_hist\":[{}],",
+        "\"sender_pacing\":{{\"mode\":\"{}\",\"diagnostics\":{},\"burst_budget_ms\":{},\"batches\":{},\"packets\":{},\"max_burst\":{},\"burst_hist\":[{}],",
         "\"commanded_packets\":{},\"error_samples\":{},\"error_abs_sum_ns\":{},\"error_max_ns\":{},\"history_records\":{},",
         "\"network_cpu_user_us\":{},\"network_cpu_sys_us\":{},\"process_cpu_user_us\":{},\"process_cpu_sys_us\":{},\"load_start\":[{}],\"load_end\":[{}]}}}}\n"),
-        to, seed, min, max, sbp.0, sbp.1, sbp.2, fec_pct, fec_mode, fec_adaptive.map(|c| format!("{c:?}")).unwrap_or_default(),
+        to, seed, min, max, sbp.0, sbp.1, sbp.2, fec_mode, "span-tail+closed-loop+real-floor",
         std::env::var("STP_TEST_DROP_SCHEDULE").unwrap_or_else(|_| std::env::var("STP_TEST_DROP_PPM").map(|v| format!("ppm={v}")).unwrap_or_default()),
         count, total_bytes, delivered, delivered_bytes, corrupt, lost, stop_reason,
         unix_epoch_s + start_ns as f64 / 1e9, wall_s, confirm_s, goodput_mbs, goodput_mbs * 8.0,
@@ -881,13 +738,10 @@ fn send(a: &Args) {
         rx.th.recv_queue_dropped_messages, rx.cpu_user_us as f64 / 1e6, rx.cpu_sys_us as f64 / 1e6,
         rx.st.rx_messages_completed, rx.st.rx_partial_evicted, rx.st.rx_partial_evicted_bytes, rx.st.rx_insert_failures, rx.st.rx_stale_fragments,
         bucket_json.join(","),
-        series.iter().map(|x| format!("[{:.1},{:.5},{:.5},{},{},{},{},{:.3},{}]", x.0, x.1, x.2, x.3, x.4, x.5, x.6, x.7, x.8)).collect::<Vec<_>>().join(","), cc_options(a),
-        ack_options(a), stats.ack_packets_sent, stats.ack_bytes_sent, stats.ack_packets_received, stats.ack_delay_us_max, stats.rtt_samples,
+        series.iter().map(|x| format!("[{:.1},{:.5},{:.5},{},{},{},{},{:.3},{}]", x.0, x.1, x.2, x.3, x.4, x.5, x.6, x.7, x.8)).collect::<Vec<_>>().join(","), "slow110",
+        "adaptive bitmap", stats.ack_packets_sent, stats.ack_bytes_sent, stats.ack_packets_received, stats.ack_delay_us_max, stats.rtt_samples,
         rx.st.ack_packets_sent, rx.st.ack_bytes_sent, rx.st.ack_delay_us_max, sender_cpu_user_us as f64 / 1e6, sender_cpu_sys_us as f64 / 1e6, stats.rtt_us,
-        pacing_options(a), a.num::<u32>("pacing-diagnostics", 0) != 0,
-        pacing_burst_budget_ns(a).map(|ns| (ns / 1_000_000).to_string()).unwrap_or_else(|| match pacing_options(a) {
-            PacingOptions::Polynomial { cadence_ms } => cadence_ms.to_string(), _ => "null".into(),
-        }), stats.pacing_batches, stats.pacing_packets, stats.pacing_max_burst,
+        "Precise", false, "null", stats.pacing_batches, stats.pacing_packets, stats.pacing_max_burst,
         stats.pacing_burst_hist.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","),
         stats.pacing_commanded_packets, stats.pacing_error_samples, stats.pacing_error_abs_sum_ns, stats.pacing_error_max_ns, stats.pacing_history_records,
         stats.network_cpu_user_us, stats.network_cpu_sys_us, sender_cpu_user_us, sender_cpu_sys_us, load_start, load_average());
