@@ -982,6 +982,8 @@ pub struct ConnectionStateConnected {
     pub ack_field: AckField,
     pub ack_timer: u64,
     pub ack_receiver: crate::ack::AckReceiver,
+    pub nack_receiver: crate::nack::NackReceiver,
+    pub peer_nack_loss_count: u32,
     /// Highest positively acknowledged peer receipt; holes are NOT declarations of loss.
     pub highest_peer_acked: Option<u64>,
     pub peer_ack_delay_us: u32,
@@ -1056,6 +1058,8 @@ pub fn new_connection_state_connected(cipher: Option<ConnectionCipherTriplet>, m
         ack_field: Default::default(),
         ack_timer: u64::MAX,
         ack_receiver: Default::default(),
+        nack_receiver: Default::default(),
+        peer_nack_loss_count: 0,
         highest_peer_acked: None,
         peer_ack_delay_us: 0,
         peer_ce_count: 0,
@@ -1115,6 +1119,16 @@ pub const RATE_FLOOR_UPPS: u64 = 100 * 1_000_000;
 pub struct ConnectionStats {
     /// Current smoothed RTT in microseconds (0 until sampled).
     pub rtt_us: u64,
+    pub nack_packets_sent: u64,
+    pub nack_packets_received: u64,
+    pub losses_by_nack: u64,
+    pub losses_by_timeout: u64,
+    pub nack_losses_declared: u64,
+    pub false_nacks: u64,
+    pub nack_ranges_expired: u64,
+    pub nack_reorder_us: u32,
+    pub congestion_loss_events: u64,
+    pub congestion_ecn_events: u64,
     /// Last CC command in micro-packets/second, after the local pacing ceiling.
     pub cc_rate_upps: u64,
     /// Number of application queue-empty transitions (not congestion events).
@@ -1356,6 +1370,8 @@ impl ConnectionStateConnected {
     }
     fn account_send(&mut self, actual_ns: u64) {
         assert!(self.send_sequence_number < crate::sequence::ACK_SPACE - 1, "data nonce space exhausted");
+        let i = self.send_sequence_number % PACKETS_WAITING_ACK_CAPACITY;
+        self.declared_lost_field[(i/64) as usize] &= !(1 << (i%64));
         if let Some(p) = &mut self.curve_pacer {
             if self.pacing_diagnostics { p.observe_send(self.send_sequence_number, actual_ns); }
             let index = self.send_sequence_number % PACKETS_WAITING_ACK_CAPACITY;
@@ -2512,21 +2528,29 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 payload = &packet_memory_encrypted[6..buf_len];
                             }
                             // Packet TYPE is still determined by authenticated payload SIZE.
-                            let is_ack = payload.len() == 516 || payload.len() == crate::ack::ACK_PAYLOAD_LEN;
+                            let is_ack = payload.len() == 516 || payload.len() == crate::ack::ACK_PAYLOAD_LEN || payload.len() == crate::nack::NACK_PAYLOAD_LEN;
                             if is_ack != crate::sequence::is_ack_space(non_virtual_nonce) { break 'conn; }
                             if !state.receive_sequences.commit(nonce) { break 'conn; }
                             // ACK nonces are not holes in the dense data stream.
                             if !is_ack { state.rx_tracker.on_packet(nonce, &mut state.stats); }
                             
-                            if payload.len() < 516 && payload.len() != crate::ack::ACK_PAYLOAD_LEN {
+                            if payload.len() < 516 && !is_ack {
                                 if OVERLY_VERBOSE { println!("Dropping from {connection_key:?}, payload < 516."); }
                                 break 'conn;
                             }
 
                             // ACKs remain identified ONLY by exact decrypted packet size.
-                            if payload.len() == 516 || payload.len() == crate::ack::ACK_PAYLOAD_LEN {
+                            if is_ack {
                                 let legacy_ack = if payload.len() == 516 { Some(unsafe { &*(payload.as_ptr() as *const AckField) }) } else { None };
-                                let bitmap_ack = if payload.len() == crate::ack::ACK_PAYLOAD_LEN {
+                                let nack_ack = if payload.len() == crate::nack::NACK_PAYLOAD_LEN {
+                                    let Some(a) = crate::nack::NackAck::decode(payload) else { break 'conn; };
+                                    if a.highest >= state.send_sequence_number { break 'conn; }
+                                    state.stats.nack_packets_received += 1;
+                                    crate::ack::update_ce_count(&mut state.peer_nack_loss_count, a.loss_count);
+                                    Some(a)
+                                } else { None };
+                                let bitmap_ack = if let Some(a) = &nack_ack { Some(a.feedback()) }
+                                else if payload.len() == crate::ack::ACK_PAYLOAD_LEN {
                                     let Some(a) = crate::ack::BitmapAck::decode(payload) else { break 'conn; };
                                     if a.highest >= state.send_sequence_number { break 'conn; }
                                     state.peer_ack_delay_us = a.delay_us;
@@ -2543,7 +2567,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     (base..base+4096).filter(move |&seq| ack.field[((seq-base)/64) as usize] & (1 << ((seq-base)%64)) != 0)
                                 });
                                 let relevant_ack = bitmap_ack.as_ref().map(|a| a.relevant(&state.packets_waiting_ack_field, &state.declared_lost_field[..]));
-                                let indices = legacy_indices.chain(relevant_ack.iter().flat_map(crate::ack::BitmapAck::acknowledged));
+                                let indices = legacy_indices.chain(relevant_ack.iter().flat_map(crate::ack::BitmapAck::acknowledged))
+                                    .chain(nack_ack.iter().flat_map(crate::nack::NackAck::acknowledged));
                                 for index in indices {
                                     if index < state.send_sequence_number {
                                         state.highest_peer_acked = Some(state.highest_peer_acked.unwrap_or(index).max(index));
@@ -2584,7 +2609,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                             
                                         }
                                     }
-                                    else if index < state.packets_waiting_ack_tail && index + PACKETS_WAITING_ACK_CAPACITY >= state.packets_waiting_ack_tail {
+                                    if index < state.send_sequence_number && index.saturating_add(PACKETS_WAITING_ACK_CAPACITY) >= state.packets_waiting_ack_tail {
                                         // Acked after it was declared lost: the declaration was spurious.
                                         let bit_index = index % PACKETS_WAITING_ACK_CAPACITY;
                                         let w = &mut state.declared_lost_field[(bit_index / 64) as usize];
@@ -2596,8 +2621,17 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     }
                                 }
 
+                                if let Some(a) = &nack_ack {
+                                    for seq in a.lost() {
+                                        if declare_packet_lost(state, seq, timestamp_ns, &cc, max_pps) {
+                                            state.stats.losses_by_nack += 1;
+                                            existing_connection.unreliable_send_buffer.fec_on_packet_lost(seq);
+                                            if let Some(t) = &mut loss_trace { t.outcome('N', existing_connection.two_byte_send_prefix, seq, timestamp_ns); }
+                                        }
+                                    }
+                                }
                                 let ce_feedback = bitmap_ack.as_ref().is_some_and(|a| crate::ack::update_ce_count(&mut state.peer_ce_count, a.ce_count));
-                                if ecn_marked || ce_feedback {
+                                if (legacy_ack.is_some() && ecn_marked) || ce_feedback {
                                     // A reordered ACK can advance CE even when all its packets were
                                     // acknowledged already. Do not consume that cumulative event silently.
                                     let anchor = if oldest_newly_acked_send_time != u64::MAX { oldest_newly_acked_send_time }
@@ -2654,7 +2688,9 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             }
                             // This is not an ack packet.
 
-                            if !matches!(ack_options, crate::ack::AckOptions::Legacy) {
+                            if matches!(ack_options, crate::ack::AckOptions::Nack) {
+                                if !state.nack_receiver.receive(nonce, timestamp_ns, ecn_marked, ack_options, &mut state.ack_timer) { break 'conn; }
+                            } else if !matches!(ack_options, crate::ack::AckOptions::Legacy) {
                                 if !state.ack_receiver.receive_with_rtt(nonce as u64, timestamp_ns, ecn_marked, ack_options, &mut state.ack_timer, state.stats.rtt_us, buf_len) { break 'conn; }
                             } else {
                             if nonce < state.ack_field_virtual_base {
@@ -2989,6 +3025,13 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             return false; // connection timeout
                         }
                         
+                        if matches!(ack_options, crate::ack::AckOptions::Nack) {
+                            state.nack_receiver.tick(current_time_now_ns, ack_options, &mut state.ack_timer);
+                            state.stats.nack_losses_declared = state.nack_receiver.losses;
+                            state.stats.false_nacks = state.nack_receiver.false_nacks;
+                            state.stats.nack_ranges_expired = state.nack_receiver.expired;
+                            state.stats.nack_reorder_us = state.nack_receiver.effective_reorder_us;
+                        }
                         if current_time_now_ns > state.ack_timer {
                             { // send ack
                                 let mut o = 0;
@@ -2998,7 +3041,15 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 state.send_ack_sequence_number = state.send_ack_sequence_number.checked_add(1).expect("ACK nonce space exhausted");
                                 
                                 let encoded;
+                                let nack_encoded;
                                 let ack_payload = match ack_options {
+                                    crate::ack::AckOptions::Nack => {
+                                        let a = state.nack_receiver.ack(current_time_now_ns, ack_options);
+                                        state.stats.ack_delay_us_max = state.stats.ack_delay_us_max.max(a.delay_us);
+                                        nack_encoded = a.encode();
+                                        state.stats.nack_packets_sent += 1;
+                                        &nack_encoded[..]
+                                    }
                                     crate::ack::AckOptions::Legacy => state.ack_field.as_bytes(),
                                     crate::ack::AckOptions::LowLatency { .. } | crate::ack::AckOptions::Adaptive { .. } => {
                                         let a = state.ack_receiver.ack(current_time_now_ns);
@@ -3011,6 +3062,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 else { o += ack_payload.write_to(&mut packet_memory_send[o..]); }
                                 let ack_ecn = matches!(ack_options, crate::ack::AckOptions::Legacy) && take_ecn_echo(state);
                                 state.ack_receiver.sent(current_time_now_ns);
+                                state.nack_receiver.sent(current_time_now_ns);
                                 state.stats.ack_packets_sent += 1;
                                 state.stats.ack_bytes_sent += o as u64;
                                 udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_send[..o], Dscp::Af21, ack_ecn);
@@ -3135,6 +3187,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             state.congestion_event_time_ns = current_time_now_ns;
                             state.app_limit_time_offset = 0;
                             state.cc_startup_done = true;
+                            state.stats.congestion_ecn_events += 1;
                             println!("congestion event ECN CE ...  rate discovered: {} pps  sent:{send_mode}@{send_t_factor:.2}", state.congestion_event_rate_upps as f64 / 1000000.0);
                         }
 
@@ -3147,8 +3200,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                         assert!(state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY);
                         while state.packets_waiting_ack_tail < state.send_sequence_number {
                             let bit_index = state.packets_waiting_ack_tail % PACKETS_WAITING_ACK_CAPACITY;
-                            // This slot now describes the tail packet (set below if declared lost).
-                            state.declared_lost_field[(bit_index / 64) as usize] &= !(1u64 << (bit_index % 64));
+                            // A NACK may already have finalized this packet as lost.
                             if state.packets_waiting_ack_field[(bit_index / 64) as usize] & (1u64 << (bit_index % 64)) != 0 {
                                 let mut send_time = state.send_time(state.packets_waiting_ack_tail);
                                 if send_time != 0 && (state.RTT_mean == 0 || (current_time_now_ns - send_time) < time_to_considered_dropped) {
@@ -3159,39 +3211,11 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     send_time = current_time_now_ns.saturating_sub(history_ns);
                                 }
                                 
-                                if state.packets_waiting_ack_tail == state.tu_probe_sequence_number {
-                                    state.tu_probe_sequence_number = u64::MAX;
-                                    state.tu_probe_size_advance /= 5;
-                                    state.tu_probe_failed_count += 1;
-                                    state.stats.tu_probes_lost += 1;
-                                }
-                                else {
-                                    // Track losses in a rolling window of 1 RTT
-                                    let rtt_ns = state.RTT_mean as u64 * 100_000;
-                                    if current_time_now_ns - state.loss_window_start_ns > rtt_ns {
-                                        state.loss_window_start_ns = current_time_now_ns;
-                                        state.loss_count_in_window = 0;
-                                    }
-                                    // Covered losses still enter loss/FEC statistics below, but
-                                    // cannot prime the threshold for a subsequent congestion cut.
-                                    let eligible = send_time > state.congestion_event_time_ns + (rtt_ns as f64 * cc.event_guard_rtts) as u64;
-                                    let threshold = if cc.loss_fraction_ppm == 0 { cc.loss_threshold } else {
-                                        let send_dt = send_time.saturating_sub(state.congestion_event_time_ns);
-                                        let rate = local_rate_limit(cc_rate(send_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery, state.cc_startup_done).0.max(cc.rate_floor_upps), max_pps);
-                                        congestion_loss_threshold(rate, rtt_ns, &cc)
-                                    };
-                                    let trigger = cc.loss_response_fraction_ppm == 0 && count_congestion_loss(&mut state.loss_count_in_window, eligible, threshold);
-
-                                    if trigger {
-                                        apply_loss_congestion(state, send_time, current_time_now_ns, &cc, max_pps);
-                                    }
-                                    assert!(state.packets_in_flight > 0, "packets_in_flight underflow");
-                                    state.packets_in_flight -= 1;
-                                    state.packet_lost_since_last_print += 1;
-                                    state.stats.packets_lost += 1;
-                                    if let Some(t) = &mut loss_trace { t.outcome('L', connection_tracking_data.two_byte_send_prefix, state.packets_waiting_ack_tail, current_time_now_ns); }
-                                    state.declared_lost_field[(bit_index / 64) as usize] |= 1u64 << (bit_index % 64);
-                                    connection_tracking_data.unreliable_send_buffer.fec_on_packet_lost(state.packets_waiting_ack_tail);
+                                let seq = state.packets_waiting_ack_tail;
+                                if declare_packet_lost(state, seq, current_time_now_ns, &cc, max_pps) {
+                                    state.stats.losses_by_timeout += 1;
+                                    if let Some(t) = &mut loss_trace { t.outcome('L', connection_tracking_data.two_byte_send_prefix, seq, current_time_now_ns); }
+                                    connection_tracking_data.unreliable_send_buffer.fec_on_packet_lost(seq);
                                 }
                             }
                             if cc.loss_response_fraction_ppm > 0 {
@@ -3741,6 +3765,47 @@ fn congestion_loss_threshold(rate_upps: u64, rtt_ns: u64, cc: &CongestionControl
     cc.loss_threshold.max(fraction.min(u64::MAX as u128) as u64)
 }
 
+/// Idempotent per-sequence accounting shared by receiver NACK and sender timeout.
+/// Returns true only for newly declared data loss (TU probes are not data loss).
+fn declare_packet_lost(state: &mut ConnectionStateConnected, seq: u64, now: u64, cc: &CongestionControlOptions, max_pps: Option<u64>) -> bool {
+    if seq < state.packets_waiting_ack_tail || seq >= state.send_sequence_number { return false; }
+    let i = seq % PACKETS_WAITING_ACK_CAPACITY;
+    let mask = 1u64 << (i%64);
+    if state.packets_waiting_ack_field[(i/64) as usize] & mask == 0 { return false; }
+    state.packets_waiting_ack_field[(i/64) as usize] &= !mask;
+    if seq == state.tu_probe_sequence_number {
+        state.tu_probe_sequence_number = u64::MAX;
+        state.tu_probe_size_advance /= 5;
+        state.tu_probe_failed_count += 1;
+        state.stats.tu_probes_lost += 1;
+        return false;
+    }
+    let mut sent = state.send_time(seq);
+    if sent == 0 || sent == u64::MAX {
+        let history_ns = if state.curve_pacer.is_some() { crate::scheduling::HISTORY_TIME_NS } else { 4_295_000_000 };
+        sent = now.saturating_sub(history_ns);
+    }
+    let rtt_ns = state.RTT_mean as u64 * 100_000;
+    if now.saturating_sub(state.loss_window_start_ns) > rtt_ns {
+        state.loss_window_start_ns = now; state.loss_count_in_window = 0;
+    }
+    let eligible = sent > state.congestion_event_time_ns.saturating_add((rtt_ns as f64 * cc.event_guard_rtts) as u64);
+    let threshold = if cc.loss_fraction_ppm == 0 { cc.loss_threshold } else {
+        let dt = sent.saturating_sub(state.congestion_event_time_ns);
+        let rate = local_rate_limit(connection_rate(dt, state.congestion_event_rate_upps, cc.recovery_rtts*rtt_ns, cc, state.cc_startup_done).0.max(cc.rate_floor_upps), max_pps);
+        congestion_loss_threshold(rate, rtt_ns, cc)
+    };
+    if cc.loss_response_fraction_ppm == 0 && count_congestion_loss(&mut state.loss_count_in_window, eligible, threshold) {
+        apply_loss_congestion(state, sent, now, cc, max_pps);
+    }
+    assert!(state.packets_in_flight > 0, "packets_in_flight underflow");
+    state.packets_in_flight -= 1;
+    state.packet_lost_since_last_print += 1;
+    state.stats.packets_lost += 1;
+    state.declared_lost_field[(i/64) as usize] |= mask;
+    true
+}
+
 fn apply_loss_congestion(state: &mut ConnectionStateConnected, send_time: u64, current_time_now_ns: u64, cc: &CongestionControlOptions, max_pps: Option<u64>) {
     let rtt_ns = state.RTT_mean as u64 * 100_000;
     // An RTT re-anchor may have moved the origin while a cohort was retiring.
@@ -3767,6 +3832,7 @@ fn apply_loss_congestion(state: &mut ConnectionStateConnected, send_time: u64, c
     state.app_limit_time_offset = 0;
     state.loss_count_in_window = 0;
     state.cc_startup_done = true;
+    state.stats.congestion_loss_events += 1;
     println!("congestion event PACKET DROPPED {} ...  rate discovered: {} pps  now:{now_mode}@{now_t_factor:.2} sent:{send_mode}@{send_t_factor:.2}", state.packets_waiting_ack_tail, state.congestion_event_rate_upps as f64 / 1000000.0);
     state.loss_response = LossResponseWindow::default();
 }
@@ -4754,5 +4820,34 @@ mod fec_closed_loop_tests {
         b.fec_on_packet_lost(4);
         assert_eq!(b.fec_send_slot.as_ref().unwrap().lost, 21);
         assert!(b.fec_send_slot.as_ref().unwrap().n <= 128);
+    }
+}
+
+#[cfg(test)]
+mod nack_loss_tests {
+    use super::*;
+    #[test]
+    fn duplicate_nack_and_timeout_cannot_account_same_loss_twice() {
+        let ConnectionState::Connected(mut s) = new_connection_state_connected(None, CONNECT_MAGIC1_PLAIN_TEXT, 1, 0) else { unreachable!() };
+        s.RTT_mean = 200;
+        s.account_send(10_000_000);
+        s.packets_in_flight = 1;
+        assert!(declare_packet_lost(&mut s, 0, 30_000_000, &CongestionControlOptions::legacy(), None));
+        assert!(!declare_packet_lost(&mut s, 0, 40_000_000, &CongestionControlOptions::legacy(), None));
+        assert_eq!(s.packets_in_flight, 0);
+        assert_eq!(s.stats.packets_lost, 1);
+        assert_eq!(s.declared_lost_field[0] & 1, 1);
+        s.packets_waiting_ack_tail = 1;
+        assert!(!declare_packet_lost(&mut s, 0, 50_000_000, &CongestionControlOptions::legacy(), None));
+    }
+    #[test]
+    fn nack_of_probe_is_not_data_loss() {
+        let ConnectionState::Connected(mut s) = new_connection_state_connected(None, CONNECT_MAGIC1_PLAIN_TEXT, 1, 0) else { unreachable!() };
+        s.account_send(10_000_000);
+        s.tu_probe_sequence_number = 0;
+        assert!(!declare_packet_lost(&mut s, 0, 30_000_000, &CongestionControlOptions::legacy(), None));
+        assert_eq!(s.stats.packets_lost, 0);
+        assert_eq!(s.stats.tu_probes_lost, 1);
+        assert_eq!(s.packets_in_flight, 0);
     }
 }

@@ -15,6 +15,8 @@ pub enum AckOptions {
     /// Gaps mature after max(1ms,RTT/16) or16 later packets. Urgent gap/CE feedback
     /// is paced at least by that interval and the normal packet-budget interval.
     Adaptive { every_packets: u16, max_delay_us: u32 },
+    /// Sparse loss/CE feedback with automatic reorder tolerance; no tuning knobs.
+    Nack,
 }
 impl Default for AckOptions {
     fn default() -> Self { Self::Legacy }
@@ -188,7 +190,7 @@ impl AckReceiver {
                 let t = (rtt_us / 8).clamp(1000, max_delay_us.max(1000) as u64).max(budget_us).min(max_delay_us as u64);
                 (n as u16, t as u32)
             }
-            AckOptions::Legacy => (0, 0),
+            AckOptions::Legacy | AckOptions::Nack => (0, 0),
         }
     }
     pub fn ack(&self, now: u64) -> BitmapAck {

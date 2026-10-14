@@ -194,7 +194,8 @@ fn ack_options(a: &Args) -> shielded_transport_pigeon::ack::AckOptions {
         "legacy" => AckOptions::Legacy,
         "bitmap" => AckOptions::LowLatency { every_packets: a.num("ack-every", 8), max_delay_us: a.num("ack-delay-us", 1000) },
         "adaptive" => AckOptions::Adaptive { every_packets: a.num("ack-every", 8), max_delay_us: a.num("ack-delay-us", 10000) },
-        _ => die("--ack needs legacy, bitmap or adaptive"),
+        "nack" => AckOptions::Nack,
+        _ => die("--ack needs legacy, bitmap, adaptive or nack"),
     }
 }
 #[test]

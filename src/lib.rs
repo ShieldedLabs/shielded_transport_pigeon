@@ -8,6 +8,7 @@
 #![allow(deprecated)]
 
 pub mod ack;
+pub mod nack;
 pub mod fec;
 pub mod fec_adapt;
 mod loss_trace;
