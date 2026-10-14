@@ -968,6 +968,9 @@ pub struct ConnectionStateConnected {
     pub magic2: u64,
 
     pub send_sequence_number: u64,
+    pub send_ack_sequence_number: u64,
+    pub receive_sequences: crate::sequence::ReceiveSequences,
+    pub ack_field_virtual_base: u64,
     pub last_sent_data_packet: u64,
     pub last_sent_could_have_sent_data_packet: u64,
     pub last_ack_received_time: u64,
@@ -1040,6 +1043,9 @@ pub fn new_connection_state_connected(cipher: Option<ConnectionCipherTriplet>, m
         magic1,
         magic2,
         send_sequence_number: 0,
+        send_ack_sequence_number: crate::sequence::ACK_SPACE,
+        receive_sequences: Default::default(),
+        ack_field_virtual_base: 0,
         last_sent_data_packet: 0,
         last_sent_could_have_sent_data_packet: 0,
         last_ack_received_time: timestamp_ns,
@@ -1349,6 +1355,7 @@ impl ConnectionStateConnected {
         }
     }
     fn account_send(&mut self, actual_ns: u64) {
+        assert!(self.send_sequence_number < crate::sequence::ACK_SPACE - 1, "data nonce space exhausted");
         if let Some(p) = &mut self.curve_pacer {
             if self.pacing_diagnostics { p.observe_send(self.send_sequence_number, actual_ns); }
             let index = self.send_sequence_number % PACKETS_WAITING_ACK_CAPACITY;
@@ -2466,12 +2473,12 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 // FALLTHROUGH TO CONNECTED
                             }
                             ConnectionState::SendingServerHello { cipher, magic1, magic2, last_sent_time_ns, hello_packet_payload } => {
-                                let non_virtual_nonce = first_six_bytes >> 16; // Todo convert this to virtual.
+                                let non_virtual_nonce = crate::sequence::ReceiveSequences::default().candidate((first_six_bytes >> 16) as u32);
     
                                 let mut can_decrypt = false;
                                 // Optimization done here. It can never be cipher.old so we skip checking.
-                                can_decrypt |= cipher.current.read_message(non_virtual_nonce, &packet_memory_encrypted[6..buf_len], &mut packet_memory_recv[..]).is_ok();
-                                can_decrypt |= cipher.current.read_message(non_virtual_nonce, &packet_memory_encrypted[6..buf_len], &mut packet_memory_recv[..]).is_ok();
+                                can_decrypt = cipher.current.read_message(non_virtual_nonce, &packet_memory_encrypted[6..buf_len], &mut packet_memory_recv[..]).is_ok()
+                                    || cipher.new.read_message(non_virtual_nonce, &packet_memory_encrypted[6..buf_len], &mut packet_memory_recv[..]).is_ok();
                                 if can_decrypt == false {
                                     break 'conn;
                                 }
@@ -2485,7 +2492,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
 //////// BEGIN ORDINARY PACKET HANDLING  ////////////////////////////////////////////////////////////////////
                         if let ConnectionState::Connected(state) = &mut existing_connection.connection_state {
                             let non_virtual_nonce = (first_six_bytes >> 16) as u32;
-                            let nonce = non_virtual_nonce; // @Todo: Convert this to virtual, like the package ID in unreliable reassembly below.
+                            let nonce = state.receive_sequences.candidate(non_virtual_nonce);
     
                             let payload;
                             if let Some(cipher) = &mut state.cipher {
@@ -2504,8 +2511,12 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             else {
                                 payload = &packet_memory_encrypted[6..buf_len];
                             }
-                            // Ground truth: every authenticated sequenced packet the peer sent.
-                            state.rx_tracker.on_packet(nonce as u64, &mut state.stats);
+                            // Packet TYPE is still determined by authenticated payload SIZE.
+                            let is_ack = payload.len() == 516 || payload.len() == crate::ack::ACK_PAYLOAD_LEN;
+                            if is_ack != crate::sequence::is_ack_space(non_virtual_nonce) { break 'conn; }
+                            if !state.receive_sequences.commit(nonce) { break 'conn; }
+                            // ACK nonces are not holes in the dense data stream.
+                            if !is_ack { state.rx_tracker.on_packet(nonce, &mut state.stats); }
                             
                             if payload.len() < 516 && payload.len() != crate::ack::ACK_PAYLOAD_LEN {
                                 if OVERLY_VERBOSE { println!("Dropping from {connection_key:?}, payload < 516."); }
@@ -2528,7 +2539,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 
                                 let mut oldest_newly_acked_send_time: u64 = u64::MAX;
                                 let legacy_indices = legacy_ack.into_iter().flat_map(|ack| {
-                                    let base = ack.field_base as u64;
+                                    let base = crate::sequence::extend(ack.field_base as u64, state.send_sequence_number.saturating_sub(1), 32);
                                     (base..base+4096).filter(move |&seq| ack.field[((seq-base)/64) as usize] & (1 << ((seq-base)%64)) != 0)
                                 });
                                 let relevant_ack = bitmap_ack.as_ref().map(|a| a.relevant(&state.packets_waiting_ack_field, &state.declared_lost_field[..]));
@@ -2646,37 +2657,30 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             if !matches!(ack_options, crate::ack::AckOptions::Legacy) {
                                 if !state.ack_receiver.receive_with_rtt(nonce as u64, timestamp_ns, ecn_marked, ack_options, &mut state.ack_timer, state.stats.rtt_us, buf_len) { break 'conn; }
                             } else {
-                            if nonce < state.ack_field.field_base {
+                            if nonce < state.ack_field_virtual_base {
                                 if OVERLY_VERBOSE { println!("Dropping from {connection_key:?}, nonce too old."); }
                                 break 'conn;
                             }
-                            if nonce > state.ack_field.field_base + u32::MAX / 2 {
+                            if nonce > state.ack_field_virtual_base + (1u64 << 30) {
                                 if OVERLY_VERBOSE { println!("Dropping from {connection_key:?}, nonce too far in the future.."); }
                                 break 'conn;
                             }
                             
-                            let bit_index = nonce-state.ack_field.field_base;
-                            if nonce < state.ack_field.field_base + 4096 && 0 != (1u64 << (bit_index % 64)) & state.ack_field.field[bit_index as usize / 64] {
+                            let bit_index = nonce-state.ack_field_virtual_base;
+                            if nonce < state.ack_field_virtual_base + 4096 && 0 != (1u64 << (bit_index % 64)) & state.ack_field.field[bit_index as usize / 64] {
 
                                 if OVERLY_VERBOSE { println!("Dropping from {connection_key:?}, nonce already received."); }
                                 break 'conn;
                             }
 
-                            if nonce >= state.ack_field.field_base + 4096 {
-                                // ring full: drop inbound instead of ack+slide (sliding would forget un-acked nonces). peer retransmits.
-                                if state.send_sequence_number - state.packets_waiting_ack_tail >= PACKETS_WAITING_ACK_CAPACITY - 1 { break 'conn; }
+                            if nonce >= state.ack_field_virtual_base + 4096 {
+                                // ACK traffic has its own space and does not require data-ring capacity.
                                 { // send ack
                                     let mut o = 0;
-                                    let virtual_nonce = state.send_sequence_number;
+                                    let virtual_nonce = state.send_ack_sequence_number;
                                     o += existing_connection.two_byte_send_prefix.write_to(&mut packet_memory_send[o..]);
-                                    o += (virtual_nonce as u32).write_to(&mut packet_memory_send[o..]);
-                                    {
-                                        let bit_index = state.send_sequence_number % PACKETS_WAITING_ACK_CAPACITY;
-                                        state.packets_waiting_ack_field[(bit_index / 64) as usize] &= !(1u64 << (bit_index % 64));
-                                        existing_connection.unreliable_send_buffer.fec_prepare_packet(state.send_sequence_number);
-                                        state.send_sequence_number += 1;
-                                        if let Some(p) = &mut state.curve_pacer { p.skip_ack(); }
-                                    }
+                                    o += crate::sequence::to_wire(virtual_nonce).write_to(&mut packet_memory_send[o..]);
+                                    state.send_ack_sequence_number = state.send_ack_sequence_number.checked_add(1).expect("ACK nonce space exhausted");
 
                                     if let Some(cipher) = &mut state.cipher { o += cipher.current.write_message(virtual_nonce, state.ack_field.as_bytes(), &mut packet_memory_send[o..]).unwrap(); }
                                     else { o += state.ack_field.as_bytes().write_to(&mut packet_memory_send[o..]); }
@@ -2687,12 +2691,14 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     state.ack_timer = u64::MAX;
                                 }
 
-                                if nonce >= state.ack_field.field_base + 4096 + 2048 {
-                                    state.ack_field.field_base = nonce;
+                                if nonce >= state.ack_field_virtual_base + 4096 + 2048 {
+                                    state.ack_field_virtual_base = nonce;
+                                    state.ack_field.field_base = nonce as u32;
                                     state.ack_field.field = [0u64; 64];
                                 }
-                                else if nonce >= state.ack_field.field_base + 4096 {
-                                    state.ack_field.field_base += 2048;
+                                else if nonce >= state.ack_field_virtual_base + 4096 {
+                                    state.ack_field_virtual_base += 2048;
+                                    state.ack_field.field_base = state.ack_field_virtual_base as u32;
                                     let mut field = state.ack_field.field;
                                     let (bottom, top) = field.split_at_mut(32);
                                     bottom.copy_from_slice(top);
@@ -2701,7 +2707,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 }
                             }
 
-                            let bit_index = nonce-state.ack_field.field_base;
+                            let bit_index = nonce-state.ack_field_virtual_base;
                             state.ack_field.field[bit_index as usize / 64] |= 1u64 << (bit_index % 64);
                             if ecn_marked { state.ecn_echo_pending = true; }
                             if state.ack_timer == u64::MAX { state.ack_timer = timestamp_ns + ACK_BUFFER_TIME_NS; }
@@ -2983,19 +2989,13 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             return false; // connection timeout
                         }
                         
-                        if current_time_now_ns > state.ack_timer && state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY - 1 {
+                        if current_time_now_ns > state.ack_timer {
                             { // send ack
                                 let mut o = 0;
-                                let virtual_nonce = state.send_sequence_number;
+                                let virtual_nonce = state.send_ack_sequence_number;
                                 o += connection_tracking_data.two_byte_send_prefix.write_to(&mut packet_memory_send[o..]);
-                                o += (virtual_nonce as u32).write_to(&mut packet_memory_send[o..]);
-                                {
-                                    let bit_index = state.send_sequence_number % PACKETS_WAITING_ACK_CAPACITY;
-                                    state.packets_waiting_ack_field[(bit_index / 64) as usize] &= !(1u64 << (bit_index % 64));
-                                    connection_tracking_data.unreliable_send_buffer.fec_prepare_packet(state.send_sequence_number);
-                                    state.send_sequence_number += 1;
-                                    if let Some(p) = &mut state.curve_pacer { p.skip_ack(); }
-                                }
+                                o += crate::sequence::to_wire(virtual_nonce).write_to(&mut packet_memory_send[o..]);
+                                state.send_ack_sequence_number = state.send_ack_sequence_number.checked_add(1).expect("ACK nonce space exhausted");
                                 
                                 let encoded;
                                 let ack_payload = match ack_options {
@@ -3287,7 +3287,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                         
                             let virtual_nonce = state.send_sequence_number;
                             store_u16(&mut packet_memory_encrypted[0..2], connection_tracking_data.two_byte_send_prefix);
-                            store_u32(&mut packet_memory_encrypted[2..6], virtual_nonce as u32);
+                            store_u32(&mut packet_memory_encrypted[2..6], crate::sequence::to_wire(virtual_nonce));
 
                             let packet_len;
                             if let Some(cipher) = &mut state.cipher {
@@ -3313,7 +3313,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                         
                             let virtual_nonce = state.send_sequence_number;
                             store_u16(&mut packet_memory_encrypted[0..2], connection_tracking_data.two_byte_send_prefix);
-                            store_u32(&mut packet_memory_encrypted[2..6], virtual_nonce as u32);
+                            store_u32(&mut packet_memory_encrypted[2..6], crate::sequence::to_wire(virtual_nonce));
 
                             let packet_len;
                             if let Some(cipher) = &mut state.cipher {
@@ -3366,7 +3366,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                         
                             let virtual_nonce = state.send_sequence_number;
                             store_u16(&mut packet_memory_encrypted[0..2], connection_tracking_data.two_byte_send_prefix);
-                            store_u32(&mut packet_memory_encrypted[2..6], virtual_nonce as u32);
+                            store_u32(&mut packet_memory_encrypted[2..6], crate::sequence::to_wire(virtual_nonce));
 
                             let packet_len;
                             if let Some(cipher) = &mut state.cipher {
