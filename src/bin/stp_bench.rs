@@ -96,7 +96,7 @@ impl Args {
             "count" | "min" | "max" | "timeout" | "idle" | "out" | "giant" |
             "giant-warmup" | "queue-us" | "queue-min" | "queue-max" | "max-pps" |
             "duration" | "send-on-ms" | "send-off-ms" | "mix" | "classes" |
-            "loss-trace" | "loss-episodes" | "queues" | "workload" | "bulk-size" | "small-rate" | "traffic-classes" | "small-class")
+            "loss-trace" | "loss-episodes" | "queues" | "workload" | "bulk-size" | "small-rate" | "small-size" | "traffic-classes" | "small-class")
     }
     fn parse(it: impl Iterator<Item = String>) -> Args {
         let mut m = HashMap::new();
@@ -836,6 +836,7 @@ fn send_magazines(a: &Args) {
     let duration = a.num::<f64>("duration", 40.0);
     let small_rate = a.num::<f64>("small-rate", 20.0);
     if !(0.0..=600.0).contains(&duration) || duration == 0.0 || !small_rate.is_finite() || small_rate <= 0.0 { die("invalid workload duration/rate"); }
+    let small_size = a.num::<usize>("small-size", 1000).clamp(HEADER, MAX_JUMBOGRAM_LEN);
     let bulk_size = a.num::<usize>("bulk-size", 50<<20).clamp(HEADER, MAX_JUMBOGRAM_LEN);
     let to = STPAddress::parse(a.str("to").unwrap_or_else(|| die("send needs --to"))).unwrap_or_else(|| die("bad --to"));
     let key = to.to_connection_key();
@@ -885,8 +886,8 @@ fn send_magazines(a: &Args) {
             if mode == "bulk-small" {
                 while next_small <= elapsed && next_small < duration {
                     let id = sizes.len() as u32;
-                    let m = frame(id, 1000-HEADER, |p| p.fill(0x77));
-                    sizes.push(1000); ids.push(small_queue); submitted.push(Some(start+(next_small*1e9) as u64)); small_ids.push(id);
+                    let m = frame(id, small_size-HEADER, |p| p.fill(0x77));
+                    sizes.push(small_size); ids.push(small_queue); submitted.push(Some(start+(next_small*1e9) as u64)); small_ids.push(id);
                     pending[small_queue].push_back((id, m));
                     next_small += -rng.random::<f64>().max(f64::MIN_POSITIVE).ln()/small_rate;
                 }
