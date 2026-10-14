@@ -701,6 +701,11 @@ const MAX_SEND_CATCHUP_NS: u64 = 2_000_000;
 #[derive(Debug)]
 struct SendPacingGrant { packets: u64, carry_ns: u64 }
 
+/// Preserve multiply-then-divide precision without overflowing the intermediate.
+fn rate_mul_div(rate: u64, multiplier: u64, divisor: u64) -> u64 {
+    (rate as u128 * multiplier as u128 / divisor as u128).min(u64::MAX as u128) as u64
+}
+
 fn send_interval_ns(rate_upps: u64) -> u64 {
     (1_000_000_000_000_000 / rate_upps.max(1)).max(1)
 }
@@ -3916,9 +3921,9 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                         }
                         // pps * 10^-6 * rtt * 10^-4 = p * 10^10
                         // BDP + sawtooth: pipe is full (BDP) plus ack batching excess (ack_pace_estimate is in 0.1ms units)
-                        let bdp = allowed_bandwidth_upps * state.RTT_mean as u64 / 10_000;
-                        let sawtooth = allowed_bandwidth_upps * state.ack_pace_estimate as u64 / 10_000;
-                        let allowed_packets_in_flight = ((bdp + sawtooth) / 1_000_000).max(1);
+                        let bdp = rate_mul_div(allowed_bandwidth_upps, state.RTT_mean as u64, 10_000);
+                        let sawtooth = rate_mul_div(allowed_bandwidth_upps, state.ack_pace_estimate as u64, 10_000);
+                        let allowed_packets_in_flight = (bdp.saturating_add(sawtooth) / 1_000_000).max(1);
 
                         // 1 / (upps * 10^-6) = 10^6 / upps <- seconds
                         // ns = (10^6 / upps) * 10^9 = 10^15 / upps
@@ -3996,7 +4001,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             state.packet_since_last_print += 1;
                         }
 
-                        connection_tracking_data.unreliable_send_buffer.set_rate(payload_size as u64 * allowed_bandwidth_upps / 1000_000);
+                        connection_tracking_data.unreliable_send_buffer.set_rate(rate_mul_div(allowed_bandwidth_upps, payload_size as u64, 1_000_000));
                         {
                             let buf = &mut connection_tracking_data.unreliable_send_buffer;
                             let (lost, spurious) = fec_learning_counters(state);
@@ -7022,5 +7027,89 @@ mod review2_tests {
         let grant = send_pacing_grant(0, 0, 0);
         assert_eq!(grant.packets, 0);
         assert_eq!(grant.carry_ns, 0);
+    }
+
+    #[test]
+    fn review2_bdp_multiply_cannot_overflow_after_days() {
+        let cc = &crate::ship::CC;
+        let k = cc.recovery_rtts * 6_553_500_000;
+        let (rate, _) = connection_rate(600_000_000_000_000, 200_000_000, k, cc, true);
+        let allowed = local_rate_limit(rate, None);
+        assert_eq!(allowed, MAX_CC_RATE_UPPS);
+        let expected = allowed.checked_mul(65535).unwrap() / 10_000;
+        assert_eq!(rate_mul_div(allowed, 65535, 10_000), expected);
+    }
+
+    #[test]
+    fn review2_rate_products_use_wide_intermediates() {
+        // Even without the safety cap, divide the full product before saturating.
+        let rate = 600_000_000_000_000u64;
+        assert!(rate.checked_mul(65535).is_none());
+        assert_eq!(rate_mul_div(rate, 65535, 10_000), 3_932_100_000_000_000);
+        assert_eq!(rate_mul_div(rate, 65507, 1_000_000), 39_304_200_000_000);
+        assert_eq!(rate_mul_div(u64::MAX, u64::MAX, 1), u64::MAX);
+        assert_eq!(rate_mul_div(u64::MAX, 1, 1), u64::MAX);
+        for rate in [0, 1, 200_000_000, MAX_CC_RATE_UPPS] {
+            for (multiplier, divisor) in [(0, 10_000), (100, 10_000), (65535, 10_000), (1472, 1_000_000)] {
+                assert_eq!(rate_mul_div(rate, multiplier, divisor), rate * multiplier / divisor);
+            }
+        }
+    }
+
+    fn connected() -> ConnectionStateConnected {
+        let ConnectionState::Connected(s) = new_connection_state_connected(None, 0, 1, 1_000_000_000) else { unreachable!() };
+        s
+    }
+
+    #[test]
+    fn review2_ackhole_repeated_cuts_no_panic() {
+        let cc = &crate::ship::CC;
+        let mut s = connected();
+        s.RTT_mean = 100;
+        s.cc_startup_done = true;
+        s.congestion_event_rate_upps = 2_000_000_000;
+        let mut now = 10_000_000_000u64;
+        s.congestion_event_time_ns = now - 10_000_000;
+        let mut cuts = 0u32;
+        for _round in 0..50u64 {
+            let hole = s.send_sequence_number;
+            // 0ad3b9d shares the two-loss RTT cohort: exercise two holes, not one.
+            // Six sends also close the send-time bucket holding the first holes.
+            for _ in 0..6 { s.account_send(now); now += 1_000_000; }
+            s.packets_in_flight += 6;
+            for i in 2..6u64 {
+                let bit = (hole + i) % PACKETS_WAITING_ACK_CAPACITY;
+                s.packets_waiting_ack_field[(bit / 64) as usize] &= !(1u64 << (bit % 64));
+                s.packets_in_flight -= 1;
+                s.ack_hole.acknowledged(hole + i);
+            }
+            let before = s.congestion_event_rate_upps;
+            for _ in 0..2 {
+                observe_ack_hole(&mut s, now, cc, None);
+                now += 2_000_000;
+                observe_ack_hole(&mut s, now, cc, None);
+            }
+            if s.congestion_event_rate_upps != before { cuts += 1; }
+            assert!(s.congestion_event_rate_upps <= before);
+            now += 100_000_000;
+        }
+        assert!(cuts >= 40, "expected persistent hole pattern to cut repeatedly, got {cuts} cuts");
+        assert_eq!(std::mem::size_of_val(&s.ack_hole), std::mem::size_of::<AckHole>());
+    }
+
+    #[test]
+    fn review2_bitmap_ack_decode_bounds() {
+        use crate::ack::BitmapAck;
+        let mut a = BitmapAck { highest: 100, sample_seq: 101, delay_us: 0, ce_count: 0, bitmap: [0; 16] };
+        a.bitmap[((100 - a.base()) / 64) as usize] |= 1u64 << ((100 - a.base()) % 64);
+        assert!(BitmapAck::decode(&a.encode()).is_none());
+        let mut b = BitmapAck { highest: 100, sample_seq: 100, delay_us: 0, ce_count: 0, bitmap: [0; 16] };
+        assert!(BitmapAck::decode(&b.encode()).is_none());
+        b.bitmap[((100 - b.base()) / 64) as usize] |= 1u64 << ((100 - b.base()) % 64);
+        let d = BitmapAck::decode(&b.encode()).unwrap();
+        assert!(d.acknowledged().all(|s| s <= d.highest));
+        let waiting = vec![0u64; PACKETS_WAITING_ACK_WORDS];
+        let lost = vec![0u64; PACKETS_WAITING_ACK_WORDS];
+        assert!(d.relevant(&waiting, &lost).acknowledged().all(|s| s <= d.highest));
     }
 }
