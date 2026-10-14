@@ -10,6 +10,7 @@
 
 pub mod fec;
 pub mod fec_adapt;
+mod loss_trace;
 pub mod helpers;
 pub mod native_sockets;
 pub mod nym_sockets;

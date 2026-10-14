@@ -9,6 +9,7 @@
 //! Decode tail uses the receiver clock: last accepted FEC block to delivery, excludes surplus repairs.
 //! Giant demo: send --to STPADDR --giant 1G --fec-pct 3 --timeout 600 --idle 30.
 //! Both endpoints must support extended FEC kind 2 for messages above 64000 source blocks.
+//!                   [--loss-trace events.csv] (S/F/L/A sender event CSV; see loss_trace.rs)
 //!
 //! Both: [--queue-us 1000000] [--queue-min 4194304] [--queue-max 67108864] [--max-pps N]
 //! (the send_buffer_params and max_pps given to the STP network thread).
@@ -17,13 +18,19 @@
 //! --cc-floor-pps, --cc-start-pps, --cc-min-growth-ppsps, --cc-max-growth-ppsps,
 //! --cc-guard-rtts.
 //! --duration S: saturated measurement for S seconds; requests receiver status while sending.
+//! --send-on-ms N --send-off-ms N: application submission duty cycle (queued packets drain normally).
 //! estimator_series rows: [seconds, FEC estimate, sample, sent packets, losses, UDP bytes, RTT us].
 //! --fec-pct X (send only): forward error correction redundancy in percent (float); messages of
 //! 2+ packets get X% extra Wirehair-coded blocks. The server needs no flag: it decodes either.
-//! --fec adaptive:v1|v2|v3 (send only): adaptive redundancy from the connection's own loss
+//! --fec adaptive:v1|v2|v3|span (send only): adaptive redundancy from the connection's own loss
 //! estimate (v1 tiered max-hold, v2 peak with decay, v3 high quantile; see fec_adapt), with
 //! [--fec-eps 1e-6] [--fec-time-scale 1.0] (scales hold/half-life/window) [--fec-min-packets 500]
+//! span targets packet_loss*sqrt(min(1,64/K)); --fec-eps optionally caps it (span default .5).
+//! [--fec-min-loss .005] [--fec-initial-loss .01]: explicit IID prior/floor, independent of span tails.
 //! [--fec-topup 0|1] (grow the message being sent when its own packets are declared lost).
+//! [--fec-span-floor none|real|legacy|robust]: opt-in measured safety floor, not a guarantee.
+//! [--fec-closed-loop 0|1]: span+topup only; own losses plus margin on the unresolved tail;
+//! full-message prior during cold start, minimum 12 repairs, no feedback wait/retransmission.
 //! [--fec-loss-signal declared|net:MS] (estimator input: raw declared loss, or declared minus
 //! spurious declarations with the counters delayed MS ms; default net:1000).
 //! --mix classes [--classes "SIZE:COUNT,..."] sends fixed counts per size class (default
@@ -346,6 +353,20 @@ fn poll(handle: &NetworkThreadHandle, outbox: &mut Outbox, wanted: &mut Wanted) 
     p
 }
 
+fn send_duty_off(elapsed_ns: u64, on_ns: u64, off_ns: u64) -> bool {
+    off_ns != 0 && elapsed_ns % (on_ns + off_ns) >= on_ns
+}
+
+#[test]
+fn send_duty_boundaries() {
+    assert!(!send_duty_off(0, 2000, 2000));
+    assert!(!send_duty_off(1999, 2000, 2000));
+    assert!(send_duty_off(2000, 2000, 2000));
+    assert!(send_duty_off(3999, 2000, 2000));
+    assert!(!send_duty_off(4000, 2000, 2000));
+    assert!(!send_duty_off(u64::MAX, 2000, 0));
+}
+
 fn send(a: &Args) {
     let to = STPAddress::parse(a.str("to").unwrap_or_else(|| die("send needs --to STPADDR"))).unwrap_or_else(|| die("bad --to address"));
     let seed: u64 = a.num("seed", 1);
@@ -355,6 +376,9 @@ fn send(a: &Args) {
     let max: usize = giant.unwrap_or_else(|| a.num("max", 50_000_000));
     let timeout = Duration::from_secs(a.num("duration", a.num("timeout", 600)));
     let idle = Duration::from_secs(a.num("idle", 10));
+    let on_ns = a.num::<u64>("send-on-ms", 2000).saturating_mul(1_000_000);
+    let off_ns = a.num::<u64>("send-off-ms", 0).saturating_mul(1_000_000);
+    if on_ns == 0 || on_ns.checked_add(off_ns).is_none() { die("invalid send duty cycle"); }
     let out = a.str("out").unwrap_or("stp_bench_report.json").to_string();
     let fec_pct: f64 = a.str("fec-pct").map(|s| s.parse().unwrap_or_else(|_| die("bad --fec-pct"))).unwrap_or(0.0);
     if !(0.0..=100.0).contains(&fec_pct) { die("--fec-pct must be in 0..=100"); }
@@ -368,9 +392,16 @@ fn send(a: &Args) {
                 Some("v1") => LossEstimatorKind::TieredMaxHold,
                 Some("v2") => LossEstimatorKind::PeakDecay,
                 Some("v3") => LossEstimatorKind::Quantile,
-                _ => die("--fec must be fixed or adaptive:v1|v2|v3"),
+                Some("span") => LossEstimatorKind::SpanTail,
+                _ => die("--fec must be fixed or adaptive:v1|v2|v3|span"),
             };
-            let cfg = AdaptiveFecConfig { kind, eps: a.num("fec-eps", 1e-6), min_packets: a.num("fec-min-packets", 500), topup: a.num::<u32>("fec-topup", 0) != 0,
+            let cfg = AdaptiveFecConfig { kind, eps: a.num("fec-eps", if kind == LossEstimatorKind::SpanTail { 0.5 } else { 1e-6 }), min_loss: a.num("fec-min-loss", 0.005), initial_loss: a.num("fec-initial-loss", 0.01), min_packets: a.num("fec-min-packets", 500), topup: a.num::<u32>("fec-topup", 0) != 0,
+                closed_loop: a.num::<u32>("fec-closed-loop", 0) != 0,
+                span_floor: match a.str("fec-span-floor").unwrap_or("none") {
+                    "none" => SpanFloorKind::None, "real" => SpanFloorKind::Real,
+                    "legacy" => SpanFloorKind::Legacy, "robust" => SpanFloorKind::Robust,
+                    _ => die("--fec-span-floor must be none|real|legacy|robust"),
+                },
                 loss_signal: match a.str("fec-loss-signal") {
                     None => AdaptiveFecConfig::default().loss_signal,
                     Some("declared") => LossSignal::Declared,
@@ -380,6 +411,9 @@ fn send(a: &Args) {
                     },
                 },
                 ..Default::default() };
+            if cfg.closed_loop && (kind != LossEstimatorKind::SpanTail || !cfg.topup) {
+                die("--fec-closed-loop 1 requires --fec adaptive:span --fec-topup 1");
+            }
             Some(cfg.scale_time(a.num("fec-time-scale", 1.0)))
         }
     };
@@ -435,7 +469,7 @@ fn send(a: &Args) {
     }
 
     let kp = new_keypair_from_connect_magic1(to.magic1).unwrap_or_else(|| die("unsupported crypto in --to"));
-    let handle = new_network_thread_with_options(vec![kp], 0, max_pps(a), send_buffer_params(a), NetworkThreadOptions { bind_ip: None, congestion_control: cc_options(a), fec_redundancy_ppm: fec_ppm, fec_adaptive, record_fec_messages: true });
+    let handle = new_network_thread_with_options(vec![kp], 0, max_pps(a), send_buffer_params(a), NetworkThreadOptions { bind_ip: None, congestion_control: cc_options(a), fec_redundancy_ppm: fec_ppm, fec_adaptive, record_fec_messages: true, loss_trace: a.str("loss-trace").map(std::path::PathBuf::from) });
     // Per data id: (k, blocks sent, blocks planned, loss estimate) of its FEC coding, if coded.
     let mut fec_info: HashMap<u32, (u32, u32, u32, f64)> = HashMap::new();
     // One sample per second: (t, loss estimate, sample, packets sent/lost, UDP bytes, RTT us).
@@ -537,7 +571,8 @@ fn send(a: &Args) {
             produced += 1;
             if start_ns.is_some() { generator_wait_ns += ns() - t; }
         }
-        let mut budget = free;
+        let in_off_period = start_ns.is_some_and(|s| send_duty_off(ns() - s, on_ns, off_ns));
+        let mut budget = if in_off_period { 0 } else { free };
         let mut send_now: Outbox = Vec::new();
         while let Some(m) = pending.front() {
             let len = m.len() as u64;
@@ -743,5 +778,6 @@ fn send(a: &Args) {
         stats.udp_payload_tu, rx.st.fec_decode_last_tail_ns as f64 / 1e6, rx.st.fec_decode_max_tail_ns as f64 / 1e6, rx.st.fec_ingress_dropped_blocks);
     std::fs::write(&out, json).unwrap_or_else(|e| die(&format!("writing {out}: {e}")));
     println!("report written to {out}");
+    drop(handle); // A traced run joins the network thread and flushes its event CSV.
     std::process::exit(if delivered == count as u64 { 0 } else { 1 });
 }

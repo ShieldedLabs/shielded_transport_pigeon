@@ -522,12 +522,15 @@ impl UnreliableSendBuffer {
         if let Some(a) = &self.fec_adaptive {
             if a.tracker.config().topup {
                 let layout = crate::fec::MessageLayout::new(f.message.len(), f.block_bytes).unwrap();
-                let group_k = layout.group(0).1 as u64;
-                // Interleaving spreads aggregate erasures across groups. Size the variance
-                // margin at group K, not whole-message K, and protect each group equally.
-                let group_lost = (f.lost as u64).div_ceil(layout.groups as u64);
-                let group_n = a.topped_up_blocks(group_k, group_lost, f.loss_estimate);
-                let n = f.k as u64 + group_n.saturating_sub(group_k) * layout.groups as u64;
+                let n = if a.closed_loop_enabled() {
+                    let repair_sent = f.next_id.saturating_sub(f.k) as u64;
+                    f.k as u64 + repair_sent + a.extra_repair_blocks_needed_now(f.k as u64, f.next_id as u64, repair_sent, f.lost as u64)
+                } else {
+                    let group_k = layout.group(0).1 as u64;
+                    let group_lost = (f.lost as u64).div_ceil(layout.groups as u64);
+                    let group_n = a.topped_up_blocks(group_k, group_lost, f.loss_estimate);
+                    f.k as u64 + group_n.saturating_sub(group_k) * layout.groups as u64
+                };
                 f.n = f.n.max(layout.round_plan(n.min(u32::MAX as u64) as u32));
             }
         }
@@ -675,6 +678,15 @@ impl UnreliableSendBuffer {
             self.start_message(front_msg, payload_len);
         }
         if self.fec_send_slot.is_some() {
+            if let (Some(a), Some(f)) = (&self.fec_adaptive, &mut self.fec_send_slot) {
+                // Refresh at source completion and the final planned repair, without tail waiting.
+                if a.closed_loop_enabled() && f.next_id >= f.k && (f.next_id == f.k || f.next_id + 1 >= f.n) {
+                    let layout = crate::fec::MessageLayout::new(f.message.len(), f.block_bytes).unwrap();
+                    let repair_sent = f.next_id.saturating_sub(f.k) as u64;
+                    let extra = a.extra_repair_blocks_needed_now(f.k as u64, f.next_id as u64, repair_sent, f.lost as u64);
+                    f.n = f.n.max(layout.round_plan((f.k as u64 + repair_sent + extra).min(u32::MAX as u64) as u32));
+                }
+            }
             let need = { let f = self.fec_send_slot.as_ref().unwrap(); STP_FEC_FRAGMENT_HEADER_SIZE + crate::fec::block_len(f.message.len(), f.block_bytes, crate::fec::MessageLayout::new(f.message.len(), f.block_bytes).unwrap().wire_id(f.next_id)) };
             if need > space {
                 if space < payload_len { return None; } // the next packet has room
@@ -1648,7 +1660,8 @@ unsafe impl std::marker::Sync for NetworkThreadInner {}
 // Note(Sam): Using this handle from two threads at once is UB. Only one thread may call service_connections at any given time.
 pub struct NetworkThreadHandle {
     inner: std::sync::Arc<NetworkThreadInner>,
-    thread: std::thread::JoinHandle<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    join_on_drop: bool,
 }
 
 // The network thread owns the socket, so it has to end for the port to close and for peers to
@@ -1656,6 +1669,8 @@ pub struct NetworkThreadHandle {
 impl Drop for NetworkThreadHandle {
     fn drop(&mut self) {
         self.inner.stop.store(true, std::sync::atomic::Ordering::Release);
+        // A traced run must flush the final buffered events before the process exits.
+        if self.join_on_drop { if let Some(t) = self.thread.take() { let _ = t.join(); } }
     }
 }
 
@@ -1737,6 +1752,8 @@ pub struct NetworkThreadOptions {
     pub fec_adaptive: Option<crate::fec_adapt::AdaptiveFecConfig>,
     /// Report every finished FEC message in `NetworkThreadPull::fec_messages` (for measurement).
     pub record_fec_messages: bool,
+    /// Optional sender packet/fragment/outcome event CSV; disabled by default.
+    pub loss_trace: Option<std::path::PathBuf>,
 }
 
 impl NetworkThreadHandle {
@@ -1779,6 +1796,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
     });
     let fec_adaptive_cfg = options.fec_adaptive;
     let record_fec_messages = options.record_fec_messages;
+    let mut loss_trace = options.loss_trace.as_deref().map(|p| crate::loss_trace::LossTrace::open(p).expect("open loss trace"));
 
     let thread_inner = inner.clone();
 
@@ -2273,6 +2291,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                         if state.packets_waiting_ack_field[(bit_index / 64) as usize] & (1u64 << (bit_index % 64)) != 0 {
                                             state.packets_waiting_ack_field[(bit_index / 64) as usize] &= !(1u64 << (bit_index % 64));
                                             state.last_ack_received_time = timestamp_ns;
+                                            if let Some(t) = &mut loss_trace { t.outcome('A', existing_connection.two_byte_send_prefix, index, timestamp_ns); }
 
                                             let send_time_of_latest_ns = get_send_time_for_sequence_number(index, &state.send_time_band, state.send_time_band_head_index);
                                             if send_time_of_latest_ns != 0 && send_time_of_latest_ns != u64::MAX {
@@ -2302,6 +2321,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                         if *w & (1u64 << (bit_index % 64)) != 0 {
                                             *w &= !(1u64 << (bit_index % 64));
                                             state.stats.spurious_losses += 1;
+                                            if let Some(t) = &mut loss_trace { t.outcome('A', existing_connection.two_byte_send_prefix, index, timestamp_ns); }
                                         }
                                     }
                                 }
@@ -2872,11 +2892,16 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     state.packets_in_flight -= 1;
                                     state.packet_lost_since_last_print += 1;
                                     state.stats.packets_lost += 1;
+                                    if let Some(t) = &mut loss_trace { t.outcome('L', connection_tracking_data.two_byte_send_prefix, state.packets_waiting_ack_tail, current_time_now_ns); }
                                     state.declared_lost_field[(bit_index / 64) as usize] |= 1u64 << (bit_index % 64);
                                     connection_tracking_data.unreliable_send_buffer.fec_on_packet_lost(state.packets_waiting_ack_tail);
                                 }
                             }
                             state.packets_waiting_ack_field[(bit_index / 64) as usize] &= !(1u64 << (bit_index % 64));
+                            if let Some(a) = &mut connection_tracking_data.unreliable_send_buffer.fec_adaptive {
+                                let lost = state.declared_lost_field[(bit_index / 64) as usize] & (1u64 << (bit_index % 64)) != 0;
+                                a.on_sequence_finalized(state.packets_waiting_ack_tail, lost, current_time_now_ns);
+                            }
                             state.packets_waiting_ack_tail += 1;
                         }
                         
@@ -3019,6 +3044,10 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             else if let Some(ns) = &connection_tracking_data.nym_sock { nym_udp_send_with_congestion_and_dscp(ns, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::BestEffort, false) }
                             else { udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::BestEffort, false) };
                             increment_sequence_number_and_account(send_time_ns, &mut state.send_sequence_number, &mut state.send_time_band, &mut state.send_time_band_head_index, &mut state.packets_waiting_ack_field);
+                            if let Some(t) = &mut loss_trace { t.sent(connection_tracking_data.two_byte_send_prefix, virtual_nonce, send_time_ns, &packet_memory_send[..payload_size]); }
+                            if let Some(a) = &mut connection_tracking_data.unreliable_send_buffer.fec_adaptive {
+                                a.on_data_sent(virtual_nonce);
+                            }
                             state.last_sent_data_packet = current_time_now_ns; // We use the older time here so the pacer skips less packets.
                             state.packets_in_flight += 1;
                             state.stats.packets_sent += 1;
@@ -3083,7 +3112,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
 
     NetworkThreadHandle {
         inner,
-        thread,
+        thread: Some(thread),
+        join_on_drop: options.loss_trace.is_some(),
     }
 }
 
@@ -3528,7 +3558,7 @@ mod fec_send_tests {
     fn grouped_adaptive_topup_uses_group_variance() {
         let mut b = new_buf(10_000);
         let a = crate::fec_adapt::FecAdaptiveState::new(crate::fec_adapt::AdaptiveFecConfig { topup: true, ..Default::default() }, 0, 0, 0);
-        b.fec_adaptive = Some(a);
+        b.fec_adaptive = Some(a.clone());
         b.start_fec(std::sync::Arc::new(msg(64001 * 32)), 32);
         let f = b.fec_send_slot.as_mut().unwrap();
         let layout = crate::fec::MessageLayout::new(f.message.len(), 32).unwrap();
@@ -3616,5 +3646,33 @@ mod rx_tracker_tests {
         // Duplicates are not received twice.
         let st = run([0, 1, 1, 2]);
         assert_eq!((st.rx_packets, st.rx_duplicates, st.rx_lost), (3, 1, 0));
+    }
+}
+
+#[cfg(test)]
+mod fec_closed_loop_tests {
+    use super::*;
+    use crate::fec_adapt::{AdaptiveFecConfig, FecAdaptiveState, LossEstimatorKind, SpanFloorKind};
+
+    #[test]
+    fn refreshes_own_loss_budget_at_source_completion_without_a_new_loss_event() {
+        let cfg = AdaptiveFecConfig { kind: LossEstimatorKind::SpanTail, topup: true, closed_loop: true, span_floor: SpanFloorKind::Real, eps: 0.5, ..Default::default() };
+        let mut b = UnreliableSendBuffer::new(100000, 1000000, 1000000);
+        b.fec_redundancy_ppm = 10000;
+        b.fec_adaptive = Some(FecAdaptiveState::new(cfg, 0, 0, 0));
+        b.start_fec(std::sync::Arc::new(vec![0u8; 1433 * 64]), 1433);
+        let initial_n = b.fec_send_slot.as_ref().unwrap().n;
+        for seq in 0..64 {
+            assert!(matches!(b.next_fragment(1449, 1449), Some(UnreliableFragment::Fec { block_id, .. }) if block_id == seq));
+            b.fec_adaptive.as_mut().unwrap().on_data_sent(seq as u64);
+        }
+        b.fec_send_slot.as_mut().unwrap().lost = 20;
+        assert!(matches!(b.next_fragment(1449, 1449), Some(UnreliableFragment::Fec { block_id: 64, .. })));
+        let f = b.fec_send_slot.as_ref().unwrap();
+        assert!(f.n > initial_n && f.n >= 96 && f.n <= 128, "initial={initial_n} n={}", f.n);
+        // Existing top-up callback also uses the same bounded closed-loop budget.
+        b.fec_on_packet_lost(4);
+        assert_eq!(b.fec_send_slot.as_ref().unwrap().lost, 21);
+        assert!(b.fec_send_slot.as_ref().unwrap().n <= 128);
     }
 }
