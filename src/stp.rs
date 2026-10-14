@@ -2173,7 +2173,7 @@ pub struct ReassemblySlot {
     pub package_id: u16,
     completed: bool,
     segment_parts: Option<Vec<(u32, Vec<u8>)>>,
-    last_segment_ns: u64,
+    last_segment_ns: u64, // Last accepted plain fragment or segment symbol.
 }
 
 impl ReassemblySlot {
@@ -2421,10 +2421,10 @@ fn fec_inactive_grace_ns(rtt: u16, pressure: bool) -> u64 {
     }
 }
 
-/// Incomplete roots follow symbol inactivity, not connection keepalive ACKs.
+/// Incomplete plain messages and roots follow fragment inactivity, not keepalive ACKs.
 fn retire_inactive_segment_roots(slots: &mut [ReassemblySlot], now_ns: u64, grace_ns: u64) {
     for slot in slots {
-        if slot.segment_parts.is_some() && now_ns.saturating_sub(slot.last_segment_ns) > grace_ns {
+        if !slot.completed && slot.reservation.is_some() && now_ns.saturating_sub(slot.last_segment_ns) > grace_ns {
             *slot = ReassemblySlot::new();
         }
     }
@@ -3531,6 +3531,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     (success, complete) = existing_connection.unreliable_reassembly[slot_idx].insert(frag_offset as usize, frag_data, is_fin);
                                     assert!(success);
                                 }
+                                existing_connection.unreliable_reassembly[slot_idx].last_segment_ns = timestamp_ns;
                                 if complete {
                                     state.stats.rx_messages_completed += 1;
                                     let reservation = existing_connection.unreliable_reassembly[slot_idx].reservation.take();
@@ -6890,5 +6891,59 @@ mod review2_tests {
         drop(slot);
         assert_eq!(peer.used(), 0);
         assert_eq!(process.used(), 0);
+    }
+
+    #[test]
+    fn review2_plain_partial_expires_with_segment_roots() {
+        let process = crate::receive_memory::ReceiveMemoryBudget::new(16 << 20);
+        let budget = crate::receive_memory::ReceiveMemoryBudget::connection_share(&process);
+        let mut slots = [ReassemblySlot::new(), ReassemblySlot::new(), ReassemblySlot::new()];
+        slots[0].package_id = 1;
+        assert!(slots[0].admit(100, 16, &budget));
+        assert_eq!(slots[0].insert(100, &[1u8; 16], false), (true, false));
+        slots[0].last_segment_ns = 1;
+        let plain_charge = budget.used();
+        assert!(plain_charge > 0);
+
+        let total = 3u32 << 20;
+        let group_len = (total as usize).div_ceil((total as usize).div_ceil(FEC_SEGMENT_BYTES));
+        let layout = crate::fec::MessageLayout::new(group_len, 1500).unwrap();
+        let seg = FecSegment { root: 5, total, offset: 0 };
+        assert!(slots[1].admit_segment(seg, layout, 0, crate::fec::block_len(group_len, 1500, 0), 1, &budget));
+        assert!(budget.used() > plain_charge);
+        // Completion tombstones must survive the inactivity sweep.
+        assert!(slots[2].admit(0, 1, &budget));
+        assert_eq!(slots[2].insert(0, &[2], true), (true, true));
+        assert_eq!(slots[2].take_complete(), vec![2]);
+
+        let grace = fec_inactive_grace_ns(100, false);
+        let charge = budget.used();
+        retire_inactive_segment_roots(&mut slots, 1 + grace, grace);
+        assert_eq!(budget.used(), charge); // strict boundary, as for FEC
+        slots[0].last_segment_ns = 2; // another successfully received fragment
+        retire_inactive_segment_roots(&mut slots, 2 + grace, grace);
+        assert_eq!(budget.used(), plain_charge);
+        assert!(slots[1].segment_parts.is_none() && slots[1].total_len.is_none());
+        retire_inactive_segment_roots(&mut slots, 1 + 3_600_000_000_000, grace);
+        assert_eq!(budget.used(), 0);
+        assert_eq!(process.used(), 0);
+        assert_eq!(slots[0].buf.capacity(), 0);
+        assert!(slots[2].completed);
+    }
+
+    #[test]
+    fn review2_segment_header_conflicts_refused() {
+        let budget = crate::receive_memory::ReceiveMemoryBudget::new(16 << 20);
+        let mut slot = ReassemblySlot::new();
+        let total = 3u32 << 20;
+        let group_len = (total as usize).div_ceil((total as usize).div_ceil(FEC_SEGMENT_BYTES));
+        let layout = crate::fec::MessageLayout::new(group_len, 1500).unwrap();
+        assert!(slot.admit_segment(FecSegment { root: 9, total, offset: 0 }, layout, 0, 1500, 1, &budget));
+        let total2 = 4u32 << 20;
+        let group_len2 = (total2 as usize).div_ceil((total2 as usize).div_ceil(FEC_SEGMENT_BYTES));
+        let layout2 = crate::fec::MessageLayout::new(group_len2, 1500).unwrap();
+        assert!(!slot.admit_segment(FecSegment { root: 9, total: total2, offset: 0 }, layout2, 0, 1500, 1, &budget));
+        assert!(!slot.admit_segment(FecSegment { root: 8, total, offset: 0 }, layout, 0, 1500, 1, &budget));
+        assert!(slot.admit_segment(FecSegment { root: 9 + 1024, total, offset: 0 }, layout, 0, 1500, 1, &budget));
     }
 }
