@@ -521,9 +521,14 @@ impl UnreliableSendBuffer {
         f.lost += 1;
         if let Some(a) = &self.fec_adaptive {
             if a.tracker.config().topup {
-                let n = a.topped_up_blocks(f.k as u64, f.lost as u64, f.loss_estimate).min(u32::MAX as u64) as u32;
                 let layout = crate::fec::MessageLayout::new(f.message.len(), f.block_bytes).unwrap();
-                f.n = f.n.max(layout.round_plan(n));
+                let group_k = layout.group(0).1 as u64;
+                // Interleaving spreads aggregate erasures across groups. Size the variance
+                // margin at group K, not whole-message K, and protect each group equally.
+                let group_lost = (f.lost as u64).div_ceil(layout.groups as u64);
+                let group_n = a.topped_up_blocks(group_k, group_lost, f.loss_estimate);
+                let n = f.k as u64 + group_n.saturating_sub(group_k) * layout.groups as u64;
+                f.n = f.n.max(layout.round_plan(n.min(u32::MAX as u64) as u32));
             }
         }
     }
@@ -3517,6 +3522,28 @@ mod fec_send_tests {
         let key = ConnectionKey { ip: std::net::Ipv6Addr::LOCALHOST, port: 1, key_15_bits: 0 };
         assert!(fec_receive_block(&mut slot, key, 0, 300 * 32, 32, 0, &[0;32], &done, &workers).is_none());
         assert!(matches!(slot.state, FecRecvState::Done)); // never an inline large solve on overload
+    }
+
+    #[test]
+    fn grouped_adaptive_topup_uses_group_variance() {
+        let mut b = new_buf(10_000);
+        let a = crate::fec_adapt::FecAdaptiveState::new(crate::fec_adapt::AdaptiveFecConfig { topup: true, ..Default::default() }, 0, 0, 0);
+        b.fec_adaptive = Some(a);
+        b.start_fec(std::sync::Arc::new(msg(64001 * 32)), 32);
+        let f = b.fec_send_slot.as_mut().unwrap();
+        let layout = crate::fec::MessageLayout::new(f.message.len(), 32).unwrap();
+        assert_eq!(layout.groups, 3);
+        f.lost = 600;
+        let initial_p = f.loss_estimate;
+        let old_n = layout.round_plan(a.topped_up_blocks(f.k as u64, 601, initial_p) as u32);
+        b.fec_on_packet_lost(0);
+        let f = b.fec_send_slot.as_ref().unwrap();
+        let group_k = layout.group(0).1 as u64;
+        let group_n = a.topped_up_blocks(group_k, 601u64.div_ceil(layout.groups as u64), initial_p);
+        let expected = layout.round_plan((layout.k as u64 + (group_n - group_k) * layout.groups as u64) as u32);
+        assert_eq!(f.n, expected);
+        assert!(f.n > old_n); // Whole-K variance fails to protect each independent solve.
+        assert_eq!((f.n - f.k) as usize % layout.groups, 0);
     }
 
     #[test]
