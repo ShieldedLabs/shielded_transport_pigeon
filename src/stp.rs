@@ -3323,6 +3323,9 @@ fn congestion_loss_threshold(rate_upps: u64, rtt_ns: u64, cc: &CongestionControl
 
 fn apply_loss_congestion(state: &mut ConnectionStateConnected, send_time: u64, current_time_now_ns: u64, cc: &CongestionControlOptions, max_pps: Option<u64>) {
     let rtt_ns = state.RTT_mean as u64 * 100_000;
+    // An RTT re-anchor may have moved the origin while a cohort was retiring.
+    // Re-check its loss send-time, not just the packet which completed the cohort.
+    if send_time <= state.congestion_event_time_ns.saturating_add((rtt_ns as f64 * cc.event_guard_rtts) as u64) { return; }
     let time_to_bandwidth_recovery = cc.recovery_rtts * rtt_ns;
     let send_dt = send_time - state.congestion_event_time_ns;
     let send_t_factor = send_dt as f64 / time_to_bandwidth_recovery as f64;
@@ -3426,6 +3429,13 @@ mod congestion_tests {
         let mut tiny = LossResponseWindow::default();
         assert_eq!(tiny.on_packet(1, true, 100_000_000, 30_000, 2), None);
         assert_eq!(tiny.on_packet(100_000_001, false, 100_000_000, 30_000, 2), None);
+        let cc = CongestionControlOptions::legacy();
+        let ConnectionState::Connected(mut state) = new_connection_state_connected(None, 0, 1, 1) else { unreachable!() };
+        state.RTT_mean = 1000;
+        state.congestion_event_time_ns = 200_000_000;
+        apply_loss_congestion(&mut state, 125_000_001, 300_000_000, &cc, None);
+        assert_eq!(state.congestion_event_time_ns, 200_000_000);
+        assert!(!state.cc_startup_done);
     }
 
     #[test]
