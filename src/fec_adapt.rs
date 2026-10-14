@@ -185,12 +185,15 @@ pub struct FecMessageInfo {
 /// Memory is independent of bandwidth, RTT, connection lifetime, and packet rate: a fixed
 /// 65536-bit history, fixed histograms and a fixed bitset matching STP's already-bounded ACK
 /// sequence ring (to exclude ACK-only and probe packets from the data sequence).
+// Exact counts below 128, then sixteen upward-rounded buckets per doubling.
+// This is still a fixed-size empirical sketch, not density/IID scaling of bursts.
+const SPAN_LOSS_BINS: usize = 288;
 #[derive(Clone, Debug)]
 pub(crate) struct SpanLossProfile {
     data_sent: [u64; crate::stp::PACKETS_WAITING_ACK_WORDS],
     history: [u64; 1024],
     counts: [u32; 16],
-    hist: [[[u32; 64]; 16]; 2],
+    hist: [[[u32; SPAN_LOSS_BINS]; 16]; 2],
     epochs: [u64; 2],
     seen: u64,
     lost_total: u64,
@@ -199,20 +202,20 @@ pub(crate) struct SpanLossProfile {
 }
 impl Default for SpanLossProfile {
     fn default() -> Self {
-        Self { data_sent: [0; crate::stp::PACKETS_WAITING_ACK_WORDS], history: [0; 1024], counts: [0; 16], hist: [[[0; 64]; 16]; 2], epochs: [u64::MAX; 2], seen: 0, lost_total: 0, sent_total: 0, pending_peak: 0 }
+        Self { data_sent: [0; crate::stp::PACKETS_WAITING_ACK_WORDS], history: [0; 1024], counts: [0; 16], hist: [[[0; SPAN_LOSS_BINS]; 16]; 2], epochs: [u64::MAX; 2], seen: 0, lost_total: 0, sent_total: 0, pending_peak: 0 }
     }
 }
 impl SpanLossProfile {
     fn bin(losses: u32) -> usize {
-        if losses < 32 { return losses as usize; }
+        if losses < 128 { return losses as usize; }
         let log = 31 - losses.leading_zeros();
         let base = 1u32 << log;
-        32 + (log as usize - 5) * 2 + (losses > base + base / 2) as usize
+        128 + (log as usize - 7) * 16 + (losses - base).div_ceil(base / 16) as usize
     }
     fn upper(bin: usize) -> u64 {
-        if bin < 32 { return bin as u64; }
-        let base = 32u64 << ((bin - 32) / 2);
-        if (bin - 32) % 2 == 0 { base + base / 2 } else { base * 2 }
+        if bin < 128 { return bin as u64; }
+        let base = 128u64 << ((bin - 128) / 16);
+        base + ((bin - 128) % 16) as u64 * (base / 16)
     }
     pub fn on_data_sent(&mut self, seq: u64) {
         let bit = seq as usize % (self.data_sent.len() * 64);
@@ -234,7 +237,7 @@ impl SpanLossProfile {
     pub fn on_outcome(&mut self, lost: bool, now_ns: u64, window_ns: u64) {
         let epoch = now_ns / (window_ns / 2).max(1);
         let h = epoch as usize % 2;
-        if self.epochs[h] != epoch { self.hist[h] = [[0; 64]; 16]; self.epochs[h] = epoch; }
+        if self.epochs[h] != epoch { self.hist[h] = [[0; SPAN_LOSS_BINS]; 16]; self.epochs[h] = epoch; }
         let pos = self.seen as usize & 65535;
         // Read the old ring before writing: the 65536-packet window expires this very bit.
         for scale in 0..16 {
@@ -260,7 +263,7 @@ impl SpanLossProfile {
         let n = n.div_ceil(pieces).max(2);
         let scale = (64 - (n - 1).leading_zeros() as usize).saturating_sub(1).min(15);
         let latest = self.epochs.iter().copied().filter(|x| *x != u64::MAX).max()?;
-        let mut bins = [0u64; 64];
+        let mut bins = [0u64; SPAN_LOSS_BINS];
         for h in 0..2 {
             if self.epochs[h] != u64::MAX && self.epochs[h] + 1 >= latest {
                 for (b, count) in bins.iter_mut().zip(self.hist[h][scale]) { *b += count as u64; }
@@ -534,6 +537,30 @@ mod tests {
     }
 
     #[test]
+    fn finer_span_bins_are_upward_only_at_every_count_and_keep_quantile_rank() {
+        let mut previous = 0;
+        for losses in 0..=65536u32 {
+            let bin = SpanLossProfile::bin(losses);
+            assert!(bin < SPAN_LOSS_BINS);
+            let upper = SpanLossProfile::upper(bin);
+            assert!(upper >= losses as u64);
+            assert!(upper >= previous);
+            assert!(upper - losses as u64 <= (losses as u64).div_ceil(16));
+            previous = upper;
+        }
+        assert_eq!(SpanLossProfile::upper(SpanLossProfile::bin(286)), 288);
+        assert_eq!(SpanLossProfile::upper(SpanLossProfile::bin(331)), 336);
+        let mut span = SpanLossProfile::default();
+        span.epochs[0] = 0;
+        span.hist[0][9][SpanLossProfile::bin(286)] = 100;
+        span.hist[0][9][SpanLossProfile::bin(331)] = 1;
+        // Horizon 513..1024 selects the same 1024-symbol empirical samples;
+        // only count-rounding slack changes, never the selected tail rank.
+        assert_eq!(span.tail_losses(700, 0.001), Some(336));
+        assert_eq!(span.tail_losses(700, 0.02), Some(288));
+    }
+
+    #[test]
     fn span_tail_sees_bursts_and_excludes_non_data() {
         let mut s = SpanLossProfile::default();
         for i in 0..20000u64 {
@@ -548,7 +575,7 @@ mod tests {
         let cfg = AdaptiveFecConfig { eps: 0.001, ..Default::default() };
         assert!(s.repair_blocks(32, &cfg, z_for_eps(cfg.eps)) >= 11);
         assert!(s.target_failure(32768, &cfg) < s.target_failure(32, &cfg));
-        assert!(std::mem::size_of::<SpanLossProfile>() < 50000);
+        assert!(std::mem::size_of::<SpanLossProfile>() < 96 * 1024);
     }
 
     #[test]

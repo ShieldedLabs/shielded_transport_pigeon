@@ -6311,7 +6311,7 @@ mod lazy_fec_segment_tests {
             let mut a = crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0);
             if learned_burst {
                 // The measured trace contains 331 declared losses in a 2048-packet
-                // span. Its histogram upper bound is 384, plus one extra symbol.
+                // span. Its finer histogram upper bound is 336, plus one extra symbol.
                 for seq in 0..8192 { a.on_data_sent(seq); }
                 for seq in 0..8192 { a.on_sequence_finalized(seq, (4096..4427).contains(&seq), 100_000_000); }
             }
@@ -6340,7 +6340,7 @@ mod lazy_fec_segment_tests {
                 if group == 0 { first_k = Some(f.k); }
                 else {
                     assert!(f.k < first_k.unwrap());
-                    if learned_burst { assert_eq!(repairs, 385); }
+                    if learned_burst { assert_eq!(repairs, 337); }
                 }
                 // Advance the lazy train without waiting for background encoding.
                 let f = s.queues[0].fec_send_slot.as_mut().unwrap();
