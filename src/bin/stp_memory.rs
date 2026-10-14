@@ -6,7 +6,7 @@ use std::{net::UdpSocket, time::Duration};
 
 struct Peer { socket: UdpSocket, cipher: ConnectionCipherTriplet, prefix: u16, seq: u64 }
 impl Peer {
-    fn connect(server: &IdentityKeyPair, port: u16) -> Self {
+    fn connect(server: &IdentityKeyPair, port: u16) -> Option<Self> {
         let magic = server.magic1;
         let params = crypto_string_from_connect_magic1(magic).unwrap().parse().unwrap();
         let key = new_keypair_from_connect_magic1(magic).unwrap();
@@ -20,10 +20,10 @@ impl Peer {
         let mut b = [0u8; 2048]; b[..6].copy_from_slice(prologue);
         let n = hs.write_message(&build_magic2_client_block(), &mut b[6..]).unwrap();
         socket.send(&b[..6+n]).unwrap();
-        let n = socket.recv(&mut b).unwrap();
+        let n = socket.recv(&mut b).ok()?;
         hs.read_message(&b[6..n], &mut [0;1024]).unwrap();
-        Self { socket, cipher: ConnectionCipherTriplet::new_from_old_init_only(hs.into_stateless_transport_mode().unwrap()),
-            prefix: u16::from_le_bytes(key.public[..2].try_into().unwrap()) << 1, seq: 0 }
+        Some(Self { socket, cipher: ConnectionCipherTriplet::new_from_old_init_only(hs.into_stateless_transport_mode().unwrap()),
+            prefix: u16::from_le_bytes(key.public[..2].try_into().unwrap()) << 1, seq: 0 })
     }
     fn send(&mut self, header: u64, word: Option<u64>, bytes: &[u8]) {
         let mut payload = vec![255u8; (8 + word.map_or(0, |_| 8) + bytes.len() + 8).max(517)];
@@ -71,7 +71,11 @@ fn main() {
             receive_memory: Some(shielded_transport_pigeon::receive_memory::ReceiveMemoryBudget::new(256<<20)), ..Default::default() });
     std::thread::sleep(Duration::from_millis(50));
     println!("baseline {}", rss());
-    let mut peers: Vec<_> = (0..connections).map(|_| Peer::connect(&kp, port)).collect();
+    let mut peers = Vec::new();
+    for _ in 0..connections {
+        if let Some(peer) = Peer::connect(&kp, port) { peers.push(peer); }
+        else { println!("connection admission refused after {} peers", peers.len()); break; }
+    }
     for peer in &mut peers {
         for i in 0..count {
             match mode.as_str() {

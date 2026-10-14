@@ -972,6 +972,7 @@ pub const MAX_RECV_QUEUE_BYTES: usize = 64 * 1024 * 1024;
 #[derive(Debug, Default)]
 pub struct ReceiveQueue {
     pub messages: VecDeque<(ConnectionKey, Vec<u8>)>,
+    reservations: VecDeque<Option<crate::receive_memory::Reservation>>,
     pub bytes: usize,
     pub peak_bytes: usize,
     pub peak_messages: usize,
@@ -988,14 +989,21 @@ impl ReceiveQueue {
     }
 
     pub fn push(&mut self, key: ConnectionKey, mut buf: Vec<u8>, cap_bytes: usize) {
+        self.push_reserved(key, buf, cap_bytes, None);
+    }
+
+    fn push_reserved(&mut self, key: ConnectionKey, mut buf: Vec<u8>, cap_bytes: usize, mut reservation: Option<crate::receive_memory::Reservation>) {
         // Reassembly grows the buffer by doubling, so a big message can carry up to 2x its size
         // in capacity; give that back before it is counted against the cap.
         buf.shrink_to_fit();
         self.bytes += Self::entry_bytes(&buf);
+        if let Some(r) = &mut reservation { r.shrink(Self::entry_bytes(&buf) + 128); }
+        self.reservations.push_back(reservation);
         self.messages.push_back((key, buf));
         // Never evict the message just pushed: one message bigger than the cap is still delivered.
         while self.bytes > cap_bytes && self.messages.len() > 1 {
             let Some((_, m)) = self.messages.pop_front() else { break; };
+            self.reservations.pop_front();
             let n = Self::entry_bytes(&m);
             self.bytes -= n;
             self.dropped_messages += 1;
@@ -1008,6 +1016,8 @@ impl ReceiveQueue {
 
     pub fn take(&mut self) -> VecDeque<(ConnectionKey, Vec<u8>)> {
         self.bytes = 0;
+        // Pulled messages belong to the application; retaining them is outside the transport budget.
+        self.reservations.clear();
         std::mem::take(&mut self.messages)
     }
 }
@@ -1044,8 +1054,10 @@ fn fill_packet_payload_with_unreliable_fragments(payload: &mut [u8], unreliable_
     used
 }
 
+const RECEIVE_CONNECTION_BYTES: usize = 512 << 10;
 #[derive(Debug)]
 pub struct ConnectionTrackingData {
+    receive_reservation: crate::receive_memory::Reservation,
     pub creation_time_ns: u64,
     pub my_ip: Ipv6Addr, // TODO: use an ipv6 type that supports Default!
     pub my_transport_identity_keypair: IdentityKeyPair,
@@ -1568,7 +1580,9 @@ pub fn connect_to_endpoint(
     my_connect_keypair: &IdentityKeyPair,
     endpoint: &STPAddress,
     send_buffer_params: (u32, u32, u32),
+    budget: &std::sync::Arc<crate::receive_memory::ReceiveMemoryBudget>,
 ) {
+    let Some(receive_reservation) = budget.reserve(RECEIVE_CONNECTION_BYTES) else { return; };
     assert!(my_connect_keypair.magic1 == endpoint.magic1);
 
     if my_connect_keypair.magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
@@ -1583,6 +1597,7 @@ pub fn connect_to_endpoint(
         connections_map.insert(
             ConnectionKey::from(endpoint),
             ConnectionTrackingData {
+                receive_reservation,
                 creation_time_ns: monotonic_clock_ns(),
                 my_ip,
                 my_transport_identity_keypair: my_connect_keypair.clone(),
@@ -1616,6 +1631,7 @@ pub fn connect_to_endpoint(
         connections_map.insert(
             ConnectionKey::from(endpoint),
             ConnectionTrackingData {
+                receive_reservation,
                 creation_time_ns: monotonic_clock_ns(),
                 my_ip,
                 my_transport_identity_keypair: my_connect_keypair.clone(),
@@ -1676,7 +1692,7 @@ impl ReassemblySlot {
         let Some(end) = offset.checked_add(len).filter(|&n| n <= MAX_JUMBOGRAM_LEN) else { return false; };
         let buf_cap = if end > self.buf.capacity() { end.max(self.buf.capacity().saturating_mul(2)).max(8) } else { self.buf.capacity() };
         let range_cap = if self.received.len() == self.received.capacity() { (self.received.capacity() * 2).max(4) } else { self.received.capacity() };
-        let Some(bytes) = range_cap.checked_mul(8).and_then(|r| buf_cap.checked_add(r)) else { return false; };
+        let Some(bytes) = range_cap.checked_mul(8).and_then(|r| buf_cap.checked_add(r)?.checked_add(256)) else { return false; };
         match &mut self.reservation {
             Some(r) => { if !r.grow(bytes) { return false; } },
             None => { let Some(r) = budget.reserve(bytes) else { return false; }; self.reservation = Some(r); },
@@ -1689,7 +1705,7 @@ impl ReassemblySlot {
     fn take_complete(&mut self) -> Vec<u8> {
         self.reservation = None;
         self.completed = true;
-        self.received.clear();
+        self.received = Vec::new();
         self.total_len = None;
         std::mem::take(&mut self.buf)
     }
@@ -2151,7 +2167,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                     }
                     for keypair in &my_keypairs {
                         if w.magic1 == keypair.magic1 {
-                            connect_to_endpoint(&mut connections_map, keypair, w, send_buffer_params);
+                            connect_to_endpoint(&mut connections_map, keypair, w, send_buffer_params, &receive_memory);
                             break;
                         }
                     }
@@ -2302,6 +2318,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                             }
                                         }
                                         else {
+                                            let Some(receive_reservation) = receive_memory.reserve(RECEIVE_CONNECTION_BYTES) else { break; };
                                             let client_key = Vec::from(client_key);
                                             store_u48(&mut packet_memory_send[0..6], 0xffff_ffff_0000 | (load_u16(&my_kp.public[0..2]) << 1) as u64);
                                             packet_memory_send[6..6+32].copy_from_slice(&my_kp.public[..]);
@@ -2312,6 +2329,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                             connections_map.insert(
                                                 connection_key,
                                                 ConnectionTrackingData {
+                                                    receive_reservation,
                                                     creation_time_ns: monotonic_clock_ns(),
                                                     my_ip,
                                                     my_transport_identity_keypair: my_kp.clone(),
@@ -2378,6 +2396,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                                 }
                                             }
                                             else {
+                                                let Some(receive_reservation) = receive_memory.reserve(RECEIVE_CONNECTION_BYTES) else { break; };
                                                 let client_key = Vec::from(client_key);
                                                 let mut chosen_magic2_bytes = [0u8; 8];
                                                 store_u64(&mut chosen_magic2_bytes, chosen_magic2);
@@ -2393,6 +2412,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                                 connections_map.insert(
                                                     connection_key,
                                                     ConnectionTrackingData {
+                                                        receive_reservation,
                                                         creation_time_ns: monotonic_clock_ns(),
                                                         my_ip,
                                                         my_transport_identity_keypair: my_kp.clone(),
@@ -2749,7 +2769,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     let dropped_before = existing_connection.unreliable_fec[slot_idx].ingress_dropped;
                                     if let Some((message, _reservation)) = fec_receive_block(&mut existing_connection.unreliable_fec[slot_idx], connection_key, package_id, message_len, block_bytes, block_id, data, &fec_done_tx, &fec_workers, &receive_memory) {
                                         state.stats.rx_messages_completed += 1;
-                                        receive_queue.push(connection_key, message, MAX_RECV_QUEUE_BYTES);
+                                        receive_queue.push_reserved(connection_key, message, MAX_RECV_QUEUE_BYTES, Some(_reservation));
                                     }
                                     memory_erased |= existing_connection.unreliable_fec[slot_idx].ingress_dropped != dropped_before;
                                     state.stats.fec_ingress_dropped_blocks += existing_connection.unreliable_fec[slot_idx].ingress_dropped - dropped_before;
@@ -2832,8 +2852,9 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 }
                                 if complete {
                                     state.stats.rx_messages_completed += 1;
+                                    let reservation = existing_connection.unreliable_reassembly[slot_idx].reservation.take();
                                     let completed = existing_connection.unreliable_reassembly[slot_idx].take_complete();
-                                    receive_queue.push(connection_key, completed, MAX_RECV_QUEUE_BYTES);
+                                    receive_queue.push_reserved(connection_key, completed, MAX_RECV_QUEUE_BYTES, reservation);
                                 }
                             }
 
@@ -2860,7 +2881,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             c.stats.fec_decode_last_tail_ns = tail;
                             c.stats.fec_decode_max_tail_ns = c.stats.fec_decode_max_tail_ns.max(tail);
                         }
-                        receive_queue.push(key, message, MAX_RECV_QUEUE_BYTES);
+                        receive_queue.push_reserved(key, message, MAX_RECV_QUEUE_BYTES, Some(_reservation));
                     }
                 }
 
@@ -4481,6 +4502,18 @@ mod fec_closed_loop_tests {
         assert!(!b.admit(599, 1, &budget)); assert_eq!(b.buf.capacity(), 0);
         drop(a); assert!(b.admit(599, 1, &budget)); drop(b); assert_eq!(budget.used(), 0);
     }
+    #[test]
+    fn completion_queue_keeps_reservation_until_application_takes_it() {
+        let budget = crate::receive_memory::ReceiveMemoryBudget::new(4096);
+        let mut queue = ReceiveQueue::default();
+        let key = ConnectionKey { ip: std::net::Ipv6Addr::LOCALHOST, port: 1, key_15_bits: 0 };
+        queue.push_reserved(key, vec![1;1000], 2000, Some(budget.reserve(2000).unwrap()));
+        assert_eq!(budget.used(), ReceiveQueue::entry_bytes(&queue.messages[0].1) + 128);
+        queue.push_reserved(key, vec![2;1000], 1500, Some(budget.reserve(2000).unwrap()));
+        assert_eq!(queue.messages.len(),1); assert!(budget.used() < 1500);
+        let messages = queue.take(); assert_eq!(budget.used(),0); assert_eq!(messages.len(),1);
+    }
+
     #[test]
     fn inline_fec_requires_and_releases_receive_budget() {
         let budget = crate::receive_memory::ReceiveMemoryBudget::new(2<<20);

@@ -26,6 +26,11 @@ impl Default for ReceiveMemoryBudget {
 #[derive(Debug)]
 pub(crate) struct Reservation { budget: Arc<ReceiveMemoryBudget>, bytes: usize }
 impl Reservation {
+    pub(crate) fn shrink(&mut self, bytes: usize) {
+        assert!(bytes <= self.bytes);
+        self.budget.used.fetch_sub(self.bytes - bytes, Ordering::AcqRel);
+        self.bytes = bytes;
+    }
     pub(crate) fn grow(&mut self, bytes: usize) -> bool {
         if bytes <= self.bytes { return true; }
         if !self.budget.acquire(bytes - self.bytes) { return false; }
