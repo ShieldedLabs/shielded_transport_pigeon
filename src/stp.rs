@@ -774,7 +774,9 @@ impl ReceiveQueue {
     }
 }
 
-fn fill_packet_payload_with_unreliable_fragments(payload: &mut [u8], unreliable_send_buffer: &mut UnreliableSendBuffer) -> bool {
+/// Returns the used payload length (0 when there is nothing to send). Real data
+/// payloads are at least 517 bytes: exactly 516 is reserved for size-identified ACKs.
+fn fill_packet_payload_with_unreliable_fragments(payload: &mut [u8], unreliable_send_buffer: &mut UnreliableSendBuffer) -> usize {
     let mut send = false;
     let mut cursor = 0;
     let payload_len = payload.len();
@@ -798,12 +800,10 @@ fn fill_packet_payload_with_unreliable_fragments(payload: &mut [u8], unreliable_
             }
         }
     }
-    if send == false { return false; }
-    while cursor < payload.len() {
-        payload[cursor] = 0xff;
-        cursor += 1;
-    }
-    return true;
+    if send == false { return 0; }
+    let used = cursor.max(517).min(payload.len());
+    payload[cursor..].fill(0xff);
+    used
 }
 
 #[derive(Debug)]
@@ -2963,9 +2963,11 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             }
                             if record_fec_messages && buf.fec_record.is_none() { buf.fec_record = Some(Vec::new()); }
                         }
+                        let mut unreliable_payload_size = 0;
                         while state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY - 1 && packet_send_allowance_now > 0 && state.packets_in_flight < allowed_packets_in_flight && {
                             connection_tracking_data.unreliable_send_buffer.next_packet_seq = state.send_sequence_number;
-                            fill_packet_payload_with_unreliable_fragments(&mut packet_memory_send[0..payload_size], &mut connection_tracking_data.unreliable_send_buffer)
+                            unreliable_payload_size = fill_packet_payload_with_unreliable_fragments(&mut packet_memory_send[0..payload_size], &mut connection_tracking_data.unreliable_send_buffer);
+                            unreliable_payload_size > 0
                         } {
                         
                             let virtual_nonce = state.send_sequence_number;
@@ -2974,11 +2976,11 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
 
                             let packet_len;
                             if let Some(cipher) = &mut state.cipher {
-                                packet_len = cipher.current.write_message(virtual_nonce, &packet_memory_send[0..payload_size], &mut packet_memory_encrypted[6..]).unwrap();
+                                packet_len = cipher.current.write_message(virtual_nonce, &packet_memory_send[0..unreliable_payload_size], &mut packet_memory_encrypted[6..]).unwrap();
                             }
                             else {
-                                (&packet_memory_send[0..payload_size]).write_to(&mut packet_memory_encrypted[6..]);
-                                packet_len = payload_size;
+                                (&packet_memory_send[0..unreliable_payload_size]).write_to(&mut packet_memory_encrypted[6..]);
+                                packet_len = unreliable_payload_size;
                             }
 
                             should_sleep = false;
@@ -3340,7 +3342,7 @@ mod fec_send_tests {
         let mut packets = Vec::new();
         let mut mem = vec![0u8; payload_len];
         while packets.len() < max_packets {
-            if fill_packet_payload_with_unreliable_fragments(&mut mem, buf) {
+            if fill_packet_payload_with_unreliable_fragments(&mut mem, buf) > 0 {
                 packets.push(parse_packet(&mem));
             } else if buf.has_unsent_data() {
                 std::thread::sleep(std::time::Duration::from_millis(1));
@@ -3444,6 +3446,27 @@ mod fec_send_tests {
     }
 
     #[test]
+    fn trimmed_data_never_uses_ack_size() {
+        let mut payload = vec![0; 9194];
+        for len in [0, 1, 500, 508, 509, 600] {
+            let mut b = new_buf(0);
+            b.submit_messages(vec![vec![7; len]]);
+            let used = fill_packet_payload_with_unreliable_fragments(&mut payload, &mut b);
+            assert_eq!(used, (len + STP_FRAGMENT_HEADER_SIZE).max(517));
+            assert!(used > 516);
+            let f = parse_packet(&payload[..used]);
+            assert_eq!(f[0].4, vec![7; len]);
+        }
+        let mut b = new_buf(100_000);
+        b.submit_messages(vec![vec![9; 200_000]]);
+        let mut small = vec![0; 1162];
+        assert_eq!(fill_packet_payload_with_unreliable_fragments(&mut small, &mut b), 1162);
+        // TU grew after coding started: do not pay 288B of padding per block.
+        let mut grown = vec![0; 1450];
+        assert_eq!(fill_packet_payload_with_unreliable_fragments(&mut grown, &mut b), 1162);
+    }
+
+    #[test]
     fn grouped_wire_round_trip_and_overload_admission() {
         let payload_len = 48;
         let m = msg(64001 * (payload_len - STP_FEC_FRAGMENT_HEADER_SIZE) - 1);
@@ -3455,7 +3478,7 @@ mod fec_send_tests {
         let mut sent = 0;
         let mut complete = false;
         while b.has_unsent_data() {
-            if !fill_packet_payload_with_unreliable_fragments(&mut packet, &mut b) {
+            if fill_packet_payload_with_unreliable_fragments(&mut packet, &mut b) == 0 {
                 std::thread::sleep(std::time::Duration::from_millis(1));
                 continue;
             }
