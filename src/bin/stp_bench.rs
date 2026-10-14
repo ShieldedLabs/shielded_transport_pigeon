@@ -141,10 +141,10 @@ impl RxReport {
         v.extend_from_slice(&[s.fec_decode_admission_refusals, s.fec_decode_timeouts, s.fec_decode_preemptions]);
         v.extend_from_slice(&[s.nack_packets_sent, s.nack_packets_received, s.losses_by_nack, s.losses_by_timeout,
             s.nack_losses_declared, s.false_nacks, s.nack_ranges_expired, s.nack_reorder_us as u64,
-            s.congestion_loss_events, s.congestion_ecn_events]);
+            s.congestion_loss_events, s.congestion_ecn_events, s.nack_late_cache_overflows]);
         v
     }
-    const WORDS: usize = 50;
+    const WORDS: usize = 51;
     fn from_words(w: &[u64]) -> Option<RxReport> {
         if w.len() < 37 { return None; }
         let mut st = ConnectionStats { rx_packets: w[0], rx_seq_span: w[1], rx_lost: w[2], rx_reordered: w[3], rx_late_beyond_window: w[4], rx_duplicates: w[5], rx_bursts: w[6], ..Default::default() };
@@ -170,6 +170,7 @@ impl RxReport {
         st.nack_reorder_us = w.get(47).copied().unwrap_or(0) as u32;
         st.congestion_loss_events = w.get(48).copied().unwrap_or(0);
         st.congestion_ecn_events = w.get(49).copied().unwrap_or(0);
+        st.nack_late_cache_overflows = w.get(50).copied().unwrap_or(0);
         Some(RxReport { st, th, cpu_user_us: w[21], cpu_sys_us: w[22] })
     }
 }
@@ -918,6 +919,7 @@ fn send(a: &Args) {
         stats.nack_packets_sent, stats.nack_packets_received, stats.losses_by_nack, stats.losses_by_timeout,
         stats.congestion_loss_events, stats.congestion_ecn_events,
         rx.st.nack_packets_sent, rx.st.nack_losses_declared, rx.st.false_nacks, rx.st.nack_ranges_expired, rx.st.nack_reorder_us));
+    json.insert_str(json.len()-2, &format!(",\"receiver_nack_late_cache_overflows\":{}", rx.st.nack_late_cache_overflows));
     let submitted = first_submit_ns.iter().filter(|s| s.is_some()).count();
     json.insert_str(json.len() - 2, &format!(",\"messages_submission_attempted\":{submitted}"));
     println!("UDP TU {}B | FEC blocks {{{block_sizes}}}B | receiver FEC last/max decode tail {:.3}/{:.3}ms | ingress erased {} blocks",

@@ -1126,6 +1126,7 @@ pub struct ConnectionStats {
     pub nack_losses_declared: u64,
     pub false_nacks: u64,
     pub nack_ranges_expired: u64,
+    pub nack_late_cache_overflows: u64,
     pub nack_reorder_us: u32,
     pub congestion_loss_events: u64,
     pub congestion_ecn_events: u64,
@@ -3034,6 +3035,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             state.stats.nack_losses_declared = state.nack_receiver.losses;
                             state.stats.false_nacks = state.nack_receiver.false_nacks;
                             state.stats.nack_ranges_expired = state.nack_receiver.expired;
+                            state.stats.nack_late_cache_overflows = state.nack_receiver.late_overflows;
                             state.stats.nack_reorder_us = state.nack_receiver.effective_reorder_us;
                         }
                         if current_time_now_ns > state.ack_timer {
