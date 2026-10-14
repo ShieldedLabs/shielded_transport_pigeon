@@ -2733,22 +2733,6 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
 
                         let time_to_bandwidth_recovery = cc.recovery_rtts * (state.RTT_mean as u64 * 100_000);
 
-                        // Local Limit congestion event
-                        if let Some(max_pps) = max_pps && max_pps*1_000_000 < cubic_rate(current_time_now_ns - state.congestion_event_time_ns, state.congestion_event_rate_upps, time_to_bandwidth_recovery).0 && current_time_now_ns > state.congestion_event_time_ns + (state.RTT_mean as f64 * 100_000.0 * cc.event_guard_rtts) as u64 {
-                            let send_dt = current_time_now_ns - state.congestion_event_time_ns;
-                            let send_t_factor = send_dt as f64 / time_to_bandwidth_recovery as f64;
-                            let (_, send_mode) = cubic_rate(send_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery);
-                            let discover_dt = if send_mode == 'P' { (time_to_bandwidth_recovery + send_dt) / 2 } else { send_dt };
-                            let mut discovered = cubic_rate(discover_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery).0;
-                            if send_mode == 'G' || send_mode == 'S' {
-                                let r_pg = (state.congestion_event_rate_upps as f64 * cc.rate_pg) as u64;
-                                discovered = r_pg + ((discovered.saturating_sub(r_pg)) as f64 * 0.5) as u64;
-                            }
-                            state.congestion_event_rate_upps = max_pps*1_000_000;
-                            state.congestion_event_time_ns = current_time_now_ns;
-                            state.app_limit_time_offset = 0;
-                            println!("local limit congestion ...  rate \"discovered\": {} pps  sent:{send_mode}@{send_t_factor:.2}", state.congestion_event_rate_upps as f64 / 1000000.0);
-                        }
 
                         // ECN congestion event: the receiver saw CE-marked packets and relayed it via the ack's IP header
                         if state.ecn_congestion_received && state.ecn_oldest_send_time > state.congestion_event_time_ns + (state.RTT_mean as f64 * 100_000.0 * cc.event_guard_rtts) as u64 {
@@ -2842,7 +2826,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                         } else {
                             cubic_rate(current_time_now_ns - state.congestion_event_time_ns, state.congestion_event_rate_upps, time_to_bandwidth_recovery)
                         };
-                        let allowed_bandwidth_upps = allowed_bandwidth_upps.max(cc.rate_floor_upps);
+                        // A local pacing ceiling is not evidence of network congestion.
+                        let allowed_bandwidth_upps = local_rate_limit(allowed_bandwidth_upps.max(cc.rate_floor_upps), max_pps);
                         // pps * 10^-6 * rtt * 10^-4 = p * 10^10
                         // BDP + sawtooth: pipe is full (BDP) plus ack batching excess (ack_pace_estimate is in 0.1ms units)
                         let bdp = allowed_bandwidth_upps * state.RTT_mean as u64 / 10_000;
@@ -3224,9 +3209,25 @@ fn quantized_rtt_mean(sum: u64, count: u64) -> u16 {
     (sum / count.max(1)).clamp(1, u16::MAX as u64) as u16
 }
 
+fn local_rate_limit(rate: u64, max_pps: Option<u64>) -> u64 {
+    max_pps.map_or(rate, |limit| rate.min(limit.saturating_mul(1_000_000).max(1)))
+}
+
 #[cfg(test)]
 mod congestion_tests {
     use super::*;
+
+    #[test]
+    fn local_ceiling_does_not_create_recovery_sawtooth() {
+        let (r, k) = (1_000_000_000, 900_000_000);
+        // The old local event restarted R at 0.67 * r on every cap crossing.
+        assert_eq!(cubic_rate(0, r, k).0, 670_000_000);
+        for t in (20 * k..40 * k).step_by(10_000_000) {
+            assert_eq!(local_rate_limit(cubic_rate(t, r, k).0, Some(1000)), r);
+        }
+        assert_eq!(local_rate_limit(100_000_000, Some(10)), 10_000_000);
+        assert_eq!(local_rate_limit(r, None), r);
+    }
 
     #[test]
     fn sub_tick_rtt_cannot_freeze_recovery() {
