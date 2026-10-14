@@ -143,6 +143,22 @@ fn send_buffer_params(a: &Args) -> (u32, u32, u32) {
 
 fn max_pps(a: &Args) -> Option<u64> { a.str("max-pps").map(|s| s.parse().unwrap_or_else(|_| die("bad --max-pps"))) }
 
+fn pacing_options(a: &Args) -> PacingOptions {
+    match a.str("pacer").unwrap_or("precise") {
+        "precise" => PacingOptions::Precise,
+        "poly" | "polynomial" => {
+            let cadence_ms = a.num("cadence-ms", 5);
+            if ![1,2,5,10].contains(&cadence_ms) { die("--cadence-ms must be 1, 2, 5 or 10"); }
+            PacingOptions::Polynomial { cadence_ms }
+        },
+        _ => die("--pacer needs precise or poly"),
+    }
+}
+fn load_average() -> String {
+    std::fs::read_to_string("/proc/loadavg").unwrap_or_default().split_whitespace()
+        .take(3).collect::<Vec<_>>().join(",")
+}
+
 fn cc_options(a: &Args) -> CongestionControlOptions {
     let mut cc = match a.str("cc").unwrap_or("legacy") {
         "legacy" => CongestionControlOptions::legacy(),
@@ -216,7 +232,7 @@ fn serve(a: &Args) {
     let kp = new_keypair_from_connect_magic1_with_seed(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, seed).unwrap();
     let addr = STPAddress::from(to_v6(advertise), port, &kp);
 
-    let handle = new_network_thread_with_options(vec![kp], port, max_pps(a), send_buffer_params(a), NetworkThreadOptions { bind_ip: bind, congestion_control: cc_options(a), ..Default::default() });
+    let handle = new_network_thread_with_options(vec![kp], port, max_pps(a), send_buffer_params(a), NetworkThreadOptions { bind_ip: bind, congestion_control: cc_options(a), pacing: pacing_options(a), pacing_diagnostics: a.num::<u32>("pacing-diagnostics", 0) != 0, ..Default::default() });
     println!("stp_bench serve: bound {}:{port}", bind.map(|b| b.to_string()).unwrap_or("[::]".into()));
     println!("STP address: {:?}", addr);
 
@@ -409,13 +425,14 @@ fn send(a: &Args) {
     }
 
     let kp = new_keypair_from_connect_magic1(to.magic1).unwrap_or_else(|| die("unsupported crypto in --to"));
-    let handle = new_network_thread_with_options(vec![kp], 0, max_pps(a), send_buffer_params(a), NetworkThreadOptions { bind_ip: None, congestion_control: cc_options(a), fec_redundancy_ppm: fec_ppm, fec_adaptive, record_fec_messages: true });
+    let handle = new_network_thread_with_options(vec![kp], 0, max_pps(a), send_buffer_params(a), NetworkThreadOptions { bind_ip: None, congestion_control: cc_options(a), fec_redundancy_ppm: fec_ppm, fec_adaptive, record_fec_messages: true, pacing: pacing_options(a), pacing_diagnostics: a.num::<u32>("pacing-diagnostics", 0) != 0 });
     // Per data id: (k, blocks sent, blocks planned, loss estimate) of its FEC coding, if coded.
     let mut fec_info: HashMap<u32, (u32, u32, u32, f64)> = HashMap::new();
     // One sample per second: (t, loss estimate, sample, packets sent/lost, UDP bytes, RTT us).
     let mut series: Vec<(f64, f64, f64, u64, u64, u64, u64)> = Vec::new();
     let key = to.to_connection_key();
     let unix_epoch_s = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
+    let load_start = load_average();
     let epoch = Instant::now();
     let ns = || epoch.elapsed().as_nanos() as u64;
 
@@ -564,6 +581,7 @@ fn send(a: &Args) {
         std::thread::sleep(Duration::from_micros(300));
     }
     let done_ns = ns();
+    let (sender_cpu_user_us, sender_cpu_sys_us) = cpu_us();
     let start_ns = start_ns.unwrap();
 
     // Report.
@@ -674,7 +692,10 @@ fn send(a: &Args) {
         "\"bursts\":{},\"mean_burst_len\":{:.3},\"burst_hist\":{{{}}},\"kernel_rx_drops\":{},\"max_loop_gap_ms\":{:.3},\"loop_gaps_over_1ms\":{},\"loop_gaps_over_10ms\":{},\"loop_gaps_over_100ms\":{},",
         "\"recv_queue_dropped_messages\":{},\"server_cpu_user_s\":{:.3},\"server_cpu_sys_s\":{:.3},",
         "\"messages_completed\":{},\"partials_evicted\":{},\"partials_evicted_bytes\":{},\"insert_failures\":{},\"stale_fragments\":{}}},",
-        "\"buckets\":[{}],\"estimator_series\":[{}],\"congestion_control\":\"{:?}\"}}\n"),
+        "\"buckets\":[{}],\"estimator_series\":[{}],\"congestion_control\":\"{:?}\",",
+        "\"sender_pacing\":{{\"mode\":\"{:?}\",\"diagnostics\":{},\"batches\":{},\"packets\":{},\"max_burst\":{},\"burst_hist\":[{}],",
+        "\"commanded_packets\":{},\"error_samples\":{},\"error_abs_sum_ns\":{},\"error_max_ns\":{},\"history_records\":{},",
+        "\"network_cpu_user_us\":{},\"network_cpu_sys_us\":{},\"process_cpu_user_us\":{},\"process_cpu_sys_us\":{},\"load_start\":[{}],\"load_end\":[{}]}}}}\n"),
         to, seed, min, max, sbp.0, sbp.1, sbp.2, fec_pct, fec_mode, fec_adaptive.map(|c| format!("{c:?}")).unwrap_or_default(),
         std::env::var("STP_TEST_DROP_SCHEDULE").unwrap_or_else(|_| std::env::var("STP_TEST_DROP_PPM").map(|v| format!("ppm={v}")).unwrap_or_default()),
         count, total_bytes, delivered, delivered_bytes, corrupt, lost, stop_reason,
@@ -690,7 +711,11 @@ fn send(a: &Args) {
         rx.th.recv_queue_dropped_messages, rx.cpu_user_us as f64 / 1e6, rx.cpu_sys_us as f64 / 1e6,
         rx.st.rx_messages_completed, rx.st.rx_partial_evicted, rx.st.rx_partial_evicted_bytes, rx.st.rx_insert_failures, rx.st.rx_stale_fragments,
         bucket_json.join(","),
-        series.iter().map(|x| format!("[{:.1},{:.5},{:.5},{},{},{},{}]", x.0, x.1, x.2, x.3, x.4, x.5, x.6)).collect::<Vec<_>>().join(","), cc_options(a));
+        series.iter().map(|x| format!("[{:.1},{:.5},{:.5},{},{},{},{}]", x.0, x.1, x.2, x.3, x.4, x.5, x.6)).collect::<Vec<_>>().join(","), cc_options(a),
+        pacing_options(a), a.num::<u32>("pacing-diagnostics", 0) != 0, stats.pacing_batches, stats.pacing_packets, stats.pacing_max_burst,
+        stats.pacing_burst_hist.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","),
+        stats.pacing_commanded_packets, stats.pacing_error_samples, stats.pacing_error_abs_sum_ns, stats.pacing_error_max_ns, stats.pacing_history_records,
+        stats.network_cpu_user_us, stats.network_cpu_sys_us, sender_cpu_user_us, sender_cpu_sys_us, load_start, load_average());
     std::fs::write(&out, json).unwrap_or_else(|e| die(&format!("writing {out}: {e}")));
     println!("report written to {out}");
     std::process::exit(if delivered == count as u64 { 0 } else { 1 });

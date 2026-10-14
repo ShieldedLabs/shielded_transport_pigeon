@@ -234,8 +234,12 @@ pub(crate) fn shift(c: &[f64], offset: f64) -> Vec<f64> {
 /// Convert the existing pps controller to cumulative pieces, splitting at phase,
 /// linear-cap and floor crossings. Coefficients are local (seconds, packets), not
 /// absolute counters, so nonce precision does not depend on the age of a connection.
-pub fn controller_schedule(t_ns: u64, r_upps: u64, k_ns: u64,
-    cc: &crate::stp::CongestionControlOptions, horizon_ns: u64,
+pub fn controller_schedule(
+    t_ns: u64,
+    r_upps: u64,
+    k_ns: u64,
+    cc: &crate::stp::CongestionControlOptions,
+    horizon_ns: u64,
 ) -> Result<PacketSchedule, CurveError> {
     if k_ns == 0 {
         return PacketSchedule::constant(r_upps.max(cc.rate_floor_upps) as f64 / 1e6, horizon_ns);
@@ -253,7 +257,11 @@ pub fn controller_schedule(t_ns: u64, r_upps: u64, k_ns: u64,
     let start = t_ns as f64 / 1e9;
     let end = start + horizon_ns as f64 / 1e9;
     let mut phases = vec![start];
-    phases.extend([p_start, g_start, s_start].into_iter().filter(|t| *t > start && *t < end));
+    phases.extend(
+        [p_start, g_start, s_start]
+            .into_iter()
+            .filter(|t| *t > start && *t < end),
+    );
     phases.push(end);
     let mut pieces = Vec::new();
     let mut emitted_ns = 0;
@@ -261,19 +269,42 @@ pub fn controller_schedule(t_ns: u64, r_upps: u64, k_ns: u64,
         let t = w[0];
         let (origin, mut rate, cap) = if t < p_start {
             let drop = r * (cc.rate_rp - cc.beta);
-            (0.0, vec![r * cc.beta, 2.0 * drop / k + growth, -drop / k.powi(2)], None)
+            (
+                0.0,
+                vec![r * cc.beta, 2.0 * drop / k + growth, -drop / k.powi(2)],
+                None,
+            )
         } else if t < g_start {
-            (p_start, vec![r * cc.rate_rp + growth * p_start, p_slope + growth],
-                Some(vec![r * cc.rate_rp + growth * t + cap_slope * (t - p_start), cap_slope + growth]))
+            (
+                p_start,
+                vec![r * cc.rate_rp + growth * p_start, p_slope + growth],
+                Some(vec![
+                    r * cc.rate_rp + growth * t + cap_slope * (t - p_start),
+                    cap_slope + growth,
+                ]),
+            )
         } else if t < s_start {
-            (g_start, vec![r * cc.rate_pg + growth * g_start, p_slope + growth, a],
-                Some(vec![r + growth * t + cap_slope * (t - p_start), cap_slope + growth]))
+            (
+                g_start,
+                vec![r * cc.rate_pg + growth * g_start, p_slope + growth, a],
+                Some(vec![
+                    r + growth * t + cap_slope * (t - p_start),
+                    cap_slope + growth,
+                ]),
+            )
         } else {
             let mut v = vec![0.0; 11];
             v[0] = r * cc.rate_gs + growth * s_start;
             v[1] = p_slope + 2.0 * a * g_span + growth;
             v[10] = r * (1.0 - cc.beta) * 10.0 / (3.0 * k).powi(10);
-            (s_start, v, Some(vec![r + growth * t + cap_slope * (t - p_start), cap_slope + growth]))
+            (
+                s_start,
+                v,
+                Some(vec![
+                    r + growth * t + cap_slope * (t - p_start),
+                    cap_slope + growth,
+                ]),
+            )
         };
         rate = shift(&rate, t - origin);
         let duration = w[1] - t;
@@ -284,19 +315,27 @@ pub fn controller_schedule(t_ns: u64, r_upps: u64, k_ns: u64,
         boundaries.extend(roots(&floor_diff, 0.0, duration));
         if let Some(cap) = &cap {
             let mut diff = rate.clone();
-            for (i, c) in cap.iter().enumerate() { diff[i] -= c; }
+            for (i, c) in cap.iter().enumerate() {
+                diff[i] -= c;
+            }
             boundaries.extend(roots(&diff, 0.0, duration));
             let mut diff = cap.clone();
             diff[0] -= floor;
             boundaries.extend(roots(&diff, 0.0, duration));
         }
-        boundaries.sort_by(|a,b| a.total_cmp(b));
-        boundaries.dedup_by(|a,b| (*a-*b).abs() < 1e-12);
+        boundaries.sort_by(|a, b| a.total_cmp(b));
+        boundaries.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
         for b in boundaries.windows(2) {
             let midpoint = (b[0] + b[1]) * 0.5;
-            let capped = cap.as_ref().is_some_and(|c| eval(c, midpoint) < eval(&rate, midpoint));
+            let capped = cap
+                .as_ref()
+                .is_some_and(|c| eval(c, midpoint) < eval(&rate, midpoint));
             let selected = if capped { cap.as_ref().unwrap() } else { &rate };
-            let local = if eval(selected, midpoint) < floor { vec![floor] } else { shift(selected, b[0]) };
+            let local = if eval(selected, midpoint) < floor {
+                vec![floor]
+            } else {
+                shift(selected, b[0])
+            };
             // Round absolute boundaries once: rounded durations still sum to horizon exactly.
             let stop_ns = (((t - start + b[1]) * 1e9).round() as u64).min(horizon_ns);
             if stop_ns > emitted_ns {
@@ -312,9 +351,16 @@ pub const HISTORY_TIME_NS: u64 = 10_000_000_000;
 pub const CONTROLLER_HORIZON_NS: u64 = 500_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StopReason { QueueEmpty, InFlight }
+pub enum StopReason {
+    QueueEmpty,
+    InFlight,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct StopPoint { pub time_ns: u64, pub completed: u64, pub reason: StopReason }
+pub struct StopPoint {
+    pub time_ns: u64,
+    pub completed: u64,
+    pub reason: StopReason,
+}
 
 /// A confirmed sequence interval on one cumulative curve. One record per batch,
 /// never per packet. Flat pieces have an empty sequence interval.
@@ -331,14 +377,26 @@ pub struct ExecutionRecord {
     pub stop: Option<StopReason>,
 }
 #[derive(Debug, Default)]
-pub struct ExecutionHistory { records: VecDeque<ExecutionRecord> }
+pub struct ExecutionHistory {
+    records: VecDeque<ExecutionRecord>,
+}
 impl ExecutionHistory {
-    pub fn len(&self) -> usize { self.records.len() }
-    pub fn is_empty(&self) -> bool { self.records.is_empty() }
-    pub fn records(&self) -> &VecDeque<ExecutionRecord> { &self.records }
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+    pub fn records(&self) -> &VecDeque<ExecutionRecord> {
+        &self.records
+    }
     fn push(&mut self, record: ExecutionRecord, now: u64) {
         if record.first_sequence == record.end_sequence {
-            if let Some(last) = self.records.back_mut().filter(|r| r.stop == record.stop && r.first_sequence == r.end_sequence) {
+            if let Some(last) = self
+                .records
+                .back_mut()
+                .filter(|r| r.stop == record.stop && r.first_sequence == r.end_sequence)
+            {
                 last.end_ns = record.end_ns;
                 self.evict(now);
                 return;
@@ -348,16 +406,25 @@ impl ExecutionHistory {
         self.evict(now);
     }
     fn evict(&mut self, now: u64) {
-        while self.records.len() > MAX_HISTORY_RECORDS || self.records.front().is_some_and(|r| r.end_ns < now.saturating_sub(HISTORY_TIME_NS)) {
+        while self.records.len() > MAX_HISTORY_RECORDS
+            || self
+                .records
+                .front()
+                .is_some_and(|r| r.end_ns < now.saturating_sub(HISTORY_TIME_NS))
+        {
             self.records.pop_front();
         }
     }
     pub fn lookup(&self, sequence: u64) -> Option<u64> {
         let index = self.records.partition_point(|r| r.end_sequence <= sequence);
         let r = self.records.get(index)?;
-        if sequence < r.first_sequence || r.stop.is_some() { return None; }
+        if sequence < r.first_sequence || r.stop.is_some() {
+            return None;
+        }
         let count = (sequence.checked_sub(r.base_sequence)? + 1) as f64 - r.count_offset;
-        r.schedule.inverse(count).and_then(|t| r.origin_ns.checked_add(t))
+        r.schedule
+            .inverse(count)
+            .and_then(|t| r.origin_ns.checked_add(t))
     }
 }
 
@@ -382,46 +449,91 @@ pub struct CurvePacer {
 }
 impl CurvePacer {
     pub fn new(now: u64, sequence: u64) -> Self {
-        Self { history: ExecutionHistory::default(), stop: Some(StopPoint { time_ns: now, completed: sequence, reason: StopReason::QueueEmpty }),
-            schedule: std::sync::Arc::new(PacketSchedule::constant(0.0, CONTROLLER_HORIZON_NS).unwrap()),
-            origin_ns: now, base_sequence: sequence, count_offset: 0.0, last_tick_ns: now,
-            key: (0,0,0,false), first_sequence: sequence, allowance: 0,
-            error_samples: 0, error_abs_sum_ns: 0, error_max_ns: 0 }
+        Self {
+            history: ExecutionHistory::default(),
+            stop: Some(StopPoint {
+                time_ns: now,
+                completed: sequence,
+                reason: StopReason::QueueEmpty,
+            }),
+            schedule: std::sync::Arc::new(
+                PacketSchedule::constant(0.0, CONTROLLER_HORIZON_NS).unwrap(),
+            ),
+            origin_ns: now,
+            base_sequence: sequence,
+            count_offset: 0.0,
+            last_tick_ns: now,
+            key: (0, 0, 0, false),
+            first_sequence: sequence,
+            allowance: 0,
+            error_samples: 0,
+            error_abs_sum_ns: 0,
+            error_max_ns: 0,
+        }
     }
     fn flat_until(&mut self, now: u64) {
         if let Some(stop) = self.stop {
-            self.history.push(ExecutionRecord { first_sequence: stop.completed, end_sequence: stop.completed,
-                start_ns: stop.time_ns, end_ns: now.max(stop.time_ns), origin_ns: stop.time_ns,
-                base_sequence: stop.completed, count_offset: 0.0,
-                schedule: std::sync::Arc::new(PacketSchedule::constant(0.0, now.saturating_sub(stop.time_ns).max(1)).unwrap()),
-                stop: Some(stop.reason) }, now);
+            self.history.push(
+                ExecutionRecord {
+                    first_sequence: stop.completed,
+                    end_sequence: stop.completed,
+                    start_ns: stop.time_ns,
+                    end_ns: now.max(stop.time_ns),
+                    origin_ns: stop.time_ns,
+                    base_sequence: stop.completed,
+                    count_offset: 0.0,
+                    schedule: std::sync::Arc::new(
+                        PacketSchedule::constant(0.0, now.saturating_sub(stop.time_ns).max(1))
+                            .unwrap(),
+                    ),
+                    stop: Some(stop.reason),
+                },
+                now,
+            );
         }
     }
-    pub fn begin(&mut self, now: u64, sequence: u64, has_work: bool,
-        key: (u64,u64,u64,bool), schedule: impl FnOnce() -> PacketSchedule,
+    pub fn begin(
+        &mut self,
+        now: u64,
+        sequence: u64,
+        has_work: bool,
+        key: (u64, u64, u64, bool),
+        schedule: impl FnOnce(u64) -> PacketSchedule,
     ) -> u64 {
         self.history.evict(now);
+        self.first_sequence = sequence;
         if self.stop.is_some() {
             self.flat_until(now);
-            if !has_work { self.allowance = 0; return 0; }
-            self.schedule = std::sync::Arc::new(schedule());
+            if !has_work {
+                self.allowance = 0;
+                return 0;
+            }
+            self.schedule = std::sync::Arc::new(schedule(now));
             self.origin_ns = now;
             self.base_sequence = sequence;
             self.count_offset = 0.0;
             self.stop = None;
             self.key = key;
-        } else if key != self.key || now.saturating_sub(self.origin_ns) >= self.schedule.duration_ns() {
+        } else if key != self.key
+            || now.saturating_sub(self.origin_ns) >= self.schedule.duration_ns()
+        {
             // End the predecessor at the last confirmed execution boundary. Its
             // unexecuted phase belongs to the successor (not to unsent packets).
-            let fraction = (self.count_offset + self.schedule.count(self.last_tick_ns.saturating_sub(self.origin_ns))
-                - (sequence - self.base_sequence) as f64).clamp(0.0, 1.0);
-            self.schedule = std::sync::Arc::new(schedule());
+            let fraction = (self.count_offset
+                + self
+                    .schedule
+                    .count(self.last_tick_ns.saturating_sub(self.origin_ns))
+                - (sequence - self.base_sequence) as f64)
+                .clamp(0.0, 1.0);
+            self.schedule = std::sync::Arc::new(schedule(self.last_tick_ns));
             self.origin_ns = self.last_tick_ns;
             self.base_sequence = sequence;
             self.count_offset = fraction;
             self.key = key;
         }
-        let target = self.base_sequence + (self.count_offset + self.schedule.count(now.saturating_sub(self.origin_ns))).floor() as u64;
+        let target = self.base_sequence
+            + (self.count_offset + self.schedule.count(now.saturating_sub(self.origin_ns))).floor()
+                as u64;
         self.first_sequence = sequence;
         self.allowance = target.saturating_sub(sequence);
         self.allowance
@@ -438,16 +550,34 @@ impl CurvePacer {
         }
     }
     pub fn finish(&mut self, now: u64, sequence: u64, reason: Option<StopReason>) {
+        if self.stop.is_some() {
+            self.last_tick_ns = now;
+            return;
+        }
         let count = (sequence - self.base_sequence) as f64 - self.count_offset;
         let stop_ns = self.origin_ns + self.schedule.inverse(count.max(0.0)).unwrap_or(0);
         if sequence > self.first_sequence {
-            self.history.push(ExecutionRecord { first_sequence: self.first_sequence, end_sequence: sequence,
-                start_ns: self.last_tick_ns, end_ns: stop_ns, origin_ns: self.origin_ns,
-                base_sequence: self.base_sequence, count_offset: self.count_offset,
-                schedule: self.schedule.clone(), stop: None }, now);
+            self.history.push(
+                ExecutionRecord {
+                    first_sequence: self.first_sequence,
+                    end_sequence: sequence,
+                    start_ns: self.last_tick_ns,
+                    end_ns: stop_ns,
+                    origin_ns: self.origin_ns,
+                    base_sequence: self.base_sequence,
+                    count_offset: self.count_offset,
+                    schedule: self.schedule.clone(),
+                    stop: None,
+                },
+                now,
+            );
         }
         if let Some(reason) = reason {
-            self.stop = Some(StopPoint { time_ns: stop_ns, completed: sequence, reason });
+            self.stop = Some(StopPoint {
+                time_ns: stop_ns,
+                completed: sequence,
+                reason,
+            });
             self.flat_until(now);
         }
         self.last_tick_ns = now;
@@ -458,7 +588,9 @@ impl CurvePacer {
     pub fn skip_ack(&mut self) {
         self.base_sequence += 1;
         self.first_sequence += 1;
-        if let Some(stop) = &mut self.stop { stop.completed += 1; }
+        if let Some(stop) = &mut self.stop {
+            stop.completed += 1;
+        }
     }
 }
 
@@ -467,64 +599,96 @@ mod tests {
     use super::*;
     #[test]
     fn eval_inverse_and_validation() {
-        let p = PacketPolynomial::from_rate(&[2.0,4.0,3.0], 2_000_000_000).unwrap();
+        let p = PacketPolynomial::from_rate(&[2.0, 4.0, 3.0], 2_000_000_000).unwrap();
         assert_eq!(p.count(1_000_000_000), 5.0);
         assert_eq!(p.inverse(5.0), Some(1_000_000_000));
         assert_eq!(p.rate(1_000_000_000), 9.0);
         for t in (0..2_000_000_000).step_by(1_234_567) {
             assert!(p.inverse(p.count(t)).unwrap().abs_diff(t) <= 1);
         }
-        assert_eq!(PacketPolynomial::from_rate(&[0.2499,-1.0,1.0],1_000_000_000).unwrap_err(), CurveError::NegativeRate);
-        assert!(PacketPolynomial::from_rate(&[f64::NAN],1).is_err());
-        assert!(PacketPolynomial::from_rate(&[1e20],1_000_000_000).is_err());
+        assert_eq!(
+            PacketPolynomial::from_rate(&[0.2499, -1.0, 1.0], 1_000_000_000).unwrap_err(),
+            CurveError::NegativeRate
+        );
+        assert!(PacketPolynomial::from_rate(&[f64::NAN], 1).is_err());
+        assert!(PacketPolynomial::from_rate(&[1e20], 1_000_000_000).is_err());
     }
     #[test]
     fn starvation_flat_resume_and_ack_gap() {
-        let mut p = CurvePacer::new(0,9);
-        let schedule = || PacketSchedule::constant(600.0,CONTROLLER_HORIZON_NS).unwrap();
-        assert_eq!(p.begin(0,9,true,(1,1,1,false),schedule),0);
-        p.finish(0,9,None);
-        assert_eq!(p.begin(10_000_000,9,true,(1,1,1,false),schedule),6);
-        p.finish(10_000_000,13,Some(StopReason::QueueEmpty));
-        assert_eq!(p.stop.unwrap().time_ns,6_666_667);
-        assert_eq!(p.history.lookup(12),Some(6_666_667));
-        assert_eq!(p.begin(100_000_000,13,true,(1,1,1,false),schedule),0);
-        p.finish(100_000_000,13,None);
+        let mut p = CurvePacer::new(0, 9);
+        let schedule = |_| PacketSchedule::constant(600.0, CONTROLLER_HORIZON_NS).unwrap();
+        assert_eq!(p.begin(0, 9, true, (1, 1, 1, false), schedule), 0);
+        p.finish(0, 9, None);
+        assert_eq!(p.begin(10_000_000, 9, true, (1, 1, 1, false), schedule), 6);
+        p.finish(10_000_000, 13, Some(StopReason::QueueEmpty));
+        assert_eq!(p.stop.unwrap().time_ns, 6_666_667);
+        assert_eq!(p.history.lookup(12), Some(6_666_667));
+        for now in (20_000_000..100_000_000).step_by(1_000_000) {
+            assert_eq!(p.begin(now, 13, false, (1, 1, 1, false), schedule), 0);
+            p.finish(now, 13, Some(StopReason::QueueEmpty));
+            assert!(p.history.len() <= 3);
+        }
+        assert_eq!(
+            p.begin(100_000_000, 13, true, (1, 1, 1, false), schedule),
+            0
+        );
+        p.finish(100_000_000, 13, None);
         p.skip_ack(); // sequence 13 is an ACK, sequence 14 is next data.
-        assert_eq!(p.begin(110_000_000,14,true,(1,1,1,false),schedule),6);
-        p.finish(110_000_000,20,None);
-        assert_eq!(p.history.lookup(13),None);
-        assert_eq!(p.history.lookup(14),Some(101_666_667));
-        assert!(p.history.records().iter().any(|r| r.stop.is_some() && r.start_ns == 6_666_667 && r.end_ns == 100_000_000));
+        assert_eq!(
+            p.begin(110_000_000, 14, true, (1, 1, 1, false), schedule),
+            6
+        );
+        p.finish(110_000_000, 20, None);
+        assert_eq!(p.history.lookup(13), None);
+        assert_eq!(p.history.lookup(14), Some(101_666_667));
+        assert!(
+            p.history
+                .records()
+                .iter()
+                .any(|r| r.stop.is_some() && r.start_ns == 6_666_667 && r.end_ns == 100_000_000)
+        );
     }
     #[test]
     fn history_bounds_time_and_high_absolute_counters() {
-        let base = (1u64<<54)+1;
-        let mut p = CurvePacer::new(0,base);
-        let schedule = || PacketSchedule::constant(1000.0,CONTROLLER_HORIZON_NS).unwrap();
-        let key = (1,1,1,false);
-        p.begin(0,base,true,key,schedule); p.finish(0,base,None);
+        let base = (1u64 << 54) + 1;
+        let mut p = CurvePacer::new(0, base);
+        let schedule = |_| PacketSchedule::constant(1000.0, CONTROLLER_HORIZON_NS).unwrap();
+        let key = (1, 1, 1, false);
+        p.begin(0, base, true, key, schedule);
+        p.finish(0, base, None);
         for i in 1..5000 {
-            let now = i*1_000_000;
-            assert_eq!(p.begin(now,base+i-1,true,key,schedule),1);
-            p.finish(now,base+i,None);
+            let now = i * 1_000_000;
+            assert_eq!(p.begin(now, base + i - 1, true, key, schedule), 1);
+            p.finish(now, base + i, None);
             assert!(p.history.len() <= MAX_HISTORY_RECORDS);
         }
-        assert_eq!(p.history.lookup(base),None);
-        assert_eq!(p.history.lookup(base+4998),Some(4_999_000_000));
-        p.begin(20_000_000_000,base+4999,false,key,schedule);
+        assert_eq!(p.history.lookup(base), None);
+        assert_eq!(p.history.lookup(base + 4998), Some(4_999_000_000));
+        p.begin(20_000_000_000, base + 4999, false, key, schedule);
         assert!(p.history.is_empty());
     }
     #[test]
     fn controller_derivative_matches_pps_across_phases_caps_floor() {
-        for cc in [crate::stp::CongestionControlOptions::legacy(),crate::stp::CongestionControlOptions::balanced()] {
-            for k in [1_000_000,30_000_000,1_800_000_000] {
-                for t in [0,k/2,k,k*2,k*5,k*15,k*20,k*30] {
-                    let s = controller_schedule(t,1_000_000_000,k,&cc,CONTROLLER_HORIZON_NS).unwrap();
-                    assert_eq!(s.duration_ns(),CONTROLLER_HORIZON_NS);
+        for cc in [
+            crate::stp::CongestionControlOptions::legacy(),
+            crate::stp::CongestionControlOptions::balanced(),
+        ] {
+            for k in [1_000_000, 30_000_000, 1_800_000_000] {
+                for t in [0, k / 2, k, k * 2, k * 5, k * 15, k * 20, k * 30] {
+                    let s = controller_schedule(t, 1_000_000_000, k, &cc, CONTROLLER_HORIZON_NS)
+                        .unwrap();
+                    assert_eq!(s.duration_ns(), CONTROLLER_HORIZON_NS);
                     for dt in (1..CONTROLLER_HORIZON_NS).step_by(997_001) {
-                        let expected = crate::stp::cubic_rate_with_options(t+dt,1_000_000_000,k,&cc).0.max(cc.rate_floor_upps) as f64 / 1e6;
-                        assert!((s.rate(dt)-expected).abs() < expected*1e-6+0.01,"t={t} dt={dt} k={k} got={} expected={expected}",s.rate(dt));
+                        let expected =
+                            crate::stp::cubic_rate_with_options(t + dt, 1_000_000_000, k, &cc)
+                                .0
+                                .max(cc.rate_floor_upps) as f64
+                                / 1e6;
+                        assert!(
+                            (s.rate(dt) - expected).abs() < expected * 1e-6 + 0.01,
+                            "t={t} dt={dt} k={k} got={} expected={expected}",
+                            s.rate(dt)
+                        );
                     }
                 }
             }
