@@ -4662,6 +4662,10 @@ bool Codec::AllocateInput()
 
     const uint64_t sizeBytes = static_cast<uint64_t>(_block_count + _extra_count) * _block_bytes;
 
+    if (sizeBytes > _memory_limit || _workspace_allocated > _memory_limit - sizeBytes ||
+        _ge_allocated > _memory_limit - sizeBytes - _workspace_allocated) {
+        return false;
+    }
     // If need to allocate more:
     if (_input_allocated < sizeBytes)
     {
@@ -4733,6 +4737,10 @@ bool Codec::AllocateMatrix()
         + heavy_bytes
         + pivot_words * sizeof(uint16_t);
 
+    if (sizeBytes > _memory_limit || _workspace_allocated > _memory_limit - sizeBytes ||
+        _input_allocated > _memory_limit - sizeBytes - _workspace_allocated) {
+        return false;
+    }
     // If need to allocate more:
     if (_ge_allocated < sizeBytes)
     {
@@ -4860,6 +4868,10 @@ bool Codec::AllocateWorkspace()
                 sizeof(ReceivedPacketRecord);
     }
 
+    if (sizeBytes > _memory_limit || _input_allocated > _memory_limit - sizeBytes ||
+        _ge_allocated > _memory_limit - sizeBytes - _input_allocated) {
+        return false;
+    }
     bool fresh_workspace = false;
     if (_workspace_allocated < sizeBytes)
     {

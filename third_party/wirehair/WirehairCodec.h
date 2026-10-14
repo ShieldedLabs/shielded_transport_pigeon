@@ -338,6 +338,8 @@ public:
     };
 
 private:
+    // STP decoder arenas must remain within their admitted receive reservation.
+    uint64_t _memory_limit = UINT64_MAX;
     //--------------------------------------------------------------------------
     // Parameters
 
@@ -1395,6 +1397,7 @@ private:
 public:
     Codec();
     ~Codec();
+    void SetMemoryLimit(uint64_t bytes) { _memory_limit = bytes; }
 
 
     //--------------------------------------------------------------------------

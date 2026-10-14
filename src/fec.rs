@@ -18,6 +18,34 @@ use std::sync::Arc;
 pub const MIN_BLOCKS: usize = 2;
 pub const MAX_BLOCKS: usize = 64000;
 
+/// Hard native-arena cap, including input, workspace, dedup and GE matrix.
+/// Per-symbol charge matters even when a malicious peer chooses one-byte blocks.
+/// Wirehair refuses a solve/regrow exceeding this cap rather than overallocating.
+pub fn decoder_memory_limit(len: usize, block_bytes: usize) -> Option<usize> {
+    let k = block_count(len, block_bytes)?;
+    len.checked_mul(2)?.checked_add(k.checked_mul(256)?)?.checked_add(1 << 20)
+}
+
+/// Both ingress levels include queue slots as well as payload allocations.
+pub fn ingress_slots(bytes: usize, block_bytes: usize) -> usize {
+    // Include the channel's per-slot stamp/alignment and allocator metadata too.
+    // The current std array channel uses less; 128 bytes leaves conservative slack.
+    (bytes / (block_bytes + std::mem::size_of::<(u32, Vec<u8>)>() + 128)).max(1)
+}
+
+pub fn receive_memory_charge(layout: MessageLayout, worker: bool, ingress_bytes: usize) -> Option<usize> {
+    let mut bytes = layout.len;
+    for group in 0..layout.groups {
+        let (_, len) = layout.group_bytes(group);
+        bytes = bytes.checked_add(decoder_memory_limit(len, layout.block_bytes)?)?.checked_add(4096)?;
+    }
+    if worker {
+        // Outer queue + grouped lane queues; include currently-handled blocks and thread bookkeeping.
+        bytes = bytes.checked_add(ingress_bytes.checked_mul(2)?)?.checked_add(256 << 10)?;
+    }
+    Some(bytes)
+}
+
 #[allow(non_camel_case_types)]
 type WirehairCodec = *mut std::ffi::c_void;
 type WirehairResult = std::ffi::c_int;
@@ -31,6 +59,7 @@ unsafe extern "C" {
     fn wirehair_encoder_create(reuse_opt: WirehairCodec, message: *const std::ffi::c_void, message_bytes: u64, block_bytes: u32) -> WirehairCodec;
     fn wirehair_encode(codec: WirehairCodec, block_id: std::ffi::c_uint, block_data_out: *mut std::ffi::c_void, out_bytes: u32, data_bytes_out: *mut u32) -> WirehairResult;
     fn wirehair_decoder_create(reuse_opt: WirehairCodec, message_bytes: u64, block_bytes: u32) -> WirehairCodec;
+    fn wirehair_decoder_create_limited(message_bytes: u64, block_bytes: u32, memory_limit: u64) -> WirehairCodec;
     fn wirehair_decode(codec: WirehairCodec, block_id: std::ffi::c_uint, block_data: *const std::ffi::c_void, data_bytes: u32) -> WirehairResult;
     fn wirehair_recover(codec: WirehairCodec, message_out: *mut std::ffi::c_void, message_bytes: u64) -> WirehairResult;
     fn wirehair_free(codec: WirehairCodec);
@@ -140,7 +169,7 @@ impl Decoder {
         block_count(message_len, block_bytes)?;
         if !init() { return None; }
         #[allow(unsafe_code)]
-        let codec = unsafe { wirehair_decoder_create(std::ptr::null_mut(), message_len as u64, block_bytes as u32) };
+        let codec = unsafe { wirehair_decoder_create_limited(message_len as u64, block_bytes as u32, decoder_memory_limit(message_len, block_bytes)? as u64) };
         if codec.is_null() { return None; }
         Some(Decoder { codec, message_len, block_bytes, done: false })
     }
@@ -379,7 +408,7 @@ pub fn decode_message_blocks(layout: MessageLayout, rx: std::sync::mpsc::Receive
         let mut senders = Vec::new();
         let mut jobs = Vec::new();
         for chunks in slices {
-            let (tx, blocks) = std::sync::mpsc::sync_channel::<(u32, Vec<u8>)>((ingress_bytes / lanes / layout.block_bytes).max(1));
+            let (tx, blocks) = std::sync::mpsc::sync_channel::<(u32, Vec<u8>)>(ingress_slots(ingress_bytes / lanes, layout.block_bytes));
             senders.push(tx);
             let done = done_tx.clone();
             jobs.push(scope.spawn(move || {
@@ -639,5 +668,16 @@ mod tests {
         let mut d = Decoder::new(2400, 1200).unwrap();
         assert_eq!(d.add(5, &[0u8; 1201]), Err(DecodeError::BadBlock));
         assert!(d.recover().is_none());
+    }
+    #[test]
+    fn bounded_native_creation_and_channel_slots() {
+        assert!(init());
+        #[allow(unsafe_code)]
+        let c = unsafe { wirehair_decoder_create_limited(256000, 1000, 1024) };
+        assert!(c.is_null());
+        let slots = ingress_slots(32<<20, 1);
+        assert!(slots * (1 + std::mem::size_of::<(u32, Vec<u8>)>()) <= 32<<20);
+        let tiny = MessageLayout::new(1<<20, 1).unwrap();
+        assert!(receive_memory_charge(tiny, true, 32<<20).unwrap() > 300<<20);
     }
 }

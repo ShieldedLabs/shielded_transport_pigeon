@@ -15,4 +15,5 @@ mod loss_trace;
 pub mod helpers;
 pub mod native_sockets;
 pub mod stp;
+pub mod receive_memory;
 pub mod sequence;
