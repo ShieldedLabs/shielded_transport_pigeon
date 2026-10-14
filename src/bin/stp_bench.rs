@@ -17,7 +17,13 @@
 //! --cc-time-gs, --cc-rate-rp, --cc-rate-pg, --cc-rate-gs, --cc-loss-threshold,
 //! --cc-floor-pps, --cc-start-pps, --cc-min-growth-ppsps, --cc-max-growth-ppsps,
 //! --cc-guard-rtts.
+//! CC2 (opt-in): --cc-startup-multiplier 1.01..2, --cc-startup-backoff-rtts 0..4,
+//! --cc-proportional-growth 0|1, --cc-ecn-guard-rtts 0..10, --cc-loss-response-pct 0..50.
+//! Defaults disable new modes; startup backoff defaults to 1 RTT, ECN guard 0 inherits loss guard.
+//! Proportional growth requires --cc-bound-recovery-growth 1 --cc-compound-growth 1
+//! and a positive --cc-relative-growth.
 //! Pacer: --pacer precise|poly1|poly2|poly5|poly10, or --pacer poly --cadence-ms 2.
+//! Startup/proportional growth automatically use precise pacing even if poly is requested.
 //! --burst-budget-ms 0 disables the polynomial burst wall-time budget (re-anchor only).
 //! ACK: --ack legacy|bitmap|adaptive (default legacy), on both endpoints.
 //! Bitmap: --ack-every 8 --ack-delay-us 1000; Adaptive defaults to 8/10000 us.
@@ -238,8 +244,12 @@ fn cc_options(a: &Args) -> CongestionControlOptions {
     let loss_fraction_pct = a.num::<f64>("cc-loss-fraction-pct", cc.loss_fraction_ppm as f64 / 10_000.0);
     if !(0.0..=50.0).contains(&loss_fraction_pct) { die("invalid --cc-loss-fraction-pct"); }
     cc.loss_fraction_ppm = (loss_fraction_pct * 10_000.0).round() as u32;
+    let response_pct = a.num::<f64>("cc-loss-response-pct", cc.loss_response_fraction_ppm as f64 / 10_000.0);
+    if !(0.0..=50.0).contains(&response_pct) { die("invalid --cc-loss-response-pct"); }
+    cc.loss_response_fraction_ppm = (response_pct * 10_000.0).round() as u32;
     cc.loss_timeout_rtts = a.num("cc-loss-timeout-rtts", cc.loss_timeout_rtts);
     cc.event_guard_rtts = a.num("cc-guard-rtts", cc.event_guard_rtts);
+    cc.ecn_event_guard_rtts = a.num("cc-ecn-guard-rtts", cc.ecn_event_guard_rtts);
     cc.rate_floor_upps = a.num::<u64>("cc-floor-pps", cc.rate_floor_upps / 1_000_000).checked_mul(1_000_000).unwrap_or_else(|| die("CC floor overflows"));
     cc.initial_rate_upps = a.num::<u64>("cc-start-pps", cc.initial_rate_upps / 1_000_000).checked_mul(1_000_000).unwrap_or_else(|| die("CC start overflows"));
     cc.min_growth_uppsps = a.num("cc-min-growth-ppsps", cc.min_growth_uppsps / 1e6) * 1e6;
@@ -248,6 +258,9 @@ fn cc_options(a: &Args) -> CongestionControlOptions {
     cc.relative_growth_per_rtt = a.num("cc-relative-growth", cc.relative_growth_per_rtt);
     cc.bound_recovery_growth = a.num::<u8>("cc-bound-recovery-growth", u8::from(cc.bound_recovery_growth)) != 0;
     cc.compound_growth = a.num::<u8>("cc-compound-growth", u8::from(cc.compound_growth)) != 0;
+    cc.proportional_growth = a.num::<u8>("cc-proportional-growth", u8::from(cc.proportional_growth)) != 0;
+    cc.startup_multiplier = a.num("cc-startup-multiplier", cc.startup_multiplier);
+    cc.startup_backoff_rtts = a.num("cc-startup-backoff-rtts", cc.startup_backoff_rtts);
     cc.record_loss_episodes = a.num::<u8>("cc-record-loss-episodes", u8::from(cc.record_loss_episodes)) != 0;
     if let Err(e) = cc.validate() { die(e); }
     cc
