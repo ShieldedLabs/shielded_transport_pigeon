@@ -531,7 +531,8 @@ impl FecAdaptiveState {
             if self.closed_loop_enabled() {
                 // Cold start has no feedback-window measurement: keep the full-message prior.
                 let horizon = if span.seen < 4096 { k } else { k.min(span.pending_peak.max(1)) };
-                span.margin_blocks(horizon, k, c).max(12.min(k))
+                let cap = ((k as f64 * c.max_redundancy).ceil() as u64).max(1).min(k);
+                span.margin_blocks(horizon, k, c).max(12.min(k)).min(cap)
             } else { span.repair_blocks(k, c, self.z) }
         }
         else { repair_blocks(k, self.p, self.z, c.eps, c.extra_blocks, c.max_redundancy) }
@@ -791,6 +792,9 @@ mod tests {
         a.tracker.cfg.closed_loop = false;
         assert!(a.repair_blocks(k) > closed);
         assert_eq!(a.extra_repair_blocks_needed_now(k, k, 0, 80), 0);
+        let limited = FecAdaptiveState::new(AdaptiveFecConfig { max_redundancy: 0.01, ..cfg }, 0, 0, 0);
+        assert_eq!(limited.repair_blocks(740), 8);
+        assert_eq!(limited.extra_repair_blocks_needed_now(740, 740, 0, 80), 8);
     }
 
     #[test]
