@@ -162,6 +162,7 @@ fn cc_options(a: &Args) -> CongestionControlOptions {
     cc.loss_fraction_ppm = (loss_fraction_pct * 10_000.0).round() as u32;
     cc.loss_timeout_rtts = a.num("cc-loss-timeout-rtts", cc.loss_timeout_rtts);
     cc.event_guard_rtts = a.num("cc-guard-rtts", cc.event_guard_rtts);
+    cc.ecn_event_guard_rtts = a.num("cc-ecn-guard-rtts", cc.ecn_event_guard_rtts);
     cc.rate_floor_upps = a.num::<u64>("cc-floor-pps", cc.rate_floor_upps / 1_000_000).checked_mul(1_000_000).unwrap_or_else(|| die("CC floor overflows"));
     cc.initial_rate_upps = a.num::<u64>("cc-start-pps", cc.initial_rate_upps / 1_000_000).checked_mul(1_000_000).unwrap_or_else(|| die("CC start overflows"));
     cc.min_growth_uppsps = a.num("cc-min-growth-ppsps", cc.min_growth_uppsps / 1e6) * 1e6;

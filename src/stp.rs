@@ -1663,6 +1663,8 @@ pub struct CongestionControlOptions {
     /// Age-based declaration, not sequence gaps: additional reorder/jitter tolerance.
     pub loss_timeout_rtts: f64,
     pub event_guard_rtts: f64,
+    /// Optional ECN-only guard override; zero inherits event_guard_rtts.
+    pub ecn_event_guard_rtts: f64,
     /// Millionths of a packet per second (100_000_000 = 100 pps).
     pub rate_floor_upps: u64,
     pub initial_rate_upps: u64,
@@ -1691,7 +1693,7 @@ impl CongestionControlOptions {
     pub const fn legacy() -> Self {
         Self { beta: CUBIC_BETA, recovery_rtts: CUBIC_K_RTT_MULTIPLIER,
             rate_rp: RATE_RP, rate_pg: RATE_PG, rate_gs: RATE_GS, time_pg: TIME_PG, time_gs: TIME_GS,
-            loss_threshold: 2, loss_fraction_ppm: 0, loss_timeout_rtts: 2.0, event_guard_rtts: 0.5, rate_floor_upps: RATE_FLOOR_UPPS, initial_rate_upps: RATE_FLOOR_UPPS,
+            loss_threshold: 2, loss_fraction_ppm: 0, loss_timeout_rtts: 2.0, event_guard_rtts: 0.5, ecn_event_guard_rtts: 0.0, rate_floor_upps: RATE_FLOOR_UPPS, initial_rate_upps: RATE_FLOOR_UPPS,
             min_growth_uppsps: CUBIC_MIN_GROWTH_UPPSPS, max_growth_uppsps: CUBIC_MAX_RATE_UPPS_PER_SEC,
             friendly_growth_alpha: 0.0, relative_growth_per_rtt: 0.0, bound_recovery_growth: false, compound_growth: false, proportional_growth: false, record_loss_episodes: false, startup_multiplier: 0.0 }
     }
@@ -1707,7 +1709,7 @@ impl CongestionControlOptions {
         let g_span = self.time_gs - self.time_pg;
         let p_slope = (self.rate_pg - self.rate_rp) / (self.time_pg - 1.0);
         if self.rate_gs - self.rate_pg - p_slope * g_span < 0.0 { return Err("CC G phase must have nonnegative curvature"); }
-        if !(0.0..=10.0).contains(&self.event_guard_rtts) { return Err("invalid CC guard"); }
+        if !(0.0..=10.0).contains(&self.event_guard_rtts) || !(0.0..=10.0).contains(&self.ecn_event_guard_rtts) { return Err("invalid CC guard"); }
         if !(1..=10000).contains(&self.loss_threshold) { return Err("CC loss threshold must be in 1..=10000"); }
         if !(self.rate_floor_upps > 0 && self.initial_rate_upps >= self.rate_floor_upps && self.initial_rate_upps <= 1_000_000_000_000 && self.min_growth_uppsps >= 0.0 && self.min_growth_uppsps.is_finite() && self.max_growth_uppsps > self.min_growth_uppsps && self.max_growth_uppsps <= 1e15) { return Err("invalid CC floor, initial rate or growth limits"); }
         if !(0.0..=100.0).contains(&self.friendly_growth_alpha) || !(0.0..=10.0).contains(&self.relative_growth_per_rtt) { return Err("invalid CC RTT-scaled growth envelope"); }
@@ -2774,7 +2776,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
 
 
                         // ECN congestion event: the receiver saw CE-marked packets and relayed it via the ack's IP header
-                        if take_ecn_signal(state, cc.event_guard_rtts) {
+                        if take_ecn_signal(state, if cc.ecn_event_guard_rtts > 0.0 { cc.ecn_event_guard_rtts } else { cc.event_guard_rtts }) {
                             let send_dt = state.ecn_oldest_send_time - state.congestion_event_time_ns;
                             let send_t_factor = send_dt as f64 / time_to_bandwidth_recovery as f64;
                             let (_, send_mode) = cc_rate(send_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery, state.cc_startup_done);
@@ -3290,7 +3292,9 @@ fn take_ecn_echo(state: &mut ConnectionStateConnected) -> bool {
 fn take_ecn_signal(state: &mut ConnectionStateConnected, guard_rtts: f64) -> bool {
     // Consume covered feedback too: it must not survive to a later ACK/epoch.
     let pending = std::mem::take(&mut state.ecn_congestion_received);
-    pending && state.ecn_oldest_send_time > state.congestion_event_time_ns.saturating_add((state.RTT_mean as f64 * 100_000.0 * guard_rtts) as u64)
+    let eligible = pending && state.ecn_oldest_send_time > state.congestion_event_time_ns.saturating_add((state.RTT_mean as f64 * 100_000.0 * guard_rtts) as u64);
+    if eligible { state.loss_count_in_window = 0; }
+    eligible
 }
 
 fn connection_rate(t_ns: u64, anchor_upps: u64, k_ns: u64, cc: &CongestionControlOptions, startup_done: bool) -> (u64, char) {
@@ -3369,12 +3373,19 @@ mod congestion_tests {
         state.ecn_echo_pending = true;
         assert!(take_ecn_echo(&mut state));
         assert!(!take_ecn_echo(&mut state));
+        state.loss_count_in_window = 9;
         assert!(take_ecn_signal(&mut state, 0.5));
+        assert_eq!(state.loss_count_in_window, 0);
         assert!(!take_ecn_signal(&mut state, 0.5));
         state.ecn_congestion_received = true;
+        state.loss_count_in_window = 3;
         state.ecn_oldest_send_time = 1_050_000_000;
         assert!(!take_ecn_signal(&mut state, 0.5));
         assert!(!state.ecn_congestion_received);
+        assert_eq!(state.loss_count_in_window, 3);
+        state.ecn_congestion_received = true;
+        state.ecn_oldest_send_time = 1_150_000_000;
+        assert!(!take_ecn_signal(&mut state, 1.0));
         assert!(!take_ecn_echo(&mut state));
         state.ecn_echo_pending = true;
         assert!(!take_ecn_signal(&mut state, 0.5));
