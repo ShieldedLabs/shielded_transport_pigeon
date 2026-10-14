@@ -519,7 +519,10 @@ impl UnreliableSendBuffer {
         f.lost += 1;
         if let Some(a) = &self.fec_adaptive {
             if a.tracker.config().topup {
-                let n = a.topped_up_blocks(f.k as u64, f.lost as u64, f.loss_estimate).min(u32::MAX as u64) as u32;
+                let n = if a.closed_loop_enabled() {
+                    let repair_sent = f.next_id.saturating_sub(f.k) as u64;
+                    f.k as u64 + repair_sent + a.extra_repair_blocks_needed_now(f.k as u64, f.next_id as u64, repair_sent, f.lost as u64)
+                } else { a.topped_up_blocks(f.k as u64, f.lost as u64, f.loss_estimate) }.min(u32::MAX as u64) as u32;
                 f.n = f.n.max(n);
             }
         }
@@ -658,6 +661,15 @@ impl UnreliableSendBuffer {
             self.start_message(front_msg, payload_len);
         }
         if self.fec_send_slot.is_some() {
+            if let (Some(a), Some(f)) = (&self.fec_adaptive, &mut self.fec_send_slot) {
+                // Close the feedback loop at the source/repair boundary and before the last
+                // planned repair. No tail-ACK wait; final unresolved losses get an open-loop margin.
+                if a.closed_loop_enabled() && f.next_id >= f.k && (f.next_id == f.k || f.next_id + 1 >= f.n) {
+                    let repair_sent = f.next_id.saturating_sub(f.k) as u64;
+                    let extra = a.extra_repair_blocks_needed_now(f.k as u64, f.next_id as u64, repair_sent, f.lost as u64);
+                    f.n = f.n.max((f.k as u64 + repair_sent + extra).min(u32::MAX as u64) as u32);
+                }
+            }
             let need = { let f = self.fec_send_slot.as_ref().unwrap(); STP_FEC_FRAGMENT_HEADER_SIZE + crate::fec::block_len(f.message.len(), f.block_bytes, f.next_id) };
             if need > space {
                 if space < payload_len { return None; } // the next packet has room
@@ -3483,5 +3495,33 @@ mod rx_tracker_tests {
         // Duplicates are not received twice.
         let st = run([0, 1, 1, 2]);
         assert_eq!((st.rx_packets, st.rx_duplicates, st.rx_lost), (3, 1, 0));
+    }
+}
+
+#[cfg(test)]
+mod fec_closed_loop_tests {
+    use super::*;
+    use crate::fec_adapt::{AdaptiveFecConfig, FecAdaptiveState, LossEstimatorKind, SpanFloorKind};
+
+    #[test]
+    fn refreshes_own_loss_budget_at_source_completion_without_a_new_loss_event() {
+        let cfg = AdaptiveFecConfig { kind: LossEstimatorKind::SpanTail, topup: true, closed_loop: true, span_floor: SpanFloorKind::Real, eps: 0.5, ..Default::default() };
+        let mut b = UnreliableSendBuffer::new(100000, 1000000, 1000000);
+        b.fec_redundancy_ppm = 10000;
+        b.fec_adaptive = Some(FecAdaptiveState::new(cfg, 0, 0, 0));
+        b.start_fec(std::sync::Arc::new(vec![0u8; 1433 * 64]), 1433);
+        let initial_n = b.fec_send_slot.as_ref().unwrap().n;
+        for seq in 0..64 {
+            assert!(matches!(b.next_fragment(1449, 1449), Some(UnreliableFragment::Fec { block_id, .. }) if block_id == seq));
+            b.fec_adaptive.as_mut().unwrap().on_data_sent(seq as u64);
+        }
+        b.fec_send_slot.as_mut().unwrap().lost = 20;
+        assert!(matches!(b.next_fragment(1449, 1449), Some(UnreliableFragment::Fec { block_id: 64, .. })));
+        let f = b.fec_send_slot.as_ref().unwrap();
+        assert!(f.n > initial_n && f.n >= 96 && f.n <= 128, "initial={initial_n} n={}", f.n);
+        // Existing top-up callback also uses the same bounded closed-loop budget.
+        b.fec_on_packet_lost(4);
+        assert_eq!(b.fec_send_slot.as_ref().unwrap().lost, 21);
+        assert!(b.fec_send_slot.as_ref().unwrap().n <= 128);
     }
 }

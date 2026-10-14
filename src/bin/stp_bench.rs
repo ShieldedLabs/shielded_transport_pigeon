@@ -22,6 +22,9 @@
 //! span targets packet_loss*sqrt(min(1,64/K)); --fec-eps optionally caps it (span default .5).
 //! [--fec-min-loss .005] [--fec-initial-loss .01]: explicit IID prior/floor, independent of span tails.
 //! [--fec-topup 0|1] (grow the message being sent when its own packets are declared lost).
+//! [--fec-span-floor none|real|legacy|robust]: opt-in measured safety floor, not a guarantee.
+//! [--fec-closed-loop 0|1]: span+topup only; own losses plus margin on the unresolved tail;
+//! full-message prior during cold start, minimum 12 repairs, no feedback wait/retransmission.
 //! [--fec-loss-signal declared|net:MS] (estimator input: raw declared loss, or declared minus
 //! spurious declarations with the counters delayed MS ms; default net:1000).
 //! --mix classes [--classes "SIZE:COUNT,..."] sends fixed counts per size class (default
@@ -368,6 +371,7 @@ fn send(a: &Args) {
                 _ => die("--fec must be fixed or adaptive:v1|v2|v3|span"),
             };
             let cfg = AdaptiveFecConfig { kind, eps: a.num("fec-eps", if kind == LossEstimatorKind::SpanTail { 0.5 } else { 1e-6 }), min_loss: a.num("fec-min-loss", 0.005), initial_loss: a.num("fec-initial-loss", 0.01), min_packets: a.num("fec-min-packets", 500), topup: a.num::<u32>("fec-topup", 0) != 0,
+                closed_loop: a.num::<u32>("fec-closed-loop", 0) != 0,
                 span_floor: match a.str("fec-span-floor").unwrap_or("none") {
                     "none" => SpanFloorKind::None, "real" => SpanFloorKind::Real,
                     "legacy" => SpanFloorKind::Legacy, "robust" => SpanFloorKind::Robust,
@@ -382,6 +386,9 @@ fn send(a: &Args) {
                     },
                 },
                 ..Default::default() };
+            if cfg.closed_loop && (kind != LossEstimatorKind::SpanTail || !cfg.topup) {
+                die("--fec-closed-loop 1 requires --fec adaptive:span --fec-topup 1");
+            }
             Some(cfg.scale_time(a.num("fec-time-scale", 1.0)))
         }
     };

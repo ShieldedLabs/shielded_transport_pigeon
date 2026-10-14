@@ -83,6 +83,9 @@ pub struct AdaptiveFecConfig {
     /// Add repair blocks to the message being sent when its own packets are declared lost
     /// (receivers do not need N, so a message can grow while it is sent).
     pub topup: bool,
+    /// SpanTail only: own-loss feedback plus a margin on unresolved packets, not all of K.
+    /// Requires topup=true. Never waits for feedback or retransmits source blocks.
+    pub closed_loop: bool,
     /// What the tracker consumes; see [`LossSignal`].
     pub loss_signal: LossSignal,
 }
@@ -118,6 +121,7 @@ impl Default for AdaptiveFecConfig {
             window_ns: 600_000_000_000,
             quantile: 0.97,
             topup: false,
+            closed_loop: false,
             loss_signal: LossSignal::NetOfSpurious { delay_ns: 1_000_000_000 },
         }
     }
@@ -361,10 +365,12 @@ pub struct SpanLossProfile {
     epochs: [u64; 2],
     seen: u64,
     lost_total: u64,
+    sent_total: u64,
+    pending_peak: u64,
 }
 impl Default for SpanLossProfile {
     fn default() -> Self {
-        Self { data_sent: [0; crate::stp::PACKETS_WAITING_ACK_WORDS], history: [0; 1024], counts: [0; 16], hist: [[[0; 64]; 16]; 2], epochs: [u64::MAX; 2], seen: 0, lost_total: 0 }
+        Self { data_sent: [0; crate::stp::PACKETS_WAITING_ACK_WORDS], history: [0; 1024], counts: [0; 16], hist: [[[0; 64]; 16]; 2], epochs: [u64::MAX; 2], seen: 0, lost_total: 0, sent_total: 0, pending_peak: 0 }
     }
 }
 impl SpanLossProfile {
@@ -382,7 +388,12 @@ impl SpanLossProfile {
     pub fn on_data_sent(&mut self, seq: u64) {
         let bit = seq as usize % (self.data_sent.len() * 64);
         self.data_sent[bit / 64] |= 1u64 << (bit % 64);
+        self.sent_total += 1;
+        self.pending_peak = self.pending_peak.max(self.unresolved_data_packets());
     }
+    /// Sent data not yet retired by STP's existing ordered ACK/loss ring. Includes ACKed data
+    /// behind a missing earlier sequence: conservative without assuming in-order arrival.
+    pub fn unresolved_data_packets(&self) -> u64 { self.sent_total.saturating_sub(self.seen) }
     /// Feed each retired sequence exactly once, in order. Loss declarations are conservative:
     /// a late ACK does not undo the tail histogram (use only where declarations are trustworthy).
     pub fn on_sequence_finalized(&mut self, seq: u64, lost: bool, now_ns: u64, window_ns: u64) {
@@ -444,11 +455,14 @@ impl SpanLossProfile {
         cfg.eps.min(p * (64.0 / k.max(1) as f64).min(1.0).sqrt()).clamp(1e-9, 0.5)
     }
     fn repair_blocks(&self, k: u64, cfg: &AdaptiveFecConfig, _z: f64) -> u64 {
+        self.margin_blocks(k, k, cfg)
+    }
+    fn margin_blocks(&self, k: u64, whole_message_k: u64, cfg: &AdaptiveFecConfig) -> u64 {
         let cap = ((k as f64 * cfg.max_redundancy).ceil() as u64).max(1);
         // Explicit prior/floor protects against unobserved loss. It cannot predict a new queue
         // overflow event; fixing CC is preferable to paying for a pathological startup prior.
         let prior = if self.seen < 4096 { cfg.initial_loss } else { cfg.min_loss };
-        let eps = self.target_failure(k, cfg);
+        let eps = self.target_failure(whole_message_k, cfg);
         let mut r = repair_blocks(k, prior, z_for_eps(eps), eps, cfg.extra_blocks, cfg.max_redundancy).max(cfg.span_floor.repair_blocks(k)).min(cap);
         for _ in 0..32 {
             let Some(q) = self.tail_losses(k + r, eps) else { break; };
@@ -513,7 +527,13 @@ impl FecAdaptiveState {
     /// Repair blocks for a new message of k source blocks.
     pub fn repair_blocks(&self, k: u64) -> u64 {
         let c = &self.tracker.cfg;
-        if let Some(span) = &self.span { span.repair_blocks(k, c, self.z) }
+        if let Some(span) = &self.span {
+            if self.closed_loop_enabled() {
+                // Cold start has no feedback-window measurement: keep the full-message prior.
+                let horizon = if span.seen < 4096 { k } else { k.min(span.pending_peak.max(1)) };
+                span.margin_blocks(horizon, k, c).max(12.min(k))
+            } else { span.repair_blocks(k, c, self.z) }
+        }
         else { repair_blocks(k, self.p, self.z, c.eps, c.extra_blocks, c.max_redundancy) }
     }
     /// Total blocks for a message of k source blocks of which `lost` sent ones are known lost.
@@ -523,6 +543,34 @@ impl FecAdaptiveState {
         let p = self.p.max(p_at_start);
         let r = repair_blocks(k + lost, p, self.z, c.eps, c.extra_blocks, c.max_redundancy * k as f64 / (k + lost) as f64);
         k + lost + r
+    }
+    pub fn closed_loop_enabled(&self) -> bool {
+        let c = &self.tracker.cfg;
+        c.kind == LossEstimatorKind::SpanTail && c.topup && c.closed_loop
+    }
+    /// Extra fresh repair symbols needed NOW, beyond repairs already sent, for one message.
+    /// All counts refer to the WHOLE message, not one Wirehair group. The caller retains its
+    /// monotone plan and distributes this budget among groups; aggregate losses alone cannot
+    /// guarantee each group (use ownership or a conservative concentration bound there).
+    /// Connection-wide unresolved data is a conservative proxy for this message's final
+    /// detection-delay window. Add unsent sources and repairs, solving the tail fixed point.
+    /// No per-packet message history, retransmission, feedback wait, or bandwidth-rate model.
+    pub fn extra_repair_blocks_needed_now(&self, k: u64, blocks_sent: u64, repair_blocks_sent: u64, own_declared_lost: u64) -> u64 {
+        let Some(span) = &self.span else { return 0; };
+        if !self.closed_loop_enabled() || k == 0 { return 0; }
+        let c = &self.tracker.cfg;
+        let cap = ((k as f64 * c.max_redundancy).ceil() as u64).min(k);
+        let unsent_sources = k.saturating_sub(blocks_sent.saturating_sub(repair_blocks_sent));
+        let pending = span.unresolved_data_packets().saturating_add(unsent_sources);
+        let mut total_repairs = own_declared_lost.saturating_add(12.min(k)).min(cap);
+        for _ in 0..32 {
+            let horizon = pending.saturating_add(total_repairs.saturating_sub(repair_blocks_sent)).min(k.saturating_add(total_repairs)).max(1);
+            let margin = span.margin_blocks(horizon, k, c).max(12.min(k));
+            let next = total_repairs.max(own_declared_lost.saturating_add(margin)).min(cap);
+            if next == total_repairs { break; }
+            total_repairs = next;
+        }
+        total_repairs.saturating_sub(repair_blocks_sent)
     }
     /// Redundancy (ppm) of a ~1000-block message, for the send queue's byte capacity.
     pub fn representative_ppm(&self) -> u32 {
@@ -718,6 +766,34 @@ mod tests {
     }
 
     #[test]
+    fn span_closed_loop_counts_pending_and_budgets_only_tail() {
+        let cfg = AdaptiveFecConfig { kind: LossEstimatorKind::SpanTail, closed_loop: true, topup: true, eps: 0.5, span_floor: SpanFloorKind::Real, ..Default::default() };
+        let mut a = FecAdaptiveState::new(cfg, 0, 0, 0);
+        for seq in 0..10000 {
+            a.on_data_sent(seq * 2);
+            a.on_sequence_finalized(seq * 2, seq % 10000 == 3, seq * 1000);
+            // ACK-only sequence and duplicate retirement must not decrement pending twice.
+            a.on_sequence_finalized(seq * 2 + 1, true, seq * 1000);
+            a.on_sequence_finalized(seq * 2, false, seq * 1000);
+        }
+        for seq in 20000..20100 { a.on_data_sent(seq); }
+        assert_eq!(a.span.as_ref().unwrap().unresolved_data_packets(), 100);
+        let k = 36613;
+        let closed = a.extra_repair_blocks_needed_now(k, k, 0, 80);
+        assert!(closed >= 92 && closed < 150, "{closed}");
+        let already = a.extra_repair_blocks_needed_now(k, k+closed, closed, 80);
+        assert_eq!(already, 0);
+        let short = a.extra_repair_blocks_needed_now(64, 64, 0, 0);
+        assert!(short >= 12 && short <= 64);
+        assert_eq!(a.extra_repair_blocks_needed_now(k, k, 0, k*2), k);
+        let initial = a.repair_blocks(k);
+        assert!(initial < 30, "tail initial {initial}");
+        a.tracker.cfg.closed_loop = false;
+        assert!(a.repair_blocks(k) > closed);
+        assert_eq!(a.extra_repair_blocks_needed_now(k, k, 0, 80), 0);
+    }
+
+    #[test]
     fn span_histograms_expire_by_time_not_packet_rate() {
         let mut s = SpanLossProfile::default();
         for i in 0..1000 { s.on_outcome(i < 10, 0, 200); }
@@ -743,5 +819,12 @@ mod tests {
         let now = std::time::Instant::now();
         for i in 0..100000 { std::hint::black_box(s.repair_blocks(2 + i % 63000, &cfg, 3.09)); }
         println!("repair_query_ns={:.2}", now.elapsed().as_nanos() as f64 / 100000.0);
+        let cfg = AdaptiveFecConfig { kind: LossEstimatorKind::SpanTail, topup: true, closed_loop: true, span_floor: SpanFloorKind::Real, eps: 0.5, ..Default::default() };
+        let mut a = FecAdaptiveState::new(cfg, 0, 0, 0);
+        for i in n..n+1000 { s.on_data_sent(i); }
+        a.span = Some(Box::new(s));
+        let now = std::time::Instant::now();
+        for _ in 0..100000 { std::hint::black_box(a.extra_repair_blocks_needed_now(36613, 36613, 0, 20)); }
+        println!("closed_loop_query_ns={:.2}", now.elapsed().as_nanos() as f64 / 100000.0);
     }
 }
