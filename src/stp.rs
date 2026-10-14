@@ -472,6 +472,8 @@ pub struct FecSendSlot {
     pub n_planned: u32,
     pub loss_estimate: f64,
     finalized_symbols: u32,
+    send_started_ns: u64,
+    original_send_duration_ns: Option<u64>,
 }
 
 // Fixed per-connection retained-source budget and slot bound. Codec arenas add their
@@ -680,7 +682,7 @@ impl UnreliableSendBuffer {
             !(r.slot.next_id >= r.slot.n && r.slot.finalized_symbols >= r.slot.next_id));
     }
 
-    fn retain_fec(&mut self, slot: FecSendSlot, package: u16) {
+    fn retain_fec(&mut self, mut slot: FecSendSlot, package: u16) {
         if slot.message.len() > FEC_RETAIN_SOURCE_BYTES || matches!(slot.encoder, FecEncoderState::Failed) && slot.k != 1 { return; }
         self.fec_prune_retained();
         self.fec_retained.retain(|r| r.package != package);
@@ -688,7 +690,12 @@ impl UnreliableSendBuffer {
         while bytes + slot.message.len() > FEC_RETAIN_SOURCE_BYTES || self.fec_retained.len() >= FEC_RETAIN_SLOTS {
             if let Some(r) = self.fec_retained.pop_front() { bytes -= r.slot.message.len(); } else { break; }
         }
-        let expires_ns = self.fec_now_ns.saturating_add(self.fec_rtt_ns.saturating_mul(6).max(2_000_000_000));
+        // Retain for at least 2 s or eight smoothed RTTs, plus the original train's
+        // send duration (slow links/queued paths). Rescue retries do not extend that duration.
+        let duration = *slot.original_send_duration_ns.get_or_insert_with(||
+            self.fec_now_ns.saturating_sub(slot.send_started_ns));
+        let hold_ns = self.fec_rtt_ns.saturating_mul(8).max(2_000_000_000).saturating_add(duration);
+        let expires_ns = self.fec_now_ns.saturating_add(hold_ns);
         self.fec_retained.push_back(RetainedFecSlot { slot, package, expires_ns });
     }
 
@@ -808,7 +815,7 @@ impl UnreliableSendBuffer {
             }
         };
         self.fec_packet_tags.get_or_insert_with(|| vec![0u64; PACKETS_WAITING_ACK_CAPACITY as usize].into_boxed_slice());
-        self.fec_send_slot = Some(FecSendSlot { finalized_symbols: 0, group_lost: vec![0; layout.groups], message, block_bytes, k, n, next_id: 0, encoder, block_buf: vec![0u8; block_bytes], first_seq: self.next_packet_seq, lost: 0, n_planned: n, loss_estimate });
+        self.fec_send_slot = Some(FecSendSlot { finalized_symbols: 0, send_started_ns: self.fec_now_ns, original_send_duration_ns: None, group_lost: vec![0; layout.groups], message, block_bytes, k, n, next_id: 0, encoder, block_buf: vec![0u8; block_bytes], first_seq: self.next_packet_seq, lost: 0, n_planned: n, loss_estimate });
     }
 
     /// Starts `msg` as the message being sent: grouped FEC if enabled and its length fits
@@ -820,7 +827,7 @@ impl UnreliableSendBuffer {
                 if self.fec_adaptive.is_some() && msg.len() <= payload_len.saturating_sub(STP_FRAGMENT_HEADER_SIZE) {
                     let slot = FecSendSlot { message: std::sync::Arc::new(msg.clone()), block_bytes: msg.len(), k: 1, n: 1, next_id: 0,
                         encoder: FecEncoderState::Failed, block_buf: Vec::new(), first_seq: self.next_packet_seq,
-                        lost: 0, group_lost: vec![0], n_planned: 1, loss_estimate: 0.0, finalized_symbols: 0 };
+                        lost: 0, group_lost: vec![0], n_planned: 1, loss_estimate: 0.0, finalized_symbols: 0, send_started_ns: self.fec_now_ns, original_send_duration_ns: Some(0) };
                     self.retain_fec(slot, self.send_package_id);
                 }
                 self.partial_send_slot = Some((msg, 0));
@@ -4252,7 +4259,7 @@ mod fec_closed_loop_tests {
         let mut f = FecSendSlot { message, block_bytes: 1433, k, n: k, next_id: k,
             encoder: FecEncoderState::Failed, block_buf: Vec::new(), first_seq: 0,
             lost: 0, group_lost: vec![0; layout.groups], n_planned: k,
-            loss_estimate: 0.0, finalized_symbols: 0 };
+            loss_estimate: 0.0, finalized_symbols: 0, send_started_ns: 0, original_send_duration_ns: None };
         f.refresh_plan(&a);
         assert!(f.n >= k + 12 * layout.groups as u32);
     }
@@ -4273,6 +4280,26 @@ mod fec_closed_loop_tests {
     }
 
     #[test]
+    fn retained_lifetime_scales_with_rtt_and_original_train() {
+        let mut b = UnreliableSendBuffer::new(100000, 1000000, 1000000);
+        b.fec_adaptive = Some(FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0));
+        b.submit_messages(vec![vec![7; 16384]]);
+        b.fec_now_ns = 1_000_000_000;
+        b.fec_rtt_ns = 400_000_000;
+        b.fec_prepare_packet(0);
+        assert!(b.next_fragment(1449, 1449).is_some());
+        let mut f = b.fec_send_slot.take().unwrap();
+        f.next_id = f.n;
+        b.fec_now_ns = 4_000_000_000;
+        b.retain_fec(f, 0);
+        assert_eq!(b.fec_retained[0].expires_ns, 10_200_000_000); // 4 + 8*0.4 + 3
+        let r = b.fec_retained.pop_front().unwrap();
+        b.fec_now_ns = 5_000_000_000;
+        b.retain_fec(r.slot, 0);
+        assert_eq!(b.fec_retained[0].expires_ns, 11_200_000_000); // original duration stays 3
+    }
+
+    #[test]
     fn retained_rescue_has_fixed_source_and_time_bounds() {
         let mut b = UnreliableSendBuffer::new(100000, 1000000, 1000000);
         b.fec_adaptive = Some(FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0));
@@ -4281,7 +4308,7 @@ mod fec_closed_loop_tests {
             let slot = FecSendSlot { message: std::sync::Arc::new(vec![0; 17 * 1024 * 1024]),
                 block_bytes: 1, k: 1, n: 1, next_id: 1, encoder: FecEncoderState::Failed,
                 block_buf: Vec::new(), first_seq: 0, lost: 0, group_lost: vec![0],
-                n_planned: 1, loss_estimate: 0.0, finalized_symbols: 0 };
+                n_planned: 1, loss_estimate: 0.0, finalized_symbols: 0, send_started_ns: 0, original_send_duration_ns: Some(0) };
             b.retain_fec(slot, package);
         }
         assert_eq!(b.fec_retained.len(), 3);
