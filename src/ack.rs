@@ -390,27 +390,24 @@ mod tests {
             for hello_udp_len in [295, 46, 359, 62] {
                 assert_ne!(hello_udp_len, ACK_PAYLOAD_LEN+22);
                 assert_ne!(hello_udp_len, ACK_PAYLOAD_LEN+6);
-                assert_ne!(hello_udp_len, 516+22);
-                assert_ne!(hello_udp_len, 516+6);
             }
         }
     }
     #[test]
     fn integrated_packet_size_inventory() {
         use crate::stp::*;
-        // (crypto, bitmap ACK, legacy ACK, minimum trimmed data, initial keepalive/probe).
+        // (crypto, bitmap ACK, minimum trimmed data, initial keepalive/probe).
         for (magic, expected) in [
-            (CONNECT_MAGIC1_PLAIN_TEXT, [158, 522, 523, 1184]),
-            (CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, [174, 538, 539, 1184]),
-            (CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b, [174, 538, 539, 1184]),
+            (CONNECT_MAGIC1_PLAIN_TEXT, [158, 523, 1184]),
+            (CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, [174, 539, 1184]),
+            (CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b, [174, 539, 1184]),
         ] {
             let overhead = total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(magic).unwrap();
-            let sizes = [ACK_PAYLOAD_LEN + overhead, std::mem::size_of::<AckField>() + overhead, 517 + overhead, 1184];
+            let sizes = [ACK_PAYLOAD_LEN + overhead, 517 + overhead, 1184];
             assert_eq!(sizes, expected);
-            for udp_len in [sizes[2], sizes[3]] {
+            for udp_len in [sizes[1], sizes[2]] {
                 assert!(udp_len - overhead >= 517);
                 assert_ne!(udp_len - overhead, 152);
-                assert_ne!(udp_len - overhead, 516);
             }
         }
         // Outer dispatch handles these before authenticated ordinary-traffic classification.
@@ -421,7 +418,6 @@ mod tests {
     fn size_cannot_collide_with_data_keepalive_or_probe() {
         use crate::stp::*;
         use crate::native_sockets::ASSUMED_UDP_PAYLOAD_SIZE_WITH_GUARANTEED_DELIVERY;
-        assert_ne!(ACK_PAYLOAD_LEN, std::mem::size_of::<AckField>());
         for magic in [CONNECT_MAGIC1_PLAIN_TEXT, CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s] {
             let overhead = total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(magic).unwrap();
             assert!(ACK_PAYLOAD_LEN + overhead < ASSUMED_UDP_PAYLOAD_SIZE_WITH_GUARANTEED_DELIVERY);

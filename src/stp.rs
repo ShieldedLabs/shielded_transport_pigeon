@@ -970,7 +970,6 @@ pub struct ConnectionStateConnected {
     pub send_sequence_number: u64,
     pub send_ack_sequence_number: u64,
     pub receive_sequences: crate::sequence::ReceiveSequences,
-    pub ack_field_virtual_base: u64,
     pub last_sent_data_packet: u64,
     pub last_sent_could_have_sent_data_packet: u64,
     pub last_ack_received_time: u64,
@@ -979,7 +978,6 @@ pub struct ConnectionStateConnected {
     pub packet_lost_since_last_print: u64,
     pub max_in_flight_since_last_print: u64,
 
-    pub ack_field: AckField,
     pub ack_timer: u64,
     pub ack_receiver: crate::ack::AckReceiver,
     /// Highest positively acknowledged peer receipt; holes are NOT declarations of loss.
@@ -990,9 +988,6 @@ pub struct ConnectionStateConnected {
     // Note(Sam): HARD ASSUMPTION that no link ever has a greater RTT than 4.295 seconds.
     pub send_time_band: [u64; 1024], // 1024 buckets of 4.194 ms giving 4.295 seconds of tracking.
     pub send_time_band_head_index: u64, // monotonic time ns / 4_194_304 aka 0x400000
-    pub curve_pacer: Option<crate::scheduling::CurvePacer>,
-    pub curve_next_tick_ns: u64,
-    pub pacing_diagnostics: bool,
     
     pub RTT_sample_sums: [u32; 16],   // sum of RTT measurements per ack, in 0.1 ms units
     pub RTT_sample_counts: [u16; 16], // count of RTT measurements per ack
@@ -1045,7 +1040,6 @@ pub fn new_connection_state_connected(cipher: Option<ConnectionCipherTriplet>, m
         send_sequence_number: 0,
         send_ack_sequence_number: crate::sequence::ACK_SPACE,
         receive_sequences: Default::default(),
-        ack_field_virtual_base: 0,
         last_sent_data_packet: 0,
         last_sent_could_have_sent_data_packet: 0,
         last_ack_received_time: timestamp_ns,
@@ -1053,7 +1047,6 @@ pub fn new_connection_state_connected(cipher: Option<ConnectionCipherTriplet>, m
         packet_since_last_print: 0,
         packet_lost_since_last_print: 0,
         max_in_flight_since_last_print: 0,
-        ack_field: Default::default(),
         ack_timer: u64::MAX,
         ack_receiver: Default::default(),
         highest_peer_acked: None,
@@ -1061,9 +1054,6 @@ pub fn new_connection_state_connected(cipher: Option<ConnectionCipherTriplet>, m
         peer_ce_count: 0,
         send_time_band: [0; 1024],
         send_time_band_head_index: 0,
-        curve_pacer: None,
-        curve_next_tick_ns: 0,
-        pacing_diagnostics: false,
         RTT_sample_sums: [0; 16],
         RTT_sample_counts: [0; 16],
         RTT_sample_cursor: 0,
@@ -1342,38 +1332,13 @@ pub fn get_send_time_for_sequence_number(sequence_number: u64, send_time_band: &
 }
 
 impl ConnectionStateConnected {
-    fn control_work_due(&self, now_ns: u64, interval_ns: u64) -> bool {
-        self.last_sent_data_packet + 5_000_000_000 < now_ns
-            || (self.tu_probe_sequence_number == u64::MAX
-                && self.current_tu < ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE as u64
-                && self.last_sent_tu_probe_time_ns + (self.tu_probe_failed_count.min(50).pow(2)*250_000_000).max(interval_ns) < now_ns)
-    }
     fn send_time(&self, sequence: u64) -> u64 {
-        match &self.curve_pacer {
-            Some(p) => p.history.lookup(sequence).unwrap_or(0),
-            None => get_send_time_for_sequence_number(sequence, &self.send_time_band, self.send_time_band_head_index),
-        }
+        get_send_time_for_sequence_number(sequence, &self.send_time_band, self.send_time_band_head_index)
     }
     fn account_send(&mut self, actual_ns: u64) {
         assert!(self.send_sequence_number < crate::sequence::ACK_SPACE - 1, "data nonce space exhausted");
-        if let Some(p) = &mut self.curve_pacer {
-            if self.pacing_diagnostics { p.observe_send(self.send_sequence_number, actual_ns); }
-            let index = self.send_sequence_number % PACKETS_WAITING_ACK_CAPACITY;
-            self.packets_waiting_ack_field[(index / 64) as usize] |= 1u64 << (index % 64);
-            self.send_sequence_number += 1;
-        } else {
-            increment_sequence_number_and_account(actual_ns, &mut self.send_sequence_number,
-                &mut self.send_time_band, &mut self.send_time_band_head_index, &mut self.packets_waiting_ack_field);
-            if self.pacing_diagnostics {
-                let estimate = self.send_time(self.send_sequence_number - 1);
-                if estimate != 0 && estimate != u64::MAX {
-                    let error = actual_ns.abs_diff(estimate);
-                    self.stats.pacing_error_samples += 1;
-                    self.stats.pacing_error_abs_sum_ns = self.stats.pacing_error_abs_sum_ns.saturating_add(error);
-                    self.stats.pacing_error_max_ns = self.stats.pacing_error_max_ns.max(error);
-                }
-            }
-        }
+        increment_sequence_number_and_account(actual_ns, &mut self.send_sequence_number,
+            &mut self.send_time_band, &mut self.send_time_band_head_index, &mut self.packets_waiting_ack_field);
     }
 }
 
@@ -1410,27 +1375,6 @@ pub fn increment_sequence_number_and_account(send_time_ns: u64, send_sequence_nu
     // equal
     *send_sequence_number += 1;
     send_time_band[(new_head_index % 1024) as usize] = *send_sequence_number;
-}
-
-/* Because rust is bad, packed is the only way for us to remove any alignment requirements and assumptions. */
-#[repr(C, packed)]
-#[derive(Clone, Copy, Debug)]
-pub struct AckField {
-    pub field_base: u32,
-    pub field: [u64; 64], // Each entry is 1 bit. 4096 entries total.
-}
-
-impl Default for AckField { fn default() -> Self { Self { field_base: 0, field: [0u64; 64], } } }
-
-impl AckField {
-    pub fn as_bytes(&self) -> &[u8] {
-        unsafe {
-            core::slice::from_raw_parts(
-                self as *const AckField as *const u8,
-                core::mem::size_of::<AckField>(),
-            )
-        }
-    }
 }
 
 pub fn get_connected<'a>(m: &'a HashMap::<ConnectionKey, ConnectionTrackingData>, k: &ConnectionKey) -> Option<&'a ConnectionTrackingData> {
@@ -2518,14 +2462,13 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             // ACK nonces are not holes in the dense data stream.
                             if !is_ack { state.rx_tracker.on_packet(nonce, &mut state.stats); }
                             
-                            if payload.len() < 516 && payload.len() != crate::ack::ACK_PAYLOAD_LEN {
-                                if OVERLY_VERBOSE { println!("Dropping from {connection_key:?}, payload < 516."); }
+                            if payload.len() < 517 && payload.len() != crate::ack::ACK_PAYLOAD_LEN {
+                                if OVERLY_VERBOSE { println!("Dropping from {connection_key:?}, payload < 517."); }
                                 break 'conn;
                             }
 
                             // ACKs remain identified ONLY by exact decrypted packet size.
-                            if payload.len() == 516 || payload.len() == crate::ack::ACK_PAYLOAD_LEN {
-                                let legacy_ack = if payload.len() == 516 { Some(unsafe { &*(payload.as_ptr() as *const AckField) }) } else { None };
+                            if payload.len() == crate::ack::ACK_PAYLOAD_LEN {
                                 let bitmap_ack = if payload.len() == crate::ack::ACK_PAYLOAD_LEN {
                                     let Some(a) = crate::ack::BitmapAck::decode(payload) else { break 'conn; };
                                     if a.highest >= state.send_sequence_number { break 'conn; }
@@ -2538,12 +2481,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 let mut RTT_count = 0u64;
                                 
                                 let mut oldest_newly_acked_send_time: u64 = u64::MAX;
-                                let legacy_indices = legacy_ack.into_iter().flat_map(|ack| {
-                                    let base = crate::sequence::extend(ack.field_base as u64, state.send_sequence_number.saturating_sub(1), 32);
-                                    (base..base+4096).filter(move |&seq| ack.field[((seq-base)/64) as usize] & (1 << ((seq-base)%64)) != 0)
-                                });
                                 let relevant_ack = bitmap_ack.as_ref().map(|a| a.relevant(&state.packets_waiting_ack_field, &state.declared_lost_field[..]));
-                                let indices = legacy_indices.chain(relevant_ack.iter().flat_map(crate::ack::BitmapAck::acknowledged));
+                                let indices = relevant_ack.iter().flat_map(crate::ack::BitmapAck::acknowledged);
                                 for index in indices {
                                     if index < state.send_sequence_number {
                                         state.highest_peer_acked = Some(state.highest_peer_acked.unwrap_or(index).max(index));
@@ -2654,65 +2593,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             }
                             // This is not an ack packet.
 
-                            if !matches!(ack_options, crate::ack::AckOptions::Legacy) {
-                                if !state.ack_receiver.receive_with_rtt(nonce as u64, timestamp_ns, ecn_marked, ack_options, &mut state.ack_timer, state.stats.rtt_us, buf_len) { break 'conn; }
-                            } else {
-                            if nonce < state.ack_field_virtual_base {
-                                if OVERLY_VERBOSE { println!("Dropping from {connection_key:?}, nonce too old."); }
-                                break 'conn;
-                            }
-                            if nonce > state.ack_field_virtual_base + (1u64 << 30) {
-                                if OVERLY_VERBOSE { println!("Dropping from {connection_key:?}, nonce too far in the future.."); }
-                                break 'conn;
-                            }
-                            
-                            let bit_index = nonce-state.ack_field_virtual_base;
-                            if nonce < state.ack_field_virtual_base + 4096 && 0 != (1u64 << (bit_index % 64)) & state.ack_field.field[bit_index as usize / 64] {
-
-                                if OVERLY_VERBOSE { println!("Dropping from {connection_key:?}, nonce already received."); }
-                                break 'conn;
-                            }
-
-                            if nonce >= state.ack_field_virtual_base + 4096 {
-                                // ACK traffic has its own space and does not require data-ring capacity.
-                                { // send ack
-                                    let mut o = 0;
-                                    let virtual_nonce = state.send_ack_sequence_number;
-                                    o += existing_connection.two_byte_send_prefix.write_to(&mut packet_memory_send[o..]);
-                                    o += crate::sequence::to_wire(virtual_nonce).write_to(&mut packet_memory_send[o..]);
-                                    state.send_ack_sequence_number = state.send_ack_sequence_number.checked_add(1).expect("ACK nonce space exhausted");
-
-                                    if let Some(cipher) = &mut state.cipher { o += cipher.current.write_message(virtual_nonce, state.ack_field.as_bytes(), &mut packet_memory_send[o..]).unwrap(); }
-                                    else { o += state.ack_field.as_bytes().write_to(&mut packet_memory_send[o..]); }
-                                    let ack_ecn = take_ecn_echo(state);
-                                    udp_send_with_congestion_and_dscp(socket, existing_connection.other_ip, existing_connection.other_port, &packet_memory_send[..o], Dscp::Af21, ack_ecn);
-                                    state.stats.ack_packets_sent += 1;
-                                    state.stats.ack_bytes_sent += o as u64;
-                                    state.ack_timer = u64::MAX;
-                                }
-
-                                if nonce >= state.ack_field_virtual_base + 4096 + 2048 {
-                                    state.ack_field_virtual_base = nonce;
-                                    state.ack_field.field_base = nonce as u32;
-                                    state.ack_field.field = [0u64; 64];
-                                }
-                                else if nonce >= state.ack_field_virtual_base + 4096 {
-                                    state.ack_field_virtual_base += 2048;
-                                    state.ack_field.field_base = state.ack_field_virtual_base as u32;
-                                    let mut field = state.ack_field.field;
-                                    let (bottom, top) = field.split_at_mut(32);
-                                    bottom.copy_from_slice(top);
-                                    top.fill(0);
-                                    state.ack_field.field = field;
-                                }
-                            }
-
-                            let bit_index = nonce-state.ack_field_virtual_base;
-                            state.ack_field.field[bit_index as usize / 64] |= 1u64 << (bit_index % 64);
-                            if ecn_marked { state.ecn_echo_pending = true; }
-                            if state.ack_timer == u64::MAX { state.ack_timer = timestamp_ns + ACK_BUFFER_TIME_NS; }
-
-                            }
+                            if !state.ack_receiver.receive_with_rtt(nonce as u64, timestamp_ns, ecn_marked, ack_options, &mut state.ack_timer, state.stats.rtt_us, buf_len) { break 'conn; }
 
                             // A legitimate data packet could never this state because to be all zeroes the
                             // first fragment would have to be package_id=0 and frag_len=0. If so that is
@@ -2982,7 +2863,6 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                         }
                     }
                     ConnectionState::Connected(state) => {
-                        state.pacing_diagnostics = pacing_diagnostics;
                         debug_assert!(state.magic2 != 0, "Connection entered Connected state without negotiating magic2");
                         if state.last_ack_received_time + 15_000_000_000 < current_time_now_ns {
                             if VERBOSE { println!("Disconnected from: {:?}.", connection_tracking_data.other_transport_identity); }
@@ -2997,35 +2877,20 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 o += crate::sequence::to_wire(virtual_nonce).write_to(&mut packet_memory_send[o..]);
                                 state.send_ack_sequence_number = state.send_ack_sequence_number.checked_add(1).expect("ACK nonce space exhausted");
                                 
-                                let encoded;
-                                let ack_payload = match ack_options {
-                                    crate::ack::AckOptions::Legacy => state.ack_field.as_bytes(),
-                                    crate::ack::AckOptions::LowLatency { .. } | crate::ack::AckOptions::Adaptive { .. } => {
-                                        let a = state.ack_receiver.ack(current_time_now_ns);
-                                        state.stats.ack_delay_us_max = state.stats.ack_delay_us_max.max(a.delay_us);
-                                        encoded = a.encode();
-                                        &encoded[..]
-                                    }
-                                };
+                                let a = state.ack_receiver.ack(current_time_now_ns);
+                                state.stats.ack_delay_us_max = state.stats.ack_delay_us_max.max(a.delay_us);
+                                let encoded = a.encode();
+                                let ack_payload = &encoded[..];
                                 if let Some(cipher) = &mut state.cipher { o += cipher.current.write_message(virtual_nonce, ack_payload, &mut packet_memory_send[o..]).unwrap(); }
                                 else { o += ack_payload.write_to(&mut packet_memory_send[o..]); }
-                                let ack_ecn = matches!(ack_options, crate::ack::AckOptions::Legacy) && take_ecn_echo(state);
                                 state.ack_receiver.sent(current_time_now_ns);
                                 state.stats.ack_packets_sent += 1;
                                 state.stats.ack_bytes_sent += o as u64;
-                                udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_send[..o], Dscp::Af21, ack_ecn);
+                                udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_send[..o], Dscp::Af21, false);
                                 state.ack_timer = u64::MAX;
                             }
                         }
                         
-                        if let Some(cadence) = curve_cadence_ns {
-                            if current_time_now_ns < state.curve_next_tick_ns { return true; }
-                            state.curve_next_tick_ns = current_time_now_ns + cadence;
-                            if state.curve_pacer.is_none() {
-                                state.curve_pacer = Some(crate::scheduling::CurvePacer::new(current_time_now_ns, state.send_sequence_number));
-                            }
-                        }
-
                         if state.RTT_sample_cursor != 0 && state.last_ack_received_time + 15_000_000_000/2 < current_time_now_ns {
                             // blackhole detected, go to safe TU
                             state.current_tu = ASSUMED_UDP_PAYLOAD_SIZE_WITH_GUARANTEED_DELIVERY as u64;
@@ -3141,7 +3006,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                         // NOTE(Sam): We may experience black holes if RTT suddenly increases since
                         // there is a cyclic dependency beteen RTT and measuring RTT because of drop.
                         
-                        let time_to_considered_dropped = ((state.RTT_mean as f64 * 100_000.0 * cc.loss_timeout_rtts) as u64).max((2*(current_time_now_ns - state.last_ack_received_time)).min(1_000_000_000)) + curve_cadence_ns.unwrap_or(0);
+                        let time_to_considered_dropped = ((state.RTT_mean as f64 * 100_000.0 * cc.loss_timeout_rtts) as u64).max((2*(current_time_now_ns - state.last_ack_received_time)).min(1_000_000_000));
                         
                         // every send site (data loop, tu probe, keepalive, both ack paths) gates on ring space, so head never laps tail
                         assert!(state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY);
@@ -3155,7 +3020,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     break;
                                 }
                                 if send_time == 0 {
-                                    let history_ns = if state.curve_pacer.is_some() { crate::scheduling::HISTORY_TIME_NS } else { 4_295_000_000 };
+                                    let history_ns = 4_295_000_000;
                                     send_time = current_time_now_ns.saturating_sub(history_ns);
                                 }
                                 
@@ -3250,26 +3115,6 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             state.send_pacer_acc_ns -= time_between_sends_ns;
                             packet_send_allowance_now += 1;
                         }
-                        let has_work = connection_tracking_data.unreliable_send_buffer.has_unsent_data()
-                            || state.control_work_due(current_time_now_ns, time_between_sends_ns);
-                        let curve_tick_ns = if curve_cadence_ns.is_some() { monotonic_clock_ns() } else { current_time_now_ns };
-                        let mut curve_cpu_late = false;
-                        if let Some(p) = &mut state.curve_pacer {
-                            let cadence = curve_cadence_ns.unwrap();
-                            // Permit one normal tick plus wake/work jitter, never
-                            // an unbounded CPU catch-up burst of stale credit.
-                            p.stop_if_late(curve_tick_ns, state.send_sequence_number, cadence * 2);
-                            state.curve_next_tick_ns = curve_tick_ns + cadence;
-                            let key = (state.congestion_event_time_ns, state.congestion_event_rate_upps, time_to_bandwidth_recovery, state.is_app_limited);
-                            packet_send_allowance_now = p.begin(curve_tick_ns, state.send_sequence_number, has_work, key, |origin| {
-                                if state.is_app_limited {
-                                    crate::scheduling::PacketSchedule::constant(allowed_bandwidth_upps as f64 / 1e6, crate::scheduling::CONTROLLER_HORIZON_NS).unwrap()
-                                } else {
-                                    crate::scheduling::controller_schedule(origin.saturating_sub(state.congestion_event_time_ns), state.congestion_event_rate_upps,
-                                        time_to_bandwidth_recovery, &cc, crate::scheduling::CONTROLLER_HORIZON_NS).expect("valid CC polynomial")
-                                }
-                            });
-                        }
                         let pacing_first_sequence = state.send_sequence_number;
                         state.stats.pacing_commanded_packets += packet_send_allowance_now;
                         let could_have_sent = packet_send_allowance_now != 0;
@@ -3277,7 +3122,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                         // ring space is checked live at each send site below so the head can never lap the tail within a tick
 
                         state.current_tu = state.current_tu.min(ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE as u64);
-                        if state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY - 1 && (curve_cadence_ns.is_none() || packet_send_allowance_now > 0) && state.current_tu != ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE as u64 && state.tu_probe_sequence_number == u64::MAX && state.last_sent_tu_probe_time_ns + (state.tu_probe_failed_count.min(50)*state.tu_probe_failed_count.min(50)*250_000_000).max(time_between_sends_ns) < current_time_now_ns {
+                        if state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY - 1 && state.current_tu != ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE as u64 && state.tu_probe_sequence_number == u64::MAX && state.last_sent_tu_probe_time_ns + (state.tu_probe_failed_count.min(50)*state.tu_probe_failed_count.min(50)*250_000_000).max(time_between_sends_ns) < current_time_now_ns {
                             state.tu_probe_size_advance = state.tu_probe_size_advance.max(1).min(ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE as u64);
                             state.tu_probe_size = (state.current_tu + state.tu_probe_size_advance).min(ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE as u64);
                             let payload_size = state.tu_probe_size as usize - total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(state.magic1).unwrap();
@@ -3302,13 +3147,12 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             connection_tracking_data.unreliable_send_buffer.fec_prepare_packet(state.send_sequence_number);
                             state.account_send(send_time_ns);
                             state.last_sent_tu_probe_time_ns = send_time_ns;
-                            if curve_cadence_ns.is_some() { packet_send_allowance_now = packet_send_allowance_now.saturating_sub(1); }
                             state.packet_since_last_print += 1;
                         }
                         
                         let payload_size = state.current_tu as usize - total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(state.magic1).unwrap();
                         
-                        if state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY - 1 && (curve_cadence_ns.is_none() || packet_send_allowance_now > 0) && state.last_sent_data_packet + 15_000_000_000/3 < current_time_now_ns {
+                        if state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY - 1 && state.last_sent_data_packet + 15_000_000_000/3 < current_time_now_ns {
                             let null_bytes = [0u8; ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE];
                         
                             let virtual_nonce = state.send_sequence_number;
@@ -3354,11 +3198,6 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                         }
                         let mut unreliable_payload_size = 0;
                         while state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY - 1 && packet_send_allowance_now > 0 && state.packets_in_flight < allowed_packets_in_flight && {
-                            // Bound work within a burst as well as debt between
-                            // ticks. Test BEFORE removing a fragment from its queue.
-                            curve_cpu_late = curve_burst_budget_ns.is_some_and(|budget| monotonic_clock_ns() >= curve_tick_ns.saturating_add(budget));
-                            !curve_cpu_late
-                        } && {
                             connection_tracking_data.unreliable_send_buffer.fec_prepare_packet(state.send_sequence_number);
                             unreliable_payload_size = fill_packet_payload_with_unreliable_fragments(&mut packet_memory_send[0..payload_size], &mut connection_tracking_data.unreliable_send_buffer);
                             unreliable_payload_size > 0
@@ -3410,24 +3249,6 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             state.stats.pacing_burst_hist[class] += 1;
                         }
                         let has_data = connection_tracking_data.unreliable_send_buffer.has_unsent_data();
-                        // Pending keepalive/probe work must be allowed to earn its
-                        // first slot, even when the application queue is empty.
-                        let has_work = has_data || state.control_work_due(current_time_now_ns, time_between_sends_ns);
-                        if let Some(p) = &mut state.curve_pacer {
-                            let reason = if !has_work { Some(crate::scheduling::StopReason::QueueEmpty) }
-                                else if curve_cpu_late { Some(crate::scheduling::StopReason::CpuLate) }
-                                else if packet_send_allowance_now > 0 { Some(crate::scheduling::StopReason::InFlight) }
-                                else { None };
-                            let finish_ns = monotonic_clock_ns();
-                            p.finish(if reason.is_some() { finish_ns } else { curve_tick_ns }, state.send_sequence_number, reason);
-                            // An OS deschedule can happen within the final send;
-                            // do not carry that execution debt into another tick.
-                            p.stop_if_late(finish_ns, state.send_sequence_number, curve_cadence_ns.unwrap() * 2);
-                            state.stats.pacing_error_samples = p.error_samples;
-                            state.stats.pacing_error_abs_sum_ns = p.error_abs_sum_ns;
-                            state.stats.pacing_error_max_ns = p.error_max_ns;
-                            state.stats.pacing_history_records = p.history.len() as u64;
-                        }
                         // Pause the active curve, not its rate divided by PG.
                         // The latter only represents the uncapped legacy phase;
                         // growth envelopes can be far below PG at that age.
@@ -3466,22 +3287,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                 // Idle: sleep instead of spinning on a core. 150us is well below
                 // any packet-arrival timescale here and keeps the thread parked when quiet.
                 if should_sleep {
-                    let sleep_ns = if let Some(cadence) = curve_cadence_ns {
-                        let now = monotonic_clock_ns();
-                        connections_map.values().filter_map(|c| match &c.connection_state {
-                            ConnectionState::Connected(s) => Some(s.curve_next_tick_ns.min(s.ack_timer).saturating_sub(now)),
-                            _ => None,
-                        }).min().unwrap_or(cadence).min(cadence)
-                    } else { 150_000 };
-                    if sleep_ns != 0 {
-                        if curve_cadence_ns.is_some() {
-                            // An application push wakes the shared network thread,
-                            // not the data pacer: send ticks stay cadence-gated.
-                            std::thread::park_timeout(std::time::Duration::from_nanos(sleep_ns));
-                        } else {
-                            std::thread::sleep(std::time::Duration::from_nanos(sleep_ns));
-                        }
-                    }
+                    std::thread::sleep(std::time::Duration::from_nanos(150_000));
                 }
             }
         }
@@ -3878,50 +3684,6 @@ mod congestion_tests {
     }
 
     #[test]
-    fn polynomial_pacing_falls_back_only_for_unmirrored_curves() {
-        let legacy = CongestionControlOptions::legacy();
-        let startup = CongestionControlOptions { startup_multiplier: 1.25, ..legacy };
-        let proportional = CongestionControlOptions { proportional_growth: true,
-            bound_recovery_growth: true, compound_growth: true, relative_growth_per_rtt: 0.02, ..legacy };
-        let loss_response = CongestionControlOptions { loss_response_fraction_ppm: 30_000,
-            ecn_event_guard_rtts: 1.0, startup_backoff_rtts: 2.0, ..legacy };
-        for cadence_ms in [1, 2, 5, 10] {
-            let pacing = PacingOptions::Polynomial { cadence_ms };
-            for cc in [legacy, CongestionControlOptions::default(), CongestionControlOptions::balanced(), loss_response] {
-                assert!(cc.validate().is_ok());
-                assert_eq!(pacing.cadence_ns(&cc), Some(cadence_ms * 1_000_000));
-            }
-            for cc in [startup, proportional] {
-                assert!(cc.validate().is_ok());
-                assert_eq!(pacing.cadence_ns(&cc), None);
-            }
-        }
-        assert_eq!(PacingOptions::Precise.cadence_ns(&legacy), None);
-        assert_eq!(PacingOptions::Precise.cadence_ns(&startup), None);
-        assert_eq!(PacingOptions::Precise.cadence_ns(&proportional), None);
-    }
-
-    #[test]
-    fn loss_cohort_uses_polynomial_execution_history() {
-        use crate::scheduling::{CurvePacer, PacketSchedule, CONTROLLER_HORIZON_NS};
-        let ConnectionState::Connected(mut state) = new_connection_state_connected(None, 0, 1, 1) else { unreachable!() };
-        let mut pacer = CurvePacer::new(1_000_000_000, 9);
-        let schedule = |_| PacketSchedule::constant(100.0, CONTROLLER_HORIZON_NS).unwrap();
-        assert_eq!(pacer.begin(1_000_000_000, 9, true, (1, 1, 1, false), schedule), 0);
-        pacer.finish(1_000_000_000, 9, None);
-        assert_eq!(pacer.begin(1_200_000_000, 9, true, (1, 1, 1, false), schedule), 20);
-        pacer.finish(1_200_000_000, 29, None);
-        state.curve_pacer = Some(pacer);
-        // Polynomial execution does not populate the precise pacer's timestamp band.
-        assert_eq!(get_send_time_for_sequence_number(9, &state.send_time_band, state.send_time_band_head_index), u64::MAX);
-        let mut window = LossResponseWindow::default();
-        for i in 0..10 {
-            assert_eq!(window.on_packet(state.send_time(9 + i), i < 2, 100_000_000, 30_000, 2), None);
-        }
-        assert_eq!(window.on_packet(state.send_time(19), false, 100_000_000, 30_000, 2), Some(1_020_000_000));
-    }
-
-    #[test]
     fn actual_loss_fraction_uses_completed_send_cohort() {
         assert_eq!(std::mem::size_of::<LossResponseWindow>(), 40);
         let mut window = LossResponseWindow::default();
@@ -4221,23 +3983,18 @@ mod congestion_tests {
 }
 
 #[cfg(test)]
-mod polynomial_pacing_tests {
+mod precise_pacing_tests {
     use super::*;
 
     #[test]
-    fn low_rate_polynomial_handshake_and_idle_then_burst() {
-        for (cadence_ms, pps) in [(2, 100), (5, 100), (2, 10)] {
+    fn low_rate_precise_handshake_and_idle_then_burst() {
+        for pps in [100, 10] {
             let port = std::net::UdpSocket::bind("[::1]:0").unwrap().local_addr().unwrap().port();
             let server_key = new_keypair_from_connect_magic1(CONNECT_MAGIC1_PLAIN_TEXT).unwrap();
             let address = STPAddress { ip: Ipv6Addr::LOCALHOST, port, magic1: CONNECT_MAGIC1_PLAIN_TEXT, key: server_key.public.clone() };
             let key = address.to_connection_key();
-            let opts = || NetworkThreadOptions {
-                pacing: PacingOptions::Polynomial { cadence_ms },
-                congestion_control: CongestionControlOptions { initial_rate_upps: pps * 1_000_000, rate_floor_upps: pps * 1_000_000, ..CongestionControlOptions::legacy() },
-                ..Default::default()
-            };
-            let server = new_network_thread_with_options(vec![server_key], port, None, (1_000_000,1<<20,1<<20), opts());
-            let client = new_network_thread_with_options(vec![new_keypair_from_connect_magic1(CONNECT_MAGIC1_PLAIN_TEXT).unwrap()], 0, None, (1_000_000,1<<20,1<<20), opts());
+            let server = new_network_thread(vec![server_key], port, Some(pps), (1_000_000,1<<20,1<<20));
+            let client = new_network_thread(vec![new_keypair_from_connect_magic1(CONNECT_MAGIC1_PLAIN_TEXT).unwrap()], 0, Some(pps), (1_000_000,1<<20,1<<20));
             service_connections(&client, NetworkThreadPush { initiate_connections: vec![address], ..Default::default() }).unwrap();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             let mut wanted = Vec::new();
@@ -4246,7 +4003,7 @@ mod polynomial_pacing_tests {
                 let p = service_connections(&client, NetworkThreadPush::default()).unwrap();
                 if !p.current_connections.is_empty() { wanted = p.current_connections; }
                 if p.connection_stats.iter().any(|(_, s)| s.packets_sent > 0 && s.rtt_us > 0) { break; }
-                assert!(std::time::Instant::now() < deadline, "{pps}pps/poly{cadence_ms} idle handshake stalled");
+                assert!(std::time::Instant::now() < deadline, "{pps}pps/precise idle handshake stalled");
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
             std::thread::sleep(std::time::Duration::from_millis(150));
@@ -4256,18 +4013,18 @@ mod polynomial_pacing_tests {
                 let p = service_connections(&server, NetworkThreadPush::default()).unwrap();
                 for (_, message) in p.received_unreliable_messages { assert_eq!(message, vec![42; 1000]); received += 1; }
                 service_connections(&client, NetworkThreadPush { wanted_connections: wanted.clone(), ..Default::default() }).unwrap();
-                assert!(std::time::Instant::now() < deadline, "{pps}pps/poly{cadence_ms} burst stalled");
+                assert!(std::time::Instant::now() < deadline, "{pps}pps/precise burst stalled");
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
         }
     }
 
     #[test]
-    fn idle_polynomial_peer_sends_control_without_application_data() {
+    fn idle_precise_peer_sends_control_without_application_data() {
         let port = std::net::UdpSocket::bind("[::1]:0").unwrap().local_addr().unwrap().port();
         let server_key = new_keypair_from_connect_magic1(CONNECT_MAGIC1_PLAIN_TEXT).unwrap();
         let address = STPAddress { ip: Ipv6Addr::LOCALHOST, port, magic1: CONNECT_MAGIC1_PLAIN_TEXT, key: server_key.public.clone() };
-        let opts = || NetworkThreadOptions { pacing: PacingOptions::Polynomial { cadence_ms: 10 }, ..Default::default() };
+        let opts = NetworkThreadOptions::default;
         let server = new_network_thread_with_options(vec![server_key], port, None, (1_000_000,1<<20,1<<20), opts());
         let client = new_network_thread_with_options(vec![new_keypair_from_connect_magic1(CONNECT_MAGIC1_PLAIN_TEXT).unwrap()], 0, None, (1_000_000,1<<20,1<<20), opts());
         service_connections(&client, NetworkThreadPush { initiate_connections: vec![address], ..Default::default() }).unwrap();
@@ -4278,7 +4035,7 @@ mod polynomial_pacing_tests {
             if p.connection_stats.iter().any(|(_,s)| s.packets_sent > 0 && s.rtt_us > 0) { return; }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        panic!("idle peer never emitted a curve-paced keepalive / probe or acquired RTT");
+        panic!("idle peer never emitted a precise-paced keepalive / probe or acquired RTT");
     }
 }
 
