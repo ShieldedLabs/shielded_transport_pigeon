@@ -16,6 +16,14 @@
 //! Transport policy is fixed: slow110 loss/ECN packet-rate control, precise pacing,
 //! adaptive bitmap ACKs and grouped Wirehair span-tail FEC with closed-loop top-up.
 //! There are no CC, ACK, FEC or pacer tuning flags.
+//! --queues N: fixed sender magazines; ordinary data ids map to id % N.
+//! --traffic-classes be,af11,af21,ef: one class or one per queue.
+//! --workload bulk|bulk-small|dueling --duration S: saturated 50 MiB trains;
+//! bulk-small adds independent 1000 B Poisson arrivals (--small-rate 20, --small-class ef).
+//! With one queue they share its FIFO, with >=2 queues small messages use queue 1.
+//! dueling saturates every configured queue (--bulk-size B can shorten trains).
+//! These modes stop producing at S, then drain accepted messages up to --timeout seconds.
+//! Reports include per-queue completion goodput/last-byte p50,p99, plus fixed-window goodput.
 //! --duration S: saturated measurement for S seconds; requests receiver status while sending.
 //! --send-on-ms N --send-off-ms N: application submission duty cycle (queued packets drain normally).
 //! --loss-episodes 1: record loss episode diagnostics without changing control behaviour.
@@ -88,7 +96,7 @@ impl Args {
             "count" | "min" | "max" | "timeout" | "idle" | "out" | "giant" |
             "giant-warmup" | "queue-us" | "queue-min" | "queue-max" | "max-pps" |
             "duration" | "send-on-ms" | "send-off-ms" | "mix" | "classes" |
-            "loss-trace" | "loss-episodes")
+            "loss-trace" | "loss-episodes" | "queues" | "workload" | "bulk-size" | "small-rate" | "traffic-classes" | "small-class")
     }
     fn parse(it: impl Iterator<Item = String>) -> Args {
         let mut m = HashMap::new();
@@ -177,7 +185,7 @@ fn main() {
     let args = Args::parse(argv);
     match mode.as_str() {
         "serve" => serve(&args),
-        "send" => send(&args),
+        "send" => if args.str("workload").is_some() { send_magazines(&args) } else { send(&args) },
         _ => die("usage: stp_bench serve --port P [--bind IP] [--advertise IP] [--seed-key HEX64] | stp_bench send --to STPADDR [--seed N] [--count N] [--min B] [--max B] [--timeout S] [--idle S] [--out FILE]"),
     }
 }
@@ -217,7 +225,7 @@ fn serve(a: &Args) {
     let kp = new_keypair_from_connect_magic1_with_seed(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, seed).unwrap();
     let addr = STPAddress::from(to_v6(advertise), port, &kp);
 
-    let handle = new_network_thread_with_options(vec![kp], port, max_pps(a), send_buffer_params(a), NetworkThreadOptions { bind_ip: bind, ..Default::default() });
+    let handle = new_network_thread_with_options(vec![kp], port, max_pps(a), send_buffer_params(a), NetworkThreadOptions { bind_ip: bind, send_queue_count: a.num("queues", 1), ..Default::default() });
     println!("stp_bench serve: bound {}:{port}", bind.map(|b| b.to_string()).unwrap_or("[::]".into()));
     println!("STP address: {:?}", addr);
 
@@ -440,7 +448,7 @@ fn send(a: &Args) {
     }
 
     let kp = new_keypair_from_connect_magic1(to.magic1).unwrap_or_else(|| die("unsupported crypto in --to"));
-    let handle = new_network_thread_with_options(vec![kp], 0, max_pps(a), send_buffer_params(a), NetworkThreadOptions { bind_ip: None, record_loss_episodes: a.num::<u8>("loss-episodes", 0) != 0, record_fec_messages: true, loss_trace: a.str("loss-trace").map(std::path::PathBuf::from), ..Default::default() });
+    let handle = new_network_thread_with_options(vec![kp], 0, max_pps(a), send_buffer_params(a), NetworkThreadOptions { send_queue_count: a.num("queues", 1), bind_ip: None, record_loss_episodes: a.num::<u8>("loss-episodes", 0) != 0, record_fec_messages: true, loss_trace: a.str("loss-trace").map(std::path::PathBuf::from), ..Default::default() });
     // Per data id: (k, blocks sent, blocks planned, loss estimate) of its FEC coding, if coded.
     let mut fec_info: HashMap<u32, (u32, u32, u32, f64)> = HashMap::new();
     // One sample per second, with the CC command and queue-empty transition count.
@@ -520,7 +528,10 @@ fn send(a: &Args) {
     let mut pending: VecDeque<Vec<u8>> = VecDeque::new();
     let mut produced = 0u32;
     let mut first_submit_ns: Vec<Option<u64>> = vec![None; count as usize];
-    let mut free: u64 = u64::MAX;
+    let nqueues = a.num::<usize>("queues", 1);
+    if !(1..=64).contains(&nqueues) { die("--queues must be 1..=64"); }
+    let traffic = traffic_classes(a, nqueues);
+    let mut free = vec![u64::MAX; nqueues];
     let mut start_ns: Option<u64> = None;
     let mut all_queued = false;
     let mut last_status_req: Option<Instant> = None;
@@ -544,16 +555,25 @@ fn send(a: &Args) {
             if start_ns.is_some() { generator_wait_ns += ns() - t; }
         }
         let in_off_period = start_ns.is_some_and(|s| send_duty_off(ns() - s, on_ns, off_ns));
-        let mut budget = if in_off_period { 0 } else { free };
+        let mut budget = if in_off_period { vec![0; nqueues] } else { free.clone() };
         let mut send_now: Outbox = Vec::new();
-        while let Some(m) = pending.front() {
+        let mut index = 0;
+        let mut blocked = vec![false; nqueues];
+        let mut sent_empty = vec![false; nqueues];
+        while index < pending.len() {
+            let m = &pending[index];
+            let id = u32_at(m, 0) as usize;
+            let q = id % nqueues;
             let len = m.len() as u64;
-            if budget == u64::MAX { if !send_now.is_empty() { break; } } else if len > budget { break; } else { budget -= len; }
-            let m = pending.pop_front().unwrap();
+            if blocked[q] || (budget[q] == u64::MAX && sent_empty[q]) || (budget[q] != u64::MAX && len > budget[q]) {
+                blocked[q] = true; index += 1; continue;
+            }
+            if budget[q] == u64::MAX { sent_empty[q] = true; } else { budget[q] -= len; }
+            let m = pending.remove(index).unwrap();
             let t = ns();
             start_ns.get_or_insert(t);
-            first_submit_ns[u32_at(&m, 0) as usize].get_or_insert(t);
-            send_now.push((key, 0, Dscp::BestEffort, m));
+            first_submit_ns[id].get_or_insert(t);
+            send_now.push((key, q, traffic[q], m));
         }
         let mut sent_status = false;
         if (all_queued || a.str("duration").is_some()) && last_status_req.is_none_or(|t| t.elapsed() > Duration::from_secs(1)) {
@@ -571,7 +591,7 @@ fn send(a: &Args) {
             rejected_total += 1;
             pending.push_front(m);
         }
-        free = p.unreliable_send_free_bytes.iter().find(|(k, q, _)| *k == key && *q == 0).map(|x| x.2).unwrap_or(0);
+        for &(k, q, bytes) in &p.unreliable_send_free_bytes { if k == key { free[q] = bytes; } }
         if let Some((_, st)) = p.connection_stats.iter().find(|(k, _)| *k == key) { stats = *st; }
         sender_thread = p.thread_stats;
         for (k, m) in &p.fec_messages {
@@ -603,7 +623,7 @@ fn send(a: &Args) {
         // Idle stop: once every message has been queued and the queue has been seen empty, all
         // data is on the wire (nothing but the 1 s status request is queued after that). From that
         // first drain, stop after --idle s in which the server reported nothing new.
-        if all_queued && free == u64::MAX && last_drained.is_none() {
+        if all_queued && free.iter().all(|b| *b == u64::MAX) && last_drained.is_none() {
             last_drained = Some(Instant::now());
             last_change = Instant::now();
         }
@@ -763,6 +783,8 @@ fn send(a: &Args) {
         stats.pacing_burst_hist.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","),
         stats.pacing_commanded_packets, stats.pacing_error_samples, stats.pacing_error_abs_sum_ns, stats.pacing_error_max_ns, stats.pacing_history_records,
         stats.network_cpu_user_us, stats.network_cpu_sys_us, sender_cpu_user_us, sender_cpu_sys_us, load_start, load_average());
+    let queues = queue_report(nqueues, &sizes, &(0..count).map(|id| id as usize % nqueues).collect::<Vec<_>>(), &first_submit_ns, &recs, offset, wall_s, None);
+    json.insert_str(json.len() - 2, &format!(",\"queues\":[{}]", queues.join(",")));
     let block_sizes = fec_info.iter().map(|(&id, &(k, _, _, _))| format!("\"{id}\":{}", sizes[id as usize].div_ceil(k as usize))).collect::<Vec<_>>().join(",");
     json.insert_str(json.len() - 2, &format!(",\"udp_payload_tu\":{},\"fec_block_bytes_by_id\":{{{block_sizes}}},\"tu_warmup_seconds\":{warmup_elapsed_s:.6},\"receiver_fec_decode_last_tail_ms\":{:.3},\"receiver_fec_decode_max_tail_ms\":{:.3},\"receiver_fec_ingress_dropped_blocks\":{}",
         stats.udp_payload_tu, rx.st.fec_decode_last_tail_ns as f64 / 1e6, rx.st.fec_decode_max_tail_ns as f64 / 1e6, rx.st.fec_ingress_dropped_blocks));
@@ -774,4 +796,162 @@ fn send(a: &Args) {
     println!("report written to {out}");
     drop(handle); // A traced run joins the network thread and flushes its event CSV.
     std::process::exit(if delivered == count as u64 { 0 } else { 1 });
+}
+
+fn traffic_classes(a: &Args, queues: usize) -> Vec<Dscp> {
+    let v: Vec<Dscp> = a.str("traffic-classes").unwrap_or("be").split(',').map(|c| match c {
+        "be" => Dscp::BestEffort, "af11" => Dscp::Af11, "af21" => Dscp::Af21, "ef" => Dscp::Ef,
+        _ => die("--traffic-classes needs be,af11,af21,ef (one or one per queue)"),
+    }).collect();
+    if v.len() == 1 { vec![v[0]; queues] } else if v.len() == queues { v } else { die("wrong number of traffic classes") }
+}
+
+fn queue_report(n: usize, sizes: &[usize], queue_ids: &[usize], submitted: &[Option<u64>], recs: &HashMap<u32, (bool, u64)>, offset: i128, wall: f64, cutoff: Option<f64>) -> Vec<String> {
+    (0..n).map(|q| {
+        let mut lat = Vec::new(); let mut bytes = 0u64; let mut count = 0;
+        for (id, &size) in sizes.iter().enumerate().filter(|(id, _)| queue_ids[*id] == q) {
+            if let Some(&(true, t)) = recs.get(&(id as u32)) {
+                let recv = (t as i128 - offset) as f64;
+                if cutoff.is_some_and(|c| recv > c) { continue; }
+                count += 1; bytes += size as u64;
+                if let Some(s) = submitted[id] { lat.push((recv - s as f64) / 1e6); }
+            }
+        }
+        lat.sort_by(f64::total_cmp);
+        let gp = bytes as f64 * 8.0 / 1e6 / wall;
+        println!("queue {q}: {count} delivered, {gp:.3} Mbit/s, last-byte latency p50 {} ms p99 {} ms", jnum(pct(&lat, 50.0)), jnum(pct(&lat, 99.0)));
+        format!("{{\"queue\":{q},\"delivered\":{count},\"delivered_bytes\":{bytes},\"goodput_Mbitps\":{gp:.6},\"latency_ms_p50\":{},\"latency_ms_p99\":{}}}", jnum(pct(&lat, 50.0)), jnum(pct(&lat, 99.0)))
+    }).collect()
+}
+
+/// Saturated magazines: bulk queues have at most one pending producer message each; tiny
+/// arrivals are generated independently, so the producer itself cannot hide sender HOL.
+/// Small latencies start at Poisson arrival, including app backpressure in the single-queue case.
+fn send_magazines(a: &Args) {
+    let mode = a.str("workload").unwrap();
+    if !matches!(mode, "bulk" | "bulk-small" | "dueling") { die("--workload must be bulk, bulk-small or dueling"); }
+    let n = a.num::<usize>("queues", if mode == "dueling" { 2 } else { 1 });
+    if !(1..=64).contains(&n) || mode == "dueling" && n < 2 { die("invalid queue count"); }
+    let traffic = traffic_classes(a, n);
+    let duration = a.num::<f64>("duration", 40.0);
+    let small_rate = a.num::<f64>("small-rate", 20.0);
+    if !(0.0..=600.0).contains(&duration) || duration == 0.0 || !small_rate.is_finite() || small_rate <= 0.0 { die("invalid workload duration/rate"); }
+    let bulk_size = a.num::<usize>("bulk-size", 50<<20).clamp(HEADER, MAX_JUMBOGRAM_LEN);
+    let to = STPAddress::parse(a.str("to").unwrap_or_else(|| die("send needs --to"))).unwrap_or_else(|| die("bad --to"));
+    let key = to.to_connection_key();
+    let kp = new_keypair_from_connect_magic1(to.magic1).unwrap();
+    let handle = new_network_thread_with_options(vec![kp], 0, max_pps(a), send_buffer_params(a), NetworkThreadOptions { send_queue_count: n, record_fec_messages: true, ..Default::default() });
+    let mut wanted = service_connections(&handle, NetworkThreadPush { initiate_connections: vec![to], ..Default::default() }).unwrap().current_connections;
+    let mut outbox = Vec::new();
+    let epoch = Instant::now(); let ns = || epoch.elapsed().as_nanos() as u64;
+    let mut pings = Vec::new();
+    let mut sent_ping = 0;
+    let mut last_ping = Instant::now() - Duration::from_secs(1);
+    while pings.len() < 10 {
+        if epoch.elapsed() > Duration::from_secs(40) { die("no connection/ping replies"); }
+        if wanted.iter().any(|(a, _)| a.connection_key() == key) && last_ping.elapsed() >= Duration::from_millis(100) && sent_ping < 10 {
+            outbox.push((key, 0, Dscp::BestEffort, ctrl(PING, &ns().to_le_bytes())));
+            last_ping = Instant::now(); sent_ping += 1;
+        }
+        let p = poll(&handle, &mut outbox, &mut wanted);
+        outbox.extend(p.send_unreliable_rejected);
+        for (_, data) in p.received_unreliable_messages {
+            if let Parsed::Ok(PONG, pl) = parse(&data) && pl.len() == 16 {
+                let (t0, ts, t1) = (u64_at(pl, 0), u64_at(pl, 8), ns());
+                pings.push((t1-t0, ts as i128 - (t0 as i128 + t1 as i128)/2));
+            }
+        }
+        std::thread::sleep(Duration::from_micros(300));
+    }
+    pings.sort(); let offset = pings[0].1;
+    // Reuse bulk payload/hash; IDs are outside the hashed payload. Generation is not measured.
+    let template = frame(0, bulk_size-HEADER, |p| p.fill(0x55));
+    let start = ns(); let cutoff = start as f64 + duration * 1e9;
+    let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(a.num("seed", 1));
+    let mut next_small = -rng.random::<f64>().max(f64::MIN_POSITIVE).ln() / small_rate;
+    let bulk_queues = if mode == "dueling" { n } else { 1 };
+    let small_queue = if n > 1 { 1 } else { 0 };
+    let small_class = match a.str("small-class") { None => traffic[small_queue], Some("be") => Dscp::BestEffort, Some("af11") => Dscp::Af11, Some("af21") => Dscp::Af21, Some("ef") => Dscp::Ef, _ => die("bad --small-class") };
+    let control_queue = if n > 1 && mode != "dueling" { 1 } else { 0 };
+    let mut pending: Vec<VecDeque<(u32, Vec<u8>)>> = (0..n).map(|_| VecDeque::new()).collect();
+    let mut sizes = Vec::new(); let mut ids = Vec::new(); let mut submitted = Vec::new(); let mut small_ids = Vec::new();
+    let mut recs = HashMap::new(); let mut stats = ConnectionStats::default();
+    let mut free = vec![u64::MAX; n]; let mut last_status = Instant::now()-Duration::from_secs(1);
+    let mut drained = false; let mut last_growth = Instant::now(); let mut last_delivery = start as f64;
+    let drain_limit = a.num::<u64>("timeout", 180);
+    loop {
+        let elapsed = (ns()-start) as f64/1e9;
+        if elapsed < duration {
+            if mode == "bulk-small" {
+                while next_small <= elapsed && next_small < duration {
+                    let id = sizes.len() as u32;
+                    let m = frame(id, 1000-HEADER, |p| p.fill(0x77));
+                    sizes.push(1000); ids.push(small_queue); submitted.push(Some(start+(next_small*1e9) as u64)); small_ids.push(id);
+                    pending[small_queue].push_back((id, m));
+                    next_small += -rng.random::<f64>().max(f64::MIN_POSITIVE).ln()/small_rate;
+                }
+            }
+            for q in 0..bulk_queues {
+                // Keep one whole bulk train standing in the transport, not two 50 MiB trains.
+                if pending[q].is_empty() && free[q] == u64::MAX {
+                    let id = sizes.len() as u32; let mut m = template.clone();
+                    m[..4].copy_from_slice(&id.to_le_bytes());
+                    sizes.push(bulk_size); ids.push(q); submitted.push(None);
+                    pending[q].push_back((id, m));
+                }
+            }
+        }
+        for q in 0..n {
+            let mut budget = free[q];
+            let mut sent_empty = false;
+            while let Some((id, m)) = pending[q].front() {
+                if budget == u64::MAX { if sent_empty { break; } sent_empty = true; }
+                else if m.len() as u64 > budget { break; } else { budget -= m.len() as u64; }
+                submitted[*id as usize].get_or_insert_with(&ns);
+                let (_, m) = pending[q].pop_front().unwrap();
+                let class = if small_ids.binary_search(&u32_at(&m, 0)).is_ok() { small_class } else { traffic[q] };
+                outbox.push((key, q, class, m));
+            }
+        }
+        if last_status.elapsed() >= Duration::from_secs(1) {
+            outbox.push((key, control_queue, traffic[control_queue], ctrl(STATUS_REQ, &(sizes.len() as u32).to_le_bytes())));
+            last_status = Instant::now();
+        }
+        let p = poll(&handle, &mut outbox, &mut wanted);
+        for (_, q, _c, m) in p.send_unreliable_rejected.into_iter().rev() {
+            let id = u32_at(&m, 0);
+            if id < CTRL_BASE { pending[q].push_front((id, m)); }
+        }
+        for &(k, q, b) in &p.unreliable_send_free_bytes { if k == key { free[q] = b; } }
+        if let Some((_, st)) = p.connection_stats.iter().find(|(k, _)| *k == key) { stats = *st; }
+        for (_, d) in p.received_unreliable_messages {
+            if let Parsed::Ok(STATUS, pl) = parse(&d) && pl.len() >= 4 {
+                let count = u32_at(pl, 0) as usize;
+                if pl.len() < 4+13*count { continue; }
+                for i in 0..count {
+                    let at = 4+13*i; let id = u32_at(pl, at); let ok = pl[at+4] != 0; let t = u64_at(pl, at+5);
+                    if recs.insert(id, (ok, t)).is_none() { last_growth = Instant::now(); }
+                    if ok { last_delivery = last_delivery.max((t as i128-offset) as f64); }
+                }
+            }
+        }
+        if elapsed >= duration {
+            drained |= pending.iter().all(VecDeque::is_empty) && free.iter().all(|&b| b == u64::MAX);
+            if recs.len() == sizes.len() || drained && last_growth.elapsed() > Duration::from_secs(a.num("idle", 10)) || elapsed > duration+drain_limit as f64 { break; }
+        }
+        std::thread::sleep(Duration::from_micros(300));
+    }
+    let wall = (last_delivery-start as f64)/1e9;
+    let queues = queue_report(n, &sizes, &ids, &submitted, &recs, offset, wall, None);
+    let window = queue_report(n, &sizes, &ids, &submitted, &recs, offset, duration, Some(cutoff));
+    let small_sizes: Vec<_> = small_ids.iter().map(|_| 1000).collect();
+    let small_times: Vec<_> = small_ids.iter().map(|&i| submitted[i as usize]).collect();
+    let small_recs: HashMap<_, _> = small_ids.iter().enumerate().filter_map(|(i, id)| recs.get(id).map(|r| (i as u32, *r))).collect();
+    let small = queue_report(1, &small_sizes, &vec![0; small_ids.len()], &small_times, &small_recs, offset, wall, None);
+    let delivered = recs.values().filter(|r| r.0).count();
+    let bytes: u64 = recs.iter().filter(|(_, r)| r.0).map(|(id, _)| sizes[*id as usize] as u64).sum();
+    let gp = bytes as f64*8.0/1e6/wall;
+    let json = format!("{{\"workload\":\"{mode}\",\"num_queues\":{n},\"duration_seconds\":{duration},\"wall_seconds\":{wall:.6},\"total_messages\":{},\"delivered\":{delivered},\"goodput_Mbitps\":{gp:.6},\"wire_bytes_per_delivered_byte\":{:.6},\"queues\":[{}],\"window_queues\":[{}],\"small\":{},\"rtt_ms_min\":{:.3},\"latency_method\":\"last-byte delivery minus first bulk submission or scheduled Poisson small arrival; ping offset error <= RTT/2\"}}\n", sizes.len(), stats.bytes_sent as f64/bytes.max(1) as f64, queues.join(","), window.join(","), small[0], pings[0].0 as f64/1e6);
+    println!("{delivered}/{} delivered, total goodput {gp:.3} Mbit/s", sizes.len());
+    std::fs::write(a.str("out").unwrap_or("stp_bench_report.json"), json).unwrap();
 }
