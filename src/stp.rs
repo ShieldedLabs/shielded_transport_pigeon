@@ -603,8 +603,14 @@ impl UnreliableSendBuffer {
                     tag[..l].copy_from_slice(&f.message[..l]);
                     rec.push(crate::fec_adapt::FecMessageInfo { tag: u64::from_le_bytes(tag), message_len: f.message.len(), k: f.k, n_planned: f.n_planned, n_sent: f.next_id, loss_estimate: f.loss_estimate, lost_during_send: f.lost });
                 }
-                self.queue_bytes_filled -= f.message.len();
-                self.fec_send_slot = None;
+                let message_len = f.message.len();
+                self.queue_bytes_filled -= message_len;
+                let finished = self.fec_send_slot.take();
+                // Giant codec arenas can take seconds to free under allocator contention.
+                // Do not stop ACK processing while returning them (and the source Arc).
+                if message_len > MAX_RECV_QUEUE_BYTES {
+                    let _ = std::thread::Builder::new().name("stp-fec-release".into()).spawn(move || drop(finished));
+                }
                 self.send_package_id = self.send_package_id.wrapping_add(1);
             }
         }
@@ -612,7 +618,7 @@ impl UnreliableSendBuffer {
 
     /// Block size for an FEC message started in a packet with `payload_len` bytes of payload:
     /// one block plus its header fills the packet. None if the message should go plain (FEC
-    /// off, or fewer than 2 / more than 64000 blocks).
+    /// off, fewer than 2 blocks, or outside the grouped wire length limit).
     fn fec_block_bytes(&self, message_len: usize, payload_len: usize) -> Option<usize> {
         if self.fec_redundancy_ppm == 0 { return None; }
         let block_bytes = payload_len.checked_sub(STP_FEC_FRAGMENT_HEADER_SIZE)?.min(0x3fff);
@@ -645,8 +651,8 @@ impl UnreliableSendBuffer {
         self.fec_send_slot = Some(FecSendSlot { message, block_bytes, k, n, next_id: 0, encoder, block_buf: vec![0u8; block_bytes], first_seq: self.next_packet_seq, lost: 0, n_planned: n, loss_estimate });
     }
 
-    /// Starts `msg` as the message being sent: FEC-coded if enabled and it has 2..=64000 blocks
-    /// at this packet size, plain otherwise.
+    /// Starts `msg` as the message being sent: grouped FEC if enabled and its length fits
+    /// the wire format with at least two blocks at this packet size, plain otherwise.
     fn start_message(&mut self, msg: Vec<u8>, payload_len: usize) {
         match self.fec_block_bytes(msg.len(), payload_len) {
             Some(block_bytes) => self.start_fec(std::sync::Arc::new(msg), block_bytes),
@@ -1017,6 +1023,8 @@ pub const RATE_FLOOR_UPPS: u64 = 100 * 1_000_000;
 pub struct ConnectionStats {
     /// Current smoothed RTT in microseconds (0 until sampled).
     pub rtt_us: u64,
+    /// Current path transmission unit, including STP header/tag inside the UDP payload.
+    pub udp_payload_tu: u64,
     /// Sequenced packets sent (data and keepalive), and their UDP payload bytes. Acks,
     /// handshake packets and transmission-unit probes are not counted.
     pub packets_sent: u64,
@@ -1070,6 +1078,12 @@ pub struct ConnectionStats {
     pub rx_insert_failures: u64,
     /// Fragments of a package older than the one holding their slot (dropped).
     pub rx_stale_fragments: u64,
+    /// Worker delivery minus its last successfully enqueued FEC fragment, on receiver's
+    /// monotonic clock. Completion can precede surplus repair packets arriving.
+    pub fec_decode_last_tail_ns: u64,
+    pub fec_decode_max_tail_ns: u64,
+    /// Authenticated FEC fragments erased by the bounded decoder ingress queue.
+    pub fec_ingress_dropped_blocks: u64,
 }
 
 /// Burst-length class boundaries of `ConnectionStats::rx_burst_hist` (inclusive upper bounds).
@@ -1458,6 +1472,8 @@ pub struct FecRecvSlot {
     state: FecRecvState,
     /// Blocks handed to this slot's decoder (for loss accounting on eviction).
     blocks_received: u32,
+    last_block_ns: u64,
+    ingress_dropped: u64,
 }
 
 #[derive(Default)]
@@ -1544,16 +1560,9 @@ fn fec_receive_block(
             let guard = FecWorkerGuard(workers.clone(), reserve);
             let r = std::thread::Builder::new().name("stp-fec-decode".into()).spawn(move || {
                 let _guard = guard;
-                let Some(mut dec) = MessageDecoder::new(message_len, block_bytes) else { return; };
-                while let Ok((id, block)) = rx.recv() {
-                    match dec.add(id, &block) {
-                        Ok(DecodeStatus::NeedMore) | Err(DecodeError::BadBlock) => {}
-                        Ok(DecodeStatus::Done) => {
-                            if let Some(m) = dec.recover() { let _ = done_tx.send((connection_key, package_id, m)); }
-                            return;
-                        }
-                        Err(DecodeError::Failed(_)) => return,
-                    }
+                let Some(layout) = MessageLayout::new(message_len, block_bytes) else { return; };
+                if let Some(m) = decode_message_blocks(layout, rx, MAX_FEC_INGRESS_BYTES) {
+                    let _ = done_tx.send((connection_key, package_id, m));
                 }
             });
             if r.is_ok() { spawned = Some(tx); }
@@ -1573,7 +1582,8 @@ fn fec_receive_block(
         FecRecvState::Worker { tx, .. } => {
             // The worker is gone once it has decoded (or failed): nothing more to do.
             match tx.try_send((block_id, data.to_vec())) {
-                Ok(()) | Err(std::sync::mpsc::TrySendError::Full(_)) => {} // overflow is an erasure, not a network-thread stall
+                Ok(()) => slot.last_block_ns = monotonic_clock_ns(),
+                Err(std::sync::mpsc::TrySendError::Full(_)) => slot.ingress_dropped += 1, // an erasure, not a network-thread stall
                 Err(std::sync::mpsc::TrySendError::Disconnected(_)) => slot.state = FecRecvState::Done,
             }
             None
@@ -1885,6 +1895,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                     ConnectionState::Connected(c) => {
                         let mut st = c.stats;
                         st.seq_numbers_used = c.send_sequence_number;
+                        st.udp_payload_tu = c.current_tu;
                         c.rx_tracker.provisional_bursts(&mut st);
                         if let Some(a) = &value.unreliable_send_buffer.fec_adaptive {
                             st.fec_loss_estimate = a.p;
@@ -2466,10 +2477,12 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                             *plain = ReassemblySlot::new();
                                         }
                                     }
+                                    let dropped_before = existing_connection.unreliable_fec[slot_idx].ingress_dropped;
                                     if let Some(message) = fec_receive_block(&mut existing_connection.unreliable_fec[slot_idx], connection_key, package_id, message_len, block_bytes, block_id, data, &fec_done_tx, &fec_workers) {
                                         state.stats.rx_messages_completed += 1;
                                         receive_queue.push(connection_key, message, MAX_RECV_QUEUE_BYTES);
                                     }
+                                    state.stats.fec_ingress_dropped_blocks += existing_connection.unreliable_fec[slot_idx].ingress_dropped - dropped_before;
                                     continue;
                                 }
                                 
@@ -2560,8 +2573,14 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                     if let Some(conn) = connections_map.get_mut(&key) {
                         let idx = package_id as usize % conn.unreliable_fec.len();
                         let slot = &mut conn.unreliable_fec[idx];
-                        if slot.package_id == package_id && slot.in_use() { slot.state = FecRecvState::Done; }
-                        if let ConnectionState::Connected(c) = &mut conn.connection_state { c.stats.rx_messages_completed += 1; }
+                        if slot.package_id != package_id || !slot.in_use() { continue; } // evicted worker completion
+                        let tail = monotonic_clock_ns().saturating_sub(slot.last_block_ns);
+                        slot.state = FecRecvState::Done;
+                        if let ConnectionState::Connected(c) = &mut conn.connection_state {
+                            c.stats.rx_messages_completed += 1;
+                            c.stats.fec_decode_last_tail_ns = tail;
+                            c.stats.fec_decode_max_tail_ns = c.stats.fec_decode_max_tail_ns.max(tail);
+                        }
                         receive_queue.push(key, message, MAX_RECV_QUEUE_BYTES);
                     }
                 }
@@ -3498,6 +3517,29 @@ mod fec_send_tests {
         let key = ConnectionKey { ip: std::net::Ipv6Addr::LOCALHOST, port: 1, key_15_bits: 0 };
         assert!(fec_receive_block(&mut slot, key, 0, 300 * 32, 32, 0, &[0;32], &done, &workers).is_none());
         assert!(matches!(slot.state, FecRecvState::Done)); // never an inline large solve on overload
+    }
+
+    #[test]
+    fn oversized_message_bypasses_only_empty_queues() {
+        let mut b = new_buf(0);
+        b.min_queue_size_bytes = 64;
+        b.max_queue_size_bytes = 64;
+        let m = msg(65);
+        assert_eq!(b.free_bytes(), u64::MAX);
+        assert_eq!(b.submit_messages(vec![m.clone(), vec![1]]), vec![vec![1]]);
+        assert_eq!(b.queue_bytes_filled, 65);
+        assert_eq!(b.free_bytes(), 0);
+        assert_eq!(drain(&mut b, 1000, 2).into_iter().flatten().next().unwrap().4, m);
+        assert_eq!(b.free_bytes(), u64::MAX);
+
+        let mut rx = ReceiveQueue::default();
+        let key = ConnectionKey::default();
+        rx.push(key, vec![1], 64);
+        rx.push(key, m.clone(), 64);
+        assert_eq!(rx.messages.len(), 1);
+        assert_eq!(rx.messages[0].1, m);
+        assert_eq!(rx.dropped_messages, 1);
+        assert!(rx.bytes > 64);
     }
 
     #[test]
