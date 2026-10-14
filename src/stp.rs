@@ -517,6 +517,31 @@ pub const MAX_FEC_REDUNDANCY_PPM: u32 = 1_000_000;
 /// the network thread (well under 1 ms); bigger ones use a helper thread.
 pub const FEC_INLINE_MAX_BLOCKS: usize = 256;
 
+// These are scheduling quanta, not rate limits. Receive capacity must cover even
+// a peer ACKing every packet; drain until empty, but do not let a flood starve sends.
+const MAX_RECV_PACKETS_PER_TICK: usize = 64;
+const MAX_SEND_PACKETS_PER_TICK: u64 = 64;
+// Retain at most 2 ms of quantum-limited catch-up credit. Old scheduling delays
+// must not become an ever-growing burst that stops ACK service and inflates RTT.
+const MAX_SEND_CATCHUP_NS: u64 = 2_000_000;
+
+#[derive(Debug)]
+struct SendPacingGrant { packets: u64, carry_ns: u64 }
+
+fn send_pacing_grant(elapsed_ns: u64, interval_ns: u64, credit_ns: u64) -> SendPacingGrant {
+    let budget = elapsed_ns.saturating_add(credit_ns);
+    let due = budget / interval_ns;
+    let packets = due.min(MAX_SEND_PACKETS_PER_TICK);
+    let carry_ns = if due > packets {
+        (budget - packets * interval_ns).min(MAX_SEND_CATCHUP_NS)
+    } else {
+        // Do not cap fractional credit: at low rates a single packet can take
+        // much longer than 2 ms. Keeping the remainder makes the pps rate exact.
+        budget % interval_ns
+    };
+    SendPacingGrant { packets, carry_ns }
+}
+
 pub enum UnreliableFragment<'a> {
     Plain { is_fin: bool, package_id: u16, data: &'a [u8], offset: u32 },
     Fec { package_id: u16, message_len: u32, block_bytes: u16, block_id: u32, data: &'a [u8] },
@@ -2251,11 +2276,13 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                 let mut should_sleep = true;
                 
 //////// BEGIN RECEIVE ////////////////////////////////////////////////////////////////////////
-                for _recv_round in 0..1 { // single-iteration loop: `continue` below skips the rest of this packet
+                // Drain ACKs before sending again. Bound the batch so a busy peer cannot
+                // monopolize the thread; the socket is nonblocking, so stop as soon as empty.
+                for _recv_round in 0..MAX_RECV_PACKETS_PER_TICK { // `continue` skips this packet
                     let (buf_len, other_ip_addr, other_port, ecn_marked, ecn_enabled, service_class, timestamp_ns) =
                         match udp_recv_with_congestion_and_dscp(socket, &mut packet_memory_encrypted[..]) {
                             Ok(r) => r,
-                            Err(_) => continue,
+                            Err(_) => break,
                         };
                     if buf_len < 6 { continue; }
                     
@@ -3279,14 +3306,9 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                         // ns = (10^6 / upps) * 10^9 = 10^15 / upps
                         let time_between_sends_ns = 1_000_000_000_000_000 / allowed_bandwidth_upps.max(1);
                         // This is some Unity Game developer level crap approximation but it will have to do.
-                        let mut packet_send_allowance_now = (current_time_now_ns + 1 - state.last_sent_could_have_sent_data_packet.max(state.last_ack_received_time.saturating_sub(ACK_BUFFER_TIME_NS))) / time_between_sends_ns;
-                        let send_allowance_time_remainder = (current_time_now_ns + 1 - state.last_sent_could_have_sent_data_packet.max(state.last_ack_received_time.saturating_sub(ACK_BUFFER_TIME_NS)))
-                                                                - time_between_sends_ns*packet_send_allowance_now;
-                        
-                        if state.send_pacer_acc_ns > time_between_sends_ns {
-                            state.send_pacer_acc_ns -= time_between_sends_ns;
-                            packet_send_allowance_now += 1;
-                        }
+                        let elapsed_ns = current_time_now_ns + 1 - state.last_sent_could_have_sent_data_packet.max(state.last_ack_received_time.saturating_sub(ACK_BUFFER_TIME_NS));
+                        let grant = send_pacing_grant(elapsed_ns, time_between_sends_ns, state.send_pacer_acc_ns);
+                        let mut packet_send_allowance_now = grant.packets;
                         let has_work = connection_tracking_data.unreliable_send_buffer.has_unsent_data()
                             || state.control_work_due(current_time_now_ns, time_between_sends_ns);
                         let curve_tick_ns = if curve_cadence_ns.is_some() { monotonic_clock_ns() } else { current_time_now_ns };
@@ -3479,7 +3501,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                         if could_have_sent {
                             state.last_sent_could_have_sent_data_packet = current_time_now_ns;
                             if packet_send_allowance_now == 0 {
-                                state.send_pacer_acc_ns += send_allowance_time_remainder;
+                                state.send_pacer_acc_ns = grant.carry_ns;
                             }
                             else {
                                 state.send_pacer_acc_ns = 0;
@@ -4078,6 +4100,34 @@ mod congestion_tests {
         apply_loss_congestion(&mut state, 10*rtt, 12*rtt, &cc, None);
         assert_eq!(state.congestion_event_rate_upps, connection_rate(8*rtt, r, k, &cc, false).0);
         assert!(state.cc_startup_done);
+    }
+
+    #[test]
+    fn send_quantum_bounds_backlog_without_losing_normal_rate_credit() {
+        let g = send_pacing_grant(700_000_000, 10_000, 0);
+        assert_eq!(g.packets, MAX_SEND_PACKETS_PER_TICK);
+        assert_eq!(g.carry_ns, MAX_SEND_CATCHUP_NS);
+        let next = send_pacing_grant(0, 10_000, g.carry_ns);
+        assert_eq!(next.packets, MAX_SEND_PACKETS_PER_TICK);
+        assert_eq!(next.carry_ns, 1_360_000);
+
+        // A modest delayed grant is split across ticks, never silently lost.
+        let first = send_pacing_grant(1_000_003, 10_000, 0);
+        let second = send_pacing_grant(0, 10_000, first.carry_ns);
+        assert_eq!(first.packets + second.packets, 100);
+        assert_eq!(second.carry_ns, 3);
+
+        // Fractional credit keeps exactly 100 pps even with 150 us polling;
+        // this also covers credit larger than the catch-up cap at low rates.
+        let mut credit = 0;
+        let mut packets = 0;
+        for _ in 0..20_000 {
+            let g = send_pacing_grant(150_000, 10_000_000, credit);
+            packets += g.packets;
+            credit = g.carry_ns;
+        }
+        assert_eq!(packets, 300);
+        assert_eq!(credit, 0);
     }
 
     #[test]
