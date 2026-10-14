@@ -223,7 +223,7 @@ fn serve(a: &Args) {
 
     let epoch = Instant::now();
     let mut wanted = Vec::new();
-    let mut outbox: Vec<(ConnectionKey, usize, Vec<u8>)> = Vec::new();
+    let mut outbox: Vec<(ConnectionKey, usize, Dscp, Vec<u8>)> = Vec::new();
     let mut peers: HashMap<ConnectionKey, PeerLog> = HashMap::new();
     let mut last_progress = Instant::now();
     let mut progress_dirty = false;
@@ -247,7 +247,7 @@ fn serve(a: &Args) {
                 Parsed::Ok(PING, pl) if pl.len() == 8 => {
                     let mut r = pl.to_vec();
                     r.extend_from_slice(&now_ns.to_le_bytes());
-                    outbox.push((key, 0, ctrl(PONG, &r)));
+                    outbox.push((key, 0, Dscp::BestEffort, ctrl(PONG, &r)));
                 }
                 Parsed::Ok(STATUS_REQ, pl) if pl.len() == 4 => {
                     p.expected = Some(u32_at(pl, 0));
@@ -263,7 +263,7 @@ fn serve(a: &Args) {
                     let words = RxReport { st, th: thread_stats, cpu_user_us, cpu_sys_us }.to_words();
                     r.extend_from_slice(&(words.len() as u32).to_le_bytes());
                     for w in words { r.extend_from_slice(&w.to_le_bytes()); }
-                    outbox.push((key, 0, ctrl(STATUS, &r)));
+                    outbox.push((key, 0, Dscp::BestEffort, ctrl(STATUS, &r)));
                     if !p.reported_complete && p.recs.len() as u32 >= u32_at(pl, 0) {
                         p.reported_complete = true;
                         print_peer(&key, p);
@@ -326,7 +326,7 @@ fn giant_size(s: &str) -> Option<usize> {
     (HEADER..=MAX_JUMBOGRAM_LEN).contains(&bytes).then_some(bytes)
 }
 
-type Outbox = Vec<(ConnectionKey, usize, Vec<u8>)>;
+type Outbox = Vec<(ConnectionKey, usize, Dscp, Vec<u8>)>;
 type Wanted = Vec<(STPAddress, [u8; 64])>;
 
 fn poll(handle: &NetworkThreadHandle, outbox: &mut Outbox, wanted: &mut Wanted) -> NetworkThreadPull {
@@ -477,7 +477,7 @@ fn send(a: &Args) {
     while pings.len() < 10 && ping_phase.elapsed() < Duration::from_secs(40) {
         sent_pings += 1;
         let before = pings.len();
-        outbox.push((key, 0, ctrl(PING, &ns().to_le_bytes())));
+        outbox.push((key, 0, Dscp::BestEffort, ctrl(PING, &ns().to_le_bytes())));
         let until = Instant::now() + Duration::from_secs(3);
         while Instant::now() < until && pings.len() == before {
             let p = poll(&handle, &mut outbox, &mut wanted);
@@ -553,17 +553,17 @@ fn send(a: &Args) {
             let t = ns();
             start_ns.get_or_insert(t);
             first_submit_ns[u32_at(&m, 0) as usize].get_or_insert(t);
-            send_now.push((key, 0, m));
+            send_now.push((key, 0, Dscp::BestEffort, m));
         }
         let mut sent_status = false;
         if (all_queued || a.str("duration").is_some()) && last_status_req.is_none_or(|t| t.elapsed() > Duration::from_secs(1)) {
-            outbox.push((key, 0, ctrl(STATUS_REQ, &count.to_le_bytes())));
+            outbox.push((key, 0, Dscp::BestEffort, ctrl(STATUS_REQ, &count.to_le_bytes())));
             last_status_req = Some(Instant::now());
             sent_status = true;
         }
         outbox.extend(send_now);
         let p = poll(&handle, &mut outbox, &mut wanted);
-        for (_, _, m) in p.send_unreliable_rejected.into_iter().rev() {
+        for (_, _, _, m) in p.send_unreliable_rejected.into_iter().rev() {
             if u32_at(&m, 0) >= CTRL_BASE {
                 if sent_status { last_status_req = None; } // retry next tick
                 continue;
