@@ -12,6 +12,7 @@
 //! --cc-floor-pps, --cc-start-pps, --cc-min-growth-ppsps, --cc-max-growth-ppsps,
 //! --cc-guard-rtts.
 //! --duration S: saturated measurement for S seconds; requests receiver status while sending.
+//! --send-on-ms N --send-off-ms N: application submission duty cycle (queued packets drain normally).
 //! estimator_series rows: [seconds, FEC estimate, sample, sent packets, losses, UDP bytes, RTT us].
 //! --fec-pct X (send only): forward error correction redundancy in percent (float); messages of
 //! 2+ packets get X% extra Wirehair-coded blocks. The server needs no flag: it decodes either.
@@ -323,6 +324,20 @@ fn poll(handle: &NetworkThreadHandle, outbox: &mut Outbox, wanted: &mut Wanted) 
     p
 }
 
+fn send_duty_off(elapsed_ns: u64, on_ns: u64, off_ns: u64) -> bool {
+    off_ns != 0 && elapsed_ns % (on_ns + off_ns) >= on_ns
+}
+
+#[test]
+fn send_duty_boundaries() {
+    assert!(!send_duty_off(0, 2000, 2000));
+    assert!(!send_duty_off(1999, 2000, 2000));
+    assert!(send_duty_off(2000, 2000, 2000));
+    assert!(send_duty_off(3999, 2000, 2000));
+    assert!(!send_duty_off(4000, 2000, 2000));
+    assert!(!send_duty_off(u64::MAX, 2000, 0));
+}
+
 fn send(a: &Args) {
     let to = STPAddress::parse(a.str("to").unwrap_or_else(|| die("send needs --to STPADDR"))).unwrap_or_else(|| die("bad --to address"));
     let seed: u64 = a.num("seed", 1);
@@ -331,6 +346,9 @@ fn send(a: &Args) {
     let max: usize = a.num("max", 50_000_000);
     let timeout = Duration::from_secs(a.num("duration", a.num("timeout", 600)));
     let idle = Duration::from_secs(a.num("idle", 10));
+    let on_ns = a.num::<u64>("send-on-ms", 2000).saturating_mul(1_000_000);
+    let off_ns = a.num::<u64>("send-off-ms", 0).saturating_mul(1_000_000);
+    if on_ns == 0 || on_ns.checked_add(off_ns).is_none() { die("invalid send duty cycle"); }
     let out = a.str("out").unwrap_or("stp_bench_report.json").to_string();
     let fec_pct: f64 = a.str("fec-pct").map(|s| s.parse().unwrap_or_else(|_| die("bad --fec-pct"))).unwrap_or(0.0);
     if !(0.0..=100.0).contains(&fec_pct) { die("--fec-pct must be in 0..=100"); }
@@ -493,7 +511,8 @@ fn send(a: &Args) {
             produced += 1;
             if start_ns.is_some() { generator_wait_ns += ns() - t; }
         }
-        let mut budget = free;
+        let in_off_period = start_ns.is_some_and(|s| send_duty_off(ns() - s, on_ns, off_ns));
+        let mut budget = if in_off_period { 0 } else { free };
         let mut send_now: Outbox = Vec::new();
         while let Some(m) = pending.front() {
             let len = m.len() as u64;
