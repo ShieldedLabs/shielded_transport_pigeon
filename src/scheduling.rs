@@ -402,7 +402,22 @@ impl ExecutionHistory {
                 return;
             }
         }
-        self.records.push_back(record);
+        if let Some(last) = self.records.back_mut().filter(|r| {
+            r.stop.is_none()
+                && record.stop.is_none()
+                && r.end_sequence == record.first_sequence
+                && r.origin_ns == record.origin_ns
+                && r.base_sequence == record.base_sequence
+                && r.count_offset == record.count_offset
+                && std::sync::Arc::ptr_eq(&r.schedule, &record.schedule)
+        }) {
+            // Without per-batch actual timestamp corrections, adjacent executed
+            // intervals on the same curve are exactly one invertible segment.
+            last.end_sequence = record.end_sequence;
+            last.end_ns = record.end_ns;
+        } else {
+            self.records.push_back(record);
+        }
         self.evict(now);
     }
     fn evict(&mut self, now: u64) {
@@ -658,7 +673,12 @@ mod tests {
         p.finish(0, base, None);
         for i in 1..5000 {
             let now = i * 1_000_000;
-            assert_eq!(p.begin(now, base + i - 1, true, key, schedule), 1);
+            // Force controller replacement every tick to exercise the hard cap,
+            // independently of the coalescing fast path.
+            assert_eq!(
+                p.begin(now, base + i - 1, true, (i, 1, 1, false), schedule),
+                1
+            );
             p.finish(now, base + i, None);
             assert!(p.history.len() <= MAX_HISTORY_RECORDS);
         }
@@ -668,10 +688,64 @@ mod tests {
         assert!(p.history.is_empty());
     }
     #[test]
+    fn coalescing_is_independent_of_packet_rate_and_cadence() {
+        for pps in [1000u64, 1_000_000] {
+            let mut p = CurvePacer::new(0, 0);
+            let schedule = |_| PacketSchedule::constant(pps as f64, CONTROLLER_HORIZON_NS).unwrap();
+            let key = (1, 1, 1, false);
+            p.begin(0, 0, true, key, schedule);
+            p.finish(0, 0, None);
+            for i in 1..=1000 {
+                let seq = (i - 1) * pps / 1000;
+                assert_eq!(p.begin(i * 1_000_000, seq, true, key, schedule), pps / 1000);
+                p.finish(i * 1_000_000, seq + pps / 1000, None);
+            }
+            assert!(
+                p.history.len() <= 4,
+                "{} records at {pps} pps",
+                p.history.len()
+            );
+            assert_eq!(p.history.lookup(pps - 1), Some(1_000_000_000));
+            assert_eq!(p.history.lookup(0), Some(1_000_000_000 / pps));
+        }
+    }
+    #[test]
+    fn fractional_credit_survives_controller_replacements() {
+        let mut p = CurvePacer::new(0, 0);
+        let schedule = |_| PacketSchedule::constant(100.5, CONTROLLER_HORIZON_NS).unwrap();
+        p.begin(0, 0, true, (0, 1, 1, false), schedule);
+        p.finish(0, 0, None);
+        let mut sequence = 0;
+        for i in 1..=100 {
+            sequence += p.begin(i * 10_000_000, sequence, true, (i, 1, 1, false), schedule);
+            assert_eq!(sequence, (i as f64 * 1.005).floor() as u64);
+            p.finish(i * 10_000_000, sequence, None);
+        }
+        assert_eq!(sequence, 100);
+    }
+    #[test]
+    fn flat_polynomial_piece_has_no_packets() {
+        let s = PacketSchedule::new(vec![
+            PacketPolynomial::from_rate(&[2.0], 1_000_000_000).unwrap(),
+            PacketPolynomial::from_rate(&[0.0], 1_000_000_000).unwrap(),
+            PacketPolynomial::from_rate(&[2.0], 1_000_000_000).unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(s.count(1_500_000_000), 2.0);
+        assert_eq!(s.inverse(2.0), Some(1_000_000_000));
+        assert_eq!(s.inverse(3.0), Some(2_500_000_000));
+        assert_eq!(s.rate(1_500_000_000), 0.0);
+    }
+    #[test]
     fn controller_derivative_matches_pps_across_phases_caps_floor() {
         for cc in [
             crate::stp::CongestionControlOptions::legacy(),
             crate::stp::CongestionControlOptions::balanced(),
+            crate::stp::CongestionControlOptions {
+                rate_floor_upps: 800_000_000,
+                initial_rate_upps: 1_000_000_000,
+                ..crate::stp::CongestionControlOptions::legacy()
+            },
         ] {
             for k in [1_000_000, 30_000_000, 1_800_000_000] {
                 for t in [0, k / 2, k, k * 2, k * 5, k * 15, k * 20, k * 30] {
