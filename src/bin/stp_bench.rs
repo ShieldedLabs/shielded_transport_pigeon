@@ -170,6 +170,7 @@ fn cc_options(a: &Args) -> CongestionControlOptions {
     cc.relative_growth_per_rtt = a.num("cc-relative-growth", cc.relative_growth_per_rtt);
     cc.bound_recovery_growth = a.num::<u8>("cc-bound-recovery-growth", u8::from(cc.bound_recovery_growth)) != 0;
     cc.compound_growth = a.num::<u8>("cc-compound-growth", u8::from(cc.compound_growth)) != 0;
+    cc.startup_multiplier = a.num("cc-startup-multiplier", cc.startup_multiplier);
     cc.record_loss_episodes = a.num::<u8>("cc-record-loss-episodes", u8::from(cc.record_loss_episodes)) != 0;
     if let Err(e) = cc.validate() { die(e); }
     cc

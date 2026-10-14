@@ -933,6 +933,8 @@ pub struct ConnectionStateConnected {
     pub send_pacer_acc_ns: u64,
     pub congestion_event_time_ns: u64,
     pub congestion_event_rate_upps: u64,
+    /// Startup exits only on a genuine loss/ECN event, never on RTT/delivery signals.
+    pub cc_startup_done: bool,
     pub stats: ConnectionStats,
     pub loss_window_start_ns: u64,
     pub loss_count_in_window: u64,
@@ -985,6 +987,7 @@ pub fn new_connection_state_connected(cipher: Option<ConnectionCipherTriplet>, m
         send_pacer_acc_ns: 0,
         congestion_event_time_ns: 0,
         congestion_event_rate_upps: RATE_FLOOR_UPPS,
+        cc_startup_done: false,
         stats: ConnectionStats::default(),
         loss_window_start_ns: 0,
         loss_count_in_window: 0,
@@ -1674,6 +1677,9 @@ pub struct CongestionControlOptions {
     pub compound_growth: bool,
     /// Opt-in fixed-memory congestion-episode instrumentation, never alters the rate.
     pub record_loss_episodes: bool,
+    /// Optional initial pps multiplication per RTT until first loss/ECN (0 disables).
+    /// Uses only elapsed active time and RTT; no delivery/bandwidth/delay signal.
+    pub startup_multiplier: f64,
 }
 impl CongestionControlOptions {
     pub const fn legacy() -> Self {
@@ -1681,7 +1687,7 @@ impl CongestionControlOptions {
             rate_rp: RATE_RP, rate_pg: RATE_PG, rate_gs: RATE_GS, time_pg: TIME_PG, time_gs: TIME_GS,
             loss_threshold: 2, loss_fraction_ppm: 0, loss_timeout_rtts: 2.0, event_guard_rtts: 0.5, rate_floor_upps: RATE_FLOOR_UPPS, initial_rate_upps: RATE_FLOOR_UPPS,
             min_growth_uppsps: CUBIC_MIN_GROWTH_UPPSPS, max_growth_uppsps: CUBIC_MAX_RATE_UPPS_PER_SEC,
-            friendly_growth_alpha: 0.0, relative_growth_per_rtt: 0.0, bound_recovery_growth: false, compound_growth: false, record_loss_episodes: false }
+            friendly_growth_alpha: 0.0, relative_growth_per_rtt: 0.0, bound_recovery_growth: false, compound_growth: false, record_loss_episodes: false, startup_multiplier: 0.0 }
     }
     /// Shorter probe plateau and stronger existing additive term; same R/P/G/S curve.
     pub const fn balanced() -> Self {
@@ -1700,6 +1706,7 @@ impl CongestionControlOptions {
         if !(self.rate_floor_upps > 0 && self.initial_rate_upps >= self.rate_floor_upps && self.initial_rate_upps <= 1_000_000_000_000 && self.min_growth_uppsps >= 0.0 && self.min_growth_uppsps.is_finite() && self.max_growth_uppsps > self.min_growth_uppsps && self.max_growth_uppsps <= 1e15) { return Err("invalid CC floor, initial rate or growth limits"); }
         if !(0.0..=100.0).contains(&self.friendly_growth_alpha) || !(0.0..=10.0).contains(&self.relative_growth_per_rtt) { return Err("invalid CC RTT-scaled growth envelope"); }
         if self.loss_fraction_ppm > 500_000 || !(2.0..=10.0).contains(&self.loss_timeout_rtts) { return Err("invalid CC loss episode/reorder tolerance"); }
+        if self.startup_multiplier != 0.0 && !(1.01..=2.0).contains(&self.startup_multiplier) { return Err("CC startup multiplier must be zero or 1.01..=2"); }
         Ok(())
     }
 }
@@ -1746,7 +1753,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
     let bind_ip = options.bind_ip;
     let cc = options.congestion_control;
     cc.validate().expect("invalid congestion controller configuration");
-    let cubic_rate = move |t, r, k| cubic_rate_with_options(t, r, k, &cc);
+    let cc_rate = move |t, r, k, startup_done| connection_rate(t, r, k, &cc, startup_done);
 
 
     // STP setup
@@ -2731,19 +2738,20 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
 
                                 // First RTT received — backdate to R→P transition
                                 if previous_rtt_mean == u16::MAX {
-                                    state.congestion_event_time_ns = current_time_now_ns.saturating_sub(new_k);
+                                    let first_t = if cc.startup_multiplier > 0.0 && !state.cc_startup_done { 0 } else { new_k };
+                                    state.congestion_event_time_ns = current_time_now_ns.saturating_sub(first_t);
                                     if state.is_app_limited {
-                                        state.app_limit_time_offset = new_k;
+                                        state.app_limit_time_offset = first_t;
                                     }
                                 }
                                 else if old_k > 0 && new_k > 0 {
                                     // Move the anchor so the rate is continuous across the change in K.
-                                    let (old_rate, _) = cubic_rate(current_t, state.congestion_event_rate_upps, old_k);
+                                    let (old_rate, _) = cc_rate(current_t, state.congestion_event_rate_upps, old_k, state.cc_startup_done);
                                     let mut lo = if new_k >= old_k { current_t } else { 0u64 };
                                     let mut hi = if new_k >= old_k { current_t * 2 + new_k } else { current_t };
                                     for _ in 0..64 {
                                         let mid = lo + (hi - lo) / 2;
-                                        if cubic_rate(mid, state.congestion_event_rate_upps, new_k).0 >= old_rate {
+                                        if cc_rate(mid, state.congestion_event_rate_upps, new_k, state.cc_startup_done).0 >= old_rate {
                                             hi = mid;
                                         } else {
                                             lo = mid + 1;
@@ -2765,10 +2773,12 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             state.ecn_congestion_received = false;
                             let send_dt = state.ecn_oldest_send_time - state.congestion_event_time_ns;
                             let send_t_factor = send_dt as f64 / time_to_bandwidth_recovery as f64;
-                            let (_, send_mode) = cubic_rate(send_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery);
+                            let (_, send_mode) = cc_rate(send_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery, state.cc_startup_done);
                             let discover_dt = if send_mode == 'P' { (time_to_bandwidth_recovery + send_dt) / 2 } else { send_dt };
-                            let mut discovered = cubic_rate(discover_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery).0;
-                            if send_mode == 'G' || send_mode == 'S' {
+                            let mut discovered = cc_rate(discover_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery, state.cc_startup_done).0;
+                            if send_mode == 'I' {
+                                discovered = cc_rate(send_dt.saturating_sub(state.RTT_mean as u64 * 100_000), state.congestion_event_rate_upps, time_to_bandwidth_recovery, false).0;
+                            } else if send_mode == 'G' || send_mode == 'S' {
                                 let r_pg = (state.congestion_event_rate_upps as f64 * cc.rate_pg) as u64;
                                 discovered = r_pg + ((discovered.saturating_sub(r_pg)) as f64 * 0.5) as u64;
                             }
@@ -2777,6 +2787,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             state.congestion_event_rate_upps = local_rate_limit(discovered, max_pps);
                             state.congestion_event_time_ns = current_time_now_ns;
                             state.app_limit_time_offset = 0;
+                            state.cc_startup_done = true;
                             println!("congestion event ECN CE ...  rate discovered: {} pps  sent:{send_mode}@{send_t_factor:.2}", state.congestion_event_rate_upps as f64 / 1000000.0);
                         }
 
@@ -2816,7 +2827,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     let eligible = send_time > state.congestion_event_time_ns + (rtt_ns as f64 * cc.event_guard_rtts) as u64;
                                     let threshold = if cc.loss_fraction_ppm == 0 { cc.loss_threshold } else {
                                         let send_dt = send_time.saturating_sub(state.congestion_event_time_ns);
-                                        let rate = local_rate_limit(cubic_rate(send_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery).0.max(cc.rate_floor_upps), max_pps);
+                                        let rate = local_rate_limit(cc_rate(send_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery, state.cc_startup_done).0.max(cc.rate_floor_upps), max_pps);
                                         congestion_loss_threshold(rate, rtt_ns, &cc)
                                     };
                                     let trigger = count_congestion_loss(&mut state.loss_count_in_window, eligible, threshold);
@@ -2824,14 +2835,16 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     if trigger {
                                         let send_dt = send_time - state.congestion_event_time_ns;
                                         let send_t_factor = send_dt as f64 / time_to_bandwidth_recovery as f64;
-                                        let (_, send_mode) = cubic_rate(send_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery);
+                                        let (_, send_mode) = cc_rate(send_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery, state.cc_startup_done);
                                         let now_dt = current_time_now_ns - state.congestion_event_time_ns;
                                         let now_t_factor = now_dt as f64 / time_to_bandwidth_recovery as f64;
-                                        let (_, now_mode) = cubic_rate(now_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery);
+                                        let (_, now_mode) = cc_rate(now_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery, state.cc_startup_done);
                                         // R: use rate at send time.
                                         // P/G/S: blend 50% toward R/P boundary rate.
-                                        let mut discovered = cubic_rate(send_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery).0;
-                                        if send_mode != 'R' {
+                                        let mut discovered = cc_rate(send_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery, state.cc_startup_done).0;
+                                        if send_mode == 'I' {
+                                            discovered = cc_rate(send_dt.saturating_sub(rtt_ns), state.congestion_event_rate_upps, time_to_bandwidth_recovery, false).0;
+                                        } else if send_mode != 'R' {
                                             let boundary = (state.congestion_event_rate_upps as f64 * cc.rate_rp) as u64;
                                             discovered = (discovered + boundary) / 2;
                                         }
@@ -2839,6 +2852,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                         state.congestion_event_time_ns = current_time_now_ns;
                                         state.app_limit_time_offset = 0;
                                         state.loss_count_in_window = 0;
+                                        state.cc_startup_done = true;
                                         println!("congestion event PACKET DROPPED {} ...  rate discovered: {} pps  now:{now_mode}@{now_t_factor:.2} sent:{send_mode}@{send_t_factor:.2}", state.packets_waiting_ack_tail, state.congestion_event_rate_upps as f64 / 1000000.0);
                                     }
                                     assert!(state.packets_in_flight > 0, "packets_in_flight underflow");
@@ -2864,10 +2878,10 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                         
                         let (allowed_bandwidth_upps, cubic_mode) = if state.is_app_limited {
                             let rtt_ns = state.RTT_mean as u64 * 100_000;
-                            let a_t = state.app_limit_time_offset.max(rtt_ns * 2);
-                            (cubic_rate(a_t, state.congestion_event_rate_upps, time_to_bandwidth_recovery).0, 'A')
+                            let a_t = if cc.startup_multiplier > 0.0 && !state.cc_startup_done { state.app_limit_time_offset } else { state.app_limit_time_offset.max(rtt_ns * 2) };
+                            (cc_rate(a_t, state.congestion_event_rate_upps, time_to_bandwidth_recovery, state.cc_startup_done).0, 'A')
                         } else {
-                            cubic_rate(current_time_now_ns - state.congestion_event_time_ns, state.congestion_event_rate_upps, time_to_bandwidth_recovery)
+                            cc_rate(current_time_now_ns - state.congestion_event_time_ns, state.congestion_event_rate_upps, time_to_bandwidth_recovery, state.cc_startup_done)
                         };
                         // A local pacing ceiling is not evidence of network congestion.
                         let allowed_bandwidth_upps = local_rate_limit(allowed_bandwidth_upps.max(cc.rate_floor_upps), max_pps);
@@ -3265,6 +3279,15 @@ use crate::helpers::*;
 use crate::native_sockets::*;
 use crate::nym_sockets::*;
 
+fn connection_rate(t_ns: u64, anchor_upps: u64, k_ns: u64, cc: &CongestionControlOptions, startup_done: bool) -> (u64, char) {
+    if cc.startup_multiplier > 0.0 && !startup_done {
+        let rtt_ns = k_ns / cc.recovery_rtts;
+        // The sentinel RTT means no sample yet: never ramp on an unknown path.
+        let exponent = if rtt_ns == u16::MAX as u64 * 100_000 { 0.0 } else { cc.startup_multiplier.ln() * t_ns as f64 / rtt_ns.max(100_000) as f64 };
+        ((anchor_upps as f64 * exponent.min(30.0).exp()).min(1e12) as u64, 'I')
+    } else { cubic_rate_with_options(t_ns, anchor_upps, k_ns, cc) }
+}
+
 fn quantized_rtt_mean(sum: u64, count: u64) -> u16 {
     (sum / count.max(1)).clamp(1, u16::MAX as u64) as u16
 }
@@ -3321,6 +3344,23 @@ impl LossEpisodes {
 #[cfg(test)]
 mod congestion_tests {
     use super::*;
+
+    #[test]
+    fn optional_startup_is_rate_based_and_exits_to_curve() {
+        let cc = CongestionControlOptions { startup_multiplier: 1.5, ..CongestionControlOptions::legacy() };
+        let r = 100_000_000;
+        let rtt = 200_000_000;
+        let k = cc.recovery_rtts * rtt;
+        assert_eq!(connection_rate(0, r, k, &cc, false), (r, 'I'));
+        assert!((connection_rate(rtt, r, k, &cc, false).0 as f64 / r as f64 - 1.5).abs() < 1e-6);
+        assert!((connection_rate(10*rtt, r, k, &cc, false).0 as f64 / r as f64 - 1.5f64.powi(10)).abs() < 1e-6);
+        assert_eq!(connection_rate(100*rtt, r, cc.recovery_rtts * u16::MAX as u64 * 100_000, &cc, false), (r, 'I'));
+        assert_eq!(connection_rate(0, r, k, &cc, true), cubic_rate(0, r, k));
+        assert!(connection_rate(u64::MAX, r, k, &cc, false).0 <= 1_000_000_000_000);
+        assert_eq!(connection_rate(0, r, k, &CongestionControlOptions::legacy(), false), cubic_rate(0, r, k));
+        assert!(CongestionControlOptions { startup_multiplier: f64::NAN, ..cc }.validate().is_err());
+        assert!(CongestionControlOptions { startup_multiplier: 1.0, ..cc }.validate().is_err());
+    }
 
     #[test]
     fn fixed_memory_episode_meter_finds_short_loss_bursts() {
