@@ -180,6 +180,7 @@ fn to_v6(ip: std::net::IpAddr) -> std::net::Ipv6Addr {
 }
 
 fn main() {
+    if let Err(error) = shielded_transport_pigeon::fec_adapt::initialize_research_policy() { die(&error); }
     let mut argv = std::env::args().skip(1);
     let mode = argv.next().unwrap_or_default();
     let args = Args::parse(argv);

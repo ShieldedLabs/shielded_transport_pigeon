@@ -14,18 +14,31 @@
 /// Temporary internal research selector; removed when a winner ships.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RepairPolicy { Reliability, MeanOpen, MeanTopup, Streaming }
+static RESEARCH_POLICY: std::sync::OnceLock<RepairPolicy> = std::sync::OnceLock::new();
 impl RepairPolicy {
-    fn selected() -> Self {
-        #[cfg(not(test))]
-        return match std::env::var("STP_RACE_POLICY").as_deref() {
-            Ok("P1") => Self::MeanOpen, Ok("P2") => Self::MeanTopup,
-            Ok("P3") => Self::Streaming, Ok("P0") | Err(_) => Self::Reliability,
-            Ok(other) => panic!("unknown STP_RACE_POLICY {other}"),
-        };
-        #[cfg(test)]
-        Self::Reliability
+    fn selected() -> Self { RESEARCH_POLICY.get().copied().unwrap_or(Self::Reliability) }
+    fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value {
+            Some("P1") => Ok(Self::MeanOpen), Some("P2") => Ok(Self::MeanTopup),
+            Some("P3") => Ok(Self::Streaming), Some("P0") | None => Ok(Self::Reliability),
+            Some(other) => Err(format!("unknown STP_RACE_POLICY {other:?}; expected P0, P1, P2, or P3")),
+        }
     }
     pub fn feedback(self) -> bool { self != Self::MeanOpen }
+}
+/// Benchmark process-start hook; normal library applications retain the shipped policy.
+/// This temporary research-only hook is removed with the race selector before shipping.
+#[doc(hidden)]
+pub fn initialize_research_policy() -> Result<(), String> {
+    if RESEARCH_POLICY.get().is_some() { return Ok(()); }
+    let value = match std::env::var("STP_RACE_POLICY") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(_) => return Err("STP_RACE_POLICY must be valid Unicode".to_string()),
+    };
+    let policy = RepairPolicy::parse(value.as_deref())?;
+    let _ = RESEARCH_POLICY.set(policy);
+    Ok(())
 }
 
 /// Expected source AND repair loss, plus two decoder-rank symbols, capped at K.
@@ -475,6 +488,13 @@ mod tests {
         let mut n = k;
         while fail_prob(k, n, p) > eps { n += 1; }
         n
+    }
+
+    #[test]
+    fn research_selector_validates_before_network_start() {
+        assert_eq!(RepairPolicy::parse(None).unwrap(), RepairPolicy::Reliability);
+        for value in ["P0", "P1", "P2", "P3"] { assert!(RepairPolicy::parse(Some(value)).is_ok()); }
+        assert!(RepairPolicy::parse(Some("typo")).unwrap_err().contains("expected P0"));
     }
 
     #[test]

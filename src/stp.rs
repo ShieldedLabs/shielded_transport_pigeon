@@ -572,11 +572,12 @@ struct RetainedFecSlot { slot: FecSendSlot, package: u16, expires_ns: u64 }
 impl FecSendSlot {
     fn rescue_plan(&mut self) {
         if !self.repair_policy.feedback() { return; }
-        if self.repair_policy != crate::fec_adapt::RepairPolicy::Reliability && self.rescue_rounds >= 3 {
-            self.n = self.next_id;
-            return;
-        }
         if self.finalized_symbols < self.next_id { return; }
+        if self.repair_policy != crate::fec_adapt::RepairPolicy::Reliability {
+            // Feedback may arrive DURING a rescue. Finish the accepted round before
+            // applying its round budget; never truncate a partially emitted third round.
+            if self.next_id < self.n || self.rescue_rounds >= 3 { return; }
+        }
         let layout = crate::fec::MessageLayout::new(self.message.len(), self.block_bytes).unwrap();
         let groups = layout.groups as u32;
         let repairs = self.next_id.saturating_sub(self.k);
@@ -901,6 +902,9 @@ impl UnreliableSendBuffer {
     }
     fn ready_rescue_package(&mut self) -> Option<u16> {
         while let Some(&package) = self.rescue_ready.front() {
+            if self.fec_retained.get(&package).is_some_and(|r| r.expires_ns <= self.fec_now_ns) {
+                self.remove_retained(package);
+            }
             if self.fec_retained.get(&package).is_some_and(|r| r.slot.next_id > 0 && r.slot.next_id < r.slot.n) { return Some(package); }
             self.rescue_ready.pop_front();
         }
@@ -908,9 +912,11 @@ impl UnreliableSendBuffer {
     }
     fn fec_prune_retained(&mut self) {
         if self.fec_now_ns < self.retained_next_prune_ns { return; }
-        self.retained_next_prune_ns = self.fec_now_ns.saturating_add(10_000_000);
-        let expired: Vec<u16> = self.fec_retained.iter().filter(|(_, r)| r.expires_ns < self.fec_now_ns).map(|(&p, _)| p).collect();
+        let expired: Vec<u16> = self.fec_retained.iter().filter(|(_, r)| r.expires_ns <= self.fec_now_ns).map(|(&p, _)| p).collect();
         for package in expired { self.remove_retained(package); }
+        // Keep periodic scans cheap, but never sleep across an absolute deadline.
+        self.retained_next_prune_ns = self.fec_now_ns.saturating_add(10_000_000)
+            .min(self.fec_retained.values().map(|r| r.expires_ns).min().unwrap_or(u64::MAX));
     }
 
     fn retain_fec(&mut self, mut slot: FecSendSlot, package: u16) {
@@ -935,6 +941,7 @@ impl UnreliableSendBuffer {
         if self.fec_now_ns >= expires_ns { return; }
         self.retained_bytes += slot.message.len();
         if slot.next_id > 0 && slot.next_id < slot.n { self.rescue_ready.push_back(package); self.rescue_ready_count += 1; }
+        self.retained_next_prune_ns = self.retained_next_prune_ns.min(expires_ns);
         self.fec_retained.insert(package, RetainedFecSlot { slot, package, expires_ns });
     }
 
@@ -1001,7 +1008,19 @@ impl UnreliableSendBuffer {
 
     // A message whose last fragment has gone out still counts against the queue until it is
     // released here.
+    fn fec_expire_active_rescue(&mut self) {
+        // P2/P3's deadline follows the retained slot into active service. A stalled
+        // top-up or outage must not extend it; original FIFO data remains untouched.
+        if self.fec_rescue_package.is_some() && self.fec_send_slot.as_ref().is_some_and(|f|
+            f.repair_policy != crate::fec_adapt::RepairPolicy::Reliability &&
+            f.retained_until_ns.is_some_and(|deadline| self.fec_now_ns >= deadline)) {
+            self.fec_send_slot = None;
+            self.fec_rescue_package = None;
+            self.resume_suspended();
+        }
+    }
     fn reclaim_finished_partial(&mut self) {
+        self.fec_expire_active_rescue();
         if let Some((msg, start_byte)) = &self.partial_send_slot {
             if *start_byte as usize >= msg.len() {
                 let msg_len = msg.len();
@@ -1322,7 +1341,7 @@ impl SendQueues {
     pub fn free_bytes(&mut self) -> Vec<u64> { self.queues.iter_mut().map(|q| q.free_bytes()).collect() }
     pub fn has_unsent_data(&self) -> bool { self.queues.iter().any(|q| q.has_unsent_data()) }
     fn set_time(&mut self, now: u64, rtt: u64) {
-        for q in &mut self.queues { q.fec_now_ns = now; q.fec_rtt_ns = rtt; q.fec_prune_retained(); }
+        for q in &mut self.queues { q.fec_now_ns = now; q.fec_rtt_ns = rtt; q.fec_prune_retained(); q.fec_expire_active_rescue(); }
     }
     fn set_rate(&mut self, bytes_per_second: u64) {
         let active = self.queues.iter().filter(|q| q.has_unsent_data()).count().max(1) as u64;
@@ -3690,7 +3709,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             return false; // connection timeout
                         }
                         
-                        if state.locally_blocked { freeze_local_send(state, current_time_now_ns); }
+                        prepare_connected_send_tick(state, &mut connection_tracking_data.unreliable_send_buffer, current_time_now_ns);
                         if let Some(pending) = state.pending_send.take() {
                             // Freeze active time and discard pacing credit throughout the block,
                             // including the interval since the last failed attempt.
@@ -3867,7 +3886,6 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             state.RTT_mean as u64 * 100_000,
                             current_time_now_ns.saturating_sub(state.last_ack_received_time), &cc);
                         
-                        connection_tracking_data.unreliable_send_buffer.set_time(current_time_now_ns, state.RTT_mean as u64 * 100_000);
                         // every send site (data loop, tu probe, keepalive, both ack paths) gates on ring space, so head never laps tail
                         assert!(state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY);
                         while state.packets_waiting_ack_tail < state.send_sequence_number {
@@ -4484,6 +4502,14 @@ fn retry_handshake(created: u64, last_sent: &mut u64, now: u64, lifetime: u64,
 
 /// A full local socket is not network congestion. Pause the existing active
 /// curve (all phases), drop credit, and backdate on every retry, not just entry.
+// Retention is wall-clock bounded even while a nonce-safe pending datagram retries.
+// No NEW repair may be formed after expiry; the single pre-assembled ciphertext
+// remains immutable and may still be accepted after expiry.
+fn prepare_connected_send_tick(state: &mut ConnectionStateConnected, buf: &mut SendQueues, now: u64) {
+    buf.set_time(now, state.RTT_mean as u64 * 100_000);
+    if state.locally_blocked { freeze_local_send(state, now); }
+}
+
 fn freeze_local_send(state: &mut ConnectionStateConnected, now: u64) {
     update_app_limit(state, now, false);
     state.congestion_event_time_ns = now.saturating_sub(state.app_limit_time_offset);
@@ -5706,7 +5732,9 @@ mod fec_closed_loop_tests {
             let mut f = b.fec_send_slot.take().unwrap();
             f.next_id = 24; f.n = 24; f.finalized_symbols = 24; f.group_lost[0] = 5;
             f.rescue_plan(); assert_eq!(f.n, 27); // 22 required - 19 received = 3
-            f.rescue_rounds = 3; f.rescue_plan(); assert_eq!(f.n, 24);
+            f.rescue_rounds = 3; f.rescue_plan(); assert_eq!(f.n, 27); // pending third round is not truncated
+            f.next_id = 27; f.finalized_symbols = 27; f.rescue_plan(); assert_eq!(f.n, 27);
+            f.next_id = 24; f.finalized_symbols = 24; f.n = 24;
             f.rescue_rounds = 0; f.group_lost[0] = 24; f.rescue_plan(); assert!(f.n <= 42);
             f.original_send_duration_ns = Some(0);
             b.fec_now_ns = 1_000_000_000; b.retain_fec(f, 0);
@@ -6001,6 +6029,48 @@ mod send_queue_tests {
         assert!(!s.has_unsent_data());
         s.submit_messages(1, vec![vec![5; 1000]]);
         assert!(s.has_unsent_data());
+    }
+    #[test]
+    fn coded_topup_on_nonzero_magazine_counts_in_share_and_routes_suspended_feedback() {
+        use crate::fec_adapt::RepairPolicy;
+        for policy in [RepairPolicy::MeanTopup, RepairPolicy::Streaming] {
+            let mut s = SendQueues::new(2, (1000000, 2<<20, 2<<20));
+            let mut a = crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0);
+            a.policy = policy; a.p = 0.02; s.fec_adaptive = Some(a);
+            s.submit_messages(1, vec![vec![7; 1433*12]]);
+            let mut seq = 0;
+            while s.queues[1].has_unsent_data() { assert_eq!(packet(&mut s, seq).0, 1); seq += 1; }
+            let first_end = seq;
+            s.submit_messages(0, vec![vec![6; 1433*64]]);
+            s.submit_messages(1, vec![vec![8; 1433*64]]);
+            let mut own = [Vec::new(), Vec::new()];
+            for _ in 0..4 { let (q, _) = packet(&mut s, seq); own[q].push(seq); seq += 1; }
+            let ordinal = s.queues[1].fec_send_slot.as_ref().unwrap().next_id;
+            for old in 0..first_end { s.fec_on_packet_finalized(old, old % 3 == 0); }
+            let rescue_symbols = s.queues[1].fec_retained[&0].slot.n - first_end as u32;
+            assert!(rescue_symbols > 1);
+            let mut rescued = 0;
+            while rescued < rescue_symbols {
+                let current = seq; let (q, p) = packet(&mut s, seq); seq += 1;
+                assert!(s.scheduled_bytes[0].abs_diff(s.scheduled_bytes[1]) <= 1449,
+                    "{policy:?} rescue stole service: {:?}", s.scheduled_bytes);
+                if q == 1 {
+                    assert_eq!((read_fragment_header(&p).unwrap().0 >> 2) & 0xffff, 0);
+                    if rescued == 0 {
+                        assert_eq!(s.queues[1].fec_suspended.as_ref().unwrap().next_id, ordinal);
+                        s.fec_on_packet_finalized(own[1][0], true);
+                        assert_eq!(s.queues[1].fec_suspended.as_ref().unwrap().lost, 1);
+                        s.fec_on_packet_finalized(own[0][0], true);
+                        assert_eq!(s.queues[0].fec_send_slot.as_ref().unwrap().lost, 1);
+                    }
+                    s.fec_on_packet_finalized(current, false); rescued += 1;
+                }
+            }
+            assert!(s.queues[1].fec_suspended.is_none());
+            assert!(!s.queues[1].fec_retained.contains_key(&0));
+            assert_eq!(s.queues[1].fec_send_slot.as_ref().unwrap().next_id, ordinal);
+            assert_eq!(s.queues[1].fec_send_slot.as_ref().unwrap().lost, 1);
+        }
     }
     #[test]
     fn per_magazine_retention_reservation_preserves_coded_history() {
@@ -7484,5 +7554,130 @@ mod local_backpressure_tests {
         assert_eq!(s.send_sequence_number, 1);
         b.fec_on_packet_finalized(0, false);
         assert_eq!(b.fec_packet_tags.as_ref().unwrap()[0], 0);
+    }
+}
+
+#[cfg(test)]
+mod race_review_tests {
+use super::*;
+use crate::fec_adapt::{FecAdaptiveState, RepairPolicy};
+
+fn buffer(policy: RepairPolicy) -> UnreliableSendBuffer {
+    let mut b = UnreliableSendBuffer::new(1_000_000, 1_000_000, 1_000_000);
+    let mut a = FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0);
+    a.policy = policy;
+    a.p = 0.02;
+    b.fec_adaptive = Some(a);
+    b
+}
+
+fn emit(b: &mut UnreliableSendBuffer, seq: &mut u64) {
+    b.fec_prepare_packet(*seq);
+    assert!(matches!(b.next_fragment(1449, 1449), Some(UnreliableFragment::Fec { .. })));
+    *seq += 1;
+}
+
+#[test]
+fn review_active_topup_must_stop_at_absolute_expiry() {
+    for policy in [RepairPolicy::MeanTopup, RepairPolicy::Streaming] {
+        let mut b = buffer(policy);
+        b.submit_messages(vec![vec![7; 1433 * 20]]);
+        let mut seq = 0;
+        loop {
+            emit(&mut b, &mut seq);
+            let f = b.fec_send_slot.as_ref().unwrap();
+            if f.next_id == f.n { break; }
+        }
+        b.reclaim_finished_partial();
+        let deadline = b.fec_retained[&0].expires_ns;
+        for old in 0..seq { b.fec_on_packet_finalized(old, true); }
+        b.fec_now_ns = deadline - 1;
+        emit(&mut b, &mut seq); // Start a multi-symbol top-up just before expiry.
+        assert!(b.fec_rescue_package.is_some());
+        b.fec_now_ns = deadline + 1;
+        b.fec_prepare_packet(seq);
+        assert!(b.next_fragment(1449, 1449).is_none(),
+            "{policy:?} emitted a top-up after absolute expiry {deadline}");
+        assert_eq!(*b.retention_quota.used.lock().unwrap(), (0, 0));
+    }
+}
+
+#[test]
+fn review_third_topup_round_must_not_be_cancelled_by_its_first_ack() {
+    let mut b = buffer(RepairPolicy::MeanTopup);
+    b.submit_messages(vec![vec![7; 1433 * 20]]);
+    let mut seq = 0;
+    loop {
+        emit(&mut b, &mut seq);
+        let f = b.fec_send_slot.as_ref().unwrap();
+        if f.next_id == f.n { break; }
+    }
+    b.reclaim_finished_partial();
+    for old in 0..seq { b.fec_on_packet_finalized(old, old >= 20); }
+    for round in 1..=2 {
+        let first = seq;
+        loop {
+            emit(&mut b, &mut seq);
+            let f = b.fec_send_slot.as_ref().unwrap();
+            assert_eq!(f.rescue_rounds, round);
+            if f.next_id == f.n { break; }
+        }
+        b.reclaim_finished_partial();
+        for old in first..seq { b.fec_on_packet_finalized(old, true); }
+    }
+    let first = seq;
+    emit(&mut b, &mut seq);
+    let f = b.fec_send_slot.as_ref().unwrap();
+    assert_eq!(f.rescue_rounds, 3);
+    let planned = f.n;
+    assert!(planned > f.next_id);
+    b.fec_on_packet_finalized(first, false);
+    assert_eq!(b.fec_send_slot.as_ref().unwrap().n, planned,
+        "an ACK of the first third-round repair must not cancel the rest of that round");
+}
+}
+
+#[cfg(test)]
+mod race_expiry_block_tests {
+    use super::*;
+    use crate::fec_adapt::{FecAdaptiveState, RepairPolicy};
+    #[test]
+    fn retention_expires_while_locally_refused_ciphertext_remains_pending() {
+        for policy in [RepairPolicy::MeanTopup, RepairPolicy::Streaming] {
+            let mut q = SendQueues::new(1, (1000000, 1000000, 1000000));
+            let mut a = FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0);
+            a.policy = policy; a.p = 0.02; q.fec_adaptive = Some(a);
+            q.submit_messages(0, vec![vec![7;1433*20], vec![8;1433*20]]);
+            let mut seq = 0;
+            while q.has_unsent_data() {
+                q.fec_prepare_packet(seq); assert!(q.fill_packet(&mut [0;1449]) > 0); seq += 1;
+            }
+            let deadline = q.queues[0].fec_retained[&0].expires_ns;
+            let first_end = q.queues[0].fec_retained[&0].slot.next_id as u64;
+            for old in 0..first_end { q.fec_on_packet_finalized(old, true); }
+            q.set_time(deadline - 1, 100_000_000);
+            q.fec_prepare_packet(seq); assert!(q.fill_packet(&mut [0;1449]) > 0);
+            assert!(q.queues[0].fec_rescue_package.is_some());
+            let ConnectionState::Connected(mut state) = new_connection_state_connected(None, 0, 1, 1_000_000_000) else { unreachable!() };
+            assert!(!finish_connected_send(&mut state, &mut q, PendingSendKind::Data, None,
+                deadline - 1, &[7;32], &[8;16], Dscp::BestEffort, 0, None));
+            prepare_connected_send_tick(&mut state, &mut q, deadline);
+            assert!(q.queues[0].fec_retained.is_empty());
+            assert!(q.queues[0].fec_rescue_package.is_none());
+            assert_eq!(*q.queues[0].retention_quota.used.lock().unwrap(), (0,0));
+            assert_eq!(state.pending_send.as_ref().unwrap().bytes, vec![7;32]);
+            assert_eq!(state.send_sequence_number, 0);
+        }
+    }
+    #[test]
+    fn reliability_rescue_can_still_refresh_an_active_round() {
+        let mut b = UnreliableSendBuffer::new(1000000, 1000000, 1000000);
+        b.fec_adaptive = Some(FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0));
+        b.start_fec(std::sync::Arc::new(vec![1;1433*20]),1433);
+        let f = b.fec_send_slot.as_mut().unwrap();
+        f.next_id = 24; f.n = 30; f.finalized_symbols = 24; f.group_lost[0] = 10;
+        f.rescue_plan(); assert_eq!(f.n,32); // P0's original active-round deficit update
+        f.repair_policy = RepairPolicy::MeanTopup; f.n = 30;
+        f.rescue_plan(); assert_eq!(f.n,30); // P2 freezes a round once accepted
     }
 }
