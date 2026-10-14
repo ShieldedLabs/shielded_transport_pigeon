@@ -2837,6 +2837,10 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 }
                             }
                             state.packets_waiting_ack_field[(bit_index / 64) as usize] &= !(1u64 << (bit_index % 64));
+                            if let Some(a) = &mut connection_tracking_data.unreliable_send_buffer.fec_adaptive {
+                                let lost = state.declared_lost_field[(bit_index / 64) as usize] & (1u64 << (bit_index % 64)) != 0;
+                                a.on_sequence_finalized(state.packets_waiting_ack_tail, lost, current_time_now_ns);
+                            }
                             state.packets_waiting_ack_tail += 1;
                         }
                         
@@ -2978,6 +2982,9 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             else { udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::BestEffort, false) };
                             increment_sequence_number_and_account(send_time_ns, &mut state.send_sequence_number, &mut state.send_time_band, &mut state.send_time_band_head_index, &mut state.packets_waiting_ack_field);
                             if let Some(t) = &mut loss_trace { t.sent(connection_tracking_data.two_byte_send_prefix, virtual_nonce, send_time_ns, &packet_memory_send[..payload_size]); }
+                            if let Some(a) = &mut connection_tracking_data.unreliable_send_buffer.fec_adaptive {
+                                a.on_data_sent(virtual_nonce);
+                            }
                             state.last_sent_data_packet = current_time_now_ns; // We use the older time here so the pacer skips less packets.
                             state.packets_in_flight += 1;
                             state.stats.packets_sent += 1;

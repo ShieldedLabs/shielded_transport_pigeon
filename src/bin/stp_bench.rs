@@ -16,7 +16,7 @@
 //! estimator_series rows: [seconds, FEC estimate, sample, sent packets, losses, UDP bytes, RTT us].
 //! --fec-pct X (send only): forward error correction redundancy in percent (float); messages of
 //! 2+ packets get X% extra Wirehair-coded blocks. The server needs no flag: it decodes either.
-//! --fec adaptive:v1|v2|v3 (send only): adaptive redundancy from the connection's own loss
+//! --fec adaptive:v1|v2|v3|span (send only): adaptive redundancy from the connection's own loss
 //! estimate (v1 tiered max-hold, v2 peak with decay, v3 high quantile; see fec_adapt), with
 //! [--fec-eps 1e-6] [--fec-time-scale 1.0] (scales hold/half-life/window) [--fec-min-packets 500]
 //! [--fec-topup 0|1] (grow the message being sent when its own packets are declared lost).
@@ -362,9 +362,10 @@ fn send(a: &Args) {
                 Some("v1") => LossEstimatorKind::TieredMaxHold,
                 Some("v2") => LossEstimatorKind::PeakDecay,
                 Some("v3") => LossEstimatorKind::Quantile,
-                _ => die("--fec must be fixed or adaptive:v1|v2|v3"),
+                Some("span") => LossEstimatorKind::SpanTail,
+                _ => die("--fec must be fixed or adaptive:v1|v2|v3|span"),
             };
-            let cfg = AdaptiveFecConfig { kind, eps: a.num("fec-eps", 1e-6), min_packets: a.num("fec-min-packets", 500), topup: a.num::<u32>("fec-topup", 0) != 0,
+            let cfg = AdaptiveFecConfig { kind, eps: a.num("fec-eps", if kind == LossEstimatorKind::SpanTail { 1e-3 } else { 1e-6 }), min_loss: a.num("fec-min-loss", 0.005), initial_loss: a.num("fec-initial-loss", 0.01), min_packets: a.num("fec-min-packets", 500), topup: a.num::<u32>("fec-topup", 0) != 0,
                 loss_signal: match a.str("fec-loss-signal") {
                     None => AdaptiveFecConfig::default().loss_signal,
                     Some("declared") => LossSignal::Declared,
