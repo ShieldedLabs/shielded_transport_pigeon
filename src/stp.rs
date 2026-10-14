@@ -1675,6 +1675,9 @@ pub struct CongestionControlOptions {
     /// Compound the relative ceiling with elapsed RTTs instead of freezing its
     /// slope at the event anchor. Pure time/rate curve; no ACK/delivery estimate.
     pub compound_growth: bool,
+    /// Use the compounded fractional envelope without a fixed pps/s ceiling.
+    /// The R/P/G/S curve is still an upper bound. Requires bounded compound growth.
+    pub proportional_growth: bool,
     /// Opt-in fixed-memory congestion-episode instrumentation, never alters the rate.
     pub record_loss_episodes: bool,
     /// Optional initial pps multiplication per RTT until first loss/ECN (0 disables).
@@ -1687,7 +1690,7 @@ impl CongestionControlOptions {
             rate_rp: RATE_RP, rate_pg: RATE_PG, rate_gs: RATE_GS, time_pg: TIME_PG, time_gs: TIME_GS,
             loss_threshold: 2, loss_fraction_ppm: 0, loss_timeout_rtts: 2.0, event_guard_rtts: 0.5, rate_floor_upps: RATE_FLOOR_UPPS, initial_rate_upps: RATE_FLOOR_UPPS,
             min_growth_uppsps: CUBIC_MIN_GROWTH_UPPSPS, max_growth_uppsps: CUBIC_MAX_RATE_UPPS_PER_SEC,
-            friendly_growth_alpha: 0.0, relative_growth_per_rtt: 0.0, bound_recovery_growth: false, compound_growth: false, record_loss_episodes: false, startup_multiplier: 0.0 }
+            friendly_growth_alpha: 0.0, relative_growth_per_rtt: 0.0, bound_recovery_growth: false, compound_growth: false, proportional_growth: false, record_loss_episodes: false, startup_multiplier: 0.0 }
     }
     /// Shorter probe plateau and stronger existing additive term; same R/P/G/S curve.
     pub const fn balanced() -> Self {
@@ -1706,6 +1709,7 @@ impl CongestionControlOptions {
         if !(self.rate_floor_upps > 0 && self.initial_rate_upps >= self.rate_floor_upps && self.initial_rate_upps <= 1_000_000_000_000 && self.min_growth_uppsps >= 0.0 && self.min_growth_uppsps.is_finite() && self.max_growth_uppsps > self.min_growth_uppsps && self.max_growth_uppsps <= 1e15) { return Err("invalid CC floor, initial rate or growth limits"); }
         if !(0.0..=100.0).contains(&self.friendly_growth_alpha) || !(0.0..=10.0).contains(&self.relative_growth_per_rtt) { return Err("invalid CC RTT-scaled growth envelope"); }
         if self.loss_fraction_ppm > 500_000 || !(2.0..=10.0).contains(&self.loss_timeout_rtts) { return Err("invalid CC loss episode/reorder tolerance"); }
+        if self.proportional_growth && !(self.bound_recovery_growth && self.compound_growth && self.relative_growth_per_rtt > 0.0) { return Err("CC proportional growth requires bounded compound relative growth"); }
         if self.startup_multiplier != 0.0 && !(1.01..=2.0).contains(&self.startup_multiplier) { return Err("CC startup multiplier must be zero or 1.01..=2"); }
         Ok(())
     }
@@ -3143,13 +3147,13 @@ pub fn cubic_rate_with_options(t_ns: u64, r_max: u64, k_ns: u64, cc: &Congestion
         cc.max_growth_uppsps.min(r * cc.relative_growth_per_rtt / rtt_seconds)
     } else { cc.max_growth_uppsps };
     let min_growth = floor / 1e9 * t;
-    let linear_cap_slope = ceiling / 1e9;
+    let linear_cap_slope = if cc.proportional_growth { f64::INFINITY } else { ceiling / 1e9 };
     let finish = |rate: u64, mode| {
         if cc.bound_recovery_growth {
             let absolute = r * cc.beta + (floor + ceiling) / 1e9 * t;
             let envelope = if cc.compound_growth && cc.relative_growth_per_rtt > 0.0 {
                 let relative = r * cc.beta * (cc.relative_growth_per_rtt * t / (rtt_seconds * 1e9)).exp() + min_growth;
-                relative.min(absolute)
+                if cc.proportional_growth { relative.min(1e12) } else { relative.min(absolute) }
             } else { absolute };
             (rate.min(envelope as u64), mode)
         } else { (rate, mode) }
@@ -3419,6 +3423,34 @@ mod congestion_tests {
             assert!(rate <= (r as f64 * cc.beta + 525e6 * t as f64 / 1e9) as u64);
             prev = rate;
         }
+    }
+
+    #[test]
+    fn proportional_growth_scales_rate_without_fixed_pps_ceiling() {
+        let mut cc = CongestionControlOptions { max_growth_uppsps: 500e6,
+            min_growth_uppsps: 0.0, relative_growth_per_rtt: 0.01,
+            bound_recovery_growth: true, compound_growth: true, proportional_growth: true,
+            ..CongestionControlOptions::balanced() };
+        let k = 1_800_000_000;
+        for t in [0, k, 2*k, 8*k, 20*k] {
+            let low = cubic_rate_with_options(t, 1_000_000_000, k, &cc).0;
+            let high = cubic_rate_with_options(t, 40_000_000_000, k, &cc).0;
+            assert!((high as f64 / low as f64 - 40.0).abs() < 1e-6);
+        }
+        let r = 40_000_000_000;
+        let t = 20*k;
+        assert!(cubic_rate_with_options(t, r, k, &cc).0 > (r as f64 * cc.beta + 500e6 * t as f64 / 1e9) as u64);
+        let mut previous = 0;
+        for t in (0..100*k).step_by((k/100) as usize) {
+            let rate = cubic_rate_with_options(t, r, k, &cc).0;
+            assert!(rate >= previous);
+            assert!(rate <= (r as f64 * cc.beta * (cc.relative_growth_per_rtt * t as f64 / 200e6).exp()).min(1e12) as u64);
+            previous = rate;
+        }
+        cc.compound_growth = false;
+        assert!(cc.validate().is_err());
+        cc.proportional_growth = false;
+        assert!(cc.validate().is_ok());
     }
 
     #[test]
