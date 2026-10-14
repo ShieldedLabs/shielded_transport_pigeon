@@ -2560,6 +2560,9 @@ fn fec_receive_block(
             let guard = FecWorkerGuard(workers.clone());
             let r = std::thread::Builder::new().name("stp-fec-decode".into()).spawn(move || {
                 let _guard = guard;
+                // Move the capture into a later local: on decode failure its
+                // budget must be released before the worker count reaches zero.
+                let reservation = reservation;
                 if let Some(m) = decode_message_blocks(layout, rx, MAX_FEC_INGRESS_BYTES) {
                     // Keep the admission charge through the completion channel, including
                     // when the network thread is stalled or this connection is evicted.
@@ -7014,6 +7017,26 @@ mod lazy_fec_segment_tests {
         drop(slots); drop(done);
         assert!(rx.recv_timeout(std::time::Duration::from_secs(5)).is_err());
         assert_eq!(workers.load(std::sync::atomic::Ordering::Acquire),0);
+        assert_eq!(budget.used(),0);
+    }
+
+    #[test]
+    fn worker_success_hands_reservation_to_completion_channel() {
+        let budget = crate::receive_memory::ReceiveMemoryBudget::new(1<<30);
+        let workers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (done, rx) = std::sync::mpsc::channel();
+        let message = vec![7;300*32];
+        let mut slot = FecRecvSlot::default();
+        for id in 0..300 {
+            assert!(fec_receive_block(&mut slot, ConnectionKey::default(), 5,
+                message.len(), 32, id, &message[id as usize*32..(id as usize+1)*32],
+                &done, &workers, &budget).is_none());
+        }
+        let (_, package, decoded, reservation) = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert_eq!(package,5);
+        assert_eq!(decoded,message);
+        assert!(budget.used()>0, "successful completion must retain its charge");
+        drop(reservation);
         assert_eq!(budget.used(),0);
     }
 
