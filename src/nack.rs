@@ -90,7 +90,7 @@ pub struct NackReceiver {
     late: [LatePositive; LATE_CACHE], late_insert: usize, late_cursor: usize,
     pub late_overflows: u64,
     pub losses: u64, pub false_nacks: u64, pub expired: u64,
-    learned_reorder_ns: u64, last_decay_ns: u64, next_tick_ns: u64,
+    learned_reorder_ns: u64, last_decay_ns: u64, next_tick_ns: u64, fallback_cap_ns: u64,
     pub effective_reorder_us: u32, cursor: u64,
 }
 impl Default for NackReceiver {
@@ -98,7 +98,7 @@ impl Default for NackReceiver {
         hole_since: Box::new([0;4096]), holes: [0;64], declared: [0;64], hole_count: 0,
         late: [LatePositive::default();LATE_CACHE], late_insert: 0, late_cursor: 0,
         late_overflows: 0, losses: 0, false_nacks: 0, expired: 0,
-        learned_reorder_ns: 0, last_decay_ns: 0, next_tick_ns: 0, effective_reorder_us: 0, cursor: 0 } }
+        learned_reorder_ns: 0, last_decay_ns: 0, next_tick_ns: 0, fallback_cap_ns: 1_000_000_000, effective_reorder_us: 0, cursor: 0 } }
 }
 /// Sorted set-bit iteration from a sequence-indexed ring. O(64+set bits), no allocation.
 fn sequences(bits: [u64;64], highest: u64) -> impl Iterator<Item=u64> {
@@ -116,6 +116,12 @@ fn sequences(bits: [u64;64], highest: u64) -> impl Iterator<Item=u64> {
     }).filter(move |&seq| seq <= highest)
 }
 impl NackReceiver {
+    /// A receiver-side proxy for the unchanged sender timeout floor (2 smoothed
+    /// RTTs), not a congestion signal. Sender timeout still runs independently;
+    /// it can always beat receiver feedback, including on asymmetric paths.
+    pub fn update_rtt(&mut self, rtt_us: u64) {
+        if rtt_us > 0 { self.fallback_cap_ns = rtt_us.saturating_mul(2000).clamp(100_000, 1_000_000_000); }
+    }
     fn clear_slot(&mut self, seq: u64) -> bool {
         let i = (seq%HISTORY) as usize; let bit = 1 << (i%64);
         let had = self.holes[i/64] & bit != 0;
@@ -156,7 +162,7 @@ impl NackReceiver {
         let cancelled = self.declared[i/64] & bit != 0;
         if self.holes[i/64] & bit != 0 {
             if cancelled { self.false_nacks += 1; *timer = (*timer).min(now); }
-            self.learned_reorder_ns = self.learned_reorder_ns.max(now.saturating_sub(self.hole_since[i]).saturating_mul(2).min(100_000_000));
+            self.learned_reorder_ns = self.learned_reorder_ns.max(now.saturating_sub(self.hole_since[i]).saturating_mul(2).min(1_000_000_000));
             self.clear_slot(seq);
         }
         if cancelled || highest.saturating_sub(seq) >= 1024 {
@@ -179,7 +185,7 @@ impl NackReceiver {
             self.learned_reorder_ns = self.learned_reorder_ns * 15 / 16;
             self.last_decay_ns = now;
         }
-        let tolerance = self.learned_reorder_ns.max(REORDER_US as u64 * 1000);
+        let tolerance = self.learned_reorder_ns.max(REORDER_US as u64 * 1000).min(self.fallback_cap_ns);
         self.effective_reorder_us = (tolerance/1000) as u32;
         let highest = self.highest.unwrap();
         let mut repeat = self.late.iter().any(|p| Self::late_valid(p, highest, now));
@@ -317,5 +323,26 @@ mod tests {
         let mut r = NackReceiver::default(); let mut t = u64::MAX;
         for s in [0, 4096, 8192, 12288] { r.receive(s, 10, false, OPT, &mut t); assert!((r.hole_count as u64) < HISTORY); }
         assert_ne!(NACK_PAYLOAD_LEN, 152); assert_ne!(NACK_PAYLOAD_LEN, 516); assert!(NACK_PAYLOAD_LEN < 517);
+    }
+
+    #[test]
+    fn reorder_then_clean_decay_and_sender_timeout_cap() {
+        let mut r = NackReceiver::default(); let mut timer = u64::MAX;
+        r.update_rtt(200_000);
+        r.receive(0, 0, false, OPT, &mut timer);
+        for seq in 2..20 { r.receive(seq, seq*1000, false, OPT, &mut timer); }
+        r.receive(1, 100_000_000, false, OPT, &mut timer);
+        r.tick(102_000_000, OPT, &mut timer);
+        assert!(r.effective_reorder_us > 190_000);
+        // A clean phase decays the observation by15/16 per second, toward3ms.
+        for second in 1..=100 { r.receive(19+second, second*1_000_000_000, false, OPT, &mut timer); }
+        assert_eq!(r.effective_reorder_us, REORDER_US);
+        r.learned_reorder_ns = 900_000_000;
+        r.update_rtt(40_000);
+        r.tick(101_000_000_000, OPT, &mut timer);
+        assert_eq!(r.effective_reorder_us, 80_000);
+        r.update_rtt(10_000_000);
+        r.tick(102_000_000_000, OPT, &mut timer);
+        assert!(r.effective_reorder_us <= 1_000_000);
     }
 }

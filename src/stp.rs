@@ -2694,6 +2694,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             // This is not an ack packet.
 
                             if matches!(ack_options, crate::ack::AckOptions::Nack) {
+                                state.nack_receiver.update_rtt(state.stats.rtt_us);
                                 if !state.nack_receiver.receive(nonce, timestamp_ns, ecn_marked, ack_options, &mut state.ack_timer) { break 'conn; }
                             } else if !matches!(ack_options, crate::ack::AckOptions::Legacy) {
                                 if !state.ack_receiver.receive_with_rtt(nonce as u64, timestamp_ns, ecn_marked, ack_options, &mut state.ack_timer, state.stats.rtt_us, buf_len) { break 'conn; }
@@ -3031,6 +3032,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                         }
                         
                         if matches!(ack_options, crate::ack::AckOptions::Nack) {
+                            state.nack_receiver.update_rtt(state.stats.rtt_us);
                             state.nack_receiver.tick(current_time_now_ns, ack_options, &mut state.ack_timer);
                             state.stats.nack_losses_declared = state.nack_receiver.losses;
                             state.stats.false_nacks = state.nack_receiver.false_nacks;
