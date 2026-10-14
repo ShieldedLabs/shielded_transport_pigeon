@@ -225,11 +225,22 @@ pub const fn total_packet_payload_overhead_from_connect_magic1_inside_udp_payloa
 }
 
 pub const STP_FRAGMENT_HEADER_SIZE: usize = 8;
+const STP_WHOLE_HEADER_SIZE: usize = 4;
+
+/// Low bits 11 denote a whole plain message (fin, offset=0); 01 denotes FEC,
+/// 00/10 denote ordinary plain fragments. Length is 14 bits, package id 16 bits.
+/// 0xffffffff is reserved for padding and cannot collide with a TU-sized message.
+pub(crate) fn read_fragment_header(payload: &[u8]) -> Option<(u64, usize)> {
+    let word = u32::from_le_bytes(payload.get(..4)?.try_into().ok()?);
+    if word == u32::MAX { return None; }
+    if word & 3 == 3 { return Some(((word & !1) as u64, STP_WHOLE_HEADER_SIZE)); }
+    Some((u64::from_le_bytes(payload.get(..8)?.try_into().ok()?), STP_FRAGMENT_HEADER_SIZE))
+}
 
 /// Largest app message STP sends in one datagram at the guaranteed TU; bigger ones are split across datagrams.
 pub const fn max_single_datagram_message_size(magic: u64) -> Option<usize> {
     match total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(magic) {
-        Some(overhead) => Some(ASSUMED_UDP_PAYLOAD_SIZE_WITH_GUARANTEED_DELIVERY - overhead - STP_FRAGMENT_HEADER_SIZE),
+        Some(overhead) => Some(ASSUMED_UDP_PAYLOAD_SIZE_WITH_GUARANTEED_DELIVERY - overhead - STP_WHOLE_HEADER_SIZE),
         None => None,
     }
 }
@@ -951,7 +962,7 @@ impl UnreliableSendBuffer {
         match self.fec_block_bytes(msg.len(), payload_len) {
             Some(block_bytes) => self.start_fec(std::sync::Arc::new(msg), block_bytes),
             None => {
-                if self.fec_adaptive.is_some() && msg.len() <= payload_len.saturating_sub(STP_FRAGMENT_HEADER_SIZE) {
+                if self.fec_adaptive.is_some() && msg.len() <= payload_len.saturating_sub(STP_WHOLE_HEADER_SIZE) {
                     let slot = FecSendSlot { retention_lease: None, retain_limit: self.retention_quota.byte_limit, package_lease: self.package_lease.clone(), dscp: self.current_dscp, message: std::sync::Arc::new(msg.clone()), block_bytes: msg.len(), k: 1, n: 1, next_id: 0,
                         encoder: FecEncoderState::Failed, block_buf: Vec::new(), first_seq: self.next_packet_seq,
                         lost: 0, group_lost: vec![0], n_planned: 1, loss_estimate: 0.0, finalized_symbols: 0, send_started_ns: self.fec_now_ns, original_send_duration_ns: Some(0) };
@@ -1009,7 +1020,7 @@ impl UnreliableSendBuffer {
         if self.fec_send_slot.is_some() {
             if self.fec_send_slot.as_ref().unwrap().k == 1 {
                 let f = self.fec_send_slot.as_ref().unwrap();
-                if f.message.len() + STP_FRAGMENT_HEADER_SIZE > space {
+                if f.message.len() + STP_WHOLE_HEADER_SIZE > space {
                     if space < payload_len { return None; }
                     // A TU shrink invalidated the whole-packet K=1 copy. Abandon this
                     // bounded rescue rather than blocking the suspended original forever.
@@ -1090,8 +1101,9 @@ impl UnreliableSendBuffer {
             self.packet_dscp = Some(dscp);
             return Some(UnreliableFragment::Fec { package_id, message_len: f.message.len() as u32, block_bytes: f.block_bytes as u16, block_id: id, data: &f.message[start..end] });
         }
-        let frag_size = space.checked_sub(STP_FRAGMENT_HEADER_SIZE)?;
         let (msg, start_byte) = self.partial_send_slot.as_ref().unwrap();
+        let whole = *start_byte == 0 && msg.len() <= payload_len.saturating_sub(STP_WHOLE_HEADER_SIZE);
+        let frag_size = space.checked_sub(if whole { STP_WHOLE_HEADER_SIZE } else { STP_FRAGMENT_HEADER_SIZE })?;
         if *start_byte == 0 && msg.len() <= frag_size {
             if let Some(r) = self.fec_retained.get_mut(&self.send_package_id).filter(|r| r.slot.k == 1) {
                 if r.slot.next_id > 0 && r.slot.next_id < r.slot.n { self.rescue_ready_count -= 1; }
@@ -1105,7 +1117,7 @@ impl UnreliableSendBuffer {
         let start = *start_byte as usize;
         // A plain message that fits a fresh packet has exactly one physical erasure event.
         // Do not fill the preceding packet's tail with a partial prefix of that message.
-        if start == 0 && msg.len() <= payload_len.saturating_sub(STP_FRAGMENT_HEADER_SIZE) && msg.len() > frag_size {
+        if whole && msg.len() > frag_size {
             return None;
         }
         let ret_size = (msg.len() - start).min(frag_size);
@@ -1287,32 +1299,36 @@ impl ReceiveQueue {
 
 /// Fill a full transmission unit, or return 0 if nothing was queued.
 /// Padding is an authenticated terminator, never a variable-size tail.
-fn fill_packet_payload_with_unreliable_fragments(payload: &mut [u8], unreliable_send_buffer: &mut UnreliableSendBuffer) -> usize {
-    unreliable_send_buffer.packet_dscp = None;
-    let mut send = false;
-    let mut cursor = 0;
-    let payload_len = payload.len();
-    while cursor + STP_FRAGMENT_HEADER_SIZE <= payload_len && let Some(frag) = unreliable_send_buffer.next_fragment(payload_len, payload_len - cursor) {
-        send = true;
-        match frag {
-            UnreliableFragment::Plain { is_fin, package_id, data: frag_data, offset: frag_offset } => {
-                let header = 0 | ((is_fin as u64) << 1) | ((package_id as u64) << 2) | ((frag_data.len() as u64 & 0x3fff) << 18) | ((frag_offset as u64) << 32);
-                store_u64(&mut payload[cursor..cursor+STP_FRAGMENT_HEADER_SIZE], header);
-                frag_data.write_to(&mut payload[cursor+STP_FRAGMENT_HEADER_SIZE..]);
-                cursor += STP_FRAGMENT_HEADER_SIZE+frag_data.len();
-            }
-            UnreliableFragment::Fec { package_id, message_len, block_bytes, block_id, data } => {
-                let word0 = 1 | ((package_id as u64) << 2) | ((data.len() as u64 & 0x3fff) << 18) | ((block_id as u64) << 32);
-                let kind = if message_len as usize > crate::fec::MAX_BLOCKS * block_bytes as usize { STP_EXT_KIND_GROUPED_FEC } else { STP_EXT_KIND_FEC };
-                let word1 = message_len as u64 | ((block_bytes as u64) << 32) | (kind << 48);
-                store_u64(&mut payload[cursor..cursor+8], word0);
-                store_u64(&mut payload[cursor+8..cursor+16], word1);
-                data.write_to(&mut payload[cursor+STP_FEC_FRAGMENT_HEADER_SIZE..]);
-                cursor += STP_FEC_FRAGMENT_HEADER_SIZE+data.len();
-            }
+fn write_fragment(payload: &mut [u8], frag: UnreliableFragment<'_>) -> usize {
+    match frag {
+        UnreliableFragment::Plain { is_fin, package_id, data, offset } => {
+            let header = ((is_fin as u64) << 1) | ((package_id as u64) << 2) | ((data.len() as u64) << 18) | ((offset as u64) << 32);
+            let size = if is_fin && offset == 0 { STP_WHOLE_HEADER_SIZE } else { STP_FRAGMENT_HEADER_SIZE };
+            if size == STP_WHOLE_HEADER_SIZE { store_u32(&mut payload[..4], header as u32 | 1); }
+            else { store_u64(&mut payload[..8], header); }
+            data.write_to(&mut payload[size..]);
+            size + data.len()
+        }
+        UnreliableFragment::Fec { package_id, message_len, block_bytes, block_id, data } => {
+            let word0 = 1 | ((package_id as u64) << 2) | ((data.len() as u64) << 18) | ((block_id as u64) << 32);
+            let kind = if message_len as usize > crate::fec::MAX_BLOCKS * block_bytes as usize { STP_EXT_KIND_GROUPED_FEC } else { STP_EXT_KIND_FEC };
+            let word1 = message_len as u64 | ((block_bytes as u64) << 32) | (kind << 48);
+            store_u64(&mut payload[..8], word0);
+            store_u64(&mut payload[8..16], word1);
+            data.write_to(&mut payload[16..]);
+            STP_FEC_FRAGMENT_HEADER_SIZE + data.len()
         }
     }
-    if send == false { return 0; }
+}
+
+fn fill_packet_payload_with_unreliable_fragments(payload: &mut [u8], buf: &mut UnreliableSendBuffer) -> usize {
+    buf.packet_dscp = None;
+    let mut cursor = 0;
+    while cursor + STP_WHOLE_HEADER_SIZE <= payload.len() {
+        let Some(frag) = buf.next_fragment(payload.len(), payload.len() - cursor) else { break; };
+        cursor += write_fragment(&mut payload[cursor..], frag);
+    }
+    if cursor == 0 { return 0; }
     payload[cursor..].fill(0xff);
     payload.len()
 }
@@ -3022,9 +3038,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             // if OVERLY_VERBOSE { println!("Got data from {:?}  data: {:?}", existing_connection.other_transport_identity, payload); }
                             
                             let mut remaining_payload = payload;
-                            while remaining_payload.len() >= 8 {
-                                let header = load_u64(&remaining_payload[0..8]);
-                                if header == u64::MAX { break; }
+                            while let Some((header, plain_header_size)) = read_fragment_header(remaining_payload) {
 
                                 if header & 1 != 0 {
                                     // Extended fragment (FEC); see STP_FEC_FRAGMENT_HEADER_SIZE.
@@ -3095,13 +3109,13 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 let frag_len = (header >> 18) & 0x3fff;
                                 let frag_offset = header >> 32;
                                 
-                                if (remaining_payload.len() as u64) < 8+frag_len {
+                                if (remaining_payload.len() as u64) < plain_header_size as u64 + frag_len {
                                     if OVERLY_VERBOSE { println!("Error, frag_len ({frag_len:?}) extends beyond end of packet received from {connection_key:?}. Disconnecting..."); }
                                     connections_map.remove(&connection_key);
                                     break 'conn;
                                 }
-                                let frag_data = &remaining_payload[8..(8+frag_len as usize)];
-                                remaining_payload = &remaining_payload[(8+frag_len as usize)..];
+                                let frag_data = &remaining_payload[plain_header_size..(plain_header_size+frag_len as usize)];
+                                remaining_payload = &remaining_payload[(plain_header_size+frag_len as usize)..];
 
                                 if frag_offset + frag_len > u32::MAX as u64 {
                                     if OVERLY_VERBOSE { println!("Error, frag_offset + frag_len overflows u32 from {connection_key:?}. Disconnecting..."); }
@@ -4449,9 +4463,7 @@ mod fec_send_tests {
 
     fn parse_packet(mut p: &[u8]) -> Vec<Frag> {
         let mut out = Vec::new();
-        while p.len() >= 8 {
-            let h = load_u64(&p[0..8]);
-            if h == u64::MAX { break; }
+        while let Some((h, plain_header_size)) = read_fragment_header(p) {
             let len = ((h >> 18) & 0x3fff) as usize;
             let pkg = ((h >> 2) & 0xffff) as u16;
             if h & 1 != 0 {
@@ -4460,8 +4472,8 @@ mod fec_send_tests {
                 out.push((pkg, Some(((w1 & 0xffff_ffff) as usize, ((w1 >> 32) & 0xffff) as usize, (h >> 32) as u32)), false, 0, p[16..16 + len].to_vec()));
                 p = &p[16 + len..];
             } else {
-                out.push((pkg, None, h & 2 != 0, (h >> 32) as u32, p[8..8 + len].to_vec()));
-                p = &p[8 + len..];
+                out.push((pkg, None, h & 2 != 0, (h >> 32) as u32, p[plain_header_size..plain_header_size + len].to_vec()));
+                p = &p[plain_header_size + len..];
             }
         }
         out
@@ -5133,13 +5145,11 @@ mod send_queue_tests {
             let mut p = vec![0; 1449];
             if s.fill_packet(&mut p) == 0 { break; }
             let mut cursor = 0;
-            while cursor + 8 <= p.len() {
-                let h = load_u64(&p[cursor..cursor+8]);
-                if h == u64::MAX { break; }
+            while let Some((h, header)) = read_fragment_header(&p[cursor..]) {
                 let len = ((h >> 18) & 0x3fff) as usize;
-                let byte = p[cursor + 8];
+                let byte = p[cursor + header];
                 if seen.last() != Some(&byte) { seen.push(byte); }
-                cursor += 8 + len;
+                cursor += header + len;
             }
             seq += 1;
         }
@@ -5199,12 +5209,12 @@ mod traffic_class_tests {
         s.fec_prepare_packet(0);
         assert_eq!(s.fill_packet(&mut p), p.len());
         assert_eq!(s.last_dscp, Dscp::Ef);
-        assert_eq!(&p[108..116], &[255; 8]);
+        assert_eq!(&p[104..112], &[255; 8]);
         s.fec_prepare_packet(1);
         assert_eq!(s.fill_packet(&mut p), p.len());
         assert_eq!(s.last_dscp, Dscp::BestEffort);
-        assert_eq!(p[8], 2);
-        assert_eq!(p[116], 3);
+        assert_eq!(p[4], 2);
+        assert_eq!(p[108], 3);
     }
     #[test]
     fn fec_sources_repairs_and_raw_rescue_keep_message_class() {
@@ -5269,8 +5279,8 @@ mod review_tests {
     }
     fn plain_ids(p: &[u8]) -> Vec<u16> {
         let mut v = Vec::new(); let mut c = 0;
-        while c + 8 <= p.len() { let h = load_u64(&p[c..c+8]); if h == u64::MAX { break; }
-            v.push(((h >> 2) & 0xffff) as u16); c += 8 + ((h >> 18) & 0x3fff) as usize; }
+        while let Some((h, header)) = read_fragment_header(&p[c..]) {
+            v.push(((h >> 2) & 0xffff) as u16); c += header + ((h >> 18) & 0x3fff) as usize; }
         v
     }
     // A long FEC train on one magazine keeps its package id while a small-message magazine burns ids.
@@ -5366,10 +5376,9 @@ mod sender_lifetime_tests {
             if s.last_queue == 1 { bulk = Some(s.queues[1].send_package_id); }
             else if let Some(id) = bulk {
                 let mut c = 0;
-                while c+8 <= p.len() {
-                    let h = load_u64(&p[c..c+8]); if h == u64::MAX { break; }
+                while let Some((h, header)) = read_fragment_header(&p[c..]) {
                     assert_ne!(((h>>2)&0xffff) as usize % 1024, id as usize%1024);
-                    c += 8+((h>>18)&0x3fff) as usize;
+                    c += header+((h>>18)&0x3fff) as usize;
                 }
             }
         }
@@ -5567,5 +5576,33 @@ mod outage_review_repros {
         s.stats.spurious_losses += 3; // late outage ACKs
         s.outage.ignored_spurious += 3;
         assert_eq!(fec_learning_counters(&s), (2, 0));
+    }
+}
+
+#[cfg(test)]
+mod compact_frame_tests {
+    use super::*;
+    #[test]
+    fn whole_messages_pack_at_four_bytes_each_and_padding_stops_in_constant_time() {
+        let mut b = UnreliableSendBuffer::new(1_000_000, 10000, 10000);
+        b.submit_messages((0..13).map(|i| vec![i; 80]).collect());
+        let mut p = [0; 1162];
+        assert_eq!(fill_packet_payload_with_unreliable_fragments(&mut p, &mut b), p.len());
+        let mut cursor = 0;
+        for i in 0..13 {
+            let (h, size) = read_fragment_header(&p[cursor..]).unwrap();
+            assert_eq!(size, 4); assert_eq!(h & 3, 2); assert_eq!(h >> 32, 0);
+            assert_eq!((h >> 18) & 0x3fff, 80);
+            assert_eq!(&p[cursor+size..cursor+size+80], &[i; 80]);
+            cursor += size+80;
+        }
+        assert_eq!(cursor, 1092);
+        assert!(read_fragment_header(&p[cursor..]).is_none());
+        assert!(p[cursor..].iter().all(|&b| b == 255));
+        for n in 0..4 { assert!(read_fragment_header(&p[cursor..cursor+n]).is_none()); }
+        // Largest package id remains distinguishable from the all-ones padding marker.
+        let mut q = [0; 84];
+        write_fragment(&mut q, UnreliableFragment::Plain { is_fin: true, package_id: u16::MAX, data: &[7;80], offset: 0 });
+        assert_eq!((read_fragment_header(&q).unwrap().0 >> 2) & 0xffff, u16::MAX as u64);
     }
 }
