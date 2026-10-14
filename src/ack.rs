@@ -10,6 +10,9 @@ pub enum AckOptions {
     /// ACK at this packet count or delay, whichever comes first. Gaps, reordering,
     /// duplicates and CE schedule an immediate ACK (coalesced within a receive batch).
     LowLatency { every_packets: u16, max_delay_us: u32 },
+    /// Rate/RTT-scaled batching. Packet threshold grows up to64, targeting1000 ACK/s;
+    /// deadline uses RTT/8 plus a packet-budget floor, bounded by max_delay_us.
+    Adaptive { every_packets: u16, max_delay_us: u32 },
 }
 impl Default for AckOptions {
     fn default() -> Self { Self::LowLatency { every_packets: 8, max_delay_us: 1000 } }
@@ -94,14 +97,19 @@ pub struct AckReceiver {
     sample_time_ns: u64,
     ce_count: u32,
     pending: u16,
+    last_arrival_ns: Option<u64>,
+    mean_gap_ns: u64,
 }
 impl Default for AckReceiver {
-    fn default() -> Self { Self { history: [0; 64], highest: None, sample_seq: 0, sample_time_ns: 0, ce_count: 0, pending: 0 } }
+    fn default() -> Self { Self { history: [0; 64], highest: None, sample_seq: 0, sample_time_ns: 0, ce_count: 0, pending: 0, last_arrival_ns: None, mean_gap_ns: 1_000_000 } }
 }
 impl AckReceiver {
     /// Returns false for duplicate/too-old data; duplicates still refresh ACK feedback.
     pub fn receive(&mut self, seq: u64, now: u64, ce: bool, options: AckOptions, timer: &mut u64) -> bool {
-        let AckOptions::LowLatency { every_packets, max_delay_us } = options else { return false; };
+        self.receive_with_rtt(seq, now, ce, options, timer, 0, 1184)
+    }
+    pub fn receive_with_rtt(&mut self, seq: u64, now: u64, ce: bool, options: AckOptions, timer: &mut u64, rtt_us: u64, wire_bytes: usize) -> bool {
+        if matches!(options, AckOptions::Legacy) { return false; }
         let old_highest = self.highest;
         if old_highest.is_some_and(|h| seq < h.saturating_sub(HISTORY_BITS - 1)) { return false; }
         if let Some(h) = old_highest {
@@ -118,10 +126,33 @@ impl AckReceiver {
         self.sample_seq = seq;
         self.sample_time_ns = now;
         if ce { self.ce_count = self.ce_count.wrapping_add(1); }
+        if let Some(last) = self.last_arrival_ns {
+            let gap = now.saturating_sub(last).clamp(1000, 100_000_000);
+            self.mean_gap_ns = (self.mean_gap_ns * 7 + gap) / 8;
+        }
+        self.last_arrival_ns = Some(now);
+        let (every_packets, max_delay_us) = self.policy(options, rtt_us, wire_bytes);
         self.pending = self.pending.saturating_add(1);
         let urgent = ce || old_highest.is_none_or(|h| seq != h + 1) || self.pending >= every_packets.max(1);
         *timer = (*timer).min(now.saturating_add(if urgent { 0 } else { max_delay_us as u64 * 1000 }));
         true
+    }
+    fn policy(&self, options: AckOptions, rtt_us: u64, wire_bytes: usize) -> (u16, u32) {
+        match options {
+            AckOptions::LowLatency { every_packets, max_delay_us } => (every_packets, max_delay_us),
+            AckOptions::Adaptive { every_packets, max_delay_us } => {
+                let pps = 1_000_000_000 / self.mean_gap_ns.max(1);
+                // 174 bytes is the encrypted UDP ACK size. At least this packet group
+                // is needed for <=2% overhead, except when the delay cap forces a flush.
+                let budget_packets = (174u64 * 50).div_ceil(wire_bytes.max(1) as u64);
+                let minimum = (every_packets as u64).max(budget_packets).clamp(1, 64);
+                let n = pps.div_ceil(1000).clamp(minimum, 64);
+                let budget_us = n * self.mean_gap_ns / 1000;
+                let t = (rtt_us / 8).clamp(1000, max_delay_us.max(1000) as u64).max(budget_us).min(max_delay_us as u64);
+                (n as u16, t as u32)
+            }
+            AckOptions::Legacy => (0, 0),
+        }
     }
     pub fn ack(&self, now: u64) -> BitmapAck {
         let highest = self.highest.unwrap_or(0);
@@ -254,6 +285,45 @@ mod tests {
             }
             assert_eq!(a.relevant(&waiting, &lost).acknowledged().collect::<Vec<_>>(), keep);
             assert_eq!(a.relevant(&[0; 4096], &[0; 4096]).acknowledged().collect::<Vec<_>>(), vec![highest]);
+        }
+    }
+    #[test]
+    fn adaptive_policy_balances_budget_rtt_and_delay_cap() {
+        let mut r = AckReceiver::default();
+        let opts = AckOptions::Adaptive { every_packets: 8, max_delay_us: 10000 };
+        assert_eq!(r.policy(opts, 10000, 1472), (8, 8000));
+        r.mean_gap_ns = 100_000;
+        assert_eq!(r.policy(opts, 10000, 1472), (10, 1250));
+        r.mean_gap_ns = 20_000;
+        assert_eq!(r.policy(opts, 10000, 1472), (50, 1250));
+        r.mean_gap_ns = 1000;
+        assert_eq!(r.policy(opts, 200000, 539), (64, 10000));
+        r.mean_gap_ns = 1_000_000;
+        assert_eq!(r.policy(opts, 10000, 539), (17, 10000)); // deadline cap wins; budget cannot be met
+    }
+    #[test]
+    fn hello_sizes_are_not_ack_sizes() {
+        use crate::stp::*;
+        assert_eq!(6+32+MAGIC2_BLOCK_SIZE, 295);
+        for magic in [CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b] {
+            let client = new_keypair_from_connect_magic1(magic).unwrap();
+            let server = new_keypair_from_connect_magic1(magic).unwrap();
+            let params = crypto_string_from_connect_magic1(magic).unwrap();
+            let prologue = magic.to_le_bytes();
+            let mut c = snow::Builder::new(params.parse().unwrap()).prologue(&prologue[..6]).unwrap().local_private_key(&client.private).unwrap().remote_public_key(&server.public).unwrap().build_initiator().unwrap();
+            let mut s = snow::Builder::new(params.parse().unwrap()).prologue(&prologue[..6]).unwrap().local_private_key(&server.private).unwrap().build_responder().unwrap();
+            let mut packet = [0; 1024]; let mut payload = [0; 1024];
+            let n = c.write_message(&build_magic2_client_block(), &mut packet).unwrap();
+            assert_eq!(n+6, 359);
+            s.read_message(&packet[..n], &mut payload).unwrap();
+            let n = s.write_message(&1u64.to_le_bytes(), &mut packet).unwrap();
+            assert_eq!(n+6, 62);
+            for hello_udp_len in [295, 46, 359, 62] {
+                assert_ne!(hello_udp_len, ACK_PAYLOAD_LEN+22);
+                assert_ne!(hello_udp_len, ACK_PAYLOAD_LEN+6);
+                assert_ne!(hello_udp_len, 516+22);
+                assert_ne!(hello_udp_len, 516+6);
+            }
         }
     }
     #[test]

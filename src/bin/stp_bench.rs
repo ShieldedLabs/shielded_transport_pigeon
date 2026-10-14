@@ -10,7 +10,7 @@
 //! --cc-time-gs, --cc-rate-rp, --cc-rate-pg, --cc-rate-gs, --cc-loss-threshold,
 //! --cc-floor-pps, --cc-start-pps, --cc-min-growth-ppsps, --cc-max-growth-ppsps,
 //! --cc-guard-rtts.
-//! ACK: --ack legacy|bitmap [--ack-every 8] [--ack-delay-us 1000], on both endpoints.
+//! ACK: --ack legacy|bitmap|adaptive [--ack-every 8] [--ack-delay-us 1000], on both endpoints.
 //! --duration S: saturated measurement for S seconds; requests receiver status while sending.
 //! estimator_series rows: [seconds, FEC estimate, sample, sent packets, losses, UDP bytes, RTT us].
 //! --fec-pct X (send only): forward error correction redundancy in percent (float); messages of
@@ -151,7 +151,8 @@ fn ack_options(a: &Args) -> shielded_transport_pigeon::ack::AckOptions {
     match a.str("ack").unwrap_or("bitmap") {
         "legacy" => AckOptions::Legacy,
         "bitmap" => AckOptions::LowLatency { every_packets: a.num("ack-every", 8), max_delay_us: a.num("ack-delay-us", 1000) },
-        _ => die("--ack needs legacy or bitmap"),
+        "adaptive" => AckOptions::Adaptive { every_packets: a.num("ack-every", 8), max_delay_us: a.num("ack-delay-us", 10000) },
+        _ => die("--ack needs legacy, bitmap or adaptive"),
     }
 }
 

@@ -2366,8 +2366,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             }
                             // This is not an ack packet.
 
-                            if matches!(ack_options, crate::ack::AckOptions::LowLatency { .. }) {
-                                if !state.ack_receiver.receive(nonce as u64, timestamp_ns, ecn_marked, ack_options, &mut state.ack_timer) { break 'conn; }
+                            if !matches!(ack_options, crate::ack::AckOptions::Legacy) {
+                                if !state.ack_receiver.receive_with_rtt(nonce as u64, timestamp_ns, ecn_marked, ack_options, &mut state.ack_timer, state.stats.rtt_us, buf_len) { break 'conn; }
                             } else {
                             if nonce < state.ack_field.field_base {
                                 if OVERLY_VERBOSE { println!("Dropping from {connection_key:?}, nonce too old."); }
@@ -2693,7 +2693,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 let encoded;
                                 let ack_payload = match ack_options {
                                     crate::ack::AckOptions::Legacy => state.ack_field.as_bytes(),
-                                    crate::ack::AckOptions::LowLatency { .. } => {
+                                    crate::ack::AckOptions::LowLatency { .. } | crate::ack::AckOptions::Adaptive { .. } => {
                                         let a = state.ack_receiver.ack(current_time_now_ns);
                                         state.stats.ack_delay_us_max = state.stats.ack_delay_us_max.max(a.delay_us);
                                         encoded = a.encode();
