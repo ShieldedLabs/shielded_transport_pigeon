@@ -154,6 +154,10 @@ fn pacing_options(a: &Args) -> PacingOptions {
         _ => die("--pacer needs precise or poly"),
     }
 }
+fn pacing_burst_budget_ns(a: &Args) -> Option<u64> {
+    a.str("burst-budget-ms").map(|_| a.num::<u64>("burst-budget-ms", 0)
+        .checked_mul(1_000_000).unwrap_or_else(|| die("--burst-budget-ms overflows")))
+}
 fn load_average() -> String {
     std::fs::read_to_string("/proc/loadavg").unwrap_or_default().split_whitespace()
         .take(3).collect::<Vec<_>>().join(",")
@@ -232,7 +236,7 @@ fn serve(a: &Args) {
     let kp = new_keypair_from_connect_magic1_with_seed(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, seed).unwrap();
     let addr = STPAddress::from(to_v6(advertise), port, &kp);
 
-    let handle = new_network_thread_with_options(vec![kp], port, max_pps(a), send_buffer_params(a), NetworkThreadOptions { bind_ip: bind, congestion_control: cc_options(a), pacing: pacing_options(a), pacing_diagnostics: a.num::<u32>("pacing-diagnostics", 0) != 0, ..Default::default() });
+    let handle = new_network_thread_with_options(vec![kp], port, max_pps(a), send_buffer_params(a), NetworkThreadOptions { bind_ip: bind, congestion_control: cc_options(a), pacing: pacing_options(a), polynomial_burst_budget_ns: pacing_burst_budget_ns(a), pacing_diagnostics: a.num::<u32>("pacing-diagnostics", 0) != 0, ..Default::default() });
     println!("stp_bench serve: bound {}:{port}", bind.map(|b| b.to_string()).unwrap_or("[::]".into()));
     println!("STP address: {:?}", addr);
 
@@ -425,7 +429,7 @@ fn send(a: &Args) {
     }
 
     let kp = new_keypair_from_connect_magic1(to.magic1).unwrap_or_else(|| die("unsupported crypto in --to"));
-    let handle = new_network_thread_with_options(vec![kp], 0, max_pps(a), send_buffer_params(a), NetworkThreadOptions { bind_ip: None, congestion_control: cc_options(a), fec_redundancy_ppm: fec_ppm, fec_adaptive, record_fec_messages: true, pacing: pacing_options(a), pacing_diagnostics: a.num::<u32>("pacing-diagnostics", 0) != 0 });
+    let handle = new_network_thread_with_options(vec![kp], 0, max_pps(a), send_buffer_params(a), NetworkThreadOptions { bind_ip: None, congestion_control: cc_options(a), fec_redundancy_ppm: fec_ppm, fec_adaptive, record_fec_messages: true, pacing: pacing_options(a), polynomial_burst_budget_ns: pacing_burst_budget_ns(a), pacing_diagnostics: a.num::<u32>("pacing-diagnostics", 0) != 0 });
     // Per data id: (k, blocks sent, blocks planned, loss estimate) of its FEC coding, if coded.
     let mut fec_info: HashMap<u32, (u32, u32, u32, f64)> = HashMap::new();
     // One sample per second: (t, loss estimate, sample, packets sent/lost, UDP bytes, RTT us).
@@ -693,7 +697,7 @@ fn send(a: &Args) {
         "\"recv_queue_dropped_messages\":{},\"server_cpu_user_s\":{:.3},\"server_cpu_sys_s\":{:.3},",
         "\"messages_completed\":{},\"partials_evicted\":{},\"partials_evicted_bytes\":{},\"insert_failures\":{},\"stale_fragments\":{}}},",
         "\"buckets\":[{}],\"estimator_series\":[{}],\"congestion_control\":\"{:?}\",",
-        "\"sender_pacing\":{{\"mode\":\"{:?}\",\"diagnostics\":{},\"batches\":{},\"packets\":{},\"max_burst\":{},\"burst_hist\":[{}],",
+        "\"sender_pacing\":{{\"mode\":\"{:?}\",\"diagnostics\":{},\"burst_budget_ms\":{},\"batches\":{},\"packets\":{},\"max_burst\":{},\"burst_hist\":[{}],",
         "\"commanded_packets\":{},\"error_samples\":{},\"error_abs_sum_ns\":{},\"error_max_ns\":{},\"history_records\":{},",
         "\"network_cpu_user_us\":{},\"network_cpu_sys_us\":{},\"process_cpu_user_us\":{},\"process_cpu_sys_us\":{},\"load_start\":[{}],\"load_end\":[{}]}}}}\n"),
         to, seed, min, max, sbp.0, sbp.1, sbp.2, fec_pct, fec_mode, fec_adaptive.map(|c| format!("{c:?}")).unwrap_or_default(),
@@ -712,7 +716,10 @@ fn send(a: &Args) {
         rx.st.rx_messages_completed, rx.st.rx_partial_evicted, rx.st.rx_partial_evicted_bytes, rx.st.rx_insert_failures, rx.st.rx_stale_fragments,
         bucket_json.join(","),
         series.iter().map(|x| format!("[{:.1},{:.5},{:.5},{},{},{},{}]", x.0, x.1, x.2, x.3, x.4, x.5, x.6)).collect::<Vec<_>>().join(","), cc_options(a),
-        pacing_options(a), a.num::<u32>("pacing-diagnostics", 0) != 0, stats.pacing_batches, stats.pacing_packets, stats.pacing_max_burst,
+        pacing_options(a), a.num::<u32>("pacing-diagnostics", 0) != 0,
+        pacing_burst_budget_ns(a).map(|ns| (ns / 1_000_000).to_string()).unwrap_or_else(|| match pacing_options(a) {
+            PacingOptions::Polynomial { cadence_ms } => cadence_ms.to_string(), _ => "null".into(),
+        }), stats.pacing_batches, stats.pacing_packets, stats.pacing_max_burst,
         stats.pacing_burst_hist.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","),
         stats.pacing_commanded_packets, stats.pacing_error_samples, stats.pacing_error_abs_sum_ns, stats.pacing_error_max_ns, stats.pacing_history_records,
         stats.network_cpu_user_us, stats.network_cpu_sys_us, sender_cpu_user_us, sender_cpu_sys_us, load_start, load_average());

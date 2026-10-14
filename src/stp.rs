@@ -1759,6 +1759,10 @@ impl PacingOptions {
 pub struct NetworkThreadOptions {
     pub congestion_control: CongestionControlOptions,
     pub pacing: PacingOptions,
+    /// Polynomial send-burst wall-time budget: None uses one cadence, Some(0)
+    /// disables it (re-anchor only), Some(ns) overrides it. Ignored by precise.
+    /// A scheduler preemption inside one packet can still exceed the budget.
+    pub polynomial_burst_budget_ns: Option<u64>,
     /// Optional per-send inversion check; do not enable when measuring CPU savings.
     pub pacing_diagnostics: bool,
     /// See `new_network_thread_with_bind`.
@@ -1796,6 +1800,8 @@ impl NetworkThreadHandle {
 pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_pps: Option<u64>, send_buffer_params: (u32, u32, u32), options: NetworkThreadOptions) -> NetworkThreadHandle {
     let bind_ip = options.bind_ip;
     let curve_cadence_ns = options.pacing.cadence_ns();
+    let curve_burst_budget_ns = curve_cadence_ns.and_then(|cadence|
+        Some(options.polynomial_burst_budget_ns.unwrap_or(cadence)).filter(|ns| *ns != 0));
     let pacing_diagnostics = options.pacing_diagnostics;
     let cc = options.congestion_control;
     cc.validate().expect("invalid congestion controller configuration");
@@ -3072,7 +3078,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                         while state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY - 1 && packet_send_allowance_now > 0 && state.packets_in_flight < allowed_packets_in_flight && {
                             // Bound work within a burst as well as debt between
                             // ticks. Test BEFORE removing a fragment from its queue.
-                            curve_cpu_late = curve_cadence_ns.is_some_and(|cadence| monotonic_clock_ns() >= curve_tick_ns + cadence);
+                            curve_cpu_late = curve_burst_budget_ns.is_some_and(|budget| monotonic_clock_ns() >= curve_tick_ns.saturating_add(budget));
                             !curve_cpu_late
                         } && {
                             connection_tracking_data.unreliable_send_buffer.next_packet_seq = state.send_sequence_number;
