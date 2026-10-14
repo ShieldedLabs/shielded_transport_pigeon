@@ -64,6 +64,7 @@ fn main() {
     let connections: usize = a.get(4).map_or(1, |v| v.parse().unwrap());
     assert!(size <= MAX_JUMBOGRAM_LEN && count <= 1024 && connections <= 4096);
     let kp = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).unwrap();
+    if mode == "pressure" { pressure(kp, count, size); return; }
     // Reserve an ephemeral port before starting STP, whose API does not expose the bound port.
     let probe = UdpSocket::bind("127.0.0.1:0").unwrap(); let port = probe.local_addr().unwrap().port(); drop(probe);
     let _server = new_network_thread_with_options(vec![kp.clone()], port, None, (1_000_000, 1<<20, 1<<20),
@@ -110,4 +111,41 @@ fn main() {
     std::thread::sleep(Duration::from_millis(300));
     let acked: usize = peers.iter().map(Peer::acked).sum();
     println!("result mode={mode} count={count} size={size} connections={connections} acked={acked} {}", rss());
+}
+
+// An honest sender, not the raw adversary: fill a small receiver budget while the
+// application is stalled, then drain it. Observe loss-driven rate control and recovery.
+fn pressure(server_key: IdentityKeyPair, seconds: usize, size: usize) {
+    use std::time::Instant;
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap(); let port = socket.local_addr().unwrap().port(); drop(socket);
+    let address = STPAddress::from("127.0.0.1".parse::<std::net::Ipv4Addr>().unwrap().to_ipv6_mapped(), port, &server_key);
+    let budget = shielded_transport_pigeon::receive_memory::ReceiveMemoryBudget::new(4<<20);
+    let server = new_network_thread_with_options(vec![server_key], port, None, (1_000_000,1<<20,1<<20),
+        NetworkThreadOptions { receive_memory: Some(budget.clone()), bind_ip: Some("127.0.0.1".parse().unwrap()), ..Default::default() });
+    let client = new_network_thread(vec![new_keypair_from_connect_magic1(address.magic1).unwrap()], 0, None, (1_000_000,1<<20,1<<20));
+    service_connections(&client, NetworkThreadPush { initiate_connections: vec![address], ..Default::default() }).unwrap();
+    let start = Instant::now(); let mut client_wanted = Vec::new(); let mut server_wanted = Vec::new();
+    let mut key = None; let mut pending = Vec::new(); let mut submitted = 0; let mut received = 0; let mut last_second = usize::MAX;
+    while start.elapsed().as_secs_f64() < seconds as f64 {
+        let second = start.elapsed().as_secs() as usize;
+        // Drain for first third, stall the middle third, then resume.
+        let stalled = second >= seconds/3 && second < 2*seconds/3;
+        if !stalled {
+            let p = service_connections(&server, NetworkThreadPush { wanted_connections: server_wanted.clone(), ..Default::default() }).unwrap();
+            server_wanted = p.current_connections; received += p.received_unreliable_messages.len();
+        }
+        if pending.is_empty() { if let Some(k) = key { pending.push((k,vec![7;size])); } }
+        let p = service_connections(&client, NetworkThreadPush { wanted_connections: client_wanted.clone(), send_unreliable: std::mem::take(&mut pending), ..Default::default() }).unwrap();
+        key = p.current_connections.first().map(|(a,_)| ConnectionKey::from(a)); client_wanted = p.current_connections;
+        pending = p.send_unreliable_rejected;
+        if key.is_some() && pending.is_empty() { submitted += 1; }
+        if second != last_second {
+            if let Some((_,s)) = p.connection_stats.first() {
+                println!("pressure second={second} stalled={stalled} pps={} sent={} lost={} submitted={submitted} delivered={received} budget_used={} budget_peak={} {}",
+                    s.cc_rate_upps as f64/1e6,s.packets_sent,s.packets_lost,budget.used(),budget.peak(),rss());
+            }
+            last_second = second;
+        }
+        std::thread::sleep(Duration::from_micros(50));
+    }
 }
