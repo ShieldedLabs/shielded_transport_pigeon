@@ -1666,6 +1666,7 @@ pub struct ConnectionStateConnected {
     pub peer_ack_delay_us: u32,
     pub peer_ce_count: u32,
     loss_timer: LossTimer,
+    ack_hole: AckHole,
 
     // Note(Sam): HARD ASSUMPTION that no link ever has a greater RTT than 4.295 seconds.
     pub send_time_band: [u64; 1024], // 1024 buckets of 4.194 ms giving 4.295 seconds of tracking.
@@ -1734,6 +1735,7 @@ pub fn new_connection_state_connected(cipher: Option<ConnectionCipherTriplet>, m
         peer_ack_delay_us: 0,
         peer_ce_count: 0,
         loss_timer: LossTimer::default(),
+        ack_hole: AckHole::default(),
         send_time_band: [0; 1024],
         send_time_band_head_index: 0,
         RTT_sample_sums: [0; 16],
@@ -3217,6 +3219,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 let mut RTT_count = 0u64;
                                 let mut ack_latency_ns = 0u64;
                                 
+                                let mut data_ack_progress = false;
                                 let mut oldest_newly_acked_send_time: u64 = u64::MAX;
                                 let relevant_ack = bitmap_ack.as_ref().map(|a| a.relevant(&state.packets_waiting_ack_field, &state.declared_lost_field[..]));
                                 let indices = relevant_ack.iter().flat_map(crate::ack::BitmapAck::acknowledged);
@@ -3247,6 +3250,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                                 state.tu_probe_failed_count = 0;
                                             }
                                             else {
+                                                state.ack_hole.acknowledged(index);
+                                                data_ack_progress = true;
                                                 assert!(state.packets_in_flight > 0, "packets_in_flight underflow");
                                                 state.packets_in_flight -= 1;
                                             }
@@ -3284,6 +3289,9 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     }
                                 }
                                 if ack_latency_ns != 0 { state.loss_timer.observe(ack_latency_ns); }
+                                if data_ack_progress {
+                                    observe_ack_hole(state, timestamp_ns, &cc, max_pps);
+                                }
 
                                 let ce_feedback = bitmap_ack.as_ref().is_some_and(|a| crate::ack::update_ce_count(&mut state.peer_ce_count, a.ce_count));
                                 if ecn_marked || ce_feedback {
@@ -4434,6 +4442,67 @@ fn quantized_rtt_mean(sum: u64, count: u64) -> u16 {
     (sum / count.max(1)).clamp(1, u16::MAX as u64) as u16
 }
 
+// Congestion-only fast feedback. Three distinct newer data receipts, then a fresh
+// ACK frame after RTT/16 (at least 1 ms), tolerate packet/ACK reordering and batching.
+// This is the receiver's existing reorder grace, not a delay-based congestion model.
+const ACK_HOLE_NEWER_PACKETS: usize = 3;
+
+#[derive(Debug, Default)]
+struct AckHole {
+    newest: [Option<u64>; ACK_HOLE_NEWER_PACKETS],
+    cursor: u64,
+    candidate: Option<(u64, u64)>, // sequence, first qualifying ACK arrival
+}
+impl AckHole {
+    fn acknowledged(&mut self, seq: u64) {
+        if self.newest.contains(&Some(seq)) { return; }
+        let mut incoming = Some(seq);
+        for slot in &mut self.newest {
+            if incoming > *slot { std::mem::swap(slot, &mut incoming); }
+        }
+    }
+}
+
+fn observe_ack_hole(state: &mut ConnectionStateConnected, now: u64, cc: &CongestionPolicy, max_pps: Option<u64>) {
+    if state.outage.since_ns.is_some() || state.RTT_mean == u16::MAX { return; }
+    let Some(third) = state.ack_hole.newest[ACK_HOLE_NEWER_PACKETS - 1] else { return; };
+    let guard = state.congestion_event_time_ns.saturating_add(
+        (state.RTT_mean as f64 * 100_000.0 * cc.event_guard_rtts) as u64);
+    let mut seq = state.ack_hole.cursor.max(state.packets_waiting_ack_tail).max(state.outage.ignore_loss_before_seq);
+    while seq < third {
+        // Skip empty ring words; cursor only advances, so retired/covered packets
+        // are not rescanned on each ACK, even behind a long unfinalized loss train.
+        let bit = seq % PACKETS_WAITING_ACK_CAPACITY;
+        let word = state.packets_waiting_ack_field[(bit / 64) as usize] >> (bit % 64);
+        if word == 0 { seq += 64 - bit % 64; continue; }
+        seq += word.trailing_zeros() as u64;
+        if seq >= third { break; }
+        let sent = state.send_time(seq);
+        if seq == state.tu_probe_sequence_number || sent == 0 || sent == u64::MAX || sent <= guard {
+            seq += 1;
+            continue;
+        }
+        state.ack_hole.cursor = seq;
+        match state.ack_hole.candidate {
+            Some((candidate, since)) if candidate == seq => {
+                let grace = (state.RTT_mean as u64 * 100_000 / 16).max(1_000_000);
+                if now.saturating_sub(since) >= grace {
+                    // Only the CC anchor changes. Pending bits, final-loss timer,
+                    // flight count, retry/rescue and FEC erasure feedback stay intact.
+                    apply_loss_congestion(state, sent, now, cc, max_pps);
+                    println!("congestion early ACK HOLE {seq} at {now} ns");
+                    state.ack_hole.cursor = seq + 1;
+                    state.ack_hole.candidate = None;
+                }
+            }
+            _ => state.ack_hole.candidate = Some((seq, now)),
+        }
+        return;
+    }
+    state.ack_hole.cursor = seq.min(third);
+    state.ack_hole.candidate = None;
+}
+
 /// Loss timing observes full ACK latency (including receiver batching), independently
 /// of the delay-corrected RTT used by CC. One sample per ACK, not per bitmap bit.
 /// Late ACKs must participate: censoring them leaves a low-rate sender blind to jitter.
@@ -4540,6 +4609,97 @@ impl LossEpisodes {
 #[cfg(test)]
 mod congestion_tests {
     use super::*;
+
+    fn hole_state() -> ConnectionStateConnected {
+        let ConnectionState::Connected(mut s) = new_connection_state_connected(None, 0, 0, 0) else { unreachable!() };
+        s.RTT_mean = 1000; // 100 ms
+        s.congestion_event_rate_upps = 2_000_000_000;
+        for _ in 0..8 { s.account_send(1_000_000_000); }
+        // Close the send-time bucket, just as the send loop does.
+        s.account_send(1_010_000_000);
+        s.packets_in_flight = 9;
+        s
+    }
+    fn data_receipt(s: &mut ConnectionStateConnected, seq: u64) {
+        let bit = seq % PACKETS_WAITING_ACK_CAPACITY;
+        s.packets_waiting_ack_field[(bit / 64) as usize] &= !(1 << (bit % 64));
+        s.packets_in_flight -= 1;
+        s.ack_hole.acknowledged(seq);
+    }
+
+    #[test]
+    fn ack_hole_requires_three_distinct_receipts_and_two_spaced_frames() {
+        let mut s = hole_state();
+        let cc = crate::ship::CC;
+        for seq in [1, 2] { data_receipt(&mut s, seq); }
+        s.ack_hole.acknowledged(2); // duplication is not a third newer receipt
+        observe_ack_hole(&mut s, 1_100_000_000, &cc, None);
+        assert!(!s.cc_startup_done);
+        data_receipt(&mut s, 3);
+        observe_ack_hole(&mut s, 1_110_000_000, &cc, None);
+        assert!(!s.cc_startup_done); // one frame is not confirmation
+        data_receipt(&mut s, 4);
+        observe_ack_hole(&mut s, 1_115_000_000, &cc, None);
+        assert!(!s.cc_startup_done); // still inside RTT/16 reordering grace
+        data_receipt(&mut s, 5);
+        observe_ack_hole(&mut s, 1_120_000_000, &cc, None);
+        assert!(s.cc_startup_done);
+        assert_eq!(s.congestion_event_time_ns, 1_120_000_000);
+        let before = connection_rate(1_120_000_000, 2_000_000_000,
+            cc.recovery_rtts * 100_000_000, &cc, false).0;
+        assert!(s.congestion_event_rate_upps < before);
+    }
+
+    #[test]
+    fn ack_hole_reordering_within_grace_does_not_cut() {
+        let mut s = hole_state();
+        for seq in [1, 2, 3] { data_receipt(&mut s, seq); }
+        observe_ack_hole(&mut s, 1_100_000_000, &crate::ship::CC, None);
+        data_receipt(&mut s, 0); // reordered original arrives before confirmation
+        observe_ack_hole(&mut s, 1_105_000_000, &crate::ship::CC, None);
+        data_receipt(&mut s, 4);
+        observe_ack_hole(&mut s, 1_120_000_000, &crate::ship::CC, None);
+        assert!(!s.cc_startup_done);
+    }
+
+    #[test]
+    fn ack_hole_burst_and_later_timeout_share_one_event_guard() {
+        let mut s = hole_state();
+        for seq in [2, 3, 4] { data_receipt(&mut s, seq); }
+        observe_ack_hole(&mut s, 1_100_000_000, &crate::ship::CC, None);
+        data_receipt(&mut s, 5);
+        observe_ack_hole(&mut s, 1_110_000_000, &crate::ship::CC, None);
+        let cut = (s.congestion_event_time_ns, s.congestion_event_rate_upps);
+        data_receipt(&mut s, 6);
+        observe_ack_hole(&mut s, 1_140_000_000, &crate::ship::CC, None);
+        let sent = s.send_time(0);
+        apply_loss_congestion(&mut s, sent, 1_300_000_000, &crate::ship::CC, None);
+        assert_eq!((s.congestion_event_time_ns, s.congestion_event_rate_upps), cut);
+    }
+
+    #[test]
+    fn ack_hole_leaves_final_loss_and_fec_accounting_untouched() {
+        let mut s = hole_state();
+        for seq in [1, 2, 3] { data_receipt(&mut s, seq); }
+        observe_ack_hole(&mut s, 1_100_000_000, &crate::ship::CC, None);
+        data_receipt(&mut s, 4);
+        let bits = s.packets_waiting_ack_field;
+        let flight = s.packets_in_flight;
+        let timeout = s.loss_timer.timeout_ns(100_000_000, 0, &crate::ship::CC);
+        observe_ack_hole(&mut s, 1_110_000_000, &crate::ship::CC, None);
+        assert!(s.cc_startup_done);
+        assert_eq!(s.packets_waiting_ack_field, bits);
+        assert_eq!(s.packets_waiting_ack_tail, 0);
+        assert_eq!(s.packets_in_flight, flight);
+        assert_eq!(s.stats.packets_lost, 0);
+        assert_eq!(s.stats.spurious_losses, 0);
+        assert_eq!(fec_learning_counters(&s), (0, 0));
+        assert!(s.declared_lost_field.iter().all(|&w| w == 0));
+        assert_eq!(s.loss_timer.timeout_ns(100_000_000, 0, &crate::ship::CC), timeout);
+        let sent = s.send_time(0);
+        assert!(1_110_000_000 - sent < timeout); // not eligible for final loss yet
+        assert!(sent + timeout >= 1_200_000_000); // unchanged conservative deadline
+    }
 
     #[test]
     fn loss_timer_keeps_ack_delay_at_the_rate_floor() {
