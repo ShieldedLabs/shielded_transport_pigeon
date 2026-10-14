@@ -2666,7 +2666,9 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             }
                             // This is not an ack packet.
 
-                            if !state.ack_receiver.receive_with_rtt(nonce as u64, timestamp_ns, ecn_marked, &mut state.ack_timer, state.stats.rtt_us, buf_len) { break 'conn; }
+                            // Authentication/replay admission precedes allocation, but positive receipt
+                            // follows it. A memory-erased packet must look lost to the sender.
+                            let mut memory_erased = false;
 
                             // A legitimate data packet could never this state because to be all zeroes the
                             // first fragment would have to be package_id=0 and frag_len=0. If so that is
@@ -2679,7 +2681,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     all_null &= payload[i] == 0;
                                     i += 1;
                                 }
-                                if all_null { 
+                                if all_null {
+                                    state.ack_receiver.receive_with_rtt(nonce, timestamp_ns, ecn_marked, &mut state.ack_timer, state.stats.rtt_us, buf_len);
                                     if OVERLY_VERBOSE { println!("Received keep alive from {connection_key:?}."); }
                                     break 'conn;
                                 }
@@ -2690,7 +2693,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             let mut remaining_payload = payload;
                             while remaining_payload.len() >= 8 {
                                 let header = load_u64(&remaining_payload[0..8]);
-                                if header == u64::MAX { break 'conn; }
+                                if header == u64::MAX { break; }
 
                                 if header & 1 != 0 {
                                     // Extended fragment (FEC); see STP_FEC_FRAGMENT_HEADER_SIZE.
@@ -2747,6 +2750,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                         state.stats.rx_messages_completed += 1;
                                         receive_queue.push(connection_key, message, MAX_RECV_QUEUE_BYTES);
                                     }
+                                    memory_erased |= existing_connection.unreliable_fec[slot_idx].ingress_dropped != dropped_before;
                                     state.stats.fec_ingress_dropped_blocks += existing_connection.unreliable_fec[slot_idx].ingress_dropped - dropped_before;
                                     if !refused_before && existing_connection.unreliable_fec[slot_idx].admission_refused {
                                         state.stats.fec_decode_admission_refusals += 1;
@@ -2815,13 +2819,13 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     }
                                 }
 
-                                if !existing_connection.unreliable_reassembly[slot_idx].admit(frag_offset as usize, frag_data.len(), &receive_memory) { continue; }
+                                if !existing_connection.unreliable_reassembly[slot_idx].admit(frag_offset as usize, frag_data.len(), &receive_memory) { memory_erased = true; continue; }
                                 let (mut success, mut complete) = existing_connection.unreliable_reassembly[slot_idx].insert(frag_offset as usize, frag_data, is_fin);
                                 if !success {
                                     state.stats.rx_insert_failures += 1;
                                     existing_connection.unreliable_reassembly[slot_idx] = ReassemblySlot::new();
                                     existing_connection.unreliable_reassembly[slot_idx].package_id = package_id;
-                                    if !existing_connection.unreliable_reassembly[slot_idx].admit(frag_offset as usize, frag_data.len(), &receive_memory) { continue; }
+                                    if !existing_connection.unreliable_reassembly[slot_idx].admit(frag_offset as usize, frag_data.len(), &receive_memory) { memory_erased = true; continue; }
                                     (success, complete) = existing_connection.unreliable_reassembly[slot_idx].insert(frag_offset as usize, frag_data, is_fin);
                                     assert!(success);
                                 }
@@ -2830,6 +2834,10 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     let completed = existing_connection.unreliable_reassembly[slot_idx].take_complete();
                                     receive_queue.push(connection_key, completed, MAX_RECV_QUEUE_BYTES);
                                 }
+                            }
+
+                            if !memory_erased {
+                                state.ack_receiver.receive_with_rtt(nonce, timestamp_ns, ecn_marked, &mut state.ack_timer, state.stats.rtt_us, buf_len);
                             }
 
 //////// END ORDINARY PACKET HANDLING  ////////////////////////////////////////////////////////////////////
