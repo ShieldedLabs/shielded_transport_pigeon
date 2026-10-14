@@ -2312,7 +2312,7 @@ impl ReassemblySlot {
             if let Some(tl) = self.total_len {
                 if start > tl { return (false, false); }
             }
-            let complete = self.total_len.is_some_and(|tl| self.received.len() == 1 && self.received[0] == (0, tl));
+            let complete = self.total_len.is_some_and(|tl| tl == 0 || (self.received.len() == 1 && self.received[0] == (0, tl)));
             return (true, complete);
         }
 
@@ -6402,11 +6402,12 @@ mod uniform_udp_capture_tests {
         messages.push((key,0,Dscp::BestEffort,vec![7;4<<20]));
         messages.extend(vec![(key,1,Dscp::BestEffort,vec![1;80]);20]);
         messages.extend(vec![(key,1,Dscp::BestEffort,vec![2;1000]);10]);
+        messages.push((key,1,Dscp::BestEffort,vec![]));
         service_connections(&client, NetworkThreadPush { wanted_connections: cw.clone(), send_unreliable: messages, ..Default::default() }).unwrap();
         let growth_time = Instant::now() + Duration::from_millis(200);
         while Instant::now() < growth_time { poll(&mut cw,&mut sw,&mut received); std::thread::sleep(Duration::from_millis(1)); }
         mtu.store(1472,Ordering::Release);
-        while received.len() < 33 {
+        while received.len() < 34 {
             poll(&mut cw,&mut sw,&mut received);
             assert!(Instant::now() < deadline, "mixed messages failed delivery: {}",received.len());
             std::thread::sleep(Duration::from_millis(1));
@@ -6415,6 +6416,7 @@ mod uniform_udp_capture_tests {
         assert_eq!(received.iter().filter(|m| m.len()==1000 && m.iter().all(|&b| b==2)).count(),10);
         assert_eq!(received.iter().filter(|m| m.len()==65536 && m.iter().all(|&b| b==3)).count(),2);
         assert_eq!(received.iter().filter(|m| m.len()==4<<20 && m.iter().all(|&b| b==7)).count(),1);
+        assert_eq!(received.iter().filter(|m| m.is_empty()).count(),1);
         // Timing/CPU load can drain the mixed train before a held MTU probe retries.
         // Explicitly wait for authenticated TU growth, then send a whole message so
         // the size-transition assertion does not depend on thread scheduling.
@@ -6460,7 +6462,7 @@ mod uniform_udp_capture_tests {
         assert!(histogram.iter().filter(|((k,_),_)| *k=="ack").all(|((_,size),_)| *size==174));
         println!("UDP_SIZE_HISTOGRAM kind,udp_payload_bytes,count");
         for ((kind,size),count) in histogram { println!("UDP_SIZE_HISTOGRAM {kind},{size},{count}"); }
-        println!("UDP_SIZE_PROOF encrypted mixed=20x80B+10x1000B+2x65536B+1x4MiB MTU=1184->1472 outage=3s idle=8s; every actual datagram matched send-site TU/ACK/probe expectation");
+        println!("UDP_SIZE_PROOF encrypted mixed=1x0B+20x80B+10x1000B+2x65536B+1x4MiB MTU=1184->1472 outage=3s idle=8s; every actual datagram matched send-site TU/ACK/probe expectation");
     }
 }
 
@@ -6945,5 +6947,41 @@ mod review2_tests {
         assert!(!slot.admit_segment(FecSegment { root: 9, total: total2, offset: 0 }, layout2, 0, 1500, 1, &budget));
         assert!(!slot.admit_segment(FecSegment { root: 8, total, offset: 0 }, layout, 0, 1500, 1, &budget));
         assert!(slot.admit_segment(FecSegment { root: 9 + 1024, total, offset: 0 }, layout, 0, 1500, 1, &budget));
+    }
+
+    #[test]
+    fn review2_zero_length_message_delivered_once() {
+        let mut b = UnreliableSendBuffer::new(100000, 1000000, 1000000);
+        assert!(b.submit_messages(vec![vec![]]).is_empty());
+        b.fec_prepare_packet(0);
+        let frag = b.next_fragment(1449, 1449).expect("empty message must produce a fragment");
+        assert!(matches!(frag, UnreliableFragment::Plain { is_fin: true, data: [], offset: 0, .. }));
+        let mut frame = [0u8; 8];
+        let used = write_fragment(&mut frame, UnreliableFragment::Plain { is_fin: true, package_id: 7, data: &[], offset: 0 });
+        assert_eq!(used, STP_WHOLE_HEADER_SIZE);
+        let (header, hdr_size) = read_fragment_header(&frame).unwrap();
+        assert_eq!(hdr_size, STP_WHOLE_HEADER_SIZE);
+        assert_eq!(header & 2, 2);
+        assert_eq!((header >> 18) & 0x3fff, 0);
+
+        let budget = crate::receive_memory::ReceiveMemoryBudget::new(1 << 20);
+        let mut slot = ReassemblySlot::new();
+        slot.package_id = 7;
+        assert!(slot.admit(0, 0, &budget));
+        assert_eq!(slot.insert(0, &[], false), (true, false)); // non-final isn't a message
+        assert_eq!(slot.insert(0, &[], true), (true, true));
+        let reservation = slot.reservation.take();
+        let mut queue = ReceiveQueue::default();
+        let key = ConnectionKey::default();
+        queue.push_reserved(key, slot.take_complete(), MAX_RECV_QUEUE_BYTES, reservation);
+        assert_eq!(queue.messages.len(), 1);
+        assert!(queue.messages[0].1.is_empty());
+        assert_eq!(budget.used(), ReceiveQueue::entry_bytes(&queue.messages[0].1) + 128);
+        for _ in 0..3 {
+            assert!(slot.admit(0, 0, &budget));
+            assert_eq!(slot.insert(0, &[], true), (true, false)); // rescue must not redeliver
+        }
+        assert_eq!(queue.take().into_iter().collect::<Vec<_>>(), vec![(key, vec![])]);
+        assert_eq!(budget.used(), 0);
     }
 }
