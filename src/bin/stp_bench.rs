@@ -942,12 +942,15 @@ fn send_magazines(a: &Args) {
             }
         }
         if elapsed >= duration {
-            drained |= pending.iter().all(VecDeque::is_empty) && free.iter().all(|&b| b == u64::MAX);
+            if !drained && pending.iter().all(VecDeque::is_empty) && free.iter().all(|&b| b == u64::MAX) {
+                drained = true;
+                last_growth = Instant::now(); // status may have been backpressured for the entire bulk train
+            }
             if recs.len() == sizes.len() || drained && last_growth.elapsed() > Duration::from_secs(a.num("idle", 10)) || elapsed > duration+drain_limit as f64 { break; }
         }
         std::thread::sleep(Duration::from_micros(300));
     }
-    let wall = (last_delivery-start as f64)/1e9;
+    let wall = if last_delivery > start as f64 { (last_delivery-start as f64)/1e9 } else { (ns()-start) as f64/1e9 }.max(1e-9);
     let queues = queue_report(n, &sizes, &ids, &submitted, &recs, offset, wall, None);
     let window = queue_report(n, &sizes, &ids, &submitted, &recs, offset, duration, Some(cutoff));
     let small_sizes: Vec<_> = small_ids.iter().map(|_| 1000).collect();
@@ -962,4 +965,6 @@ fn send_magazines(a: &Args) {
     let mut json = json;
     json.insert_str(json.len()-2, &format!(",\"packets_sent\":{},\"packets_lost\":{},\"spurious_losses\":{},\"receiver_rx_lost\":{},\"receiver_rx_reordered\":{},\"receiver_rx_late_beyond_window\":{},\"cc_rate_pps\":{:.3}", stats.packets_sent, stats.packets_lost, stats.spurious_losses, receiver.st.rx_lost, receiver.st.rx_reordered, receiver.st.rx_late_beyond_window, stats.cc_rate_upps as f64/1e6));
     std::fs::write(a.str("out").unwrap_or("stp_bench_report.json"), json).unwrap();
+    drop(handle);
+    if delivered != sizes.len() { std::process::exit(1); }
 }
