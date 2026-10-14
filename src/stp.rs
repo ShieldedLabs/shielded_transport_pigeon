@@ -1215,6 +1215,12 @@ pub fn get_send_time_for_sequence_number(sequence_number: u64, send_time_band: &
 }
 
 impl ConnectionStateConnected {
+    fn control_work_due(&self, now_ns: u64, interval_ns: u64) -> bool {
+        self.last_sent_data_packet + 5_000_000_000 < now_ns
+            || (self.tu_probe_sequence_number == u64::MAX
+                && self.current_tu < ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE as u64
+                && self.last_sent_tu_probe_time_ns + (self.tu_probe_failed_count.min(50).pow(2)*250_000_000).max(interval_ns) < now_ns)
+    }
     fn send_time(&self, sequence: u64) -> u64 {
         match &self.curve_pacer {
             Some(p) => p.history.lookup(sequence).unwrap_or(0),
@@ -2961,11 +2967,9 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             state.send_pacer_acc_ns -= time_between_sends_ns;
                             packet_send_allowance_now += 1;
                         }
+                        let has_work = connection_tracking_data.unreliable_send_buffer.has_unsent_data()
+                            || state.control_work_due(current_time_now_ns, time_between_sends_ns);
                         if let Some(p) = &mut state.curve_pacer {
-                            let has_work = connection_tracking_data.unreliable_send_buffer.has_unsent_data()
-                                || state.last_sent_data_packet + 5_000_000_000 < current_time_now_ns
-                                || (state.tu_probe_sequence_number == u64::MAX && state.current_tu < ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE as u64
-                                    && state.last_sent_tu_probe_time_ns + (state.tu_probe_failed_count.min(50).pow(2)*250_000_000).max(time_between_sends_ns) < current_time_now_ns);
                             let key = (state.congestion_event_time_ns, state.congestion_event_rate_upps, time_to_bandwidth_recovery, state.is_app_limited);
                             packet_send_allowance_now = p.begin(current_time_now_ns, state.send_sequence_number, has_work, key, |origin| {
                                 if state.is_app_limited {
@@ -3106,8 +3110,11 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             state.stats.pacing_burst_hist[class] += 1;
                         }
                         let has_data = connection_tracking_data.unreliable_send_buffer.has_unsent_data();
+                        // Pending keepalive/probe work must be allowed to earn its
+                        // first slot, even when the application queue is empty.
+                        let has_work = has_data || state.control_work_due(current_time_now_ns, time_between_sends_ns);
                         if let Some(p) = &mut state.curve_pacer {
-                            let reason = if !has_data { Some(crate::scheduling::StopReason::QueueEmpty) }
+                            let reason = if !has_work { Some(crate::scheduling::StopReason::QueueEmpty) }
                                 else if packet_send_allowance_now > 0 { Some(crate::scheduling::StopReason::InFlight) }
                                 else { None };
                             p.finish(current_time_now_ns, state.send_sequence_number, reason);
@@ -3435,6 +3442,30 @@ mod congestion_tests {
             CongestionControlOptions { time_pg: 1.1, time_gs: 100.0, ..base }] {
             assert!(bad.validate().is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod polynomial_pacing_tests {
+    use super::*;
+
+    #[test]
+    fn idle_polynomial_peer_sends_control_without_application_data() {
+        let port = std::net::UdpSocket::bind("[::1]:0").unwrap().local_addr().unwrap().port();
+        let server_key = new_keypair_from_connect_magic1(CONNECT_MAGIC1_PLAIN_TEXT).unwrap();
+        let address = STPAddress { ip: Ipv6Addr::LOCALHOST, port, magic1: CONNECT_MAGIC1_PLAIN_TEXT, key: server_key.public.clone() };
+        let opts = || NetworkThreadOptions { pacing: PacingOptions::Polynomial { cadence_ms: 10 }, ..Default::default() };
+        let server = new_network_thread_with_options(vec![server_key], port, None, (1_000_000,1<<20,1<<20), opts());
+        let client = new_network_thread_with_options(vec![new_keypair_from_connect_magic1(CONNECT_MAGIC1_PLAIN_TEXT).unwrap()], 0, None, (1_000_000,1<<20,1<<20), opts());
+        service_connections(&client, NetworkThreadPush { initiate_connections: vec![address], ..Default::default() }).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            service_connections(&server, NetworkThreadPush::default()).unwrap();
+            let p = service_connections(&client, NetworkThreadPush::default()).unwrap();
+            if p.connection_stats.iter().any(|(_,s)| s.packets_sent > 0 && s.rtt_us > 0) { return; }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("idle peer never emitted a curve-paced keepalive / probe or acquired RTT");
     }
 }
 
