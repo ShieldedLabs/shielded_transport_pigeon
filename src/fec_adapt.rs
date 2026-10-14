@@ -6,137 +6,31 @@
 //! samples (one per `bucket_ns`, and only once `min_packets` were sent in the bucket, so a sample
 //! is never a handful of packets), and an estimator turns the samples into a loss estimate that
 //! latches up quickly and comes down slowly. Everything is O(1) per tick with small fixed memory
-//! (V1: 16 slots, V3: 2 x 32 bins) and no allocation.
+//! (16 max-hold slots and the span-tail sketch) and no allocation.
 //!
 //! [`repair_blocks`] picks, for a message of K source blocks, the smallest N with
 //! P(fewer than K of N blocks arrive) <= eps under independent loss p.
 
-/// Which estimator turns short-term loss samples into the loss estimate.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LossEstimatorKind {
-    /// V1 tiered max-hold: a ring of `slots` per-interval maxima (`slot_ns` each); estimate = max of
-    /// the ring. A spike latches the estimate up at once and expires `slots * slot_ns` later,
-    /// falling to the highest remaining slot.
-    TieredMaxHold,
-    /// V2 peak follower: est = max(sample, est decayed with half-life `half_life_ns`).
-    PeakDecay,
-    /// V3 high quantile: `quantile` of the samples of the last 1-2 half-windows (`window_ns / 2`
-    /// each), from two fixed 32-bin log-spaced histograms.
-    Quantile,
-    /// Empirical losses-in-packet-span tails (fixed memory), rather than IID packet loss.
-    SpanTail,
-}
-
-/// Explicit research safety floors, calibrated on held-out and cross-trace placement tests.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SpanFloorKind {
-    None,
-    /// Real Singapore traces: at least 12 repairs, plus the configured IID min-loss floor.
-    Real,
-    /// Legacy-CC emulation: at least 16 repairs and 2% of K.
-    Legacy,
-    /// Full legacy/balanced matrix: 12 repairs for K<=64, 16 otherwise; 10% through
-    /// K=1024, 5% through K=8192, 2% beyond. Not a guarantee for unseen loss profiles.
-    Robust,
-}
-impl SpanFloorKind {
-    pub fn repair_blocks(self, k: u64) -> u64 {
-        let r = match self {
-            Self::None => 0,
-            Self::Real => 12,
-            Self::Legacy => 16.max(k.div_ceil(50)),
-            Self::Robust => {
-                let denominator = if k <= 1024 { 10 } else if k <= 8192 { 20 } else { 50 };
-                (if k <= 64 { 12 } else { 16 }).max(k.div_ceil(denominator))
-            }
-        };
-        r.min(k)
-    }
-}
-
+/// Internal span-tail protection policy. The sole configuration lives in ship.rs.
 #[derive(Clone, Copy, Debug)]
-pub struct AdaptiveFecConfig {
-    pub kind: LossEstimatorKind,
-    pub span_floor: SpanFloorKind,
-    /// Target probability that a message cannot be decoded (given the loss estimate is right).
+pub(crate) struct AdaptiveFecConfig {
     pub eps: f64,
-    /// Lower bound on the loss rate used for sizing (the estimate is never trusted below this).
     pub min_loss: f64,
-    /// Loss rate assumed before the first sample.
     pub initial_loss: f64,
-    /// Upper bound on repair blocks as a fraction of K (1.0 = 100%).
     pub max_redundancy: f64,
-    /// Repair blocks always added on top of the formula, for Wirehair's own decoding overhead
-    /// (it needs K + 0.02 blocks on average). The total is never below 1 repair block.
     pub extra_blocks: u32,
-    /// Short-term loss bucket: closes after this long AND `min_packets` sent.
     pub bucket_ns: u64,
     pub min_packets: u64,
-    /// V1: slot length and slot count (hold = slots * slot_ns). slots <= 16.
     pub slot_ns: u64,
     pub slots: usize,
-    /// V2: half-life of the decay.
-    pub half_life_ns: u64,
-    /// V3: window (two half-window histograms) and quantile.
     pub window_ns: u64,
-    pub quantile: f64,
-    /// Add repair blocks to the message being sent when its own packets are declared lost
-    /// (receivers do not need N, so a message can grow while it is sent).
-    pub topup: bool,
-    /// SpanTail only: own-loss feedback plus a margin on unresolved packets, not all of K.
-    /// Requires topup=true. Never waits for feedback or retransmits source blocks.
-    pub closed_loop: bool,
-    /// What the tracker consumes; see [`LossSignal`].
-    pub loss_signal: LossSignal,
+    pub loss_delay_ns: u64,
 }
-
-/// The loss count fed to the estimator.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LossSignal {
-    /// The sender's declared losses as they happen (unacked after ~2 RTT), spurious ones included.
-    Declared,
-    /// Declared losses minus those later found spurious (an ack arrived for the packet after
-    /// all), with the counters delayed by `delay_ns` so a late ack can cancel its declaration
-    /// before the loss reaches the estimator. delay_ns <= 3 s (LOSS_SIGNAL_RING x 50 ms).
-    NetOfSpurious { delay_ns: u64 },
-}
-pub const LOSS_SIGNAL_SNAPSHOT_NS: u64 = 50_000_000;
-pub const LOSS_SIGNAL_RING: usize = 64;
-
 impl Default for AdaptiveFecConfig {
-    fn default() -> Self {
-        AdaptiveFecConfig {
-            kind: LossEstimatorKind::TieredMaxHold,
-            span_floor: SpanFloorKind::None,
-            eps: 1e-6,
-            min_loss: 0.005,
-            initial_loss: 0.01,
-            max_redundancy: 1.0,
-            extra_blocks: 1,
-            bucket_ns: 1_000_000_000,
-            min_packets: 500,
-            slot_ns: 60_000_000_000,
-            slots: 10,
-            half_life_ns: 180_000_000_000,
-            window_ns: 600_000_000_000,
-            quantile: 0.97,
-            topup: false,
-            closed_loop: false,
-            loss_signal: LossSignal::NetOfSpurious { delay_ns: 1_000_000_000 },
-        }
-    }
+    fn default() -> Self { crate::ship::FEC }
 }
-
-impl AdaptiveFecConfig {
-    /// Scales every time constant by `f` (tests and benchmarks run with shortened clocks).
-    pub fn scale_time(mut self, f: f64) -> Self {
-        let s = |x: u64| ((x as f64 * f) as u64).max(1);
-        self.slot_ns = s(self.slot_ns);
-        self.half_life_ns = s(self.half_life_ns);
-        self.window_ns = s(self.window_ns);
-        self
-    }
-}
+const LOSS_SIGNAL_SNAPSHOT_NS: u64 = 50_000_000;
+const LOSS_SIGNAL_RING: usize = 64;
 
 /// Upper-tail standard normal quantile: z with P(Z > z) = eps (Abramowitz-Stegun 26.2.23,
 /// |error| < 4.5e-4). eps is clamped to [1e-300, 0.5].
@@ -199,32 +93,12 @@ pub fn repair_blocks(k: u64, p: f64, z: f64, eps: f64, extra: u32, max_redundanc
 #[derive(Clone, Copy, Debug)]
 struct ShortTerm { start_ns: u64, sent: u64, lost: u64 }
 
-#[derive(Clone, Copy, Debug)]
-enum Est {
-    /// (slot index, max loss in slot) ring.
-    V1 { ring: [(u64, f32); 16] },
-    V2 { est: f64, at_ns: u64 },
-    /// Per half-window: sample counts per log bin, and the largest sample seen in each bin.
-    V3 { hist: [[u32; 32]; 2], bmax: [[f64; 32]; 2], half: [u64; 2] },
-}
-
-const V3_LO: f64 = 1e-3;
-const V3_HI: f64 = 0.5;
-fn v3_bin(loss: f64) -> usize {
-    if loss < V3_LO { return 0; }
-    let f = (loss / V3_LO).ln() / (V3_HI / V3_LO).ln(); // 0..1 over [LO, HI]
-    (1 + (f * 30.0).floor() as i64).clamp(1, 31) as usize
-}
-/// Upper edge of a bin (bin 0 -> V3_LO).
-#[cfg(test)]
-fn v3_upper(bin: usize) -> f64 { V3_LO * (V3_HI / V3_LO).powf(bin as f64 / 30.0) }
-
 /// Per-connection loss tracker: short-term buckets plus one estimator. Fixed size, no allocation.
 #[derive(Clone, Copy, Debug)]
-pub struct LossTracker {
+pub(crate) struct LossTracker {
     cfg: AdaptiveFecConfig,
     st: ShortTerm,
-    est: Est,
+    ring: [(u64, f32); 16],
     have_sample: bool,
     last_sample: f64,
     cached: f64,
@@ -233,15 +107,10 @@ pub struct LossTracker {
 
 impl LossTracker {
     pub fn new(cfg: AdaptiveFecConfig, now_ns: u64) -> Self {
-        let est = match cfg.kind {
-            LossEstimatorKind::TieredMaxHold | LossEstimatorKind::SpanTail => Est::V1 { ring: [(u64::MAX, 0.0); 16] },
-            LossEstimatorKind::PeakDecay => Est::V2 { est: 0.0, at_ns: now_ns },
-            LossEstimatorKind::Quantile => Est::V3 { hist: [[0; 32]; 2], bmax: [[0.0; 32]; 2], half: [u64::MAX; 2] },
-        };
-        LossTracker { cfg, st: ShortTerm { start_ns: now_ns, sent: 0, lost: 0 }, est, have_sample: false, last_sample: 0.0, cached: cfg.initial_loss, last_refresh_ns: now_ns }
+        LossTracker { cfg, st: ShortTerm { start_ns: now_ns, sent: 0, lost: 0 }, ring: [(u64::MAX, 0.0); 16], have_sample: false, last_sample: 0.0, cached: cfg.initial_loss, last_refresh_ns: now_ns }
     }
 
-    /// Feed counter deltas since the previous call. O(1) (V1/V3 refresh is a fixed 16/64 loop at
+    /// Feed counter deltas since the previous call. O(1) (refresh is a fixed 16-slot loop at
     /// most once per `bucket_ns`).
     pub fn on_tick(&mut self, now_ns: u64, sent_delta: u64, lost_delta: u64) {
         self.st.sent += sent_delta;
@@ -265,28 +134,11 @@ impl LossTracker {
         self.have_sample = true;
         self.last_sample = loss;
         let cfg = self.cfg;
-        match &mut self.est {
-            Est::V1 { ring } => {
-                let n = cfg.slots.clamp(1, 16);
-                let idx = now_ns / cfg.slot_ns.max(1);
-                let s = &mut ring[(idx % n as u64) as usize];
-                if s.0 != idx { *s = (idx, 0.0); }
-                s.1 = s.1.max(loss as f32);
-            }
-            Est::V2 { est, at_ns } => {
-                let dt = now_ns.saturating_sub(*at_ns) as f64;
-                *est = loss.max(*est * (0.5f64).powf(dt / cfg.half_life_ns.max(1) as f64));
-                *at_ns = now_ns;
-            }
-            Est::V3 { hist, bmax, half } => {
-                let idx = now_ns / (cfg.window_ns / 2).max(1);
-                let h = (idx % 2) as usize;
-                if half[h] != idx { hist[h] = [0; 32]; bmax[h] = [0.0; 32]; half[h] = idx; }
-                let b = v3_bin(loss);
-                hist[h][b] += 1;
-                bmax[h][b] = bmax[h][b].max(loss);
-            }
-        }
+        let n = cfg.slots.clamp(1, 16);
+        let idx = now_ns / cfg.slot_ns.max(1);
+        let s = &mut self.ring[(idx % n as u64) as usize];
+        if s.0 != idx { *s = (idx, 0.0); }
+        s.1 = s.1.max(loss as f32);
         self.refresh(now_ns);
     }
 
@@ -294,35 +146,9 @@ impl LossTracker {
         self.last_refresh_ns = now_ns;
         if !self.have_sample { return; }
         let cfg = self.cfg;
-        self.cached = match &self.est {
-            Est::V1 { ring } => {
-                let n = cfg.slots.clamp(1, 16) as u64;
-                let idx = now_ns / cfg.slot_ns.max(1);
-                ring.iter().filter(|s| s.0 != u64::MAX && s.0 + n > idx).map(|s| s.1 as f64).fold(0.0, f64::max)
-            }
-            Est::V2 { est, at_ns } => *est * (0.5f64).powf(now_ns.saturating_sub(*at_ns) as f64 / cfg.half_life_ns.max(1) as f64),
-            Est::V3 { hist, bmax, half } => {
-                let idx = now_ns / (cfg.window_ns / 2).max(1);
-                let mut c = [0u32; 32];
-                let mut m = [0f64; 32];
-                let mut total = 0u64;
-                for h in 0..2 {
-                    if half[h] != u64::MAX && half[h] + 2 > idx {
-                        for b in 0..32 { c[b] += hist[h][b]; m[b] = m[b].max(bmax[h][b]); total += hist[h][b] as u64; }
-                    }
-                }
-                if total == 0 { 0.0 } else {
-                    // Smallest bin whose cumulative count reaches quantile * total; the largest
-                    // sample actually seen in it. (The bin's upper edge overstated the quantile by
-                    // up to one bin width, 23%, e.g. a 7.8% sample read as 9.5%.)
-                    let target = (cfg.quantile * total as f64).ceil().max(1.0) as u64;
-                    let mut acc = 0u64;
-                    let mut bin = 31;
-                    for b in 0..32 { acc += c[b] as u64; if acc >= target { bin = b; break; } }
-                    m[bin]
-                }
-            }
-        };
+        let n = cfg.slots.clamp(1, 16) as u64;
+        let idx = now_ns / cfg.slot_ns.max(1);
+        self.cached = self.ring.iter().filter(|s| s.0 != u64::MAX && s.0 + n > idx).map(|s| s.1 as f64).fold(0.0, f64::max);
     }
 
     /// Current loss estimate (raw; before the `min_loss` floor). `initial_loss` until the first sample.
@@ -341,7 +167,7 @@ pub struct FecMessageInfo {
     /// Block count planned when the message started, and actually sent (larger after top-up).
     pub n_planned: u32,
     pub n_sent: u32,
-    /// Loss rate the plan was sized for (after the floor); 0 for fixed redundancy.
+    /// Loss rate the plan was sized for (after the floor); the packet-loss estimate.
     pub loss_estimate: f64,
     /// Own packets declared lost while the message was being sent.
     pub lost_during_send: u32,
@@ -357,7 +183,7 @@ pub struct FecMessageInfo {
 /// 65536-bit history, fixed histograms and a fixed bitset matching STP's already-bounded ACK
 /// sequence ring (to exclude ACK-only and probe packets from the data sequence).
 #[derive(Clone, Debug)]
-pub struct SpanLossProfile {
+pub(crate) struct SpanLossProfile {
     data_sent: [u64; crate::stp::PACKETS_WAITING_ACK_WORDS],
     history: [u64; 1024],
     counts: [u32; 16],
@@ -466,7 +292,7 @@ impl SpanLossProfile {
         // overflow event; fixing CC is preferable to paying for a pathological startup prior.
         let prior = if self.seen < 4096 { cfg.initial_loss } else { cfg.min_loss };
         let eps = self.target_failure(whole_message_k, cfg) / groups.max(1) as f64;
-        let mut r = repair_blocks(k, prior, z_for_eps(eps), eps, cfg.extra_blocks, cfg.max_redundancy).max(cfg.span_floor.repair_blocks(k)).min(cap);
+        let mut r = repair_blocks(k, prior, z_for_eps(eps), eps, cfg.extra_blocks, cfg.max_redundancy).max(12.min(k)).min(cap);
         for _ in 0..32 {
             let Some(q) = self.tail_losses(k + r, eps) else { break; };
             let next = r.max(q.saturating_add(cfg.extra_blocks as u64).max(1)).min(cap);
@@ -479,41 +305,36 @@ impl SpanLossProfile {
 
 /// Per-connection adaptive state: tracker plus counter baselines. Lives in UnreliableSendBuffer.
 #[derive(Clone, Debug)]
-pub struct FecAdaptiveState {
+pub(crate) struct FecAdaptiveState {
     pub tracker: LossTracker,
-    z: f64,
     last_sent: u64,
     last_lost: u64,
-    /// LossSignal::NetOfSpurious: (time, sent, declared lost) snapshots every LOSS_SIGNAL_SNAPSHOT_NS.
+    /// Net-of-spurious: (time, sent, declared lost) snapshots every LOSS_SIGNAL_SNAPSHOT_NS.
     ring: [(u64, u64, u64); LOSS_SIGNAL_RING],
     ring_head: usize,
     /// Floored loss estimate used for new messages.
     pub p: f64,
-    /// Allocated only in SpanTail mode; all other modes retain their original bounded state.
-    span: Option<Box<SpanLossProfile>>,
+    /// Fixed size, independent of bandwidth and packet rate.
+    span: Box<SpanLossProfile>,
 }
 
 impl FecAdaptiveState {
     pub fn new(cfg: AdaptiveFecConfig, now_ns: u64, sent: u64, lost: u64) -> Self {
         let tracker = LossTracker::new(cfg, now_ns);
-        FecAdaptiveState { tracker, z: z_for_eps(cfg.eps), last_sent: sent, last_lost: lost, ring: [(now_ns, sent, lost); LOSS_SIGNAL_RING], ring_head: 0, p: tracker.estimate().max(cfg.min_loss), span: (cfg.kind == LossEstimatorKind::SpanTail).then(|| Box::new(SpanLossProfile::default())) }
+        FecAdaptiveState { tracker, last_sent: sent, last_lost: lost, ring: [(now_ns, sent, lost); LOSS_SIGNAL_RING], ring_head: 0, p: tracker.estimate().max(cfg.min_loss), span: Box::new(SpanLossProfile::default()) }
     }
     /// Feed the connection's cumulative counters: packets sent, declared lost, and declarations
     /// found spurious so far.
     pub fn on_tick(&mut self, now_ns: u64, sent: u64, lost: u64, spurious: u64) {
-        let (sent, lost) = match self.tracker.cfg.loss_signal {
-            LossSignal::Declared => (sent, lost),
-            LossSignal::NetOfSpurious { delay_ns } => {
-                if now_ns.saturating_sub(self.ring[self.ring_head].0) >= LOSS_SIGNAL_SNAPSHOT_NS {
-                    self.ring_head = (self.ring_head + 1) % LOSS_SIGNAL_RING;
-                    self.ring[self.ring_head] = (now_ns, sent, lost);
-                }
-                // Newest snapshot at least delay_ns old (the oldest one if none is).
-                let back = ((delay_ns + LOSS_SIGNAL_SNAPSHOT_NS - 1) / LOSS_SIGNAL_SNAPSHOT_NS).min(LOSS_SIGNAL_RING as u64 - 1) as usize;
-                let (_, s, l) = self.ring[(self.ring_head + LOSS_SIGNAL_RING - back) % LOSS_SIGNAL_RING];
-                (s, l.saturating_sub(spurious))
-            }
-        };
+        if now_ns.saturating_sub(self.ring[self.ring_head].0) >= LOSS_SIGNAL_SNAPSHOT_NS {
+            self.ring_head = (self.ring_head + 1) % LOSS_SIGNAL_RING;
+            self.ring[self.ring_head] = (now_ns, sent, lost);
+        }
+        // Net of spurious declarations, delayed so late ACKs can cancel false losses.
+        let delay_ns = self.tracker.cfg.loss_delay_ns;
+        let back = ((delay_ns + LOSS_SIGNAL_SNAPSHOT_NS - 1) / LOSS_SIGNAL_SNAPSHOT_NS).min(LOSS_SIGNAL_RING as u64 - 1) as usize;
+        let (_, sent, lost) = self.ring[(self.ring_head + LOSS_SIGNAL_RING - back) % LOSS_SIGNAL_RING];
+        let lost = lost.saturating_sub(spurious);
         // Monotone: a correction that arrives after its loss was consumed nets out of later losses.
         let (ds, dl) = (sent.saturating_sub(self.last_sent), lost.saturating_sub(self.last_lost));
         self.last_sent = self.last_sent.max(sent);
@@ -522,46 +343,25 @@ impl FecAdaptiveState {
         self.p = self.tracker.estimate().max(self.tracker.cfg.min_loss);
     }
     pub fn on_data_sent(&mut self, seq: u64) {
-        if let Some(s) = &mut self.span { s.on_data_sent(seq); }
+        self.span.on_data_sent(seq);
     }
     pub fn on_sequence_finalized(&mut self, seq: u64, lost: bool, now_ns: u64) {
-        if let Some(s) = &mut self.span { s.on_sequence_finalized(seq, lost, now_ns, self.tracker.cfg.window_ns); }
+        self.span.on_sequence_finalized(seq, lost, now_ns, self.tracker.cfg.window_ns);
     }
     /// Whole-message failure target, divided among independent Wirehair groups.
     pub fn group_failure_target(&self, whole_message_k: u64, groups: usize) -> f64 {
         let c = &self.tracker.cfg;
-        self.span.as_ref().map_or(c.eps, |s| s.target_failure(whole_message_k, c)) / groups.max(1) as f64
+        self.span.target_failure(whole_message_k, c) / groups.max(1) as f64
     }
     /// Repair blocks for a new message of k source blocks.
     pub fn repair_blocks(&self, k: u64) -> u64 { self.repair_blocks_for_group(k, k, 1) }
     pub fn repair_blocks_for_group(&self, k: u64, whole_message_k: u64, groups: usize) -> u64 {
         let c = &self.tracker.cfg;
-        if let Some(span) = &self.span {
-            let horizon = if self.closed_loop_enabled() && span.seen >= 4096 { k.min(span.pending_peak.max(1)) } else { k };
-            let cap = ((k as f64 * c.max_redundancy).ceil() as u64).max(1).min(k);
-            let r = span.margin_blocks_for_groups(horizon, whole_message_k, groups, c);
-            if self.closed_loop_enabled() { r.max(12.min(k)).min(cap) } else { r.min(cap) }
-        } else {
-            let eps = self.group_failure_target(whole_message_k, groups);
-            repair_blocks(k, self.p, z_for_eps(eps), eps, c.extra_blocks, c.max_redundancy)
-        }
-    }
-    /// Total blocks for a message of k source blocks of which `lost` sent ones are known lost.
-    pub fn topped_up_blocks(&self, k: u64, lost: u64, p_at_start: f64) -> u64 {
-        self.topped_up_blocks_for_group(k, k, 1, lost, p_at_start)
-    }
-    pub fn topped_up_blocks_for_group(&self, k: u64, whole_message_k: u64, groups: usize, lost: u64, p_at_start: f64) -> u64 {
-        let c = &self.tracker.cfg;
-        let cap = ((k as f64 * c.max_redundancy).ceil() as u64).min(k);
-        if self.span.is_some() { return k + lost.saturating_add(self.repair_blocks_for_group(k, whole_message_k, groups)).min(cap); }
-        let eps = self.group_failure_target(whole_message_k, groups);
-        let p = self.p.max(p_at_start);
-        let r = repair_blocks(k + lost, p, z_for_eps(eps), eps, c.extra_blocks, c.max_redundancy * k as f64 / (k + lost) as f64);
-        k + lost.saturating_add(r).min(cap)
-    }
-    pub fn closed_loop_enabled(&self) -> bool {
-        let c = &self.tracker.cfg;
-        c.kind == LossEstimatorKind::SpanTail && c.topup && c.closed_loop
+        let span = &self.span;
+        let horizon = if span.seen >= 4096 { k.min(span.pending_peak.max(1)) } else { k };
+        let cap = ((k as f64 * c.max_redundancy).ceil() as u64).max(1).min(k);
+        let r = span.margin_blocks_for_groups(horizon, whole_message_k, groups, c);
+        r.max(12.min(k)).min(cap)
     }
     /// Extra fresh repairs for a single-group message; no retransmission or feedback wait.
     pub fn extra_repair_blocks_needed_now(&self, k: u64, blocks_sent: u64, repair_blocks_sent: u64, own_declared_lost: u64) -> u64 {
@@ -571,8 +371,8 @@ impl FecAdaptiveState {
     /// Connection-wide unresolved data conservatively bounds each group's tail; it is NOT
     /// divided by group count (interleaving does not prove equal loss ownership).
     pub fn extra_repair_blocks_needed_for_group(&self, k: u64, whole_message_k: u64, groups: usize, blocks_sent: u64, repair_blocks_sent: u64, own_declared_lost: u64) -> u64 {
-        let Some(span) = &self.span else { return 0; };
-        if !self.closed_loop_enabled() || k == 0 { return 0; }
+        let span = &self.span;
+        if k == 0 { return 0; }
         let c = &self.tracker.cfg;
         let cap = ((k as f64 * c.max_redundancy).ceil() as u64).min(k);
         let unsent_sources = k.saturating_sub(blocks_sent.saturating_sub(repair_blocks_sent));
@@ -666,7 +466,7 @@ mod tests {
 
     #[test]
     fn v1_latches_and_steps_down() {
-        let cfg = AdaptiveFecConfig { kind: LossEstimatorKind::TieredMaxHold, slot_ns: 1_000_000_000, slots: 10, min_packets: 100, ..Default::default() };
+        let cfg = AdaptiveFecConfig { slot_ns: 1_000_000_000, slots: 10, min_packets: 100, ..Default::default() };
         let mut t = LossTracker::new(cfg, 0);
         feed(&mut t, 0.0, 5.0, 0.01, 1000);
         assert!((t.estimate() - 0.01).abs() < 1e-3);
@@ -679,49 +479,18 @@ mod tests {
     }
 
     #[test]
-    fn v2_decays() {
-        let cfg = AdaptiveFecConfig { kind: LossEstimatorKind::PeakDecay, half_life_ns: 2_000_000_000, min_packets: 100, ..Default::default() };
-        let mut t = LossTracker::new(cfg, 0);
-        feed(&mut t, 0.0, 2.0, 0.04, 1000);
-        assert!((t.estimate() - 0.04).abs() < 2e-3);
-        feed(&mut t, 2.0, 6.05, 0.0, 1000);
-        assert!((t.estimate() - 0.01).abs() < 2e-3, "{}", t.estimate());
-    }
-
-    #[test]
-    fn v3_ignores_lone_spike_tracks_sustained() {
-        let cfg = AdaptiveFecConfig { kind: LossEstimatorKind::Quantile, window_ns: 100_000_000_000, quantile: 0.95, min_packets: 100, ..Default::default() };
-        let mut t = LossTracker::new(cfg, 0);
-        feed(&mut t, 0.0, 40.0, 0.01, 1000);
-        feed(&mut t, 40.0, 41.0, 0.08, 1000);
-        feed(&mut t, 41.0, 45.0, 0.01, 1000);
-        let e = t.estimate();
-        assert!(e >= 0.01 && e < 0.013, "{e}");
-        feed(&mut t, 45.0, 60.0, 0.04, 1000);
-        let e = t.estimate();
-        assert!(e >= 0.04 && e < 0.05, "{e}");
-    }
-
-    #[test]
     fn net_of_spurious_cancels_late_acked_declarations() {
         // 1% declared loss at 10k pps for 30 s, all of it found spurious ~200 ms later.
-        let base = AdaptiveFecConfig { kind: LossEstimatorKind::TieredMaxHold, slot_ns: 1_000_000_000, slots: 10, min_packets: 100, ..Default::default() };
-        let run = |signal: LossSignal| {
-            let mut a = FecAdaptiveState::new(AdaptiveFecConfig { loss_signal: signal, ..base }, 0, 0, 0);
-            for i in 1..=3000u64 {
-                let t = i * 10_000_000;
-                let (sent, lost) = (i * 100, i);
-                let spurious = i.saturating_sub(20); // the ack shows up 20 ticks (200 ms) later
-                a.on_tick(t, sent, lost, spurious);
-            }
-            a.tracker.estimate()
-        };
-        let declared = run(LossSignal::Declared);
-        let net = run(LossSignal::NetOfSpurious { delay_ns: 1_000_000_000 });
-        assert!(declared > 0.009, "{declared}");
+        let base = AdaptiveFecConfig { slot_ns: 1_000_000_000, slots: 10, min_packets: 100, ..Default::default() };
+        let mut a = FecAdaptiveState::new(base, 0, 0, 0);
+        for i in 1..=3000u64 {
+            let t = i * 10_000_000;
+            a.on_tick(t, i * 100, i, i.saturating_sub(20));
+        }
+        let net = a.tracker.estimate();
         assert!(net < 0.001, "{net}");
         // Genuine loss (never acked) still gets through, just 1 s later.
-        let mut a = FecAdaptiveState::new(AdaptiveFecConfig { loss_signal: LossSignal::NetOfSpurious { delay_ns: 1_000_000_000 }, ..base }, 0, 0, 0);
+        let mut a = FecAdaptiveState::new(base, 0, 0, 0);
         for i in 1..=3000u64 { a.on_tick(i * 10_000_000, i * 100, i, 0); }
         assert!(a.tracker.estimate() > 0.009, "{}", a.tracker.estimate());
     }
@@ -760,29 +529,24 @@ mod tests {
         assert_eq!(s.seen, 20000);
         assert_eq!(s.lost_total, 200);
         assert!(s.tail_losses(32, 0.001).unwrap() >= 10);
-        let cfg = AdaptiveFecConfig { kind: LossEstimatorKind::SpanTail, eps: 0.001, ..Default::default() };
+        let cfg = AdaptiveFecConfig { eps: 0.001, ..Default::default() };
         assert!(s.repair_blocks(32, &cfg, z_for_eps(cfg.eps)) >= 11);
         assert!(s.target_failure(32768, &cfg) < s.target_failure(32, &cfg));
         assert!(std::mem::size_of::<SpanLossProfile>() < 50000);
     }
 
     #[test]
-    fn span_safety_floors_are_explicit_and_capped() {
-        assert_eq!(SpanFloorKind::None.repair_blocks(740), 0);
-        assert_eq!(SpanFloorKind::Real.repair_blocks(740), 12);
-        assert_eq!(SpanFloorKind::Legacy.repair_blocks(36613), 733);
-        assert_eq!(SpanFloorKind::Robust.repair_blocks(740), 74);
-        assert_eq!(SpanFloorKind::Robust.repair_blocks(3662), 184);
-        assert_eq!(SpanFloorKind::Robust.repair_blocks(36613), 733);
-        assert_eq!(SpanFloorKind::Robust.repair_blocks(2), 2);
+    fn real_span_floor_is_capped_at_source_count() {
         let s = SpanLossProfile::default();
-        let cfg = AdaptiveFecConfig { kind: LossEstimatorKind::SpanTail, span_floor: SpanFloorKind::Robust, eps: 0.5, ..Default::default() };
-        assert!(s.repair_blocks(740, &cfg, 0.0) >= 74);
+        for k in [2, 12, 64, 740, 36613] {
+            let r = s.repair_blocks(k, &crate::ship::FEC, 0.0);
+            assert!(r >= 12.min(k) && r <= k);
+        }
     }
 
     #[test]
     fn span_closed_loop_counts_pending_and_budgets_only_tail() {
-        let cfg = AdaptiveFecConfig { kind: LossEstimatorKind::SpanTail, closed_loop: true, topup: true, eps: 0.5, span_floor: SpanFloorKind::Real, ..Default::default() };
+        let cfg = AdaptiveFecConfig { eps: 0.5, ..Default::default() };
         let mut a = FecAdaptiveState::new(cfg, 0, 0, 0);
         for seq in 0..10000 {
             a.on_data_sent(seq * 2);
@@ -792,7 +556,7 @@ mod tests {
             a.on_sequence_finalized(seq * 2, false, seq * 1000);
         }
         for seq in 20000..20100 { a.on_data_sent(seq); }
-        assert_eq!(a.span.as_ref().unwrap().unresolved_data_packets(), 100);
+        assert_eq!(a.span.as_ref().unresolved_data_packets(), 100);
         let k = 36613;
         let closed = a.extra_repair_blocks_needed_now(k, k, 0, 80);
         assert!(closed >= 92 && closed < 150, "{closed}");
@@ -803,9 +567,6 @@ mod tests {
         assert_eq!(a.extra_repair_blocks_needed_now(k, k, 0, k*2), k);
         let initial = a.repair_blocks(k);
         assert!(initial < 30, "tail initial {initial}");
-        a.tracker.cfg.closed_loop = false;
-        assert!(a.repair_blocks(k) > closed);
-        assert_eq!(a.extra_repair_blocks_needed_now(k, k, 0, 80), 0);
         let limited = FecAdaptiveState::new(AdaptiveFecConfig { max_redundancy: 0.01, ..cfg }, 0, 0, 0);
         assert_eq!(limited.repair_blocks(740), 8);
         assert_eq!(limited.extra_repair_blocks_needed_now(740, 740, 0, 80), 8);
@@ -837,10 +598,10 @@ mod tests {
         let now = std::time::Instant::now();
         for i in 0..100000 { std::hint::black_box(s.repair_blocks(2 + i % 63000, &cfg, 3.09)); }
         println!("repair_query_ns={:.2}", now.elapsed().as_nanos() as f64 / 100000.0);
-        let cfg = AdaptiveFecConfig { kind: LossEstimatorKind::SpanTail, topup: true, closed_loop: true, span_floor: SpanFloorKind::Real, eps: 0.5, ..Default::default() };
+        let cfg = AdaptiveFecConfig { eps: 0.5, ..Default::default() };
         let mut a = FecAdaptiveState::new(cfg, 0, 0, 0);
         for i in n..n+1000 { s.on_data_sent(i); }
-        a.span = Some(Box::new(s));
+        a.span = Box::new(s);
         let now = std::time::Instant::now();
         for _ in 0..100000 { std::hint::black_box(a.extra_repair_blocks_needed_now(36613, 36613, 0, 20)); }
         println!("closed_loop_query_ns={:.2}", now.elapsed().as_nanos() as f64 / 100000.0);

@@ -426,16 +426,15 @@ pub struct UnreliableSendBuffer {
     pub partial_send_slot: Option<(Vec<u8>, u32)>,
     pub send_package_id: u16,
     pub current_bytes_per_second: u64,
-    /// Forward error correction for messages that start sending from now on, in parts per
-    /// million of extra coded blocks (0 = off, plain fragments exactly as without FEC). Set
-    /// every tick by the network thread from `NetworkThreadHandle::set_fec_redundancy_ppm`.
-    pub fec_redundancy_ppm: u32,
+    /// Queue-capacity estimate in parts per million, updated from the adaptive policy.
+    /// This is accounting, never a fixed-parity FEC selection.
+    fec_capacity_overhead_ppm: u32,
     /// The FEC-coded message being sent (instead of `partial_send_slot`), if any.
     pub fec_send_slot: Option<FecSendSlot>,
     /// Adaptive FEC: per-connection loss estimate. When Some, each new message gets the repair
-    /// blocks this estimate calls for (and `fec_redundancy_ppm` is only a nonzero summary of it,
+    /// blocks this estimate calls for (and `fec_capacity_overhead_ppm` is only a nonzero summary of it,
     /// used for the queue capacity). Maintained by the network thread.
-    pub fec_adaptive: Option<crate::fec_adapt::FecAdaptiveState>,
+    fec_adaptive: Option<crate::fec_adapt::FecAdaptiveState>,
     /// Sequence number of the packet the next fragment goes into (set by the network thread), so
     /// an FEC message knows which packets are its own when they are declared lost.
     pub next_packet_seq: u64,
@@ -459,7 +458,7 @@ pub struct FecSendSlot {
     encoder: FecEncoderState,
     block_buf: Vec<u8>,
     /// Sequence number of the message's first packet, own packets declared lost since, the block
-    /// count planned at the start, and the loss rate the plan was sized for (0 for fixed ppm).
+    /// count planned at the start, and the loss rate the plan was sized for.
     pub first_seq: u64,
     pub lost: u32,
     pub group_lost: Vec<u32>,
@@ -478,11 +477,7 @@ impl FecSendSlot {
             let k = layout.group(group).1 as u64;
             let source_sent = (sources / groups + u64::from((group as u64) < sources % groups)).min(k);
             let repair_sent = repairs / groups + u64::from((group as u64) < repairs % groups);
-            let total_repairs = if a.closed_loop_enabled() {
-                repair_sent + a.extra_repair_blocks_needed_for_group(k, self.k as u64, layout.groups, source_sent + repair_sent, repair_sent, self.group_lost[group] as u64)
-            } else {
-                a.topped_up_blocks_for_group(k, self.k as u64, layout.groups, self.group_lost[group] as u64, self.loss_estimate).saturating_sub(k)
-            };
+            let total_repairs = repair_sent + a.extra_repair_blocks_needed_for_group(k, self.k as u64, layout.groups, source_sent + repair_sent, repair_sent, self.group_lost[group] as u64);
             per_group_repairs = per_group_repairs.max(total_repairs);
         }
         // Equal complete rounds conservatively protect the most affected group, not mean loss.
@@ -512,7 +507,6 @@ pub const STP_EXT_KIND_FEC: u64 = 1;
 /// Balanced groups of <=32000 blocks, inferred from length/block size; same 16-byte header.
 pub const STP_EXT_KIND_GROUPED_FEC: u64 = 2;
 /// Redundancy is capped at 100% (n = 2k).
-pub const MAX_FEC_REDUNDANCY_PPM: u32 = 1_000_000;
 /// Messages with at most this many blocks have their Wirehair encoder/decoder run inline on
 /// the network thread (well under 1 ms); bigger ones use a helper thread.
 pub const FEC_INLINE_MAX_BLOCKS: usize = 256;
@@ -533,7 +527,7 @@ impl UnreliableSendBuffer {
             partial_send_slot: None,
             send_package_id: 0,
             current_bytes_per_second: 0,
-            fec_redundancy_ppm: 0,
+            fec_capacity_overhead_ppm: 0,
             fec_send_slot: None,
             fec_adaptive: None,
             next_packet_seq: 0,
@@ -565,7 +559,7 @@ impl UnreliableSendBuffer {
         }
         f.lost = f.lost.saturating_add(count);
         if let Some(a) = &self.fec_adaptive {
-            if a.tracker.config().topup { f.refresh_plan(a); }
+            f.refresh_plan(a);
         }
     }
 
@@ -576,8 +570,8 @@ impl UnreliableSendBuffer {
     #[inline]
     pub fn current_byte_capacity(&self) -> u32 {
         let mut dynamic_target = self.target_queue_size_us as u64 * self.current_bytes_per_second / 1000_000;
-        if self.fec_redundancy_ppm != 0 {
-            dynamic_target = dynamic_target * 1_000_000 / (1_000_000 + self.fec_redundancy_ppm as u64);
+        if self.fec_capacity_overhead_ppm != 0 {
+            dynamic_target = dynamic_target * 1_000_000 / (1_000_000 + self.fec_capacity_overhead_ppm as u64);
         }
         dynamic_target.max(self.min_queue_size_bytes as u64).min(self.max_queue_size_bytes as u64) as u32
     }
@@ -661,7 +655,7 @@ impl UnreliableSendBuffer {
     /// one block plus its header fills the packet. None if the message should go plain (FEC
     /// off, fewer than 2 blocks, or outside the grouped wire length limit).
     fn fec_block_bytes(&self, message_len: usize, payload_len: usize) -> Option<usize> {
-        if self.fec_redundancy_ppm == 0 { return None; }
+        if self.fec_adaptive.is_none() { return None; }
         let block_bytes = payload_len.checked_sub(STP_FEC_FRAGMENT_HEADER_SIZE)?.min(0x3fff);
         crate::fec::MessageLayout::new(message_len, block_bytes)?;
         Some(block_bytes)
@@ -670,16 +664,9 @@ impl UnreliableSendBuffer {
     fn start_fec(&mut self, message: std::sync::Arc<Vec<u8>>, block_bytes: usize) {
         let layout = crate::fec::MessageLayout::new(message.len(), block_bytes).unwrap();
         let k = layout.k as u32;
-        let (n, loss_estimate) = match &self.fec_adaptive {
-            Some(a) => {
-                let repairs = (0..layout.groups).map(|g| a.repair_blocks_for_group(layout.group(g).1 as u64, k as u64, layout.groups)).max().unwrap_or(0);
-                (k + repairs as u32 * layout.groups as u32, a.p)
-            },
-            None => {
-                let ppm = self.fec_redundancy_ppm.min(MAX_FEC_REDUNDANCY_PPM) as u64;
-                (k + ((k as u64 * ppm + 999_999) / 1_000_000) as u32, 0.0)
-            }
-        };
+        let a = self.fec_adaptive.as_ref().expect("adaptive FEC initialized before coding");
+        let repairs = (0..layout.groups).map(|g| a.repair_blocks_for_group(layout.group(g).1 as u64, k as u64, layout.groups)).max().unwrap_or(0);
+        let (n, loss_estimate) = (k + repairs as u32 * layout.groups as u32, a.p);
         let n = layout.round_plan(n);
         let encoder = if k as usize <= FEC_INLINE_MAX_BLOCKS {
             match crate::fec::encode_message(message.clone(), block_bytes) { Some(e) => FecEncoderState::Ready(e), None => FecEncoderState::Failed }
@@ -716,7 +703,7 @@ impl UnreliableSendBuffer {
         if self.fec_send_slot.is_some() {
             if let (Some(a), Some(f)) = (&self.fec_adaptive, &mut self.fec_send_slot) {
                 // Refresh at source completion and the final planned repair, without tail waiting.
-                if a.closed_loop_enabled() && f.next_id >= f.k && (f.next_id == f.k || f.next_id + 1 >= f.n) {
+                if f.next_id >= f.k && (f.next_id == f.k || f.next_id + 1 >= f.n) {
                     f.refresh_plan(a);
                 }
             }
@@ -1019,12 +1006,10 @@ pub struct ConnectionStateConnected {
     pub loss_window_start_ns: u64,
     pub loss_count_in_window: u64,
     loss_episodes: LossEpisodes,
-    loss_response: LossResponseWindow,
     pub is_app_limited: bool,
     pub app_limit_time_offset: u64,
     /// Sender feedback and receiver echo are independent directions.
     pub ecn_congestion_received: bool,
-    pub ecn_echo_pending: bool,
     pub ecn_oldest_send_time: u64,
     /// Per sequence number in [tail - CAPACITY, tail): declared lost and not yet acked since
     /// (spurious-loss detection). Same ring indexing as packets_waiting_ack_field.
@@ -1080,11 +1065,9 @@ pub fn new_connection_state_connected(cipher: Option<ConnectionCipherTriplet>, m
         loss_window_start_ns: 0,
         loss_count_in_window: 0,
         loss_episodes: LossEpisodes::default(),
-        loss_response: LossResponseWindow::default(),
         is_app_limited: false,
         app_limit_time_offset: 0,
         ecn_congestion_received: false,
-        ecn_echo_pending: false,
         ecn_oldest_send_time: 0,
         declared_lost_field: Box::new([0; PACKETS_WAITING_ACK_WORDS]),
         rx_tracker: RxSeqTracker::default(),
@@ -1774,8 +1757,6 @@ struct NetworkThreadInner {
     stop: std::sync::atomic::AtomicBool,
     push: std::cell::UnsafeCell<NetworkThreadPush>,
     pull: std::cell::UnsafeCell<NetworkThreadPull>,
-    fec_redundancy_ppm: std::sync::atomic::AtomicU32,
-    fec_adaptive_enabled: std::sync::atomic::AtomicBool,
 }
 
 #[allow(unsafe_code)]
@@ -1810,9 +1791,9 @@ pub fn new_network_thread_with_bind(my_keypairs: Vec<IdentityKeyPair>, my_port: 
     new_network_thread_with_options(my_keypairs, my_port, max_pps, send_buffer_params, NetworkThreadOptions { bind_ip, ..Default::default() })
 }
 
-/// Parameters of the existing R/P/G/S sending-rate curve; no alternative control law.
+/// Internal loss/ECN-driven packet-rate policy. Values are fixed in ship.rs.
 #[derive(Debug, Clone, Copy)]
-pub struct CongestionControlOptions {
+pub(crate) struct CongestionPolicy {
     pub beta: f64,
     pub recovery_rtts: u64,
     pub rate_rp: f64,
@@ -1821,157 +1802,34 @@ pub struct CongestionControlOptions {
     pub time_pg: f64,
     pub time_gs: f64,
     pub loss_threshold: u64,
-    /// Also require this fraction of a commanded-rate RTT's packets to be lost.
-    /// Zero preserves the two-loss legacy detector; nonzero can tolerate radio noise.
-    pub loss_fraction_ppm: u32,
-    /// Opt-in completed send-time RTT cohort loss fraction. Below this fraction
-    /// do not cut; at/above it use the normal beta cut. Uses actual packet counts,
-    /// not delivery-rate estimation. Zero retains the legacy episode detector.
-    pub loss_response_fraction_ppm: u32,
-    /// Age-based declaration, not sequence gaps: additional reorder/jitter tolerance.
     pub loss_timeout_rtts: f64,
     pub event_guard_rtts: f64,
-    /// Optional ECN-only guard override; zero inherits event_guard_rtts.
-    pub ecn_event_guard_rtts: f64,
-    /// Millionths of a packet per second (100_000_000 = 100 pps).
     pub rate_floor_upps: u64,
     pub initial_rate_upps: u64,
     pub min_growth_uppsps: f64,
     pub max_growth_uppsps: f64,
-    /// Optional Reno-friendly additive floor: alpha / RTT_seconds^2 pps/s (0 disables).
-    pub friendly_growth_alpha: f64,
-    /// Optional growth ceiling as a fraction of the anchor rate per RTT (0 disables).
-    /// The additive floor remains available even at low anchor rates.
     pub relative_growth_per_rtt: f64,
-    /// Apply the growth envelope to R as well as P/G/S, bounding regrowth after cuts.
-    pub bound_recovery_growth: bool,
-    /// Compound the relative ceiling with elapsed RTTs instead of freezing its
-    /// slope at the event anchor. Pure time/rate curve; no ACK/delivery estimate.
-    pub compound_growth: bool,
-    /// Use the compounded fractional envelope without a fixed pps/s ceiling.
-    /// The R/P/G/S curve is still an upper bound. Requires bounded compound growth.
-    pub proportional_growth: bool,
-    /// Opt-in fixed-memory congestion-episode instrumentation, never alters the rate.
-    pub record_loss_episodes: bool,
-    /// Optional initial pps multiplication per RTT until first loss/ECN (0 disables).
-    /// Uses only elapsed active time and RTT; no delivery/bandwidth/delay signal.
     pub startup_multiplier: f64,
-    /// Anchor startup exit this many RTTs before the lost/marked packet's send.
-    /// One preserves the initial experiment; larger values cut overshoot harder.
     pub startup_backoff_rtts: f64,
 }
-impl CongestionControlOptions {
-    pub const fn legacy() -> Self {
-        Self { beta: CUBIC_BETA, recovery_rtts: CUBIC_K_RTT_MULTIPLIER,
-            rate_rp: RATE_RP, rate_pg: RATE_PG, rate_gs: RATE_GS, time_pg: TIME_PG, time_gs: TIME_GS,
-            loss_threshold: 2, loss_fraction_ppm: 0, loss_response_fraction_ppm: 0, loss_timeout_rtts: 2.0, event_guard_rtts: 0.5, ecn_event_guard_rtts: 0.0, rate_floor_upps: RATE_FLOOR_UPPS, initial_rate_upps: RATE_FLOOR_UPPS,
-            min_growth_uppsps: CUBIC_MIN_GROWTH_UPPSPS, max_growth_uppsps: CUBIC_MAX_RATE_UPPS_PER_SEC,
-            friendly_growth_alpha: 0.0, relative_growth_per_rtt: 0.0, bound_recovery_growth: false, compound_growth: false, proportional_growth: false, record_loss_episodes: false, startup_multiplier: 0.0, startup_backoff_rtts: 1.0 }
-    }
-    /// Shorter probe plateau and stronger existing additive term; same R/P/G/S curve.
-    pub const fn balanced() -> Self {
-        Self { time_pg: 2.0, time_gs: 8.0, min_growth_uppsps: 25_000_000.0,
-            initial_rate_upps: 1_000_000_000, ..Self::legacy() }
-    }
-    pub fn validate(&self) -> Result<(), &'static str> {
-        if !(self.beta > 0.0 && self.beta < 1.0 && self.beta < self.rate_rp && self.rate_rp < self.rate_pg && self.rate_pg < self.rate_gs && self.rate_gs <= 100.0) { return Err("CC rate factors need 0 < beta < RP < PG < GS <= 100"); }
-        if !(1..=100).contains(&self.recovery_rtts) { return Err("CC recovery RTTs must be in 1..=100"); }
-        if !(1.1 <= self.time_pg && self.time_pg * 1.1 <= self.time_gs && self.time_gs <= 100.0) { return Err("CC phase times need PG >= 1.1 and GS >= 1.1*PG, GS <= 100"); }
-        let g_span = self.time_gs - self.time_pg;
-        let p_slope = (self.rate_pg - self.rate_rp) / (self.time_pg - 1.0);
-        if self.rate_gs - self.rate_pg - p_slope * g_span < 0.0 { return Err("CC G phase must have nonnegative curvature"); }
-        if !(0.0..=10.0).contains(&self.event_guard_rtts) || !(0.0..=10.0).contains(&self.ecn_event_guard_rtts) { return Err("invalid CC guard"); }
-        if !(1..=10000).contains(&self.loss_threshold) { return Err("CC loss threshold must be in 1..=10000"); }
-        if !(self.rate_floor_upps > 0 && self.initial_rate_upps >= self.rate_floor_upps && self.initial_rate_upps <= 1_000_000_000_000 && self.min_growth_uppsps >= 0.0 && self.min_growth_uppsps.is_finite() && self.max_growth_uppsps > self.min_growth_uppsps && self.max_growth_uppsps <= 1e15) { return Err("invalid CC floor, initial rate or growth limits"); }
-        if !(0.0..=100.0).contains(&self.friendly_growth_alpha) || !(0.0..=10.0).contains(&self.relative_growth_per_rtt) { return Err("invalid CC RTT-scaled growth envelope"); }
-        if self.loss_fraction_ppm > 500_000 || self.loss_response_fraction_ppm > 500_000 || !(2.0..=10.0).contains(&self.loss_timeout_rtts) { return Err("invalid CC loss episode/reorder tolerance"); }
-        if self.proportional_growth && !(self.bound_recovery_growth && self.compound_growth && self.relative_growth_per_rtt > 0.0) { return Err("CC proportional growth requires bounded compound relative growth"); }
-        if self.startup_multiplier != 0.0 && !(1.01..=2.0).contains(&self.startup_multiplier) { return Err("CC startup multiplier must be zero or 1.01..=2"); }
-        if !(0.0..=4.0).contains(&self.startup_backoff_rtts) { return Err("CC startup backoff must be in 0..=4 RTTs"); }
-        Ok(())
-    }
-}
-impl Default for CongestionControlOptions {
-    fn default() -> Self { Self::legacy() }
-}
 
-/// Coarse wake cadence is independent of the rate-based congestion controller.
-/// Polynomial pacing falls back to precise for startup or proportional growth:
-/// those optional curves are not represented by the polynomial scheduler.
-#[derive(Debug, Clone, Copy, Default)]
-pub enum PacingOptions {
-    #[default]
-    Precise,
-    Polynomial { cadence_ms: u64 },
-}
-impl PacingOptions {
-    fn cadence_ns(self, cc: &CongestionControlOptions) -> Option<u64> {
-        match self {
-            Self::Precise => None,
-            Self::Polynomial { cadence_ms } => {
-                assert!([1,2,5,10].contains(&cadence_ms), "polynomial cadence must be 1, 2, 5 or 10 ms");
-                if cc.startup_multiplier > 0.0 || cc.proportional_growth { None }
-                else { Some(cadence_ms * 1_000_000) }
-            }
-        }
-    }
-}
-
+/// Socket binding and optional measurement. The transport policy is fixed internally.
 #[derive(Debug, Clone, Default)]
 pub struct NetworkThreadOptions {
-    pub congestion_control: CongestionControlOptions,
-    /// ACK format and receive-side delay; use Legacy for pre-upgrade peers.
-    pub acknowledgements: crate::ack::AckOptions,
-    pub pacing: PacingOptions,
-    /// Polynomial send-burst wall-time budget: None uses one cadence, Some(0)
-    /// disables it (re-anchor only), Some(ns) overrides it. Ignored by precise.
-    /// A scheduler preemption inside one packet can still exceed the budget.
-    pub polynomial_burst_budget_ns: Option<u64>,
-    /// Optional per-send inversion check; do not enable when measuring CPU savings.
-    pub pacing_diagnostics: bool,
     /// See `new_network_thread_with_bind`.
     pub bind_ip: Option<std::net::IpAddr>,
-    /// Sender-side forward error correction for unreliable messages of 2+ packets: extra
-    /// Wirehair-coded blocks in parts per million of the message's block count (20_000 = 2%),
-    /// so a message survives losing about that fraction of its packets. 0 = off: plain
-    /// fragments, wire bytes exactly as without FEC. Capped at 1_000_000 (100%). Receivers
-    /// decode FEC messages without configuration (but must run code that knows FEC fragments).
-    /// Can be changed later with `NetworkThreadHandle::set_fec_redundancy_ppm`.
-    pub fec_redundancy_ppm: u32,
-    /// FEC mode: None = fixed `fec_redundancy_ppm` (above). Some = adaptive: each connection
-    /// estimates its packet loss from its own sent/lost counts and sizes every message's repair
-    /// blocks so it fails with probability ~eps at that loss (see `fec_adapt`); then
-    /// `fec_redundancy_ppm` is ignored. Toggle with `NetworkThreadHandle::set_fec_adaptive_enabled`.
-    pub fec_adaptive: Option<crate::fec_adapt::AdaptiveFecConfig>,
-    /// Report every finished FEC message in `NetworkThreadPull::fec_messages` (for measurement).
+    /// Report finished FEC messages in `NetworkThreadPull::fec_messages`.
     pub record_fec_messages: bool,
-    /// Optional sender packet/fragment/outcome event CSV; disabled by default.
+    /// Record loss-episode statistics only; never changes congestion control.
+    pub record_loss_episodes: bool,
+    /// Optional sender packet/fragment/outcome event CSV.
     pub loss_trace: Option<std::path::PathBuf>,
-}
-
-impl NetworkThreadHandle {
-    /// Changes the FEC redundancy (see `NetworkThreadOptions::fec_redundancy_ppm`) for messages
-    /// that start sending from now on, on all connections.
-    pub fn set_fec_redundancy_ppm(&self, ppm: u32) {
-        self.inner.fec_redundancy_ppm.store(ppm.min(MAX_FEC_REDUNDANCY_PPM), std::sync::atomic::Ordering::Relaxed);
-    }
-    /// Switches between adaptive FEC (if `NetworkThreadOptions::fec_adaptive` was given) and the
-    /// fixed `fec_redundancy_ppm`. Per-connection estimator state is dropped while switched off
-    /// and starts over from `initial_loss` when switched back on.
-    pub fn set_fec_adaptive_enabled(&self, on: bool) {
-        self.inner.fec_adaptive_enabled.store(on, std::sync::atomic::Ordering::Relaxed);
-    }
 }
 
 pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_pps: Option<u64>, send_buffer_params: (u32, u32, u32), options: NetworkThreadOptions) -> NetworkThreadHandle {
     let bind_ip = options.bind_ip;
-    // Only the measured ship policy runs; research configuration is removed next.
-    let curve_cadence_ns: Option<u64> = None;
-    let curve_burst_budget_ns: Option<u64> = None;
-    let pacing_diagnostics = false;
+    // One measured policy, not application configuration.
     let cc = crate::ship::CC;
-    let ack_options = crate::ship::ACK;
-    cc.validate().expect("invalid congestion controller configuration");
     let cc_rate = move |t, r, k, startup_done| connection_rate(t, r, k, &cc, startup_done);
 
 
@@ -1986,11 +1844,9 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
         stop: std::sync::atomic::AtomicBool::new(false),
         push: std::cell::UnsafeCell::new(NetworkThreadPush::default()),
         pull: std::cell::UnsafeCell::new(NetworkThreadPull::default()),
-        fec_redundancy_ppm: std::sync::atomic::AtomicU32::new(0),
-        fec_adaptive_enabled: std::sync::atomic::AtomicBool::new(true),
     });
-    let fec_adaptive_cfg = Some(crate::ship::FEC);
     let record_fec_messages = options.record_fec_messages;
+    let record_loss_episodes = options.record_loss_episodes;
     let mut loss_trace = options.loss_trace.as_deref().map(|p| crate::loss_trace::LossTrace::open(p).expect("open loss trace"));
 
     let thread_inner = inner.clone();
@@ -2045,8 +1901,6 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                 last_loop_start_ns = t;
                 thread_stats.loop_iterations += 1;
             }
-            let fec_redundancy_ppm = 0;
-            let fec_adaptive_now = fec_adaptive_cfg;
             let test_drop_ppm = match &test_drop_schedule { Some(sch) => sch.ppm_at(monotonic_clock_ns().saturating_sub(test_drop_t0)), None => test_drop_ppm };
             if thread_inner.state.load(std::sync::atomic::Ordering::Acquire) == 1 {
                 let mut req = NetworkThreadPush::default();
@@ -2593,7 +2447,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             }
                             // This is not an ack packet.
 
-                            if !state.ack_receiver.receive_with_rtt(nonce as u64, timestamp_ns, ecn_marked, ack_options, &mut state.ack_timer, state.stats.rtt_us, buf_len) { break 'conn; }
+                            if !state.ack_receiver.receive_with_rtt(nonce as u64, timestamp_ns, ecn_marked, &mut state.ack_timer, state.stats.rtt_us, buf_len) { break 'conn; }
 
                             // A legitimate data packet could never this state because to be all zeroes the
                             // first fragment would have to be package_id=0 and frag_len=0. If so that is
@@ -2982,7 +2836,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
 
 
                         // ECN congestion event: the receiver saw CE-marked packets and relayed it via the ack's IP header
-                        if take_ecn_signal(state, if cc.ecn_event_guard_rtts > 0.0 { cc.ecn_event_guard_rtts } else { cc.event_guard_rtts }) {
+                        if take_ecn_signal(state, cc.event_guard_rtts) {
                             let send_dt = state.ecn_oldest_send_time - state.congestion_event_time_ns;
                             let send_t_factor = send_dt as f64 / time_to_bandwidth_recovery as f64;
                             let (_, send_mode) = cc_rate(send_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery, state.cc_startup_done);
@@ -3040,12 +2894,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     // Covered losses still enter loss/FEC statistics below, but
                                     // cannot prime the threshold for a subsequent congestion cut.
                                     let eligible = send_time > state.congestion_event_time_ns + (rtt_ns as f64 * cc.event_guard_rtts) as u64;
-                                    let threshold = if cc.loss_fraction_ppm == 0 { cc.loss_threshold } else {
-                                        let send_dt = send_time.saturating_sub(state.congestion_event_time_ns);
-                                        let rate = local_rate_limit(cc_rate(send_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery, state.cc_startup_done).0.max(cc.rate_floor_upps), max_pps);
-                                        congestion_loss_threshold(rate, rtt_ns, &cc)
-                                    };
-                                    let trigger = cc.loss_response_fraction_ppm == 0 && count_congestion_loss(&mut state.loss_count_in_window, eligible, threshold);
+                                        let trigger = count_congestion_loss(&mut state.loss_count_in_window, eligible, cc.loss_threshold);
 
                                     if trigger {
                                         apply_loss_congestion(state, send_time, current_time_now_ns, &cc, max_pps);
@@ -3059,18 +2908,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     connection_tracking_data.unreliable_send_buffer.fec_on_packet_lost(state.packets_waiting_ack_tail);
                                 }
                             }
-                            if cc.loss_response_fraction_ppm > 0 {
-                                let sent_ns = state.send_time(state.packets_waiting_ack_tail);
-                                let rtt_ns = state.RTT_mean as u64 * 100_000;
-                                let eligible = sent_ns != u64::MAX && sent_ns > state.congestion_event_time_ns.saturating_add((rtt_ns as f64 * cc.event_guard_rtts) as u64);
-                                if eligible {
-                                    let lost = state.declared_lost_field[(bit_index / 64) as usize] & (1u64 << (bit_index % 64)) != 0;
-                                    if let Some(loss_ns) = state.loss_response.on_packet(sent_ns, lost, rtt_ns, cc.loss_response_fraction_ppm, cc.loss_threshold) {
-                                        apply_loss_congestion(state, loss_ns, current_time_now_ns, &cc, max_pps);
-                                    }
-                                }
-                            }
-                            if cc.record_loss_episodes {
+                            if record_loss_episodes {
                                 let sent_ns = state.send_time(state.packets_waiting_ack_tail);
                                 let lost = state.declared_lost_field[(bit_index / 64) as usize] & (1u64 << (bit_index % 64)) != 0;
                                 if sent_ns != 0 && sent_ns != u64::MAX {
@@ -3183,17 +3021,9 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                         connection_tracking_data.unreliable_send_buffer.current_bytes_per_second = payload_size as u64 * allowed_bandwidth_upps / 1000_000;
                         {
                             let buf = &mut connection_tracking_data.unreliable_send_buffer;
-                            match &fec_adaptive_now {
-                                Some(cfg) => {
-                                    let a = buf.fec_adaptive.get_or_insert_with(|| crate::fec_adapt::FecAdaptiveState::new(*cfg, current_time_now_ns, state.stats.packets_sent, state.stats.packets_lost));
-                                    a.on_tick(current_time_now_ns, state.stats.packets_sent, state.stats.packets_lost, state.stats.spurious_losses);
-                                    buf.fec_redundancy_ppm = a.representative_ppm();
-                                }
-                                None => {
-                                    buf.fec_adaptive = None;
-                                    buf.fec_redundancy_ppm = fec_redundancy_ppm;
-                                }
-                            }
+                            let a = buf.fec_adaptive.get_or_insert_with(|| crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, current_time_now_ns, state.stats.packets_sent, state.stats.packets_lost));
+                            a.on_tick(current_time_now_ns, state.stats.packets_sent, state.stats.packets_lost, state.stats.spurious_losses);
+                            buf.fec_capacity_overhead_ppm = a.representative_ppm();
                             if record_fec_messages && buf.fec_record.is_none() { buf.fec_record = Some(Vec::new()); }
                         }
                         let mut unreliable_payload_size = 0;
@@ -3300,79 +3130,29 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
     }
 }
 
-const CUBIC_BETA: f64 = 0.67;
-const CUBIC_K_RTT_MULTIPLIER: u64 = 9;
-const CUBIC_MAX_RATE_UPPS_PER_SEC: f64 = 83_668_000_000.0; // 1000 Mbps/s linear cap
-const CUBIC_MIN_GROWTH_UPPSPS: f64 = 1_000_000.0; // 1 pps per second minimum linear growth
-
-// -- Edit with Claude ------------------------------------------------------
-// Piecewise rate curve after recovery. All times are multiples of k (the
-// recovery time = CUBIC_K_RTT_MULTIPLIER * RTT).  Rate targets are
-// multiples of r (the pre-drop rate, "congestion upps").
-//
-//  Transition times (as factors on k, cumulative from congestion event):
-//    R-P  1.0  (implicit: recovery ends at t = k)
-//    P-G  5.0
-//    G-S  15.0
-//
-//  Rate targets at each transition (as factors on r):
-//    R-P  0.98   (recovery stops 2% below r)
-//    P-G  1.05   (5% above r)
-//    G-S  4.0    (300% above r)
-//
-//  Curve shapes:
-//    R: p^2 recovery from r*BETA up to r*RATE_RP
-//    P: linear from r to r*P-G_factor, entry derivative carried into G
-//    G: quadratic from P-G point, entry derivative matches P exit
-//    S: p^10 explosive ramp (startup / bandwidth discovery)
-//    L: linear cap at CUBIC_MAX_RATE_UPPS_PER_SEC
-//
-//  Modes: R P G S L
-//
-// Note(Claude): When changing constants below, always update this
-// description block to match. The description is the source of truth
-// for the curve design.
-// -------------------------------------------------------------------------─
-const RATE_RP: f64 = 0.98;  // rate factor at R-P transition
-const RATE_PG: f64 = 1.05;  // rate factor at P-G transition
-const RATE_GS: f64 = 4.0;   // rate factor at G-S transition
-const TIME_PG: f64 = 5.0;   // time factor (in k) for P-G transition
-const TIME_GS: f64 = 15.0;  // time factor (in k) for G-S transition
-
-/// Evaluate the legacy CUBIC sending-rate function (use `cubic_rate_with_options` for a configured curve).
-/// t_ns:  nanoseconds since the last congestion event.
-/// r_max: sending rate (upps) at the time the dropped packet was sent.
-/// k_ns:  time in nanoseconds to recover back to r_max.
-/// Returns (target sending rate in upps, mode char: R/P/G/S/L).
-pub fn cubic_rate(t_ns: u64, r_max: u64, k_ns: u64) -> (u64, char) {
-    cubic_rate_with_options(t_ns, r_max, k_ns, &CongestionControlOptions::legacy())
+/// Post-congestion recovery/probing curve in millionths of a packet/second.
+/// Recovery takes nine RTTs; compounded relative and absolute growth envelopes
+/// bound every phase. See ship.rs for the sole policy and research evidence.
+fn cubic_rate(t_ns: u64, r_max: u64, k_ns: u64) -> (u64, char) {
+    cubic_rate_with_options(t_ns, r_max, k_ns, &crate::ship::CC)
 }
 
-/// The original rate function, with its constants supplied at runtime.
-pub fn cubic_rate_with_options(t_ns: u64, r_max: u64, k_ns: u64, cc: &CongestionControlOptions) -> (u64, char) {
+/// Internal evaluation with the fixed policy (no application tuning API).
+pub(crate) fn cubic_rate_with_options(t_ns: u64, r_max: u64, k_ns: u64, cc: &CongestionPolicy) -> (u64, char) {
     if k_ns == 0 { return (r_max, 'R'); }
     let t = t_ns as f64;
     let r = r_max as f64;
     let k = k_ns as f64;
     let drop = r * (1.0 - cc.beta);
     let rtt_seconds = k / (cc.recovery_rtts as f64 * 1e9);
-    let floor = if cc.friendly_growth_alpha > 0.0 {
-        cc.min_growth_uppsps.max(cc.friendly_growth_alpha * 1e6 / (rtt_seconds * rtt_seconds)).min(cc.max_growth_uppsps)
-    } else { cc.min_growth_uppsps };
-    let ceiling = if cc.relative_growth_per_rtt > 0.0 && !cc.compound_growth {
-        cc.max_growth_uppsps.min(r * cc.relative_growth_per_rtt / rtt_seconds)
-    } else { cc.max_growth_uppsps };
+    let floor = cc.min_growth_uppsps;
+    let ceiling = cc.max_growth_uppsps;
     let min_growth = floor / 1e9 * t;
-    let linear_cap_slope = if cc.proportional_growth { f64::INFINITY } else { ceiling / 1e9 };
+    let linear_cap_slope = ceiling / 1e9;
     let finish = |rate: u64, mode| {
-        if cc.bound_recovery_growth {
-            let absolute = r * cc.beta + (floor + ceiling) / 1e9 * t;
-            let envelope = if cc.compound_growth && cc.relative_growth_per_rtt > 0.0 {
-                let relative = r * cc.beta * (cc.relative_growth_per_rtt * t / (rtt_seconds * 1e9)).exp() + min_growth;
-                if cc.proportional_growth { relative.min(1e12) } else { relative.min(absolute) }
-            } else { absolute };
-            (rate.min(envelope as u64), mode)
-        } else { (rate, mode) }
+        let absolute = r * cc.beta + (floor + ceiling) / 1e9 * t;
+        let relative = r * cc.beta * (cc.relative_growth_per_rtt * t / (rtt_seconds * 1e9)).exp() + min_growth;
+        (rate.min(relative.min(absolute) as u64), mode)
     };
 
     // R: p^2 recovery from r*BETA up to r*cc.rate_rp
@@ -3499,15 +3279,11 @@ pub fn get_handshake_hash(handshake: &snow::HandshakeState) -> [u8; 64] {
 use crate::helpers::*;
 use crate::native_sockets::*;
 
-fn take_ecn_echo(state: &mut ConnectionStateConnected) -> bool {
-    std::mem::take(&mut state.ecn_echo_pending)
-}
-
 fn take_ecn_signal(state: &mut ConnectionStateConnected, guard_rtts: f64) -> bool {
     // Consume covered feedback too: it must not survive to a later ACK/epoch.
     let pending = std::mem::take(&mut state.ecn_congestion_received);
     let eligible = pending && state.ecn_oldest_send_time > state.congestion_event_time_ns.saturating_add((state.RTT_mean as f64 * 100_000.0 * guard_rtts) as u64);
-    if eligible { state.loss_count_in_window = 0; state.loss_response = LossResponseWindow::default(); }
+    if eligible { state.loss_count_in_window = 0; }
     eligible
 }
 
@@ -3524,8 +3300,8 @@ fn update_app_limit(state: &mut ConnectionStateConnected, now_ns: u64, has_data:
     }
 }
 
-fn connection_rate(t_ns: u64, anchor_upps: u64, k_ns: u64, cc: &CongestionControlOptions, startup_done: bool) -> (u64, char) {
-    if cc.startup_multiplier > 0.0 && !startup_done {
+fn connection_rate(t_ns: u64, anchor_upps: u64, k_ns: u64, cc: &CongestionPolicy, startup_done: bool) -> (u64, char) {
+    if !startup_done {
         let rtt_ns = k_ns / cc.recovery_rtts;
         // The sentinel RTT means no sample yet: never ramp on an unknown path.
         let exponent = if rtt_ns == u16::MAX as u64 * 100_000 { 0.0 } else { cc.startup_multiplier.ln() * t_ns as f64 / rtt_ns.max(100_000) as f64 };
@@ -3541,13 +3317,7 @@ fn local_rate_limit(rate: u64, max_pps: Option<u64>) -> u64 {
     max_pps.map_or(rate, |limit| rate.min(limit.saturating_mul(1_000_000).max(1)))
 }
 
-fn congestion_loss_threshold(rate_upps: u64, rtt_ns: u64, cc: &CongestionControlOptions) -> u64 {
-    // Detection uses only the commanded rate and packet loss, never ACK/delivery rate.
-    let fraction = (rate_upps as u128 * rtt_ns as u128 * cc.loss_fraction_ppm as u128).div_ceil(1_000_000_000_000_000_000_000);
-    cc.loss_threshold.max(fraction.min(u64::MAX as u128) as u64)
-}
-
-fn apply_loss_congestion(state: &mut ConnectionStateConnected, send_time: u64, current_time_now_ns: u64, cc: &CongestionControlOptions, max_pps: Option<u64>) {
+fn apply_loss_congestion(state: &mut ConnectionStateConnected, send_time: u64, current_time_now_ns: u64, cc: &CongestionPolicy, max_pps: Option<u64>) {
     let rtt_ns = state.RTT_mean as u64 * 100_000;
     // An RTT re-anchor may have moved the origin while a cohort was retiring.
     // Re-check its loss send-time, not just the packet which completed the cohort.
@@ -3574,34 +3344,12 @@ fn apply_loss_congestion(state: &mut ConnectionStateConnected, send_time: u64, c
     state.loss_count_in_window = 0;
     state.cc_startup_done = true;
     println!("congestion event PACKET DROPPED {} ...  rate discovered: {} pps  now:{now_mode}@{now_t_factor:.2} sent:{send_mode}@{send_t_factor:.2}", state.packets_waiting_ack_tail, state.congestion_event_rate_upps as f64 / 1000000.0);
-    state.loss_response = LossResponseWindow::default();
 }
 
 fn count_congestion_loss(count: &mut u64, eligible: bool, threshold: u64) -> bool {
     if !eligible { return false; }
     *count = count.saturating_add(1);
     *count >= threshold
-}
-
-/// Constant-memory send-time cohort, evaluated only when a full RTT has retired.
-/// Counting ACKed and lost packets is a loss fraction, never an ACK-rate estimate.
-#[derive(Debug, Default)]
-struct LossResponseWindow { start_ns: u64, width_ns: u64, packets: u64, lost: u64, last_loss_ns: u64 }
-impl LossResponseWindow {
-    fn on_packet(&mut self, sent_ns: u64, lost: bool, rtt_ns: u64, fraction_ppm: u32, min_losses: u64) -> Option<u64> {
-        let mut signal = None;
-        if self.packets > 0 && sent_ns.saturating_sub(self.start_ns) >= self.width_ns {
-            if self.lost >= min_losses && self.lost as u128 * 1_000_000 >= self.packets as u128 * fraction_ppm as u128 {
-                signal = Some(self.last_loss_ns);
-            }
-            *self = Self::default();
-        }
-        if self.packets == 0 { self.start_ns = sent_ns; self.width_ns = rtt_ns.max(100_000); }
-        self.packets += 1;
-        self.lost += u64::from(lost);
-        if lost { self.last_loss_ns = sent_ns; }
-        signal
-    }
 }
 
 #[derive(Debug, Default)]
@@ -3643,15 +3391,8 @@ mod congestion_tests {
 
     #[test]
     fn loss_free_app_empty_resume_preserves_every_active_curve() {
-        let compound = CongestionControlOptions {
-            max_growth_uppsps: 500e6, relative_growth_per_rtt: 0.02,
-            bound_recovery_growth: true, compound_growth: true,
-            ..CongestionControlOptions::balanced()
-        };
-        for cc in [CongestionControlOptions::legacy(), CongestionControlOptions::balanced(),
-            compound, CongestionControlOptions { proportional_growth: true, ..compound },
-            CongestionControlOptions { compound_growth: false, ..compound },
-            CongestionControlOptions { startup_multiplier: 1.5, ..compound }] {
+        let cc = crate::ship::CC;
+        for startup_done in [false, true] {
             for rtt_ns in [40_000_000, 200_000_000] {
                 let k = cc.recovery_rtts * rtt_ns;
                 for age in [k / 2, k + k / 2, 3 * k, 9 * k, 30 * k] {
@@ -3659,20 +3400,20 @@ mod congestion_tests {
                     state.congestion_event_rate_upps = 8_000_000_000;
                     state.congestion_event_time_ns = 1_000_000_000;
                     let mut now = state.congestion_event_time_ns + age;
-                    let mut previous_rate = connection_rate(age, state.congestion_event_rate_upps, k, &cc, false).0;
+                    let mut previous_rate = connection_rate(age, state.congestion_event_rate_upps, k, &cc, startup_done).0;
                     for cycle in 0..100 {
                         let active_age = now - state.congestion_event_time_ns;
-                        let before = connection_rate(active_age, state.congestion_event_rate_upps, k, &cc, false).0;
+                        let before = connection_rate(active_age, state.congestion_event_rate_upps, k, &cc, startup_done).0;
                         assert!(before >= previous_rate);
                         let anchor = state.congestion_event_rate_upps;
                         update_app_limit(&mut state, now, false);
                         now += 5_000_000_000;
                         update_app_limit(&mut state, now, false);
                         assert_eq!(state.congestion_event_rate_upps, anchor);
-                        let idle = connection_rate(state.app_limit_time_offset, anchor, k, &cc, false).0;
+                        let idle = connection_rate(state.app_limit_time_offset, anchor, k, &cc, startup_done).0;
                         assert_eq!(idle, before, "idle cycle {cycle}: {cc:?}");
                         update_app_limit(&mut state, now, true);
-                        let resumed = connection_rate(now - state.congestion_event_time_ns, anchor, k, &cc, false).0;
+                        let resumed = connection_rate(now - state.congestion_event_time_ns, anchor, k, &cc, startup_done).0;
                         assert_eq!(resumed, before, "resume cycle {cycle}: {cc:?}");
                         previous_rate = resumed;
                         now += 2_000_000;
@@ -3684,38 +3425,12 @@ mod congestion_tests {
     }
 
     #[test]
-    fn actual_loss_fraction_uses_completed_send_cohort() {
-        assert_eq!(std::mem::size_of::<LossResponseWindow>(), 40);
-        let mut window = LossResponseWindow::default();
-        // Two scattered losses out of 100: no cut at 3%, including before closure.
-        for i in 0..100 { assert_eq!(window.on_packet(1 + i * 1_000_000, i == 10 || i == 80, 100_000_000, 30_000, 2), None); }
-        assert_eq!(window.on_packet(100_000_001, false, 100_000_000, 30_000, 2), None);
-        // A six-packet cluster out of 100 crosses the threshold at cohort closure.
-        for i in 1..100 { assert_eq!(window.on_packet(100_000_001 + i * 1_000_000, (20..26).contains(&i), 100_000_000, 30_000, 2), None); }
-        assert_eq!(window.on_packet(200_000_001, false, 100_000_000, 30_000, 2), Some(125_000_001));
-        // One loss in a tiny cohort still respects min_losses.
-        let mut tiny = LossResponseWindow::default();
-        assert_eq!(tiny.on_packet(1, true, 100_000_000, 30_000, 2), None);
-        assert_eq!(tiny.on_packet(100_000_001, false, 100_000_000, 30_000, 2), None);
-        let cc = CongestionControlOptions::legacy();
-        let ConnectionState::Connected(mut state) = new_connection_state_connected(None, 0, 1, 1) else { unreachable!() };
-        state.RTT_mean = 1000;
-        state.congestion_event_time_ns = 200_000_000;
-        apply_loss_congestion(&mut state, 125_000_001, 300_000_000, &cc, None);
-        assert_eq!(state.congestion_event_time_ns, 200_000_000);
-        assert!(!state.cc_startup_done);
-    }
-
-    #[test]
-    fn ecn_echo_cannot_steal_sender_feedback_or_repeat_guarded_signals() {
+    fn ecn_feedback_is_consumed_once_even_when_guarded() {
         let ConnectionState::Connected(mut state) = new_connection_state_connected(None, 0, 1, 1) else { unreachable!() };
         state.RTT_mean = 2000;
         state.congestion_event_time_ns = 1_000_000_000;
         state.ecn_oldest_send_time = 1_200_000_000;
         state.ecn_congestion_received = true;
-        state.ecn_echo_pending = true;
-        assert!(take_ecn_echo(&mut state));
-        assert!(!take_ecn_echo(&mut state));
         state.loss_count_in_window = 9;
         assert!(take_ecn_signal(&mut state, 0.5));
         assert_eq!(state.loss_count_in_window, 0);
@@ -3729,34 +3444,26 @@ mod congestion_tests {
         state.ecn_congestion_received = true;
         state.ecn_oldest_send_time = 1_150_000_000;
         assert!(!take_ecn_signal(&mut state, 1.0));
-        assert!(!take_ecn_echo(&mut state));
-        state.ecn_echo_pending = true;
         assert!(!take_ecn_signal(&mut state, 0.5));
-        assert!(take_ecn_echo(&mut state));
     }
 
     #[test]
-    fn optional_startup_is_rate_based_and_exits_to_curve() {
-        let cc = CongestionControlOptions { startup_multiplier: 1.5, ..CongestionControlOptions::legacy() };
+    fn startup_is_rate_based_and_exits_to_ship_curve() {
+        let cc = crate::ship::CC;
         let r = 100_000_000;
         let rtt = 200_000_000;
         let k = cc.recovery_rtts * rtt;
         assert_eq!(connection_rate(0, r, k, &cc, false), (r, 'I'));
-        assert!((connection_rate(rtt, r, k, &cc, false).0 as f64 / r as f64 - 1.5).abs() < 1e-6);
-        assert!((connection_rate(10*rtt, r, k, &cc, false).0 as f64 / r as f64 - 1.5f64.powi(10)).abs() < 1e-6);
+        assert!((connection_rate(rtt, r, k, &cc, false).0 as f64 / r as f64 - 1.1).abs() < 1e-6);
+        assert!((connection_rate(10*rtt, r, k, &cc, false).0 as f64 / r as f64 - 1.1f64.powi(10)).abs() < 1e-6);
         assert_eq!(connection_rate(100*rtt, r, cc.recovery_rtts * u16::MAX as u64 * 100_000, &cc, false), (r, 'I'));
         assert_eq!(connection_rate(0, r, k, &cc, true), cubic_rate(0, r, k));
         assert!(connection_rate(u64::MAX, r, k, &cc, false).0 <= 1_000_000_000_000);
-        assert_eq!(connection_rate(0, r, k, &CongestionControlOptions::legacy(), false), cubic_rate(0, r, k));
-        assert!(CongestionControlOptions { startup_multiplier: f64::NAN, ..cc }.validate().is_err());
-        assert!(CongestionControlOptions { startup_multiplier: 1.0, ..cc }.validate().is_err());
-        assert!(CongestionControlOptions { startup_backoff_rtts: f64::NAN, ..cc }.validate().is_err());
-        let cc = CongestionControlOptions { startup_backoff_rtts: 2.0, ..cc };
         let ConnectionState::Connected(mut state) = new_connection_state_connected(None, 0, 1, 1) else { unreachable!() };
         state.RTT_mean = 2000;
         state.congestion_event_rate_upps = r;
         apply_loss_congestion(&mut state, 10*rtt, 12*rtt, &cc, None);
-        assert_eq!(state.congestion_event_rate_upps, connection_rate(8*rtt, r, k, &cc, false).0);
+        assert_eq!(state.congestion_event_rate_upps, connection_rate(9*rtt, r, k, &cc, false).0);
         assert!(state.cc_startup_done);
     }
 
@@ -3774,21 +3481,6 @@ mod congestion_tests {
     }
 
     #[test]
-    fn radio_threshold_counts_loss_episodes_not_isolated_noise() {
-        let mut cc = CongestionControlOptions::legacy();
-        assert_eq!(congestion_loss_threshold(1_000_000_000, 200_000_000, &cc), 2);
-        cc.loss_fraction_ppm = 50_000;
-        assert_eq!(congestion_loss_threshold(1_000_000_000, 200_000_000, &cc), 10);
-        assert_eq!(congestion_loss_threshold(10_000_000_000, 200_000_000, &cc), 100);
-        let mut count = 0;
-        for _ in 0..4 { assert!(!count_congestion_loss(&mut count, true, 10)); }
-        for _ in 4..9 { assert!(!count_congestion_loss(&mut count, true, 10)); }
-        assert!(count_congestion_loss(&mut count, true, 10));
-        cc.loss_timeout_rtts = 1.0;
-        assert!(cc.validate().is_err());
-    }
-
-    #[test]
     fn congestion_after_local_ceiling_still_cuts_actual_pacing() {
         let (r, k) = (1_000_000_000, 900_000_000);
         let stale_discovery = cubic_rate(20 * k, r, k).0;
@@ -3798,97 +3490,6 @@ mod congestion_tests {
         let anchor = local_rate_limit(stale_discovery, Some(1000));
         assert_eq!(anchor, r);
         assert_eq!(local_rate_limit(cubic_rate(0, anchor, k).0, Some(1000)), 670_000_000);
-    }
-
-    #[test]
-    fn compounded_growth_remains_bounded_without_delivery_sampling() {
-        let mut cc = CongestionControlOptions::balanced();
-        cc.max_growth_uppsps = 500e6;
-        cc.relative_growth_per_rtt = 0.01;
-        cc.bound_recovery_growth = true;
-        let (r, k) = (1_000_000_000, 1_800_000_000);
-        let linear = cubic_rate_with_options(60_000_000_000, r, k, &cc).0;
-        cc.compound_growth = true;
-        assert!(cubic_rate_with_options(60_000_000_000, r, k, &cc).0 > linear);
-        let mut prev = 0;
-        for t in (0..100*k).step_by((k/1000) as usize) {
-            let rate = cubic_rate_with_options(t, r, k, &cc).0;
-            assert!(rate >= prev);
-            assert!(rate <= (r as f64 * cc.beta + 525e6 * t as f64 / 1e9) as u64);
-            prev = rate;
-        }
-    }
-
-    #[test]
-    fn proportional_growth_scales_rate_without_fixed_pps_ceiling() {
-        let mut cc = CongestionControlOptions { max_growth_uppsps: 500e6,
-            min_growth_uppsps: 0.0, relative_growth_per_rtt: 0.01,
-            bound_recovery_growth: true, compound_growth: true, proportional_growth: true,
-            ..CongestionControlOptions::balanced() };
-        let k = 1_800_000_000;
-        for t in [0, k, 2*k, 8*k, 20*k] {
-            let low = cubic_rate_with_options(t, 1_000_000_000, k, &cc).0;
-            let high = cubic_rate_with_options(t, 40_000_000_000, k, &cc).0;
-            assert!((high as f64 / low as f64 - 40.0).abs() < 1e-6);
-        }
-        let r = 40_000_000_000;
-        let t = 20*k;
-        assert!(cubic_rate_with_options(t, r, k, &cc).0 > (r as f64 * cc.beta + 500e6 * t as f64 / 1e9) as u64);
-        let mut previous = 0;
-        for t in (0..100*k).step_by((k/100) as usize) {
-            let rate = cubic_rate_with_options(t, r, k, &cc).0;
-            assert!(rate >= previous);
-            assert!(rate <= (r as f64 * cc.beta * (cc.relative_growth_per_rtt * t as f64 / 200e6).exp()).min(1e12) as u64);
-            previous = rate;
-        }
-        cc.compound_growth = false;
-        assert!(cc.validate().is_err());
-        cc.proportional_growth = false;
-        assert!(cc.validate().is_ok());
-    }
-
-    #[test]
-    fn bounded_recovery_cannot_bypass_relative_growth_limit() {
-        let mut cc = CongestionControlOptions::balanced();
-        cc.max_growth_uppsps = 500e6;
-        cc.relative_growth_per_rtt = 0.02;
-        let (r, k) = (1_000_000_000, 1_800_000_000);
-        assert_eq!(cubic_rate_with_options(k, r, k, &cc).0, 1_025_000_000);
-        cc.bound_recovery_growth = true;
-        assert_eq!(cubic_rate_with_options(k, r, k, &cc).0, 895_000_000);
-        let mut prev = 0;
-        for t in (0..100*k).step_by((k/1000) as usize) {
-            let rate = cubic_rate_with_options(t, r, k, &cc).0;
-            assert!(rate >= prev);
-            assert!(rate <= (r as f64 * cc.beta + 125e6 * t as f64 / 1e9) as u64);
-            prev = rate;
-        }
-    }
-
-    #[test]
-    fn rtt_growth_envelope_is_rate_based_and_option_gated() {
-        let mut cc = CongestionControlOptions::balanced();
-        cc.max_growth_uppsps = 500e6;
-        let k = 1_800_000_000;
-        let base = cubic_rate_with_options(20 * k, 1_000_000_000, k, &cc).0;
-        cc.relative_growth_per_rtt = 0.02;
-        let slow = cubic_rate_with_options(20 * k, 1_000_000_000, k, &cc).0;
-        assert!(slow < base);
-        cc.relative_growth_per_rtt = 0.0;
-        assert_eq!(cubic_rate_with_options(20 * k, 1_000_000_000, k, &cc).0, base);
-        cc.friendly_growth_alpha = 4.0;
-        assert!(cubic_rate_with_options(k, 1_000_000_000, k, &cc).0 > cubic_rate_with_options(k, 1_000_000_000, k, &CongestionControlOptions::balanced()).0);
-        for rtt in [100_000, 30_000_000, 200_000_000] {
-            let k = cc.recovery_rtts * rtt;
-            let mut prev = 0;
-            for t in (0..50*k).step_by((k/100).max(1) as usize) {
-                let rate = cubic_rate_with_options(t, 1_000_000_000, k, &cc).0;
-                assert!(rate >= prev);
-                prev = rate;
-            }
-        }
-        cc.friendly_growth_alpha = f64::NAN;
-        assert!(cc.validate().is_err());
     }
 
     #[test]
@@ -3917,67 +3518,27 @@ mod congestion_tests {
         assert_eq!(quantized_rtt_mean(0, 16), 1);
         assert_eq!(quantized_rtt_mean(30, 16), 1);
         assert_eq!(quantized_rtt_mean(1830 * 16, 16), 1830);
-        let k = CongestionControlOptions::legacy().recovery_rtts * quantized_rtt_mean(0, 16) as u64 * 100_000;
+        let k = crate::ship::CC.recovery_rtts * quantized_rtt_mean(0, 16) as u64 * 100_000;
         assert!(k > 0);
         assert!(cubic_rate(20 * k, 100_000_000, k).0 > cubic_rate(0, 100_000_000, k).0);
     }
 
     #[test]
-    fn legacy_transition_rates() {
-        let (r, k) = (1_000_000_000, 900_000_000);
-        assert_eq!(cubic_rate(0, r, k), (670_000_000, 'R'));
-        assert_eq!(cubic_rate(k, r, k), (980_900_000, 'R'));
-        assert_eq!(cubic_rate(5 * k, r, k), (1_054_500_000, 'P'));
-        assert_eq!(cubic_rate(15 * k, r, k), (4_013_499_999, 'G'));
-    }
-
-    #[test]
-    fn parameters_change_only_the_original_curve() {
-        let mut cc = CongestionControlOptions::legacy();
-        cc.beta = 0.8;
-        cc.recovery_rtts = 4;
-        cc.time_pg = 2.0;
-        cc.time_gs = 6.0;
-        cc.validate().unwrap();
-        assert_eq!(cubic_rate_with_options(0, 1_000_000_000, 800_000_000, &cc), (800_000_000, 'R'));
-        assert_eq!(cubic_rate_with_options(1_600_000_000, 1_000_000_000, 800_000_000, &cc), (1_051_600_000, 'P'));
-        let mut previous = 0;
-        for t in (0..100_000_000_000u64).step_by(10_000_000) {
-            let rate = cubic_rate_with_options(t, 1_000_000_000, 800_000_000, &cc).0;
-            assert!(rate >= previous);
-            previous = rate;
-        }
-    }
-
-    #[test]
-    fn balanced_changes_only_four_parameters() {
-        let cc = CongestionControlOptions::balanced();
-        let old = CongestionControlOptions::legacy();
-        cc.validate().unwrap();
-        assert_eq!(cc.beta, old.beta);
-        assert_eq!(cc.recovery_rtts, old.recovery_rtts);
-        assert_eq!((cc.rate_rp, cc.rate_pg, cc.rate_gs), (old.rate_rp, old.rate_pg, old.rate_gs));
-        assert_eq!((cc.loss_threshold, cc.event_guard_rtts), (old.loss_threshold, old.event_guard_rtts));
-        assert_eq!(cc.rate_floor_upps, old.rate_floor_upps);
-        assert_eq!(cc.max_growth_uppsps, old.max_growth_uppsps);
-        assert_eq!((cc.time_pg, cc.time_gs, cc.min_growth_uppsps, cc.initial_rate_upps), (2.0, 8.0, 25_000_000.0, 1_000_000_000));
-        assert_eq!(cubic_rate_with_options(0, 1_000_000_000, 1_800_000_000, &cc), (670_000_000, 'R'));
-        assert_eq!(cubic_rate_with_options(3_600_000_000, 1_000_000_000, 1_800_000_000, &cc), (1_140_000_000, 'P'));
-    }
-
-    #[test]
-    fn invalid_parameters_are_rejected() {
-        let base = CongestionControlOptions::legacy();
-        for bad in [CongestionControlOptions { beta: f64::NAN, ..base },
-            CongestionControlOptions { beta: 1.0, ..base },
-            CongestionControlOptions { recovery_rtts: 0, ..base },
-            CongestionControlOptions { time_pg: 1.0, ..base },
-            CongestionControlOptions { time_gs: 1.5, ..base },
-            CongestionControlOptions { loss_threshold: 0, ..base },
-            CongestionControlOptions { initial_rate_upps: 1, ..base },
-            CongestionControlOptions { event_guard_rtts: f64::NAN, ..base },
-            CongestionControlOptions { time_pg: 1.1, time_gs: 100.0, ..base }] {
-            assert!(bad.validate().is_err());
+    fn compounded_growth_is_monotone_and_bounded_in_every_phase() {
+        let cc = crate::ship::CC;
+        for r in [100_000_000, 1_000_000_000, 40_000_000_000] {
+            for rtt in [100_000, 30_000_000, 200_000_000] {
+                let k = cc.recovery_rtts * rtt;
+                let mut previous = 0;
+                for t in (0..100*k).step_by((k/1000).max(1) as usize) {
+                    let rate = cubic_rate(t, r, k).0;
+                    assert!(rate >= previous);
+                    // Arithmetic reordering can differ by one millionth of a pps.
+                    assert!(rate <= (r as f64 * cc.beta + 525e6 * t as f64 / 1e9) as u64 + 1,
+                        "r={r} rtt={rtt} t={t} rate={rate}");
+                    previous = rate;
+                }
+            }
         }
     }
 }
@@ -4090,16 +3651,18 @@ mod fec_send_tests {
         v
     }
 
-    fn new_buf(ppm: u32) -> UnreliableSendBuffer {
+    fn new_buf() -> UnreliableSendBuffer {
         let mut b = UnreliableSendBuffer::new(1_000_000, 1 << 26, 1 << 26);
-        b.fec_redundancy_ppm = ppm;
+        let a = crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0);
+        b.fec_capacity_overhead_ppm = a.representative_ppm();
+        b.fec_adaptive = Some(a);
         b
     }
 
     #[test]
     fn thousand_byte_messages_occupy_one_physical_packet_each() {
         for payload_len in [1162, 1450, 9194] {
-            let mut b = new_buf(0);
+            let mut b = new_buf();
             // Leave a tail too short for the next message, followed by many fresh-packet messages.
             let mut messages = vec![msg(payload_len - 600)];
             messages.extend((0..200).map(|_| msg(1000)));
@@ -4122,7 +3685,7 @@ mod fec_send_tests {
 
     #[test]
     fn small_plain_message_defers_tail_and_rechecks_tu() {
-        let mut b = new_buf(0);
+        let mut b = new_buf();
         assert!(b.submit_messages(vec![msg(1000)]).is_empty());
         assert!(b.next_fragment(1450, 500).is_none());
         assert_eq!(b.partial_send_slot.as_ref().unwrap().1, 0);
@@ -4135,29 +3698,13 @@ mod fec_send_tests {
         }
     }
 
-    #[test]
-    fn ppm_zero_sends_plain_fragments() {
-        let mut b = new_buf(0);
-        let (m1, m2) = (msg(20_000), msg(100));
-        assert!(b.submit_messages(vec![m1.clone(), m2.clone()]).is_empty());
-        let packets = drain(&mut b, 9194, 100);
-        assert_eq!(packets.len(), 3);
-        let frags: Vec<Frag> = packets.into_iter().flatten().collect();
-        assert!(frags.iter().all(|f| f.1.is_none()));
-        // 9186 + 9186 + 1628 bytes of package 0, then package 1 packed into the third packet.
-        assert_eq!(frags.iter().map(|f| (f.0, f.3, f.4.len(), f.2)).collect::<Vec<_>>(), vec![(0, 0, 9186, false), (0, 9186, 9186, false), (0, 18372, 1628, true), (1, 0, 100, true)]);
-        let joined: Vec<u8> = frags[..3].iter().flat_map(|f| f.4.clone()).collect();
-        assert_eq!(joined, m1);
-        assert_eq!(frags[3].4, m2);
-        assert_eq!(b.queue_bytes_filled, 0);
-    }
-
-    fn check_fec(frags: &[Frag], package_id: u16, m: &[u8], ppm: u64, drop_every: usize) {
+    fn check_fec(frags: &[Frag], package_id: u16, m: &[u8], drop_every: usize) {
         let mine: Vec<&Frag> = frags.iter().filter(|f| f.0 == package_id).collect();
         let (len, bb, _) = mine[0].1.unwrap();
         assert_eq!(len, m.len());
         let k = crate::fec::block_count(len, bb).unwrap();
-        let n = k + ((k as u64 * ppm).div_ceil(1_000_000)) as usize;
+        let n = mine.len();
+        assert!(n > k && n <= 2 * k);
         let ids: Vec<u32> = mine.iter().map(|f| f.1.unwrap().2).collect();
         assert_eq!(ids, (0..n as u32).collect::<Vec<_>>());
         for f in &mine[..k] {
@@ -4177,40 +3724,38 @@ mod fec_send_tests {
 
     #[test]
     fn fec_small_inline_encoder() {
-        let ppm = 50_000;
-        let mut b = new_buf(ppm as u32);
+        let mut b = new_buf();
         let (m1, m2, m3) = (msg(100_000), msg(500), msg(1146 * 2));
         assert!(b.submit_messages(vec![m1.clone(), m2.clone(), m3.clone()]).is_empty());
         let frags: Vec<Frag> = drain(&mut b, 1162, 1000).into_iter().flatten().collect();
-        // K = 88 blocks of 1146 B, N = 88 + ceil(4.4) = 93; losing 4 of them is fine.
-        check_fec(&frags, 0, &m1, ppm, 25);
+        // K = 88 source blocks; the real floor supplies at least 12 repairs.
+        check_fec(&frags, 0, &m1, 25);
         // One block: plain.
         assert!(frags.iter().any(|f| f.0 == 1 && f.1.is_none() && f.4 == m2));
-        // Exactly two blocks: FEC with 3 blocks.
-        check_fec(&frags, 2, &m3, ppm, 0);
+        // Exactly two blocks: the repair cap is two more blocks.
+        check_fec(&frags, 2, &m3, 0);
         assert_eq!(b.queue_bytes_filled, 0);
     }
 
     #[test]
     fn fec_big_threaded_encoder() {
-        let ppm = 20_000;
-        let mut b = new_buf(ppm as u32);
+        let mut b = new_buf();
         let m = msg(3_000_000);
         b.submit_messages(vec![m.clone()]);
         let frags: Vec<Frag> = drain(&mut b, 9194, 100_000).into_iter().flatten().collect();
-        check_fec(&frags, 0, &m, ppm, 60);
+        check_fec(&frags, 0, &m, 60);
     }
 
     #[test]
     fn fec_restarts_when_tu_shrinks() {
-        let mut b = new_buf(100_000);
+        let mut b = new_buf();
         let m = msg(200_000);
         b.submit_messages(vec![m.clone()]);
         let mut first = drain(&mut b, 9194, 5);
         assert!(first.iter().flatten().all(|f| f.0 == 0 && f.1.unwrap().1 == 9178));
         let rest: Vec<Frag> = drain(&mut b, 1162, 10_000).into_iter().flatten().collect();
         assert!(rest.iter().all(|f| f.0 == 1 && f.1.unwrap().1 == 1146));
-        check_fec(&rest, 1, &m, 100_000, 0);
+        check_fec(&rest, 1, &m, 0);
         first.clear();
         assert_eq!(b.queue_bytes_filled, 0);
     }
@@ -4219,7 +3764,7 @@ mod fec_send_tests {
     fn trimmed_data_never_uses_ack_size() {
         let mut payload = vec![0; 9194];
         for len in [0, 1, 500, 508, 509, 600] {
-            let mut b = new_buf(0);
+            let mut b = new_buf();
             b.submit_messages(vec![vec![7; len]]);
             let used = fill_packet_payload_with_unreliable_fragments(&mut payload, &mut b);
             assert_eq!(used, (len + STP_FRAGMENT_HEADER_SIZE).max(517));
@@ -4227,7 +3772,7 @@ mod fec_send_tests {
             let f = parse_packet(&payload[..used]);
             assert_eq!(f[0].4, vec![7; len]);
         }
-        let mut b = new_buf(100_000);
+        let mut b = new_buf();
         b.submit_messages(vec![vec![9; 200_000]]);
         let mut small = vec![0; 1162];
         assert_eq!(fill_packet_payload_with_unreliable_fragments(&mut small, &mut b), 1162);
@@ -4241,7 +3786,7 @@ mod fec_send_tests {
         let payload_len = 48;
         let m = msg(64001 * (payload_len - STP_FEC_FRAGMENT_HEADER_SIZE) - 1);
         let layout = crate::fec::MessageLayout::new(m.len(), 32).unwrap();
-        let mut b = new_buf(50_000);
+        let mut b = new_buf();
         b.submit_messages(vec![m.clone()]);
         let mut dec = crate::fec::MessageDecoder::new(m.len(), 32).unwrap();
         let mut packet = vec![0u8; payload_len];
@@ -4328,41 +3873,8 @@ mod fec_send_tests {
     }
 
     #[test]
-    fn grouped_adaptive_topup_uses_owned_group_losses() {
-        let mut b = new_buf(10_000);
-        let a = crate::fec_adapt::FecAdaptiveState::new(crate::fec_adapt::AdaptiveFecConfig { topup: true, ..Default::default() }, 0, 0, 0);
-        b.fec_adaptive = Some(a.clone());
-        b.start_fec(std::sync::Arc::new(msg(64001 * 32)), 32);
-        // One real group-zero source, followed by a control nonce that is NOT a symbol.
-        b.fec_prepare_packet(0);
-        assert!(matches!(b.next_fragment(48, 48), Some(UnreliableFragment::Fec { block_id: 0, .. })));
-        b.fec_prepare_packet(1);
-        let f = b.fec_send_slot.as_mut().unwrap();
-        let layout = crate::fec::MessageLayout::new(f.message.len(), 32).unwrap();
-        assert_eq!(layout.groups, 3);
-        f.lost = 600;
-        f.group_lost[0] = 600;
-        let initial_p = f.loss_estimate;
-        b.fec_on_packet_lost(1); // ACK/probe/keepalive gap must not own a group.
-        assert_eq!(b.fec_send_slot.as_ref().unwrap().lost, 600);
-        b.fec_on_packet_lost(0);
-        b.fec_on_packet_lost(0); // repeated declaration must not count twice.
-        let f = b.fec_send_slot.as_ref().unwrap();
-        assert_eq!(f.group_lost, vec![601, 0, 0]);
-        assert_eq!(f.lost, 601);
-        let group_k = layout.group(0).1 as u64;
-        let group_n = a.topped_up_blocks_for_group(group_k, layout.k as u64, layout.groups, 601, initial_p);
-        let expected = layout.round_plan((layout.k as u64 + (group_n - group_k) * layout.groups as u64) as u32);
-        assert_eq!(f.n, expected);
-        let averaged = a.topped_up_blocks_for_group(group_k, layout.k as u64, layout.groups, 601u64.div_ceil(layout.groups as u64), initial_p);
-        assert!(group_n > averaged); // Concentrated erasures must not be averaged away.
-        assert_eq!((f.n - f.k) as usize % layout.groups, 0);
-        assert_eq!(a.group_failure_target(layout.k as u64, layout.groups), a.tracker.config().eps / layout.groups as f64);
-    }
-
-    #[test]
     fn fec_nonce_ring_tracks_multi_group_packets_wrap_and_slot_generation() {
-        let mut b = new_buf(30_000);
+        let mut b = new_buf();
         assert!(b.fec_packet_tags.is_none());
         b.start_fec(std::sync::Arc::new(msg(64001 * 32)), 32);
         let allocation = b.fec_packet_tags.as_ref().unwrap().as_ptr();
@@ -4389,8 +3901,8 @@ mod fec_send_tests {
     #[test]
     fn grouped_closed_loop_sizes_each_owned_tail_with_union_bound() {
         use crate::fec_adapt::*;
-        let mut b = new_buf(10_000);
-        let a = FecAdaptiveState::new(AdaptiveFecConfig { kind: LossEstimatorKind::SpanTail, eps: 0.5, topup: true, closed_loop: true, ..Default::default() }, 0, 0, 0);
+        let mut b = new_buf();
+        let a = FecAdaptiveState::new(AdaptiveFecConfig { eps: 0.5, ..Default::default() }, 0, 0, 0);
         b.fec_adaptive = Some(a.clone());
         b.start_fec(std::sync::Arc::new(msg(64001 * 32)), 32);
         let f = b.fec_send_slot.as_mut().unwrap();
@@ -4412,7 +3924,7 @@ mod fec_send_tests {
 
     #[test]
     fn oversized_message_bypasses_only_empty_queues() {
-        let mut b = new_buf(0);
+        let mut b = new_buf();
         b.min_queue_size_bytes = 64;
         b.max_queue_size_bytes = 64;
         let m = msg(65);
@@ -4435,11 +3947,12 @@ mod fec_send_tests {
 
     #[test]
     fn fec_capacity_scales_with_redundancy() {
-        let mut b = new_buf(0);
+        let mut b = new_buf();
         b.min_queue_size_bytes = 0;
         b.current_bytes_per_second = 1_100_000;
+        b.fec_capacity_overhead_ppm = 0;
         assert_eq!(b.current_byte_capacity(), 1_100_000);
-        b.fec_redundancy_ppm = 100_000;
+        b.fec_capacity_overhead_ppm = 100_000;
         assert_eq!(b.current_byte_capacity(), 1_000_000);
     }
 }
@@ -4486,13 +3999,13 @@ mod rx_tracker_tests {
 #[cfg(test)]
 mod fec_closed_loop_tests {
     use super::*;
-    use crate::fec_adapt::{AdaptiveFecConfig, FecAdaptiveState, LossEstimatorKind, SpanFloorKind};
+    use crate::fec_adapt::{AdaptiveFecConfig, FecAdaptiveState};
 
     #[test]
     fn refreshes_own_loss_budget_at_source_completion_without_a_new_loss_event() {
-        let cfg = AdaptiveFecConfig { kind: LossEstimatorKind::SpanTail, topup: true, closed_loop: true, span_floor: SpanFloorKind::Real, eps: 0.5, ..Default::default() };
+        let cfg = AdaptiveFecConfig { eps: 0.5, ..Default::default() };
         let mut b = UnreliableSendBuffer::new(100000, 1000000, 1000000);
-        b.fec_redundancy_ppm = 10000;
+        b.fec_capacity_overhead_ppm = 10000;
         b.fec_adaptive = Some(FecAdaptiveState::new(cfg, 0, 0, 0));
         b.start_fec(std::sync::Arc::new(vec![0u8; 1433 * 64]), 1433);
         let initial_n = b.fec_send_slot.as_ref().unwrap().n;
