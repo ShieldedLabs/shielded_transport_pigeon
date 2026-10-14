@@ -367,7 +367,7 @@ mod linux {
         payload: &[u8],
         dscp: Dscp,
         ecn_signal: bool,
-    ) -> u64 {
+    ) -> Option<u64> {
         let fd = udp_socket.0;
         let known_good_ipv6_address = udp_socket.1;
 
@@ -473,13 +473,16 @@ mod linux {
             let n = libc::sendmsg(fd, &msg as *const _ as *mut _, 0);
             if n < 0 {
                 let err = std::io::Error::last_os_error();
-                if err.raw_os_error() == Some(libc::EMSGSIZE) || err.raw_os_error() == Some(libc::EAGAIN)
+                if err.raw_os_error().is_some_and(|e| e == libc::EAGAIN || e == libc::EWOULDBLOCK || e == libc::ENOBUFS) {
+                    return None; // Local backpressure: the caller retains this datagram.
+                }
+                if err.raw_os_error() == Some(libc::EMSGSIZE)
                     || err.raw_os_error() == Some(libc::ENETUNREACH) || err.raw_os_error() == Some(libc::EHOSTUNREACH)
                     || err.raw_os_error() == Some(libc::ENETDOWN) || err.raw_os_error() == Some(libc::ECONNREFUSED)
                     || err.raw_os_error() == Some(libc::EHOSTDOWN) /* @todo(judah): ensure we actually want to tolerate this error  */
                     // A socket bound to an IPv4 address cannot send to an IPv6 peer: unreachable.
                     || err.raw_os_error() == Some(libc::EAFNOSUPPORT) {
-                    return timestamp_ns;
+                    return Some(timestamp_ns);
                 }
                 panic!("UDP Socket error: {}", err);
             }
@@ -487,7 +490,7 @@ mod linux {
             if sent != payload.len() {
                 panic!("partial UDP send: {sent} of {}", payload.len());
             }
-            timestamp_ns
+            Some(timestamp_ns)
         }
     }
 
@@ -996,7 +999,7 @@ mod windows {
         payload: &[u8],
         dscp: Dscp,
         ecn_signal: bool,
-    ) -> u64 {
+    ) -> Option<u64> {
         let sock = udp_socket.0;
 
         let tclass_byte: u8 = ((dscp as u8) << 2) | if ecn_signal { 0b11 } else { 0b10 };
@@ -1041,10 +1044,11 @@ mod windows {
         };
         if n == SOCKET_ERROR {
             let e = unsafe { WSAGetLastError() };
-            if e == WSAEMSGSIZE || e == WSAEWOULDBLOCK || e == WSAENETUNREACH
+            if e == WSAEWOULDBLOCK || e == WSAENOBUFS { return None; }
+            if e == WSAEMSGSIZE || e == WSAENETUNREACH
                 || e == WSAEHOSTUNREACH || e == WSAECONNREFUSED || e == WSAECONNRESET
                 || e == WSAEINVAL || e == WSAEHOSTDOWN /* @todo(judah): ensure we actually want to tolerate this error */ {
-                return timestamp_ns;
+                return Some(timestamp_ns);
             }
             panic!("UDP Socket error: {}", std::io::Error::from_raw_os_error(e));
         }
@@ -1052,7 +1056,7 @@ mod windows {
             panic!("partial UDP send: {} of {}", n, payload.len());
         }
 
-        timestamp_ns
+        Some(timestamp_ns)
     }
 
     #[inline]
@@ -1493,7 +1497,7 @@ mod macos {
         payload: &[u8],
         dscp: Dscp,
         ecn_signal: bool,
-    ) -> u64 {
+    ) -> Option<u64> {
         // Darwin constants (not always exposed by Rust libc)
         const SO_NET_SERVICE_TYPE: libc::c_int = 0x1116;
 
@@ -1572,11 +1576,14 @@ mod macos {
             let n = libc::sendmsg(fd, &msg as *const _ as *mut _, 0);
             if n < 0 {
                 let err = std::io::Error::last_os_error();
-                if err.raw_os_error() == Some(libc::EMSGSIZE) || err.raw_os_error() == Some(libc::EAGAIN)
+                if err.raw_os_error().is_some_and(|e| e == libc::EAGAIN || e == libc::EWOULDBLOCK || e == libc::ENOBUFS) {
+                    return None; // Local backpressure: the caller retains this datagram.
+                }
+                if err.raw_os_error() == Some(libc::EMSGSIZE)
                     || err.raw_os_error() == Some(libc::ENETUNREACH) || err.raw_os_error() == Some(libc::EHOSTUNREACH)
                     || err.raw_os_error() == Some(libc::ENETDOWN) || err.raw_os_error() == Some(libc::ECONNREFUSED)
                     || err.raw_os_error() == Some(libc::EHOSTDOWN) /* @todo(judah): ensure we actually want to tolerate this error */ {
-                    return timestamp_ns;
+                    return Some(timestamp_ns);
                 }
                 panic!("UDP Socket error: {}", err);
             }
@@ -1585,7 +1592,7 @@ mod macos {
                 panic!("partial UDP send: {n} of {}", payload.len());
             }
 
-            timestamp_ns
+            Some(timestamp_ns)
         }
     }
 

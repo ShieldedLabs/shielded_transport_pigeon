@@ -1655,8 +1655,30 @@ pub enum ConnectionState {
     Connected(ConnectionStateConnected),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingSendKind { Ack, Data, Keepalive, MtuProbe, Outage }
+impl PendingSendKind {
+    #[cfg(test)]
+    fn name(self) -> &'static str {
+        match self { Self::Ack => "ack", Self::Data => "data", Self::Keepalive => "keepalive",
+            Self::MtuProbe => "mtu_probe", Self::Outage => "outage" }
+    }
+}
+
+/// At most one refused datagram per connection. Nothing else may use its nonce
+/// until these exact ciphertext bytes are accepted. Allocation is failure-only.
+#[derive(Debug)]
+struct PendingSend {
+    kind: PendingSendKind,
+    bytes: Vec<u8>,
+    plaintext: Vec<u8>,
+    dscp: Dscp,
+}
+
 #[derive(Debug)]
 pub struct ConnectionStateConnected {
+    pending_send: Option<PendingSend>,
+    locally_blocked: bool,
     pub cipher: Option<ConnectionCipherTriplet>,
     pub magic1: u64,
     pub magic2: u64,
@@ -1729,6 +1751,8 @@ pub struct ConnectionStateConnected {
 }
 pub fn new_connection_state_connected(cipher: Option<ConnectionCipherTriplet>, magic1: u64, magic2: u64, timestamp_ns: u64) -> ConnectionState {
     ConnectionState::Connected(ConnectionStateConnected {
+        pending_send: None,
+        locally_blocked: false,
         cipher,
         magic1,
         magic2,
@@ -2661,11 +2685,22 @@ pub struct SentDatagram {
     bytes: Vec<u8>,
 }
 
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct TestSendFailure {
+    kind: Option<&'static str>,
+    remaining: usize,
+    blocked: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    attempts: Vec<Vec<u8>>,
+}
+
 /// Socket binding and optional measurement. The transport policy is fixed internally.
 #[derive(Debug, Clone)]
 pub struct NetworkThreadOptions {
     #[cfg(test)]
     pub datagram_log: Option<std::sync::Arc<std::sync::Mutex<Vec<SentDatagram>>>>,
+    #[cfg(test)]
+    send_failure: Option<std::sync::Arc<std::sync::Mutex<TestSendFailure>>>,
     /// Fixed number of sender-only FIFO queues per connection (1..=64).
     /// Total app capacity is N x max_queue_size_bytes (plus the inherited oversized-alone
     /// exception). Rescue reservations are 64 MiB/N and 4096/N per magazine, no borrowing.
@@ -2684,7 +2719,7 @@ pub struct NetworkThreadOptions {
 }
 
 impl Default for NetworkThreadOptions {
-    fn default() -> Self { Self { #[cfg(test)] datagram_log: None, send_queue_count: 1, receive_memory: None, bind_ip: None, record_fec_messages: false, record_loss_episodes: false, loss_trace: None } }
+    fn default() -> Self { Self { #[cfg(test)] datagram_log: None, #[cfg(test)] send_failure: None, send_queue_count: 1, receive_memory: None, bind_ip: None, record_fec_messages: false, record_loss_episodes: false, loss_trace: None } }
 }
 
 pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_pps: Option<u64>, send_buffer_params: (u32, u32, u32), options: NetworkThreadOptions) -> NetworkThreadHandle {
@@ -2718,6 +2753,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
 
     #[cfg(test)]
     let datagram_log = options.datagram_log;
+    #[cfg(test)]
+    let send_failure = options.send_failure;
     let thread = std::thread::spawn(move || {
         #[cfg(test)]
         let datagram_expectation = std::cell::Cell::new(("handshake", None::<usize>));
@@ -2725,9 +2762,20 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
         // UDP relay test cross-checks these exact bytes against socket reception.
         #[cfg(test)]
         let udp_send_with_congestion_and_dscp = |socket, ip, port, bytes: &[u8], dscp, ecn| {
-            let sent = crate::native_sockets::udp_send_with_congestion_and_dscp(socket, ip, port, bytes, dscp, ecn);
             let (kind, expected) = datagram_expectation.replace(("handshake", None));
-            if let Some(log) = &datagram_log { log.lock().unwrap().push(SentDatagram { kind, expected, bytes: bytes.to_vec() }); }
+            if let Some(hook) = &send_failure {
+                let mut hook = hook.lock().unwrap();
+                if hook.kind.is_none_or(|k| k == kind) && (hook.remaining > 0 ||
+                    hook.blocked.as_ref().is_some_and(|b| b.load(std::sync::atomic::Ordering::Acquire))) {
+                    hook.remaining = hook.remaining.saturating_sub(1);
+                    hook.attempts.push(bytes.to_vec());
+                    return None;
+                }
+            }
+            let sent = crate::native_sockets::udp_send_with_congestion_and_dscp(socket, ip, port, bytes, dscp, ecn);
+            if sent.is_some() {
+                if let Some(log) = &datagram_log { log.lock().unwrap().push(SentDatagram { kind, expected, bytes: bytes.to_vec() }); }
+            }
             sent
         };
 
@@ -3616,60 +3664,28 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                 }
                 connections_map.retain(|connection_key, connection_tracking_data| {match &mut connection_tracking_data.connection_state {
                     ConnectionState::SendingClientHelloPlaintext { last_sent_time_ns, hello_packet_payload } => {
-                        if *last_sent_time_ns + 2_500_000_000 < current_time_now_ns {
-                            udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &hello_packet_payload, Dscp::Af21, false);
-                            if *last_sent_time_ns == 0 { // cheeky optimization
-                                *last_sent_time_ns = current_time_now_ns - 2_500_000_000 + 10_000_000;
-                            } else {
-                                *last_sent_time_ns = current_time_now_ns;
-                            }
-                            return true;
-                        }
-                        if connection_tracking_data.creation_time_ns + 30_000_000_000 < current_time_now_ns {
-                            return false;
-                        }
+                        return retry_handshake(connection_tracking_data.creation_time_ns, last_sent_time_ns,
+                            current_time_now_ns, 30_000_000_000, || udp_send_with_congestion_and_dscp(socket,
+                                connection_tracking_data.other_ip, connection_tracking_data.other_port,
+                                &hello_packet_payload, Dscp::Af21, false));
                     }
                     ConnectionState::SendingClientHello { magic1, last_sent_time_ns, hello_packet_payload, handshake } => {
-                        if *last_sent_time_ns + 2_500_000_000 < current_time_now_ns {
-                            udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &hello_packet_payload, Dscp::Af21, false);
-                            if *last_sent_time_ns == 0 { // cheeky optimization
-                                *last_sent_time_ns = current_time_now_ns - 2_500_000_000 + 10_000_000;
-                            } else {
-                                *last_sent_time_ns = current_time_now_ns;
-                            }
-                            return true;
-                        }
-                        if connection_tracking_data.creation_time_ns + 30_000_000_000 < current_time_now_ns {
-                            return false;
-                        }
+                        return retry_handshake(connection_tracking_data.creation_time_ns, last_sent_time_ns,
+                            current_time_now_ns, 30_000_000_000, || udp_send_with_congestion_and_dscp(socket,
+                                connection_tracking_data.other_ip, connection_tracking_data.other_port,
+                                &hello_packet_payload, Dscp::Af21, false));
                     }
                     ConnectionState::SendingServerHelloPlaintext { magic2: _, last_sent_time_ns, hello_packet_payload } => {
-                        if *last_sent_time_ns + 2_500_000_000 < current_time_now_ns {
-                            udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &hello_packet_payload, Dscp::Af21, false);
-                            if *last_sent_time_ns == 0 { // cheeky optimization
-                                *last_sent_time_ns = current_time_now_ns - 2_500_000_000 + 10_000_000;
-                            } else {
-                                *last_sent_time_ns = current_time_now_ns;
-                            }
-                            return true;
-                        }
-                        if connection_tracking_data.creation_time_ns + 15_000_000_000 < current_time_now_ns {
-                            return false;
-                        }
+                        return retry_handshake(connection_tracking_data.creation_time_ns, last_sent_time_ns,
+                            current_time_now_ns, 15_000_000_000, || udp_send_with_congestion_and_dscp(socket,
+                                connection_tracking_data.other_ip, connection_tracking_data.other_port,
+                                &hello_packet_payload, Dscp::Af21, false));
                     }
                     ConnectionState::SendingServerHello { magic1, magic2: _, cipher, last_sent_time_ns, hello_packet_payload } => {
-                        if *last_sent_time_ns + 2_500_000_000 < current_time_now_ns {
-                            udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &hello_packet_payload, Dscp::Af21, false);
-                            if *last_sent_time_ns == 0 { // cheeky optimization
-                                *last_sent_time_ns = current_time_now_ns - 2_500_000_000 + 10_000_000;
-                            } else {
-                                *last_sent_time_ns = current_time_now_ns;
-                            }
-                            return true;
-                        }
-                        if connection_tracking_data.creation_time_ns + 15_000_000_000 < current_time_now_ns {
-                            return false;
-                        }
+                        return retry_handshake(connection_tracking_data.creation_time_ns, last_sent_time_ns,
+                            current_time_now_ns, 15_000_000_000, || udp_send_with_congestion_and_dscp(socket,
+                                connection_tracking_data.other_ip, connection_tracking_data.other_port,
+                                &hello_packet_payload, Dscp::Af21, false));
                     }
                     ConnectionState::Connected(state) => {
                         debug_assert!(state.magic2 != 0, "Connection entered Connected state without negotiating magic2");
@@ -3678,13 +3694,39 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             return false; // connection timeout
                         }
                         
+                        if state.locally_blocked { freeze_local_send(state, current_time_now_ns); }
+                        if let Some(pending) = state.pending_send.take() {
+                            // Freeze active time and discard pacing credit throughout the block,
+                            // including the interval since the last failed attempt.
+                            freeze_local_send(state, current_time_now_ns);
+                            if let Some(t) = &mut loss_trace {
+                                t.set_cc(connection_tracking_data.two_byte_send_prefix,
+                                    cc_trace_context(state, current_time_now_ns, &cc, max_pps));
+                            }
+                            #[cfg(test)]
+                            datagram_expectation.set((pending.kind.name(), Some(pending.bytes.len())));
+                            let sent = udp_send_with_congestion_and_dscp(socket,
+                                connection_tracking_data.other_ip, connection_tracking_data.other_port,
+                                &pending.bytes, pending.dscp, false);
+                            if let Some(sent) = sent {
+                                commit_connected_send(state, &mut connection_tracking_data.unreliable_send_buffer,
+                                    pending.kind, sent, pending.bytes.len(), &pending.plaintext,
+                                    connection_tracking_data.two_byte_send_prefix, loss_trace.as_mut());
+                                update_app_limit(state, current_time_now_ns,
+                                    connection_tracking_data.unreliable_send_buffer.has_unsent_data());
+                            } else { state.pending_send = Some(pending); }
+                            return true; // no catch-up burst, and one refusal ends this tick
+                        }
+
                         if current_time_now_ns > state.ack_timer {
                             { // send ack
                                 let mut o = 0;
                                 let virtual_nonce = state.send_ack_sequence_number;
+                                // ACK delay is time-sensitive: a refused snapshot is discarded.
+                                // Burn its ACK-only nonce, never encrypt a fresh snapshot with it.
+                                state.send_ack_sequence_number = state.send_ack_sequence_number.checked_add(1).expect("ACK nonce space exhausted");
                                 o += connection_tracking_data.two_byte_send_prefix.write_to(&mut packet_memory_send[o..]);
                                 o += crate::sequence::to_wire(virtual_nonce).write_to(&mut packet_memory_send[o..]);
-                                state.send_ack_sequence_number = state.send_ack_sequence_number.checked_add(1).expect("ACK nonce space exhausted");
                                 
                                 let a = state.ack_receiver.ack(current_time_now_ns);
                                 state.stats.ack_delay_us_max = state.stats.ack_delay_us_max.max(a.delay_us);
@@ -3692,12 +3734,12 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 let ack_payload = &encoded[..];
                                 if let Some(cipher) = &mut state.cipher { o += cipher.current.write_message(virtual_nonce, ack_payload, &mut packet_memory_send[o..]).unwrap(); }
                                 else { o += ack_payload.write_to(&mut packet_memory_send[o..]); }
-                                state.ack_receiver.sent(current_time_now_ns);
-                                state.stats.ack_packets_sent += 1;
-                                state.stats.ack_bytes_sent += o as u64;
                                 #[cfg(test)]
                                 datagram_expectation.set(("ack", Some(crate::ack::ACK_PAYLOAD_LEN + total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(state.magic1).unwrap())));
-                                udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_send[..o], Dscp::Af21, false);
+                                let sent = udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_send[..o], Dscp::Af21, false);
+                                if !finish_connected_send(state, &mut connection_tracking_data.unreliable_send_buffer,
+                                    PendingSendKind::Ack, sent, current_time_now_ns, &packet_memory_send[..o], &[], Dscp::Af21,
+                                    connection_tracking_data.two_byte_send_prefix, loss_trace.as_mut()) { return true; }
                                 state.ack_timer = u64::MAX;
                             }
                         }
@@ -3728,14 +3770,9 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 let send_time = udp_send_with_congestion_and_dscp(socket,
                                     connection_tracking_data.other_ip, connection_tracking_data.other_port,
                                     &packet_memory_encrypted[..6+packet_len], Dscp::Af21, false);
-                                state.account_send(send_time);
-                                state.outage.probes[(seq % 8) as usize] = (seq, send_time);
-                                state.packets_in_flight += 1;
-                                state.stats.packets_sent += 1;
-                                state.stats.bytes_sent += (6 + packet_len) as u64;
-                                state.last_sent_data_packet = send_time;
-                                state.packet_since_last_print += 1;
-                                if let Some(t) = &mut loss_trace { t.sent(connection_tracking_data.two_byte_send_prefix, seq, send_time, &data); }
+                                finish_connected_send(state, &mut connection_tracking_data.unreliable_send_buffer,
+                                    PendingSendKind::Outage, send_time, current_time_now_ns, &packet_memory_encrypted[..6+packet_len],
+                                    data, Dscp::Af21, connection_tracking_data.two_byte_send_prefix, loss_trace.as_mut());
                             }
                             return true;
                         }
@@ -3944,7 +3981,6 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             let payload_size = state.tu_probe_size as usize - total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(state.magic1).unwrap();
                             let null_bytes = [0xffu8; ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE];
                             
-                            state.tu_probe_sequence_number = state.send_sequence_number;
                         
                             let virtual_nonce = state.send_sequence_number;
                             store_u16(&mut packet_memory_encrypted[0..2], connection_tracking_data.two_byte_send_prefix);
@@ -3962,10 +3998,9 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             #[cfg(test)]
                             datagram_expectation.set(("mtu_probe", Some(state.tu_probe_size as usize)));
                             let send_time_ns = udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::Af21, false);
-                            connection_tracking_data.unreliable_send_buffer.fec_prepare_packet(state.send_sequence_number);
-                            state.account_send(send_time_ns);
-                            state.last_sent_tu_probe_time_ns = send_time_ns;
-                            state.packet_since_last_print += 1;
+                            if !finish_connected_send(state, &mut connection_tracking_data.unreliable_send_buffer,
+                                PendingSendKind::MtuProbe, send_time_ns, current_time_now_ns, &packet_memory_encrypted[..6+packet_len],
+                                &[], Dscp::Af21, connection_tracking_data.two_byte_send_prefix, loss_trace.as_mut()) { return true; }
                         }
                         
                         let payload_size = state.current_tu as usize - total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(state.magic1).unwrap();
@@ -3989,15 +4024,10 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             #[cfg(test)]
                             datagram_expectation.set(("keepalive", Some(state.current_tu as usize)));
                             let send_time_ns = udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::Af21, false);
-                            connection_tracking_data.unreliable_send_buffer.fec_prepare_packet(state.send_sequence_number);
-                            state.account_send(send_time_ns);
-                            state.last_sent_data_packet = current_time_now_ns; // We use the older time here so the pacer skips less packets.
-                            state.packets_in_flight += 1;
-                            state.stats.packets_sent += 1;
-                            state.stats.bytes_sent += 6 + packet_len as u64;
-                            state.max_in_flight_since_last_print = state.max_in_flight_since_last_print.max(state.packets_in_flight);
+                            if !finish_connected_send(state, &mut connection_tracking_data.unreliable_send_buffer,
+                                PendingSendKind::Keepalive, send_time_ns, current_time_now_ns, &packet_memory_encrypted[..6+packet_len],
+                                &[], Dscp::Af21, connection_tracking_data.two_byte_send_prefix, loss_trace.as_mut()) { return true; }
                             packet_send_allowance_now = packet_send_allowance_now.saturating_sub(1);
-                            state.packet_since_last_print += 1;
                         }
 
                         connection_tracking_data.unreliable_send_buffer.set_rate(rate_mul_div(allowed_bandwidth_upps, payload_size as u64, 1_000_000));
@@ -4039,20 +4069,14 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             if test_drop { state.stats.test_dropped += 1; }
                             #[cfg(test)]
                             datagram_expectation.set(("data", Some(state.current_tu as usize)));
-                            let send_time_ns = if test_drop { monotonic_clock_ns() }
+                            let send_time_ns = if test_drop { Some(monotonic_clock_ns()) }
                             else { udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], connection_tracking_data.unreliable_send_buffer.last_dscp, false) };
-                            state.account_send(send_time_ns);
-                            if let Some(t) = &mut loss_trace { t.sent(connection_tracking_data.two_byte_send_prefix, virtual_nonce, send_time_ns, &packet_memory_send[..payload_size]); }
-                            if let Some(a) = &mut connection_tracking_data.unreliable_send_buffer.fec_adaptive {
-                                a.on_data_sent(virtual_nonce);
-                            }
-                            state.last_sent_data_packet = current_time_now_ns; // We use the older time here so the pacer skips less packets.
-                            state.packets_in_flight += 1;
-                            state.stats.packets_sent += 1;
-                            state.stats.bytes_sent += 6 + packet_len as u64;
-                            state.max_in_flight_since_last_print = state.max_in_flight_since_last_print.max(state.packets_in_flight);
+                            let dscp = connection_tracking_data.unreliable_send_buffer.last_dscp;
+                            if !finish_connected_send(state, &mut connection_tracking_data.unreliable_send_buffer,
+                                PendingSendKind::Data, send_time_ns, current_time_now_ns, &packet_memory_encrypted[..6+packet_len],
+                                &packet_memory_send[..payload_size], dscp, connection_tracking_data.two_byte_send_prefix,
+                                loss_trace.as_mut()) { return true; }
                             packet_send_allowance_now = packet_send_allowance_now.saturating_sub(1);
-                            state.packet_since_last_print += 1;
                         }
 
                         let pacing_burst = state.send_sequence_number - pacing_first_sequence;
@@ -4304,11 +4328,12 @@ impl OutageState {
         self.probe_interval_ns = OUTAGE_FIRST_PROBE_NS;
         self.resume_rate_upps = rate.min(crate::ship::CC.initial_rate_upps);
     }
-    fn probe_due(&mut self, now: u64) -> bool {
-        if self.since_ns.is_none() || now < self.next_probe_ns { return false; }
+    fn probe_due(&self, now: u64) -> bool {
+        self.since_ns.is_some() && now >= self.next_probe_ns
+    }
+    fn probe_sent(&mut self, now: u64) {
         self.next_probe_ns = now.saturating_add(self.probe_interval_ns);
         self.probe_interval_ns = self.probe_interval_ns.saturating_mul(2).min(OUTAGE_MAX_PROBE_NS);
-        true
     }
     fn expired(now: u64, last_ack: u64) -> bool {
         now.saturating_sub(last_ack) >= OUTAGE_TIMEOUT_NS
@@ -4405,6 +4430,7 @@ fn research_outage_backoff_is_bounded_and_dead_peer_expires_at_120s() {
     for due in [1_000_000_000, 1_250_000_000, 1_750_000_000, 2_750_000_000, 4_750_000_000, 8_750_000_000] {
         assert!(!o.probe_due(due - 1));
         assert!(o.probe_due(due));
+        o.probe_sent(due);
     }
     assert_eq!(o.probe_interval_ns, OUTAGE_MAX_PROBE_NS);
     assert!(!OutageState::expired(119_999_999_999, 0));
@@ -4443,6 +4469,84 @@ fn take_ecn_signal(state: &mut ConnectionStateConnected, guard_rtts: f64) -> boo
     let eligible = pending && state.ecn_oldest_send_time > state.congestion_event_time_ns.saturating_add((state.RTT_mean as f64 * 100_000.0 * guard_rtts) as u64);
     if eligible { state.loss_count_in_window = 0; }
     eligible
+}
+
+// All handshake flights retain their original bytes and expire even if every
+// attempted send is refused. Never advance their resend time on local refusal.
+fn retry_handshake(created: u64, last_sent: &mut u64, now: u64, lifetime: u64,
+    send: impl FnOnce() -> Option<u64>) -> bool {
+    if now.saturating_sub(created) > lifetime { return false; }
+    if last_sent.saturating_add(2_500_000_000) < now && send().is_some() {
+        *last_sent = if *last_sent == 0 { now - 2_500_000_000 + 10_000_000 } else { now };
+    }
+    true
+}
+
+/// A full local socket is not network congestion. Pause the existing active
+/// curve (all phases), drop credit, and backdate on every retry, not just entry.
+fn freeze_local_send(state: &mut ConnectionStateConnected, now: u64) {
+    update_app_limit(state, now, false);
+    state.congestion_event_time_ns = now.saturating_sub(state.app_limit_time_offset);
+    state.last_sent_could_have_sent_data_packet = now;
+    state.send_pacer_acc_ns = 0;
+}
+
+/// The send buffer has already assembled this packet. On refusal its FEC tags
+/// remain attached to the uncommitted sequence; do not prepare or fill again.
+fn finish_connected_send(state: &mut ConnectionStateConnected, buf: &mut SendQueues,
+    kind: PendingSendKind, sent: Option<u64>, now: u64, bytes: &[u8], plaintext: &[u8],
+    dscp: Dscp, prefix: u16, trace: Option<&mut crate::loss_trace::LossTrace>) -> bool {
+    if let Some(sent) = sent {
+        commit_connected_send(state, buf, kind, sent, bytes.len(), plaintext, prefix, trace);
+        if kind == PendingSendKind::Ack { update_app_limit(state, now, buf.has_unsent_data()); }
+        true
+    } else {
+        debug_assert!(state.pending_send.is_none());
+        if kind != PendingSendKind::Ack {
+            state.pending_send = Some(PendingSend { kind, bytes: bytes.to_vec(), plaintext: plaintext.to_vec(), dscp });
+        }
+        state.locally_blocked = true;
+        freeze_local_send(state, now);
+        false
+    }
+}
+
+fn commit_connected_send(state: &mut ConnectionStateConnected, buf: &mut SendQueues,
+    kind: PendingSendKind, sent: u64, len: usize, plaintext: &[u8], prefix: u16,
+    trace: Option<&mut crate::loss_trace::LossTrace>) {
+    state.locally_blocked = false;
+    if kind == PendingSendKind::Ack {
+        // A fresh accepted ACK ends an ACK-only local limit. The rejected ACK
+        // changed neither batching state nor send statistics.
+        state.ack_receiver.sent(sent);
+        state.stats.ack_packets_sent += 1;
+        state.stats.ack_bytes_sent += len as u64;
+        return;
+    }
+    let seq = state.send_sequence_number;
+    if kind != PendingSendKind::Data { buf.fec_prepare_packet(seq); }
+    state.account_send(sent);
+    state.packet_since_last_print += 1;
+    if kind == PendingSendKind::MtuProbe {
+        state.tu_probe_sequence_number = seq;
+        state.last_sent_tu_probe_time_ns = sent;
+        return;
+    }
+    if kind == PendingSendKind::Data {
+        if let Some(a) = &mut buf.fec_adaptive { a.on_data_sent(seq); }
+    }
+    if kind == PendingSendKind::Outage {
+        state.outage.probes[(seq % 8) as usize] = (seq, sent);
+        state.outage.probe_sent(sent);
+    }
+    if matches!(kind, PendingSendKind::Data | PendingSendKind::Outage) {
+        if let Some(t) = trace { t.sent(prefix, seq, sent, plaintext); }
+    }
+    state.last_sent_data_packet = sent;
+    state.packets_in_flight += 1;
+    state.stats.packets_sent += 1;
+    state.stats.bytes_sent += len as u64;
+    state.max_in_flight_since_last_print = state.max_in_flight_since_last_print.max(state.packets_in_flight);
 }
 
 /// Freeze active curve time on starvation; preserve the anchor and phase for
@@ -6452,7 +6556,9 @@ mod uniform_udp_capture_tests {
         let key = address.to_connection_key();
         let options = || NetworkThreadOptions { send_queue_count: 2, datagram_log: Some(log.clone()), ..Default::default() };
         let mut server = new_network_thread_with_options(vec![server_key], port, Some(1000), (1_000_000, 16<<20, 16<<20), options());
-        let mut client = new_network_thread_with_options(vec![new_keypair_from_connect_magic1(address.magic1).unwrap()], 0, Some(1000), (1_000_000, 16<<20, 16<<20), options());
+        let refused = Arc::new(Mutex::new(TestSendFailure { kind: Some("data"), remaining: 8, ..Default::default() }));
+        let client_options = NetworkThreadOptions { send_failure: Some(refused.clone()), ..options() };
+        let mut client = new_network_thread_with_options(vec![new_keypair_from_connect_magic1(address.magic1).unwrap()], 0, Some(1000), (1_000_000, 16<<20, 16<<20), client_options);
         server.join_on_drop = true; client.join_on_drop = true;
         let mut cw = service_connections(&client, NetworkThreadPush { initiate_connections: vec![address], ..Default::default() }).unwrap().current_connections;
         let mut sw = Vec::new(); let mut received = Vec::new();
@@ -6535,6 +6641,11 @@ mod uniform_udp_capture_tests {
         assert!(histogram.iter().filter(|((k,_),_)| *k=="ack").all(|((_,size),_)| *size==174));
         println!("UDP_SIZE_HISTOGRAM kind,udp_payload_bytes,count");
         for ((kind,size),count) in histogram { println!("UDP_SIZE_HISTOGRAM {kind},{size},{count}"); }
+        let refused = refused.lock().unwrap();
+        assert_eq!(refused.remaining, 0);
+        assert_eq!(refused.attempts.len(), 8);
+        assert!(refused.attempts.iter().all(|b| b == &refused.attempts[0]), "retry must preserve exact Noise ciphertext/nonce");
+        assert!(sent.iter().any(|d| d.kind == "data" && d.bytes == refused.attempts[0]));
         println!("UDP_SIZE_PROOF encrypted mixed=1x0B+20x80B+10x1000B+2x65536B+1x4MiB MTU=1184->1472 outage=3s idle=8s; every actual datagram matched send-site TU/ACK/probe expectation");
     }
 }
@@ -7171,5 +7282,242 @@ mod review2_tests {
         let waiting = vec![0u64; PACKETS_WAITING_ACK_WORDS];
         let lost = vec![0u64; PACKETS_WAITING_ACK_WORDS];
         assert!(d.relevant(&waiting, &lost).acknowledged().all(|s| s <= d.highest));
+    }
+}
+
+#[cfg(test)]
+mod local_backpressure_tests {
+    use super::*;
+
+    fn state() -> ConnectionStateConnected {
+        let ConnectionState::Connected(s) = new_connection_state_connected(None, CONNECT_MAGIC1_PLAIN_TEXT, 1, 1_000_000_000) else { unreachable!() };
+        s
+    }
+
+    #[test]
+    fn permanently_refused_handshake_still_expires() {
+        for lifetime in [15_000_000_000, 30_000_000_000] {
+            let mut last = 0;
+            let mut attempts = 0;
+            for now in (4_000_000_000..=lifetime).step_by(1_000_000_000) {
+                assert!(retry_handshake(0, &mut last, now, lifetime, || { attempts += 1; None }));
+                assert_eq!(last, 0);
+            }
+            assert!(attempts > 0);
+            let before = attempts;
+            assert!(!retry_handshake(0, &mut last, lifetime + 1, lifetime, || { attempts += 1; None }));
+            assert_eq!(attempts, before, "expiry must precede the due send");
+        }
+    }
+
+    #[test]
+    fn refused_data_and_control_commit_no_nonce_time_flight_or_loss() {
+        for kind in [PendingSendKind::Data, PendingSendKind::MtuProbe,
+            PendingSendKind::Keepalive, PendingSendKind::Outage] {
+            let mut s = state();
+            let mut b = SendQueues::new(1, (1_000_000, 8<<20, 8<<20));
+            let bytes = vec![7; 1184];
+            let plain = vec![8; 1162];
+            let ack_nonce = s.send_ack_sequence_number;
+            s.send_pacer_acc_ns = 2_000_000;
+            s.congestion_event_time_ns = 1_000_000_000;
+            let before_times = s.send_time_band;
+            assert!(!finish_connected_send(&mut s, &mut b, kind, None, 2_000_000_000,
+                &bytes, &plain, Dscp::BestEffort, 0, None));
+            for now in [3_000_000_000, 6_000_000_000, 100_000_000_000] {
+                freeze_local_send(&mut s, now);
+                assert_eq!(s.send_sequence_number, 0, "{kind:?}");
+                assert_eq!(s.send_ack_sequence_number, ack_nonce);
+                assert_eq!(s.send_time_band, before_times);
+                assert!(s.packets_waiting_ack_field.iter().all(|&x| x == 0));
+                assert_eq!(s.packets_in_flight, 0);
+                assert_eq!(s.stats.packets_sent, 0);
+                assert_eq!(s.stats.ack_packets_sent, 0);
+                assert_eq!(s.stats.packets_lost, 0);
+                assert_eq!(s.outage.pending_since_ns, None);
+                assert_eq!(s.tu_probe_sequence_number, u64::MAX);
+                assert_eq!(s.last_sent_data_packet, 0);
+                assert_eq!(s.send_pacer_acc_ns, 0);
+                assert_eq!(s.last_sent_could_have_sent_data_packet, now);
+                assert_eq!(s.pending_send.as_ref().unwrap().bytes, bytes);
+            }
+            let p = s.pending_send.take().unwrap();
+            commit_connected_send(&mut s, &mut b, p.kind, 100_000_001_000, p.bytes.len(), &p.plaintext, 0, None);
+            assert_eq!(s.stats.packets_lost, 0);
+            assert_eq!(s.send_sequence_number, 1);
+            assert_eq!(s.send_ack_sequence_number, ack_nonce);
+            assert_eq!(s.packets_waiting_ack_field[0], 1);
+            assert_eq!(s.packets_in_flight, u64::from(kind != PendingSendKind::MtuProbe));
+            assert_eq!(s.stats.packets_sent, u64::from(kind != PendingSendKind::MtuProbe));
+        }
+    }
+
+    #[test]
+    fn pending_ack_does_not_turn_local_blockage_into_rtt() {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        use std::time::{Duration, Instant};
+        let port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let magic = CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s;
+        let remote = new_keypair_from_connect_magic1(magic).unwrap();
+        let address = STPAddress { ip: "127.0.0.1".parse::<std::net::Ipv4Addr>().unwrap().to_ipv6_mapped(), port, magic1: magic, key: remote.public.clone() };
+        let refused = Arc::new(AtomicBool::new(true));
+        let mut server = new_network_thread_with_options(vec![remote], port, Some(100), (100000,1000000,1000000), NetworkThreadOptions { send_failure: Some(Arc::new(std::sync::Mutex::new(TestSendFailure { kind: Some("ack"), blocked: Some(refused.clone()), ..Default::default() }))), ..Default::default() });
+        let mut client = new_network_thread_with_options(vec![new_keypair_from_connect_magic1(magic).unwrap()], 0, Some(100), (100000,1000000,1000000), Default::default());
+        server.join_on_drop = true; client.join_on_drop = true;
+        let mut cw = service_connections(&client, NetworkThreadPush { initiate_connections: vec![address], ..Default::default() }).unwrap().current_connections;
+        let mut sw = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while cw.is_empty() || sw.is_empty() {
+            cw = service_connections(&client, NetworkThreadPush { wanted_connections: cw, ..Default::default() }).unwrap().current_connections;
+            sw = service_connections(&server, NetworkThreadPush { wanted_connections: sw, ..Default::default() }).unwrap().current_connections;
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::thread::sleep(Duration::from_secs(1));
+        refused.store(false, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let pull = service_connections(&client, NetworkThreadPush { wanted_connections: cw.clone(), ..Default::default() }).unwrap();
+            if let Some((_, stats)) = pull.connection_stats.first() {
+                if stats.rtt_us != 0 {
+                    println!("ACK_REFUSAL_RTT {} us after 1s local block", stats.rtt_us);
+                    assert!(stats.rtt_us < 100_000, "loopback RTT includes receiver-local refusal: {} us", stats.rtt_us);
+                    break;
+                }
+            }
+            assert!(Instant::now() < deadline, "no RTT sample");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn refused_outage_probe_does_not_preadvance_backoff() {
+        let mut s = state();
+        let mut b = SendQueues::new(1, (1_000_000, 8<<20, 8<<20));
+        s.outage.enter(1_000_000_000, 1_000_000_000);
+        assert!(s.outage.probe_due(1_000_000_000));
+        assert!(!finish_connected_send(&mut s, &mut b, PendingSendKind::Outage, None,
+            1_000_000_000, &[7; 1184], &[], Dscp::Af21, 0, None));
+        assert_eq!(s.outage.next_probe_ns, 1_000_000_000);
+        assert_eq!(s.outage.probe_interval_ns, OUTAGE_FIRST_PROBE_NS);
+        let p = s.pending_send.take().unwrap();
+        commit_connected_send(&mut s, &mut b, p.kind, 6_000_000_000, p.bytes.len(), &[], 0, None);
+        assert!(!s.outage.probe_due(6_000_000_000));
+        assert_eq!(s.outage.next_probe_ns, 6_000_000_000 + OUTAGE_FIRST_PROBE_NS);
+        assert_eq!(s.outage.probe_interval_ns, 2 * OUTAGE_FIRST_PROBE_NS);
+    }
+
+    #[test]
+    fn refused_ack_skips_nonce_and_refreshes_authenticated_delay() {
+        let params: snow::params::NoiseParams = "Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
+        let ka = snow::Builder::new(params.clone()).generate_keypair().unwrap();
+        let kb = snow::Builder::new(params.clone()).generate_keypair().unwrap();
+        let mut a = snow::Builder::new(params.clone()).local_private_key(&ka.private).unwrap().remote_public_key(&kb.public).unwrap().build_initiator().unwrap();
+        let mut b = snow::Builder::new(params).local_private_key(&kb.private).unwrap().build_responder().unwrap();
+        let mut enc = [0; 1024]; let mut dec = [0; 1024];
+        let n = a.write_message(&[], &mut enc).unwrap(); b.read_message(&enc[..n], &mut dec).unwrap();
+        let n = b.write_message(&[], &mut enc).unwrap(); a.read_message(&enc[..n], &mut dec).unwrap();
+        let mut sender = a.into_stateless_transport_mode().unwrap();
+        let receiver = b.into_stateless_transport_mode().unwrap();
+        let mut s = state();
+        let mut queues = SendQueues::new(1, (1_000_000, 8<<20, 8<<20));
+        s.ack_receiver.receive(0, 2_000_000_000, false, &mut s.ack_timer);
+        let original_nonce = s.send_ack_sequence_number;
+        let first = s.ack_receiver.ack(2_001_000_000).encode();
+        s.send_ack_sequence_number += 1; // Production reserves ACK nonce before encryption.
+        let n = sender.write_message(original_nonce, &first, &mut enc).unwrap();
+        assert!(!finish_connected_send(&mut s, &mut queues, PendingSendKind::Ack, None,
+            2_001_000_000, &enc[..n], &[], Dscp::Af21, 0, None));
+        assert!(s.pending_send.is_none(), "stale delay must never be cached");
+        assert!(s.locally_blocked);
+        assert_eq!(s.stats.ack_packets_sent, 0);
+        assert_eq!(s.send_sequence_number, 0);
+        assert_eq!(s.packets_in_flight, 0);
+        freeze_local_send(&mut s, 2_101_000_000);
+        let nonce = s.send_ack_sequence_number;
+        assert_eq!(nonce, original_nonce + 1);
+        let fresh = s.ack_receiver.ack(2_101_000_000).encode();
+        s.send_ack_sequence_number += 1;
+        let n = sender.write_message(nonce, &fresh, &mut enc).unwrap();
+        let mut seqs = crate::sequence::ReceiveSequences::default();
+        assert_eq!(seqs.candidate(crate::sequence::to_wire(nonce)), nonce);
+        let len = receiver.read_message(nonce, &enc[..n], &mut dec).unwrap();
+        assert!(seqs.commit(nonce), "first ACK may follow a refused-nonce gap");
+        assert!(!seqs.commit(nonce));
+        let decoded = crate::ack::BitmapAck::decode(&dec[..len]).unwrap();
+        assert_eq!(decoded.delay_us, 101_000);
+        // 110 ms raw sample, minus 101 ms receiver dwell = 9 ms network RTT.
+        assert_eq!(110_000_000u64 - decoded.delay_us as u64 * 1000, 9_000_000);
+        assert!(finish_connected_send(&mut s, &mut queues, PendingSendKind::Ack,
+            Some(2_101_000_001), 2_101_000_000, &enc[..n], &[], Dscp::Af21, 0, None));
+        assert!(!s.locally_blocked);
+        assert_eq!(s.stats.ack_packets_sent, 1);
+        assert_eq!(s.stats.packets_lost, 0);
+        // Established ACK windows tolerate missing ACKs too, without data holes.
+        assert_eq!(seqs.candidate(crate::sequence::to_wire(nonce + 8)), nonce + 8);
+        assert!(seqs.commit(nonce + 8));
+        assert!(seqs.commit(0));
+    }
+
+    #[test]
+    fn local_block_freezes_all_curve_phases_without_cut_or_catchup() {
+        let cc = crate::ship::CC;
+        for startup_done in [false, true] {
+            for rtt_ns in [40_000_000, 200_000_000] {
+                let k = cc.recovery_rtts * rtt_ns;
+                for age in [k / 2, k, 3*k, 9*k, 30*k] {
+                    let mut s = state();
+                    s.cc_startup_done = startup_done;
+                    s.RTT_mean = (rtt_ns / 100_000) as u16;
+                    s.congestion_event_rate_upps = 2_000_000_000;
+                    s.congestion_event_time_ns = 1_000_000_000;
+                    let now = s.congestion_event_time_ns + age;
+                    let before = cc_trace_context(&s, now, &cc, None).pps;
+                    freeze_local_send(&mut s, now);
+                    for delay in [1_000_000, 200_000_000, 15_000_000_000] {
+                        freeze_local_send(&mut s, now + delay);
+                        let context = cc_trace_context(&s, now + delay, &cc, None);
+                        assert_eq!(context.pps, before);
+                        assert_eq!(context.slope_ppsps, 0.0);
+                        assert_eq!(s.congestion_event_rate_upps, 2_000_000_000);
+                        assert_eq!(s.cc_startup_done, startup_done);
+                    }
+                    let resume = now + 15_000_000_000;
+                    update_app_limit(&mut s, resume, true);
+                    assert_eq!(cc_trace_context(&s, resume, &cc, None).pps, before);
+                    let elapsed = resume - s.last_sent_could_have_sent_data_packet;
+                    assert_eq!(send_pacing_grant(elapsed, send_interval_ns((before*1e6) as u64), s.send_pacer_acc_ns).packets, 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn refused_data_keeps_original_fec_tags_until_success() {
+        let mut s = state();
+        let mut b = SendQueues::new(1, (1_000_000, 8<<20, 8<<20));
+        b.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 1_000_000_000, 0, 0));
+        b.submit_messages(0, vec![vec![7; 3<<20]]);
+        b.fec_prepare_packet(0);
+        let mut plain = vec![0; 1162];
+        // Lazy encoder worker may not yet have completed its first block.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while b.fill_packet(&mut plain) == 0 {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let tag = b.fec_packet_tags.as_ref().unwrap()[0];
+        assert_ne!(tag, 0);
+        assert!(!finish_connected_send(&mut s, &mut b, PendingSendKind::Data, None, 2_000_000_000,
+            &[9; 1184], &plain, Dscp::BestEffort, 0, None));
+        freeze_local_send(&mut s, 3_000_000_000);
+        let p = s.pending_send.take().unwrap();
+        assert_eq!(p.plaintext, plain);
+        assert_eq!(b.fec_packet_tags.as_ref().unwrap()[0], tag);
+        commit_connected_send(&mut s, &mut b, p.kind, 3_000_000_001, p.bytes.len(), &p.plaintext, 0, None);
+        assert_eq!(b.fec_packet_tags.as_ref().unwrap()[0], tag, "success must not prepare/clear consumed data tags");
+        assert_eq!(s.send_sequence_number, 1);
+        b.fec_on_packet_finalized(0, false);
+        assert_eq!(b.fec_packet_tags.as_ref().unwrap()[0], 0);
     }
 }
