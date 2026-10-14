@@ -28,6 +28,7 @@
 //! ACK: --ack legacy|bitmap|adaptive|nack (default legacy), on both endpoints.
 //! Bitmap: --ack-every 8 --ack-delay-us 1000; Adaptive defaults to 8/10000 us.
 //! --duration S: saturated measurement for S seconds; requests receiver status while sending.
+//! --status-every-ms N (default1000): research-only control-report interval; increase for reverse bottleneck tests.
 //! --send-on-ms N --send-off-ms N: application submission duty cycle (queued packets drain normally).
 //! estimator_series rows: [seconds, FEC estimate, sample, sent packets, losses, UDP bytes, RTT us, CC pps, app-limited entries].
 //! --fec-pct X (send only): forward error correction redundancy in percent (float); messages of
@@ -701,7 +702,7 @@ fn send(a: &Args) {
             send_now.push((key, m));
         }
         let mut sent_status = false;
-        if (all_queued || a.str("duration").is_some()) && last_status_req.is_none_or(|t| t.elapsed() > Duration::from_secs(1)) {
+        if (all_queued || a.str("duration").is_some()) && last_status_req.is_none_or(|t| t.elapsed() > Duration::from_millis(a.num("status-every-ms", 1000))) {
             outbox.push((key, ctrl(STATUS_REQ, &count.to_le_bytes())));
             last_status_req = Some(Instant::now());
             sent_status = true;
