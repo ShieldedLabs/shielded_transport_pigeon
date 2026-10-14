@@ -1638,8 +1638,9 @@ const OVERLY_VERBOSE                :bool=0!=                (0);
 
 macro_rules! pod { ($($item:item)*) => { $(#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)] $item)* }; }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Default)]
 pub struct ReassemblySlot {
+    reservation: Option<crate::receive_memory::Reservation>,
     pub buf: Vec<u8>,
     pub total_len: Option<u32>,
     pub received: Vec<(u32, u32)>, // sorted non-overlapping non-adjacent ranges: [start, end)
@@ -1650,6 +1651,7 @@ pub struct ReassemblySlot {
 impl ReassemblySlot {
     pub fn new() -> Self {
         Self {
+            reservation: None,
             buf: Vec::new(),
             total_len: None,
             received: Vec::new(),
@@ -1667,7 +1669,25 @@ impl ReassemblySlot {
         vec
     }
 
+    /// Reserve before any allocation, including a sparse fragment's high-water offset.
+    /// Geometric growth is explicit so Vec cannot silently exceed the admitted capacity.
+    fn admit(&mut self, offset: usize, len: usize, budget: &std::sync::Arc<crate::receive_memory::ReceiveMemoryBudget>) -> bool {
+        if self.completed { return true; }
+        let Some(end) = offset.checked_add(len).filter(|&n| n <= MAX_JUMBOGRAM_LEN) else { return false; };
+        let buf_cap = if end > self.buf.capacity() { end.max(self.buf.capacity().saturating_mul(2)).max(8) } else { self.buf.capacity() };
+        let range_cap = if self.received.len() == self.received.capacity() { (self.received.capacity() * 2).max(4) } else { self.received.capacity() };
+        let Some(bytes) = range_cap.checked_mul(8).and_then(|r| buf_cap.checked_add(r)) else { return false; };
+        match &mut self.reservation {
+            Some(r) => { if !r.grow(bytes) { return false; } },
+            None => { let Some(r) = budget.reserve(bytes) else { return false; }; self.reservation = Some(r); },
+        }
+        if buf_cap > self.buf.capacity() { self.buf.reserve_exact(buf_cap - self.buf.len()); }
+        if range_cap > self.received.capacity() { self.received.reserve_exact(range_cap - self.received.len()); }
+        true
+    }
+
     fn take_complete(&mut self) -> Vec<u8> {
+        self.reservation = None;
         self.completed = true;
         self.received.clear();
         self.total_len = None;
@@ -2008,6 +2028,9 @@ pub(crate) struct CongestionPolicy {
 /// Socket binding and optional measurement. The transport policy is fixed internally.
 #[derive(Debug, Clone, Default)]
 pub struct NetworkThreadOptions {
+    /// Receive allocation budget. Share the same Arc across sockets for an overall limit.
+    /// None uses one process-wide 3 GiB default. Application-owned pulled messages are excluded.
+    pub receive_memory: Option<std::sync::Arc<crate::receive_memory::ReceiveMemoryBudget>>,
     /// See `new_network_thread_with_bind`.
     pub bind_ip: Option<std::net::IpAddr>,
     /// Report cumulative source/repair progress in `NetworkThreadPull::fec_messages`.
@@ -2020,6 +2043,8 @@ pub struct NetworkThreadOptions {
 
 pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_pps: Option<u64>, send_buffer_params: (u32, u32, u32), options: NetworkThreadOptions) -> NetworkThreadHandle {
     let bind_ip = options.bind_ip;
+    static DEFAULT_RECEIVE_MEMORY: std::sync::OnceLock<std::sync::Arc<crate::receive_memory::ReceiveMemoryBudget>> = std::sync::OnceLock::new();
+    let receive_memory = options.receive_memory.unwrap_or_else(|| DEFAULT_RECEIVE_MEMORY.get_or_init(|| std::sync::Arc::new(Default::default())).clone());
     // One measured policy, not application configuration.
     let cc = crate::ship::CC;
     let cc_rate = move |t, r, k, startup_done| connection_rate(t, r, k, &cc, startup_done);
@@ -2790,11 +2815,13 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     }
                                 }
 
+                                if !existing_connection.unreliable_reassembly[slot_idx].admit(frag_offset as usize, frag_data.len(), &receive_memory) { continue; }
                                 let (mut success, mut complete) = existing_connection.unreliable_reassembly[slot_idx].insert(frag_offset as usize, frag_data, is_fin);
                                 if !success {
                                     state.stats.rx_insert_failures += 1;
                                     existing_connection.unreliable_reassembly[slot_idx] = ReassemblySlot::new();
                                     existing_connection.unreliable_reassembly[slot_idx].package_id = package_id;
+                                    if !existing_connection.unreliable_reassembly[slot_idx].admit(frag_offset as usize, frag_data.len(), &receive_memory) { continue; }
                                     (success, complete) = existing_connection.unreliable_reassembly[slot_idx].insert(frag_offset as usize, frag_data, is_fin);
                                     assert!(success);
                                 }
@@ -4432,5 +4459,16 @@ mod fec_closed_loop_tests {
         b.fec_on_packet_lost(4);
         assert_eq!(b.fec_send_slot.as_ref().unwrap().lost, 21);
         assert!(b.fec_send_slot.as_ref().unwrap().n <= 128);
+    }
+
+    #[test]
+    fn sparse_plain_fragments_require_shared_byte_admission() {
+        let budget = crate::receive_memory::ReceiveMemoryBudget::new(1024);
+        let mut a = ReassemblySlot::new(); let mut b = ReassemblySlot::new();
+        assert!(!a.admit(MAX_JUMBOGRAM_LEN - 1, 1, &budget));
+        assert_eq!(a.buf.capacity(), 0); assert_eq!(budget.used(), 0);
+        assert!(a.admit(599, 1, &budget)); assert_eq!(a.insert(599, &[1], false), (true,false));
+        assert!(!b.admit(599, 1, &budget)); assert_eq!(b.buf.capacity(), 0);
+        drop(a); assert!(b.admit(599, 1, &budget)); drop(b); assert_eq!(budget.used(), 0);
     }
 }
