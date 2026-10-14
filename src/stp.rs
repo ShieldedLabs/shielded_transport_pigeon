@@ -534,6 +534,7 @@ pub struct UnreliableSendBuffer {
 pub struct FecSendSlot {
     segment: Option<FecSegment>,
     root_lease: Option<std::sync::Arc<PackageLease>>,
+    plan_ks: Option<std::sync::Arc<std::sync::Mutex<Vec<u64>>>>,
     retention_lease: Option<std::sync::Arc<RetentionLease>>,
     retain_limit: usize,
     package_lease: Option<std::sync::Arc<PackageLease>>,
@@ -598,7 +599,7 @@ impl FecSendSlot {
         let layout = crate::fec::MessageLayout::new(self.message.len(), self.block_bytes).unwrap();
         let total = self.segment.map_or(self.message.len(), |s| s.total as usize);
         let groups = self.segment.map_or(layout.groups, |s| (s.total as usize).div_ceil(FEC_SEGMENT_BYTES));
-        (total.div_ceil(self.block_bytes) as u64, groups, total > self.retain_limit)
+        (segment_source_horizon(total, self.block_bytes, self.plan_ks.as_ref()), groups, total > self.retain_limit)
     }
 
     fn refresh_plan(&mut self, a: &crate::fec_adapt::FecAdaptiveState) {
@@ -633,6 +634,18 @@ impl std::fmt::Debug for FecSendSlot {
     }
 }
 
+// Started segments keep their real K, including after TU growth or restart.
+// Future widths are unknowable: estimate those ranges at the current width,
+// replacing each estimate when it starts. Shared context also updates retained tails.
+fn segment_source_horizon(total: usize, block_bytes: usize,
+    plan_ks: Option<&std::sync::Arc<std::sync::Mutex<Vec<u64>>>>) -> u64 {
+    let Some(plan_ks) = plan_ks else { return total.div_ceil(block_bytes) as u64; };
+    let ks = plan_ks.lock().unwrap();
+    let group_len = total.div_ceil(ks.len());
+    ks.iter().enumerate().map(|(group, &k)| if k != 0 { k }
+        else { (total - group * group_len).min(group_len).div_ceil(block_bytes) as u64 }).sum()
+}
+
 /// Header of an FEC fragment: two little-endian u64 words.
 ///   word0: bit 0 = 1 (extended fragment; plain fragments have 0 here), bit 1 = 0,
 ///          bits 2..18 package id, bits 18..32 block data length, bits 32..64 block id
@@ -649,6 +662,7 @@ pub struct FecSegment { root: u16, total: u32, offset: u32 }
 
 #[derive(Debug)]
 struct SegmentedSend {
+    plan_ks: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
     message: std::sync::Arc<Vec<u8>>,
     offset: usize,
     root: u16,
@@ -989,18 +1003,24 @@ impl UnreliableSendBuffer {
     }
 
     fn start_fec(&mut self, message: std::sync::Arc<Vec<u8>>, block_bytes: usize) {
-        self.start_fec_group(message, block_bytes, None, None);
+        self.start_fec_group(message, block_bytes, None, None, None);
     }
 
     fn start_fec_group(&mut self, message: std::sync::Arc<Vec<u8>>, block_bytes: usize,
-        segment: Option<FecSegment>, root_lease: Option<std::sync::Arc<PackageLease>>) {
+        segment: Option<FecSegment>, root_lease: Option<std::sync::Arc<PackageLease>>,
+        plan_ks: Option<std::sync::Arc<std::sync::Mutex<Vec<u64>>>>) {
         let layout = crate::fec::MessageLayout::new(message.len(), block_bytes).unwrap();
         let k = layout.k as u32;
         let a = self.fec_adaptive.as_ref().expect("adaptive FEC initialized before coding");
         let total = segment.map_or(message.len(), |s| s.total as usize);
+        if let (Some(segment), Some(ks)) = (segment, &plan_ks) {
+            let group_len = total.div_ceil(total.div_ceil(FEC_SEGMENT_BYTES));
+            ks.lock().unwrap()[segment.offset as usize / group_len] = k as u64;
+        }
+        let whole_k = segment_source_horizon(total, block_bytes, plan_ks.as_ref());
         let target_groups = segment.map_or(layout.groups, |s| (s.total as usize).div_ceil(FEC_SEGMENT_BYTES));
         let repairs = (0..layout.groups).map(|g| a.repair_blocks_for_group_at_tail(layout.group(g).1 as u64,
-            total.div_ceil(block_bytes) as u64, target_groups, total > self.retention_quota.byte_limit)).max().unwrap_or(0);
+            whole_k, target_groups, total > self.retention_quota.byte_limit)).max().unwrap_or(0);
         let (n, loss_estimate) = (k + repairs as u32 * layout.groups as u32, a.p);
         let n = layout.round_plan(n);
         let encoder = if k as usize <= FEC_INLINE_MAX_BLOCKS {
@@ -1014,7 +1034,7 @@ impl UnreliableSendBuffer {
             }
         };
         self.fec_packet_tags.get_or_insert_with(|| vec![0u64; PACKETS_WAITING_ACK_CAPACITY as usize].into_boxed_slice());
-        self.fec_send_slot = Some(FecSendSlot { segment, root_lease, retention_lease: None, retain_limit: self.retention_quota.byte_limit, package_lease: self.package_lease.clone(), dscp: self.current_dscp, finalized_symbols: 0, send_started_ns: self.fec_now_ns, original_send_duration_ns: None, group_lost: vec![0; layout.groups], message, block_bytes, k, n, next_id: 0, encoder, block_buf: vec![0u8; block_bytes], first_seq: self.next_packet_seq, lost: 0, n_planned: n, loss_estimate });
+        self.fec_send_slot = Some(FecSendSlot { segment, root_lease, plan_ks, retention_lease: None, retain_limit: self.retention_quota.byte_limit, package_lease: self.package_lease.clone(), dscp: self.current_dscp, finalized_symbols: 0, send_started_ns: self.fec_now_ns, original_send_duration_ns: None, group_lost: vec![0; layout.groups], message, block_bytes, k, n, next_id: 0, encoder, block_buf: vec![0u8; block_bytes], first_seq: self.next_packet_seq, lost: 0, n_planned: n, loss_estimate });
     }
 
     /// Starts `msg` as the message being sent: grouped FEC if enabled and its length fits
@@ -1033,7 +1053,7 @@ impl UnreliableSendBuffer {
             self.package_lease = Some(lease);
         }
         if self.fec_adaptive.is_some() && msg.len() > FEC_SEGMENT_BYTES {
-            self.segmented_send = Some(SegmentedSend { message: std::sync::Arc::new(msg), offset: 0,
+            self.segmented_send = Some(SegmentedSend { plan_ks: std::sync::Arc::new(std::sync::Mutex::new(vec![0; msg.len().div_ceil(FEC_SEGMENT_BYTES)])), message: std::sync::Arc::new(msg), offset: 0,
                 root: self.send_package_id, root_lease: self.package_lease.take() });
             return self.start_segment(payload_len);
         }
@@ -1041,7 +1061,7 @@ impl UnreliableSendBuffer {
             Some(block_bytes) => self.start_fec(std::sync::Arc::new(msg), block_bytes),
             None => {
                 if self.fec_adaptive.is_some() && msg.len() <= payload_len.saturating_sub(STP_WHOLE_HEADER_SIZE) {
-                    let slot = FecSendSlot { segment: None, root_lease: None, retention_lease: None, retain_limit: self.retention_quota.byte_limit, package_lease: self.package_lease.clone(), dscp: self.current_dscp, message: std::sync::Arc::new(msg.clone()), block_bytes: msg.len(), k: 1, n: 1, next_id: 0,
+                    let slot = FecSendSlot { segment: None, root_lease: None, plan_ks: None, retention_lease: None, retain_limit: self.retention_quota.byte_limit, package_lease: self.package_lease.clone(), dscp: self.current_dscp, message: std::sync::Arc::new(msg.clone()), block_bytes: msg.len(), k: 1, n: 1, next_id: 0,
                         encoder: FecEncoderState::Failed, block_buf: Vec::new(), first_seq: self.next_packet_seq,
                         lost: 0, group_lost: vec![0], n_planned: 1, loss_estimate: 0.0, finalized_symbols: 0, send_started_ns: self.fec_now_ns, original_send_duration_ns: Some(0) };
                     self.retain_fec(slot, self.send_package_id);
@@ -1071,10 +1091,11 @@ impl UnreliableSendBuffer {
         self.package_lease = lease;
         let segment = FecSegment { root: source.root, total: source.message.len() as u32, offset: start as u32 };
         let root_lease = source.root_lease.clone();
+        let plan_ks = source.plan_ks.clone();
         let message = std::sync::Arc::new(source.message[start..end].to_vec());
         self.segmented_send.as_mut().unwrap().offset = end;
         if end == segment.total as usize { self.segmented_send = None; }
-        self.start_fec_group(message, block_bytes, Some(segment), root_lease);
+        self.start_fec_group(message, block_bytes, Some(segment), root_lease, Some(plan_ks));
         true
     }
 
@@ -1164,7 +1185,7 @@ impl UnreliableSendBuffer {
                     let f = self.fec_send_slot.take().unwrap();
                     self.send_package_id = lease.as_ref().map_or(self.send_package_id.wrapping_add(1), |l| l.id);
                     self.package_lease = lease;
-                    self.start_fec_group(f.message, payload_len - STP_SEGMENT_FEC_HEADER_SIZE, f.segment, f.root_lease);
+                    self.start_fec_group(f.message, payload_len - STP_SEGMENT_FEC_HEADER_SIZE, f.segment, f.root_lease, f.plan_ks);
                     return self.next_fragment(payload_len, space);
                 }
                 let f = self.fec_send_slot.take().unwrap();
@@ -5170,7 +5191,7 @@ mod fec_closed_loop_tests {
         let message = std::sync::Arc::new(vec![0; FEC_RETAIN_SOURCE_BYTES + 1]);
         let layout = crate::fec::MessageLayout::new(message.len(), 1433).unwrap();
         let k = layout.k as u32;
-        let mut f = FecSendSlot { segment: None, root_lease: None, retention_lease: None, retain_limit: FEC_RETAIN_SOURCE_BYTES, package_lease: None, dscp: Dscp::BestEffort, message, block_bytes: 1433, k, n: k, next_id: k,
+        let mut f = FecSendSlot { segment: None, root_lease: None, plan_ks: None, retention_lease: None, retain_limit: FEC_RETAIN_SOURCE_BYTES, package_lease: None, dscp: Dscp::BestEffort, message, block_bytes: 1433, k, n: k, next_id: k,
             encoder: FecEncoderState::Failed, block_buf: Vec::new(), first_seq: 0,
             lost: 0, group_lost: vec![0; layout.groups], n_planned: k,
             loss_estimate: 0.0, finalized_symbols: 0, send_started_ns: 0, original_send_duration_ns: None };
@@ -5219,7 +5240,7 @@ mod fec_closed_loop_tests {
         b.fec_adaptive = Some(FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0));
         // A large raw stand-in tests accounting without constructing a codec arena.
         for package in 0..5 {
-            let slot = FecSendSlot { segment: None, root_lease: None, retention_lease: None, retain_limit: FEC_RETAIN_SOURCE_BYTES, package_lease: None, dscp: Dscp::BestEffort, message: std::sync::Arc::new(vec![0; 17 * 1024 * 1024]),
+            let slot = FecSendSlot { segment: None, root_lease: None, plan_ks: None, retention_lease: None, retain_limit: FEC_RETAIN_SOURCE_BYTES, package_lease: None, dscp: Dscp::BestEffort, message: std::sync::Arc::new(vec![0; 17 * 1024 * 1024]),
                 block_bytes: 1, k: 1, n: 1, next_id: 1, encoder: FecEncoderState::Failed,
                 block_buf: Vec::new(), first_seq: 0, lost: 0, group_lost: vec![0],
                 n_planned: 1, loss_estimate: 0.0, finalized_symbols: 0, send_started_ns: 0, original_send_duration_ns: Some(0) };
@@ -5470,7 +5491,7 @@ mod send_queue_tests {
     #[test]
     fn per_magazine_retention_reservation_preserves_small_history() {
         let mut s = SendQueues::new(2, (1000000, 1<<20, 1<<20));
-        let slot = |len| FecSendSlot { segment: None, root_lease: None, retention_lease: None, retain_limit: FEC_RETAIN_SOURCE_BYTES, package_lease: None, dscp: Dscp::BestEffort, message: std::sync::Arc::new(vec![0; len]), block_bytes: len,
+        let slot = |len| FecSendSlot { segment: None, root_lease: None, plan_ks: None, retention_lease: None, retain_limit: FEC_RETAIN_SOURCE_BYTES, package_lease: None, dscp: Dscp::BestEffort, message: std::sync::Arc::new(vec![0; len]), block_bytes: len,
             k: 1, n: 1, next_id: 1, encoder: FecEncoderState::Failed, block_buf: Vec::new(),
             first_seq: 0, lost: 0, group_lost: vec![0], n_planned: 1, loss_estimate: 0.0,
             finalized_symbols: 0, send_started_ns: 0, original_send_duration_ns: None };
@@ -5628,7 +5649,7 @@ mod review_tests {
     // Per-packet cost of retained-slot scans added to fill_packet (bound_retention + has_unsent_data).
     #[test]
     fn review_hot_path_cost_with_full_retention() {
-        let slot = |len| FecSendSlot { segment: None, root_lease: None, retention_lease: None, retain_limit: FEC_RETAIN_SOURCE_BYTES, package_lease: None, dscp: Dscp::BestEffort, message: std::sync::Arc::new(vec![0; len]), block_bytes: len,
+        let slot = |len| FecSendSlot { segment: None, root_lease: None, plan_ks: None, retention_lease: None, retain_limit: FEC_RETAIN_SOURCE_BYTES, package_lease: None, dscp: Dscp::BestEffort, message: std::sync::Arc::new(vec![0; len]), block_bytes: len,
             k: 1, n: 1, next_id: 1, encoder: FecEncoderState::Failed, block_buf: Vec::new(),
             first_seq: 0, lost: 0, group_lost: vec![0], n_planned: 1, loss_estimate: 0.0,
             finalized_symbols: 0, send_started_ns: 0, original_send_duration_ns: None };
@@ -6197,6 +6218,51 @@ fn idle_join_and_clock_normalization_are_bounded() {
 mod lazy_fec_segment_tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn lazy_group_plans_use_their_own_k_after_tu_growth() {
+        for learned_burst in [false, true] {
+            let mut s = SendQueues::new(1, (1_000_000, 16<<20, 16<<20));
+            let mut a = crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0);
+            if learned_burst {
+                // The measured trace contains 331 declared losses in a 2048-packet
+                // span. Its histogram upper bound is 384, plus one extra symbol.
+                for seq in 0..8192 { a.on_data_sent(seq); }
+                for seq in 0..8192 { a.on_sequence_finalized(seq, (4096..4427).contains(&seq), 100_000_000); }
+            }
+            s.fec_adaptive = Some(a);
+            s.submit_messages(0, vec![vec![7; (4<<20)+123]]);
+            let mut first_k = None;
+            for group in 0..3 {
+                let payload_len = if group == 0 { 1193 } else { 1450 };
+                let mut packet = vec![0; payload_len];
+                s.fec_prepare_packet(group);
+                assert!(s.fill_packet(&mut packet) > 0);
+                let f = s.queues[0].fec_send_slot.as_ref().unwrap();
+                let layout = crate::fec::MessageLayout::new(f.message.len(), f.block_bytes).unwrap();
+                let a = s.fec_adaptive.as_ref().unwrap();
+                let (whole_k, groups, tail) = f.plan_context();
+                assert_eq!(groups, 3);
+                let total = (4usize<<20)+123;
+                let group_len = total.div_ceil(3);
+                let expected_whole_k = if group == 0 { 3 * layout.k as u64 }
+                    else { first_k.unwrap() as u64 + group_len.div_ceil(1424) as u64
+                        + (total - 2 * group_len).div_ceil(1424) as u64 };
+                assert_eq!(whole_k, expected_whole_k);
+                let repairs = a.repair_blocks_for_group_at_tail(layout.k as u64, expected_whole_k, groups, tail);
+                assert_eq!(f.k, layout.k as u32);
+                assert_eq!(f.n_planned, f.k + repairs as u32);
+                if group == 0 { first_k = Some(f.k); }
+                else {
+                    assert!(f.k < first_k.unwrap());
+                    if learned_burst { assert_eq!(repairs, 385); }
+                }
+                // Advance the lazy train without waiting for background encoding.
+                let f = s.queues[0].fec_send_slot.as_mut().unwrap();
+                f.next_id = f.n;
+            }
+        }
+    }
 
     #[test]
     fn lazy_groups_pick_up_tu_growth_burst_loss_and_deliver_original_once() {
