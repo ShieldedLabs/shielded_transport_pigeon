@@ -2202,13 +2202,13 @@ impl ReassemblySlot {
         vec
     }
 
-    /// Reserve before any allocation, including a sparse fragment's high-water offset.
-    /// Geometric growth is explicit so Vec cannot silently exceed the admitted capacity.
+    /// Plain messages never need the lazy-FEC segment path. Bound their high-water
+    /// allocation and reserve only the arrived extent (not a claimed larger total).
     fn admit(&mut self, offset: usize, len: usize, budget: &std::sync::Arc<crate::receive_memory::ReceiveMemoryBudget>) -> bool {
         if self.completed { return true; }
         if self.segment_parts.is_some() { return false; }
-        let Some(end) = offset.checked_add(len).filter(|&n| n <= MAX_JUMBOGRAM_LEN) else { return false; };
-        let buf_cap = if end > self.buf.capacity() { end.max(self.buf.capacity().saturating_mul(2)).max(8) } else { self.buf.capacity() };
+        let Some(end) = offset.checked_add(len).filter(|&n| n <= FEC_SEGMENT_BYTES) else { return false; };
+        let buf_cap = end.max(self.buf.capacity());
         let range_cap = if self.received.len() == self.received.capacity() { (self.received.capacity() * 2).max(4) } else { self.received.capacity() };
         let Some(bytes) = range_cap.checked_mul(8).and_then(|r| buf_cap.checked_add(r)?.checked_add(256)) else { return false; };
         match &mut self.reservation {
@@ -2290,8 +2290,9 @@ impl ReassemblySlot {
     pub fn insert(&mut self, offset: usize, data: &[u8], is_fin: bool) -> (bool, bool) {
         if self.completed { return (true, false); } // fresh-nonce K=1 rescue must not redeliver
 
+        let Some(end) = offset.checked_add(data.len()).filter(|&n| n <= FEC_SEGMENT_BYTES) else { return (false, false); };
         let start = offset as u32;
-        let end = (offset + data.len()) as u32;
+        let end = end as u32;
 
         // If this is the final fragment, derive total_len from offset + data.len()
         if is_fin {
@@ -6860,5 +6861,34 @@ mod lazy_fec_segment_tests {
             let (header,size)=read_fragment_header(&p).unwrap();
             assert_eq!(size,4); assert_eq!(header&1,0); assert_eq!((header>>18)&0x3fff,len as u64);
         }
+    }
+}
+
+#[cfg(test)]
+mod review2_tests {
+    use super::*;
+
+    #[test]
+    fn review2_sparse_fragment_rejected_without_high_water_allocation() {
+        let process = crate::receive_memory::ReceiveMemoryBudget::new(4 << 30);
+        let peer = crate::receive_memory::ReceiveMemoryBudget::connection_share(&process);
+        let mut slot = ReassemblySlot::new();
+        for offset in [32usize << 20, MAX_JUMBOGRAM_LEN - 1, FEC_SEGMENT_BYTES, usize::MAX] {
+            assert!(!slot.admit(offset, 1, &peer));
+            assert_eq!(slot.insert(offset, &[0xAA], false), (false, false));
+            assert_eq!(slot.insert(offset, &[0xAA], true), (false, false));
+            assert_eq!(slot.buf.capacity(), 0);
+            assert_eq!(peer.used(), 0);
+            assert_eq!(process.used(), 0);
+        }
+        // The boundary itself remains legal and charged at its exact capacity.
+        assert!(slot.admit(FEC_SEGMENT_BYTES - 1, 1, &peer));
+        assert_eq!(slot.insert(FEC_SEGMENT_BYTES - 1, &[0xAA], true), (true, false));
+        assert_eq!(slot.buf.len(), FEC_SEGMENT_BYTES);
+        assert_eq!(peer.used(), slot.buf.capacity() + slot.received.capacity() * 8 + 256);
+        assert_eq!(process.used(), peer.used());
+        drop(slot);
+        assert_eq!(peer.used(), 0);
+        assert_eq!(process.used(), 0);
     }
 }
