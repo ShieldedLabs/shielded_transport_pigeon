@@ -386,7 +386,32 @@ fn integrated_rx_report_roundtrip() {
     assert_eq!(old.st.fec_decode_admission_refusals, 0);
 }
 
+// Research-only sidecar: disk stream, not an unbounded in-memory result list.
+struct FecTrace(Option<std::io::BufWriter<std::fs::File>>);
+impl FecTrace {
+    fn open(a: &Args) -> Self {
+        use std::io::Write;
+        Self(a.str("loss-trace").map(|p| {
+            let mut w = std::io::BufWriter::new(std::fs::File::create(std::path::Path::new(p).with_extension("fec.csv")).unwrap());
+            writeln!(w, "time_ns,package_id,root_id,offset,tag,message_len,block_bytes,k,n_planned,n_sent,lost,rescue_rounds,rescue_symbols").unwrap();
+            w
+        }))
+    }
+    fn record(&mut self, time_ns: u64, rows: &[(ConnectionKey, shielded_transport_pigeon::fec_adapt::FecMessageInfo)]) {
+        use std::io::Write;
+        if let Some(w) = &mut self.0 {
+            for (_, m) in rows {
+                writeln!(w, "{},{},{},{},{},{},{},{},{},{},{},{},{}", time_ns, m.package_id, m.root_id,
+                    m.segment_offset, m.tag, m.message_len, m.block_bytes, m.k, m.n_planned, m.n_sent,
+                    m.lost_during_send, m.rescue_rounds, m.rescue_symbols).unwrap();
+            }
+        }
+    }
+    fn flush(&mut self) { use std::io::Write; if let Some(w) = &mut self.0 { w.flush().unwrap(); } }
+}
+
 fn send(a: &Args) {
+    let mut fec_trace = FecTrace::open(a);
     let to = STPAddress::parse(a.str("to").unwrap_or_else(|| die("send needs --to STPADDR"))).unwrap_or_else(|| die("bad --to address"));
     let seed: u64 = a.num("seed", 1);
     let giant = a.str("giant").map(|s| giant_size(s).unwrap_or_else(|| die("--giant needs a byte count, 256M or 1G (binary units, whole framed message)")));
@@ -594,6 +619,7 @@ fn send(a: &Args) {
         for &(k, q, bytes) in &p.unreliable_send_free_bytes { if k == key { free[q] = bytes; } }
         if let Some((_, st)) = p.connection_stats.iter().find(|(k, _)| *k == key) { stats = *st; }
         sender_thread = p.thread_stats;
+        fec_trace.record(ns(), &p.fec_messages);
         for (k, m) in &p.fec_messages {
             let id = m.tag as u32;
             if *k == key && id < count && m.message_len == sizes[id as usize] { fec_info.insert(id, (m.k, m.n_sent, m.n_planned, m.loss_estimate)); }
@@ -794,6 +820,7 @@ fn send(a: &Args) {
         stats.udp_payload_tu, rx.st.fec_decode_last_tail_ns as f64 / 1e6, rx.st.fec_decode_max_tail_ns as f64 / 1e6, rx.st.fec_ingress_dropped_blocks);
     std::fs::write(&out, json).unwrap_or_else(|e| die(&format!("writing {out}: {e}")));
     println!("report written to {out}");
+    fec_trace.flush();
     drop(handle); // A traced run joins the network thread and flushes its event CSV.
     std::process::exit(if delivered == count as u64 { 0 } else { 1 });
 }
@@ -828,6 +855,7 @@ fn queue_report(n: usize, sizes: &[usize], queue_ids: &[usize], submitted: &[Opt
 /// arrivals are generated independently, so the producer itself cannot hide sender HOL.
 /// Small latencies start at Poisson arrival, including app backpressure in the single-queue case.
 fn send_magazines(a: &Args) {
+    let mut fec_trace = FecTrace::open(a);
     let mode = a.str("workload").unwrap();
     if !matches!(mode, "bulk" | "bulk-small" | "dueling") { die("--workload must be bulk, bulk-small or dueling"); }
     let n = a.num::<usize>("queues", if mode == "dueling" { 2 } else { 1 });
@@ -923,6 +951,7 @@ fn send_magazines(a: &Args) {
             let id = u32_at(&m, 0);
             if id < CTRL_BASE { pending[q].push_front((id, m)); }
         }
+        fec_trace.record(ns(), &p.fec_messages);
         for &(k, q, b) in &p.unreliable_send_free_bytes { if k == key { free[q] = b; } }
         if let Some((_, st)) = p.connection_stats.iter().find(|(k, _)| *k == key) { stats = *st; }
         for (_, d) in p.received_unreliable_messages {
@@ -967,6 +996,7 @@ fn send_magazines(a: &Args) {
     json.insert_str(json.len()-2, &format!(",\"packets_sent\":{},\"packets_lost\":{},\"spurious_losses\":{},\"receiver_rx_lost\":{},\"receiver_rx_reordered\":{},\"receiver_rx_late_beyond_window\":{},\"cc_rate_pps\":{:.3}", stats.packets_sent, stats.packets_lost, stats.spurious_losses, receiver.st.rx_lost, receiver.st.rx_reordered, receiver.st.rx_late_beyond_window, stats.cc_rate_upps as f64/1e6));
     json.insert_str(json.len()-2, &format!(",\"receiver_stale_fragments\":{},\"receiver_partials_evicted\":{},\"receiver_insert_failures\":{}", receiver.st.rx_stale_fragments, receiver.st.rx_partial_evicted, receiver.st.rx_insert_failures));
     std::fs::write(a.str("out").unwrap_or("stp_bench_report.json"), json).unwrap();
+    fec_trace.flush();
     drop(handle);
     if delivered != sizes.len() { std::process::exit(1); }
 }

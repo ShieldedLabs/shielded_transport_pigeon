@@ -11,6 +11,30 @@
 //! [`repair_blocks`] picks, for a message of K source blocks, the smallest N with
 //! P(fewer than K of N blocks arrive) <= eps under independent loss p.
 
+/// Temporary internal research selector; removed when a winner ships.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RepairPolicy { Reliability, MeanOpen, MeanTopup, Streaming }
+impl RepairPolicy {
+    fn selected() -> Self {
+        #[cfg(not(test))]
+        return match std::env::var("STP_RACE_POLICY").as_deref() {
+            Ok("P1") => Self::MeanOpen, Ok("P2") => Self::MeanTopup,
+            Ok("P3") => Self::Streaming, Ok("P0") | Err(_) => Self::Reliability,
+            Ok(other) => panic!("unknown STP_RACE_POLICY {other}"),
+        };
+        #[cfg(test)]
+        Self::Reliability
+    }
+    pub fn feedback(self) -> bool { self != Self::MeanOpen }
+}
+
+/// Expected source AND repair loss, plus two decoder-rank symbols, capped at K.
+pub(crate) fn mean_repairs(k: u64, p: f64) -> u64 {
+    if k == 0 { return 0; }
+    ((k as f64 * p.clamp(0.0, 0.9) / (1.0 - p.clamp(0.0, 0.9))).ceil() as u64)
+        .saturating_add(2).min(k)
+}
+
 /// Internal span-tail protection policy. The sole configuration lives in ship.rs.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct AdaptiveFecConfig {
@@ -105,12 +129,13 @@ pub(crate) struct LossTracker {
     have_sample: bool,
     last_sample: f64,
     cached: f64,
+    mean: f64,
     last_refresh_ns: u64,
 }
 
 impl LossTracker {
     pub fn new(cfg: AdaptiveFecConfig, now_ns: u64) -> Self {
-        LossTracker { cfg, st: ShortTerm { start_ns: now_ns, sent: 0, lost: 0 }, ring: [(u64::MAX, 0.0); 16], have_sample: false, last_sample: 0.0, cached: cfg.initial_loss, last_refresh_ns: now_ns }
+        LossTracker { cfg, st: ShortTerm { start_ns: now_ns, sent: 0, lost: 0 }, ring: [(u64::MAX, 0.0); 16], have_sample: false, last_sample: 0.0, cached: cfg.initial_loss, mean: cfg.initial_loss, last_refresh_ns: now_ns }
     }
 
     /// Feed counter deltas since the previous call. O(1) (refresh is a fixed 16-slot loop at
@@ -134,6 +159,7 @@ impl LossTracker {
     }
 
     fn on_sample(&mut self, now_ns: u64, loss: f64) {
+        self.mean = if self.have_sample { self.mean * 0.875 + loss * 0.125 } else { loss };
         self.have_sample = true;
         self.last_sample = loss;
         let cfg = self.cfg;
@@ -174,6 +200,13 @@ pub struct FecMessageInfo {
     pub loss_estimate: f64,
     /// Own packets declared lost while the message was being sent.
     pub lost_during_send: u32,
+    /// Research group identity and feedback repair counters (opt-in recording only).
+    pub package_id: u16,
+    pub root_id: u16,
+    pub segment_offset: u32,
+    pub block_bytes: u32,
+    pub rescue_rounds: u8,
+    pub rescue_symbols: u32,
 }
 
 /// Fixed-memory losses-in-span sketch. Sixteen dyadic sliding windows (2..65536 packets),
@@ -319,6 +352,7 @@ impl SpanLossProfile {
 #[derive(Clone, Debug)]
 pub(crate) struct FecAdaptiveState {
     pub tracker: LossTracker,
+    pub policy: RepairPolicy,
     last_sent: u64,
     last_lost: u64,
     /// Net-of-spurious: (time, sent, declared lost) snapshots every LOSS_SIGNAL_SNAPSHOT_NS.
@@ -333,7 +367,7 @@ pub(crate) struct FecAdaptiveState {
 impl FecAdaptiveState {
     pub fn new(cfg: AdaptiveFecConfig, now_ns: u64, sent: u64, lost: u64) -> Self {
         let tracker = LossTracker::new(cfg, now_ns);
-        FecAdaptiveState { tracker, last_sent: sent, last_lost: lost, ring: [(now_ns, sent, lost); LOSS_SIGNAL_RING], ring_head: 0, p: tracker.estimate().max(cfg.min_loss), span: Box::new(SpanLossProfile::default()) }
+        FecAdaptiveState { tracker, policy: RepairPolicy::selected(), last_sent: sent, last_lost: lost, ring: [(now_ns, sent, lost); LOSS_SIGNAL_RING], ring_head: 0, p: tracker.estimate().max(cfg.min_loss), span: Box::new(SpanLossProfile::default()) }
     }
     /// Feed the connection's cumulative counters: packets sent, declared lost, and declarations
     /// found spurious so far.
@@ -352,7 +386,8 @@ impl FecAdaptiveState {
         self.last_sent = self.last_sent.max(sent);
         self.last_lost = self.last_lost.max(lost);
         self.tracker.on_tick(now_ns, ds, dl);
-        self.p = self.tracker.estimate().max(self.tracker.cfg.min_loss);
+        self.p = if self.policy == RepairPolicy::Reliability { self.tracker.estimate().max(self.tracker.cfg.min_loss) }
+            else { self.tracker.mean };
     }
     pub fn on_data_sent(&mut self, seq: u64) {
         self.span.on_data_sent(seq);
@@ -371,6 +406,8 @@ impl FecAdaptiveState {
         self.repair_blocks_for_group_at_tail(k, whole_message_k, groups, true)
     }
     pub fn repair_blocks_for_group_at_tail(&self, k: u64, whole_message_k: u64, groups: usize, burst_tail: bool) -> u64 {
+        if self.policy == RepairPolicy::Streaming { return 2.min(k); }
+        if self.policy != RepairPolicy::Reliability { return mean_repairs(k, self.p); }
         let c = &self.tracker.cfg;
         let span = &self.span;
         let horizon = if span.seen >= 4096 { k.min(span.pending_peak.max(1)) } else { k };
@@ -438,6 +475,22 @@ mod tests {
         let mut n = k;
         while fail_prob(k, n, p) > eps { n += 1; }
         n
+    }
+
+    #[test]
+    fn mean_policy_is_a_mean_not_a_max_hold_or_tail() {
+        let cfg = AdaptiveFecConfig { min_packets: 100, ..Default::default() };
+        let mut t = LossTracker::new(cfg, 0);
+        t.on_sample(1, 0.02);
+        t.on_sample(2, 0.10);
+        assert!((t.mean - 0.03).abs() < 1e-9);
+        t.on_sample(3, 0.02);
+        assert!(t.mean < 0.03);
+        assert!(t.estimate() > 0.09);
+        assert_eq!(mean_repairs(1000, 0.02), 23);
+        for k in [0, 1, 2, 12, 1000, u32::MAX as u64] {
+            assert!(mean_repairs(k, 0.9) <= k);
+        }
     }
 
     #[test]
