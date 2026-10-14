@@ -19,6 +19,8 @@
 //! --fec adaptive:v1|v2|v3|span (send only): adaptive redundancy from the connection's own loss
 //! estimate (v1 tiered max-hold, v2 peak with decay, v3 high quantile; see fec_adapt), with
 //! [--fec-eps 1e-6] [--fec-time-scale 1.0] (scales hold/half-life/window) [--fec-min-packets 500]
+//! span targets packet_loss*sqrt(min(1,64/K)); --fec-eps optionally caps it (span default .5).
+//! [--fec-min-loss .005] [--fec-initial-loss .01]: explicit IID prior/floor, independent of span tails.
 //! [--fec-topup 0|1] (grow the message being sent when its own packets are declared lost).
 //! [--fec-loss-signal declared|net:MS] (estimator input: raw declared loss, or declared minus
 //! spurious declarations with the counters delayed MS ms; default net:1000).
@@ -365,7 +367,12 @@ fn send(a: &Args) {
                 Some("span") => LossEstimatorKind::SpanTail,
                 _ => die("--fec must be fixed or adaptive:v1|v2|v3|span"),
             };
-            let cfg = AdaptiveFecConfig { kind, eps: a.num("fec-eps", if kind == LossEstimatorKind::SpanTail { 1e-3 } else { 1e-6 }), min_loss: a.num("fec-min-loss", 0.005), initial_loss: a.num("fec-initial-loss", 0.01), min_packets: a.num("fec-min-packets", 500), topup: a.num::<u32>("fec-topup", 0) != 0,
+            let cfg = AdaptiveFecConfig { kind, eps: a.num("fec-eps", if kind == LossEstimatorKind::SpanTail { 0.5 } else { 1e-6 }), min_loss: a.num("fec-min-loss", 0.005), initial_loss: a.num("fec-initial-loss", 0.01), min_packets: a.num("fec-min-packets", 500), topup: a.num::<u32>("fec-topup", 0) != 0,
+                span_floor: match a.str("fec-span-floor").unwrap_or("none") {
+                    "none" => SpanFloorKind::None, "real" => SpanFloorKind::Real,
+                    "legacy" => SpanFloorKind::Legacy, "robust" => SpanFloorKind::Robust,
+                    _ => die("--fec-span-floor must be none|real|legacy|robust"),
+                },
                 loss_signal: match a.str("fec-loss-signal") {
                     None => AdaptiveFecConfig::default().loss_signal,
                     Some("declared") => LossSignal::Declared,

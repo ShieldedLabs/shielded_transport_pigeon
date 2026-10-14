@@ -27,9 +27,37 @@ pub enum LossEstimatorKind {
     SpanTail,
 }
 
+/// Explicit research safety floors, calibrated on held-out and cross-trace placement tests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpanFloorKind {
+    None,
+    /// Real Singapore traces: at least 12 repairs, plus the configured IID min-loss floor.
+    Real,
+    /// Legacy-CC emulation: at least 16 repairs and 2% of K.
+    Legacy,
+    /// Full legacy/balanced matrix: 12 repairs for K<=64, 16 otherwise; 10% through
+    /// K=1024, 5% through K=8192, 2% beyond. Not a guarantee for unseen loss profiles.
+    Robust,
+}
+impl SpanFloorKind {
+    pub fn repair_blocks(self, k: u64) -> u64 {
+        let r = match self {
+            Self::None => 0,
+            Self::Real => 12,
+            Self::Legacy => 16.max(k.div_ceil(50)),
+            Self::Robust => {
+                let denominator = if k <= 1024 { 10 } else if k <= 8192 { 20 } else { 50 };
+                (if k <= 64 { 12 } else { 16 }).max(k.div_ceil(denominator))
+            }
+        };
+        r.min(k)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct AdaptiveFecConfig {
     pub kind: LossEstimatorKind,
+    pub span_floor: SpanFloorKind,
     /// Target probability that a message cannot be decoded (given the loss estimate is right).
     pub eps: f64,
     /// Lower bound on the loss rate used for sizing (the estimate is never trusted below this).
@@ -76,6 +104,7 @@ impl Default for AdaptiveFecConfig {
     fn default() -> Self {
         AdaptiveFecConfig {
             kind: LossEstimatorKind::TieredMaxHold,
+            span_floor: SpanFloorKind::None,
             eps: 1e-6,
             min_loss: 0.005,
             initial_loss: 0.01,
@@ -420,7 +449,7 @@ impl SpanLossProfile {
         // overflow event; fixing CC is preferable to paying for a pathological startup prior.
         let prior = if self.seen < 4096 { cfg.initial_loss } else { cfg.min_loss };
         let eps = self.target_failure(k, cfg);
-        let mut r = repair_blocks(k, prior, z_for_eps(eps), eps, cfg.extra_blocks, cfg.max_redundancy);
+        let mut r = repair_blocks(k, prior, z_for_eps(eps), eps, cfg.extra_blocks, cfg.max_redundancy).max(cfg.span_floor.repair_blocks(k)).min(cap);
         for _ in 0..32 {
             let Some(q) = self.tail_losses(k + r, eps) else { break; };
             let next = r.max(q.saturating_add(cfg.extra_blocks as u64).max(1)).min(cap);
@@ -672,6 +701,20 @@ mod tests {
         assert!(s.repair_blocks(32, &cfg, z_for_eps(cfg.eps)) >= 11);
         assert!(s.target_failure(32768, &cfg) < s.target_failure(32, &cfg));
         assert!(std::mem::size_of::<SpanLossProfile>() < 50000);
+    }
+
+    #[test]
+    fn span_safety_floors_are_explicit_and_capped() {
+        assert_eq!(SpanFloorKind::None.repair_blocks(740), 0);
+        assert_eq!(SpanFloorKind::Real.repair_blocks(740), 12);
+        assert_eq!(SpanFloorKind::Legacy.repair_blocks(36613), 733);
+        assert_eq!(SpanFloorKind::Robust.repair_blocks(740), 74);
+        assert_eq!(SpanFloorKind::Robust.repair_blocks(3662), 184);
+        assert_eq!(SpanFloorKind::Robust.repair_blocks(36613), 733);
+        assert_eq!(SpanFloorKind::Robust.repair_blocks(2), 2);
+        let s = SpanLossProfile::default();
+        let cfg = AdaptiveFecConfig { kind: LossEstimatorKind::SpanTail, span_floor: SpanFloorKind::Robust, eps: 0.5, ..Default::default() };
+        assert!(s.repair_blocks(740, &cfg, 0.0) >= 74);
     }
 
     #[test]
