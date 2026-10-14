@@ -1111,6 +1111,10 @@ pub const RATE_FLOOR_UPPS: u64 = 100 * 1_000_000;
 pub struct ConnectionStats {
     /// Current smoothed RTT in microseconds (0 until sampled).
     pub rtt_us: u64,
+    /// Last CC command in micro-packets/second, after the local pacing ceiling.
+    pub cc_rate_upps: u64,
+    /// Number of application queue-empty transitions (not congestion events).
+    pub cc_app_limited_entries: u64,
     /// Current path transmission unit, including STP header/tag inside the UDP payload.
     pub udp_payload_tu: u64,
     /// Constant-memory send-loop burst and curve-inversion diagnostics.
@@ -3191,14 +3195,15 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                         state.congestion_event_rate_upps = state.congestion_event_rate_upps.max(cc.rate_floor_upps);
                         
                         let (allowed_bandwidth_upps, cubic_mode) = if state.is_app_limited {
-                            let rtt_ns = state.RTT_mean as u64 * 100_000;
-                            let a_t = if cc.startup_multiplier > 0.0 && !state.cc_startup_done { state.app_limit_time_offset } else { state.app_limit_time_offset.max(rtt_ns * 2) };
-                            (cc_rate(a_t, state.congestion_event_rate_upps, time_to_bandwidth_recovery, state.cc_startup_done).0, 'A')
+                            // Freeze at the exact active age, including during recovery.
+                            // A minimum age of two RTTs would spuriously grow an idle curve.
+                            (cc_rate(state.app_limit_time_offset, state.congestion_event_rate_upps, time_to_bandwidth_recovery, state.cc_startup_done).0, 'A')
                         } else {
                             cc_rate(current_time_now_ns - state.congestion_event_time_ns, state.congestion_event_rate_upps, time_to_bandwidth_recovery, state.cc_startup_done)
                         };
                         // A local pacing ceiling is not evidence of network congestion.
                         let allowed_bandwidth_upps = local_rate_limit(allowed_bandwidth_upps.max(cc.rate_floor_upps), max_pps);
+                        state.stats.cc_rate_upps = allowed_bandwidth_upps;
                         // pps * 10^-6 * rtt * 10^-4 = p * 10^10
                         // BDP + sawtooth: pipe is full (BDP) plus ack batching excess (ack_pace_estimate is in 0.1ms units)
                         let bdp = allowed_bandwidth_upps * state.RTT_mean as u64 / 10_000;
@@ -3398,23 +3403,13 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             state.stats.pacing_error_max_ns = p.error_max_ns;
                             state.stats.pacing_history_records = p.history.len() as u64;
                         }
-                        if !has_data && !state.is_app_limited {
-                            if OVERLY_VERBOSE { println!("####### START APP LIMITED ######"); }
-                            state.is_app_limited = true;
-                            state.app_limit_time_offset = current_time_now_ns - state.congestion_event_time_ns;
-                            if cubic_mode == 'G' || cubic_mode == 'S' || cubic_mode == 'L' {
-                                state.congestion_event_rate_upps = (allowed_bandwidth_upps as f64 / cc.rate_pg) as u64;
-                                let t_pg = (cc.time_pg * time_to_bandwidth_recovery as f64) as u64;
-                                state.app_limit_time_offset = t_pg;
-                                state.congestion_event_time_ns = current_time_now_ns.saturating_sub(t_pg);
-                            }
-                        } else if has_data && state.is_app_limited {
-                            if OVERLY_VERBOSE { println!("####### END APP LIMITED ######"); }
-                            state.is_app_limited = false;
-                            let rtt_ns = state.RTT_mean as u64 * 100_000;
-                            let exit_t = state.app_limit_time_offset.max(rtt_ns * 2);
-                            state.congestion_event_time_ns = current_time_now_ns.saturating_sub(exit_t);
-                        }
+                        // Pause the active curve, not its rate divided by PG.
+                        // The latter only represents the uncapped legacy phase;
+                        // growth envelopes can be far below PG at that age.
+                        // Queue starvation is not evidence of congestion and
+                        // must neither lower the command nor grow it while idle.
+                        // Shared with the no-loss idle/resume regressions below.
+                        update_app_limit(state, current_time_now_ns, has_data);
                         
                         if could_have_sent {
                             state.last_sent_could_have_sent_data_packet = current_time_now_ns;
@@ -3686,6 +3681,19 @@ fn take_ecn_signal(state: &mut ConnectionStateConnected, guard_rtts: f64) -> boo
     eligible
 }
 
+/// Freeze active curve time on starvation; preserve the anchor and phase for
+/// every controller, including bounded, compounded, proportional and startup.
+fn update_app_limit(state: &mut ConnectionStateConnected, now_ns: u64, has_data: bool) {
+    if !has_data && !state.is_app_limited {
+        state.stats.cc_app_limited_entries += 1;
+        state.app_limit_time_offset = now_ns.saturating_sub(state.congestion_event_time_ns);
+        state.is_app_limited = true;
+    } else if has_data && state.is_app_limited {
+        state.congestion_event_time_ns = now_ns.saturating_sub(state.app_limit_time_offset);
+        state.is_app_limited = false;
+    }
+}
+
 fn connection_rate(t_ns: u64, anchor_upps: u64, k_ns: u64, cc: &CongestionControlOptions, startup_done: bool) -> (u64, char) {
     if cc.startup_multiplier > 0.0 && !startup_done {
         let rtt_ns = k_ns / cc.recovery_rtts;
@@ -3802,6 +3810,48 @@ impl LossEpisodes {
 #[cfg(test)]
 mod congestion_tests {
     use super::*;
+
+    #[test]
+    fn loss_free_app_empty_resume_preserves_every_active_curve() {
+        let compound = CongestionControlOptions {
+            max_growth_uppsps: 500e6, relative_growth_per_rtt: 0.02,
+            bound_recovery_growth: true, compound_growth: true,
+            ..CongestionControlOptions::balanced()
+        };
+        for cc in [CongestionControlOptions::legacy(), CongestionControlOptions::balanced(),
+            compound, CongestionControlOptions { proportional_growth: true, ..compound },
+            CongestionControlOptions { compound_growth: false, ..compound },
+            CongestionControlOptions { startup_multiplier: 1.5, ..compound }] {
+            for rtt_ns in [40_000_000, 200_000_000] {
+                let k = cc.recovery_rtts * rtt_ns;
+                for age in [k / 2, k + k / 2, 3 * k, 9 * k, 30 * k] {
+                    let ConnectionState::Connected(mut state) = new_connection_state_connected(None, 0, 1, 1) else { unreachable!() };
+                    state.congestion_event_rate_upps = 8_000_000_000;
+                    state.congestion_event_time_ns = 1_000_000_000;
+                    let mut now = state.congestion_event_time_ns + age;
+                    let mut previous_rate = connection_rate(age, state.congestion_event_rate_upps, k, &cc, false).0;
+                    for cycle in 0..100 {
+                        let active_age = now - state.congestion_event_time_ns;
+                        let before = connection_rate(active_age, state.congestion_event_rate_upps, k, &cc, false).0;
+                        assert!(before >= previous_rate);
+                        let anchor = state.congestion_event_rate_upps;
+                        update_app_limit(&mut state, now, false);
+                        now += 5_000_000_000;
+                        update_app_limit(&mut state, now, false);
+                        assert_eq!(state.congestion_event_rate_upps, anchor);
+                        let idle = connection_rate(state.app_limit_time_offset, anchor, k, &cc, false).0;
+                        assert_eq!(idle, before, "idle cycle {cycle}: {cc:?}");
+                        update_app_limit(&mut state, now, true);
+                        let resumed = connection_rate(now - state.congestion_event_time_ns, anchor, k, &cc, false).0;
+                        assert_eq!(resumed, before, "resume cycle {cycle}: {cc:?}");
+                        previous_rate = resumed;
+                        now += 2_000_000;
+                    }
+                    assert_eq!(state.stats.cc_app_limited_entries, 100);
+                }
+            }
+        }
+    }
 
     #[test]
     fn polynomial_pacing_falls_back_only_for_unmirrored_curves() {

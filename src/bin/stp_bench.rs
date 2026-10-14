@@ -29,7 +29,7 @@
 //! Bitmap: --ack-every 8 --ack-delay-us 1000; Adaptive defaults to 8/10000 us.
 //! --duration S: saturated measurement for S seconds; requests receiver status while sending.
 //! --send-on-ms N --send-off-ms N: application submission duty cycle (queued packets drain normally).
-//! estimator_series rows: [seconds, FEC estimate, sample, sent packets, losses, UDP bytes, RTT us].
+//! estimator_series rows: [seconds, FEC estimate, sample, sent packets, losses, UDP bytes, RTT us, CC pps, app-limited entries].
 //! --fec-pct X (send only): forward error correction redundancy in percent (float); messages of
 //! 2+ packets get X% extra Wirehair-coded blocks. The server needs no flag: it decodes either.
 //! --fec adaptive:v1|v2|v3|span (send only): adaptive redundancy from the connection's own loss
@@ -565,8 +565,8 @@ fn send(a: &Args) {
     let handle = new_network_thread_with_options(vec![kp], 0, max_pps(a), send_buffer_params(a), NetworkThreadOptions { bind_ip: None, congestion_control: cc_options(a), acknowledgements: ack_options(a), pacing: pacing_options(a), polynomial_burst_budget_ns: pacing_burst_budget_ns(a), pacing_diagnostics: a.num::<u32>("pacing-diagnostics", 0) != 0, fec_redundancy_ppm: fec_ppm, fec_adaptive, record_fec_messages: true, loss_trace: a.str("loss-trace").map(std::path::PathBuf::from) });
     // Per data id: (k, blocks sent, blocks planned, loss estimate) of its FEC coding, if coded.
     let mut fec_info: HashMap<u32, (u32, u32, u32, f64)> = HashMap::new();
-    // One sample per second: (t, loss estimate, sample, packets sent/lost, UDP bytes, RTT us).
-    let mut series: Vec<(f64, f64, f64, u64, u64, u64, u64)> = Vec::new();
+    // One sample per second, with the CC command and queue-empty transition count.
+    let mut series: Vec<(f64, f64, f64, u64, u64, u64, u64, f64, u64)> = Vec::new();
     let key = to.to_connection_key();
     let unix_epoch_s = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
     let load_start = load_average();
@@ -702,7 +702,7 @@ fn send(a: &Args) {
         }
         if let Some(s0) = start_ns {
             let t = (ns() - s0) as f64 / 1e9;
-            if series.last().is_none_or(|x| t - x.0 >= 1.0) { series.push((t, stats.fec_loss_estimate, stats.fec_last_loss_sample, stats.packets_sent, stats.packets_lost, stats.bytes_sent, stats.rtt_us)); }
+            if series.last().is_none_or(|x| t - x.0 >= 1.0) { series.push((t, stats.fec_loss_estimate, stats.fec_last_loss_sample, stats.packets_sent, stats.packets_lost, stats.bytes_sent, stats.rtt_us, stats.cc_rate_upps as f64 / 1e6, stats.cc_app_limited_entries)); }
         }
         if produced == count && pending.is_empty() { all_queued = true; }
         for (_, d) in p.received_unreliable_messages {
@@ -873,7 +873,7 @@ fn send(a: &Args) {
         rx.th.recv_queue_dropped_messages, rx.cpu_user_us as f64 / 1e6, rx.cpu_sys_us as f64 / 1e6,
         rx.st.rx_messages_completed, rx.st.rx_partial_evicted, rx.st.rx_partial_evicted_bytes, rx.st.rx_insert_failures, rx.st.rx_stale_fragments,
         bucket_json.join(","),
-        series.iter().map(|x| format!("[{:.1},{:.5},{:.5},{},{},{},{}]", x.0, x.1, x.2, x.3, x.4, x.5, x.6)).collect::<Vec<_>>().join(","), cc_options(a),
+        series.iter().map(|x| format!("[{:.1},{:.5},{:.5},{},{},{},{},{:.3},{}]", x.0, x.1, x.2, x.3, x.4, x.5, x.6, x.7, x.8)).collect::<Vec<_>>().join(","), cc_options(a),
         ack_options(a), stats.ack_packets_sent, stats.ack_bytes_sent, stats.ack_packets_received, stats.ack_delay_us_max, stats.rtt_samples,
         rx.st.ack_packets_sent, rx.st.ack_bytes_sent, rx.st.ack_delay_us_max, sender_cpu_user_us as f64 / 1e6, sender_cpu_sys_us as f64 / 1e6, stats.rtt_us,
         pacing_options(a), a.num::<u32>("pacing-diagnostics", 0) != 0,
