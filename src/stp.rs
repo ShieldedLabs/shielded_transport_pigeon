@@ -1610,6 +1610,7 @@ pub struct ReassemblySlot {
     pub total_len: Option<u32>,
     pub received: Vec<(u32, u32)>, // sorted non-overlapping non-adjacent ranges: [start, end)
     pub package_id: u16,
+    completed: bool,
 }
 
 impl ReassemblySlot {
@@ -1619,6 +1620,7 @@ impl ReassemblySlot {
             total_len: None,
             received: Vec::new(),
             package_id: 0,
+            completed: false,
         }
     }
     
@@ -1631,8 +1633,16 @@ impl ReassemblySlot {
         vec
     }
 
+    fn take_complete(&mut self) -> Vec<u8> {
+        self.completed = true;
+        self.received.clear();
+        self.total_len = None;
+        std::mem::take(&mut self.buf)
+    }
+
     /// returns (success, is_complete)
     pub fn insert(&mut self, offset: usize, data: &[u8], is_fin: bool) -> (bool, bool) {
+        if self.completed { return (true, false); } // fresh-nonce K=1 rescue must not redeliver
 
         let start = offset as u32;
         let end = (offset + data.len()) as u32;
@@ -2661,8 +2671,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                         }
                                         slot.package_id = package_id;
                                         let plain = &mut existing_connection.unreliable_reassembly[slot_idx];
-                                        if (plain.total_len.is_some() || !plain.received.is_empty()) && plain.package_id != package_id && (package_id.wrapping_sub(plain.package_id) as i16) > 0 {
-                                            state.stats.rx_partial_evicted += 1;
+                                        if (plain.completed || plain.total_len.is_some() || !plain.received.is_empty()) && plain.package_id != package_id && (package_id.wrapping_sub(plain.package_id) as i16) > 0 {
+                                            if !plain.completed { state.stats.rx_partial_evicted += 1; }
                                             state.stats.rx_partial_evicted_bytes += plain.bytes_received();
                                             *plain = ReassemblySlot::new();
                                         }
@@ -2727,10 +2737,10 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 // wraps around onto its ID. The nonce above has the same @Todo.
                                 {
                                     let slot = &mut existing_connection.unreliable_reassembly[slot_idx];
-                                    let slot_in_use = slot.total_len.is_some() || !slot.received.is_empty();
+                                    let slot_in_use = slot.completed || slot.total_len.is_some() || !slot.received.is_empty();
                                     if slot_in_use && slot.package_id != package_id {
                                         if (package_id.wrapping_sub(slot.package_id) as i16) < 0 { state.stats.rx_stale_fragments += 1; continue; }
-                                        state.stats.rx_partial_evicted += 1;
+                                        if !slot.completed { state.stats.rx_partial_evicted += 1; }
                                         state.stats.rx_partial_evicted_bytes += slot.bytes_received();
                                         *slot = ReassemblySlot::new();
                                     }
@@ -2756,8 +2766,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 }
                                 if complete {
                                     state.stats.rx_messages_completed += 1;
-                                    let completed = std::mem::replace(&mut existing_connection.unreliable_reassembly[slot_idx], ReassemblySlot::new());
-                                    receive_queue.push(connection_key, completed.buf, MAX_RECV_QUEUE_BYTES);
+                                    let completed = existing_connection.unreliable_reassembly[slot_idx].take_complete();
+                                    receive_queue.push(connection_key, completed, MAX_RECV_QUEUE_BYTES);
                                 }
                             }
 
@@ -4176,6 +4186,21 @@ mod rx_tracker_tests {
 mod fec_closed_loop_tests {
     use super::*;
     use crate::fec_adapt::{AdaptiveFecConfig, FecAdaptiveState};
+
+    #[test]
+    fn completed_raw_package_deduplicates_fresh_nonce_rescue() {
+        let mut slot = ReassemblySlot::new();
+        slot.package_id = 7;
+        assert_eq!(slot.insert(0, &[1, 2, 3], true), (true, true));
+        assert_eq!(slot.take_complete(), vec![1, 2, 3]);
+        assert_eq!(slot.package_id, 7);
+        assert_eq!(slot.insert(0, &[1, 2, 3], true), (true, false));
+        assert!(slot.buf.is_empty());
+        // Receiver replacement for a newer package clears the marker.
+        slot = ReassemblySlot::new();
+        slot.package_id = 1031;
+        assert_eq!(slot.insert(0, &[4, 5, 6], true), (true, true));
+    }
 
     #[test]
     fn retained_rescue_has_fixed_source_and_time_bounds() {
