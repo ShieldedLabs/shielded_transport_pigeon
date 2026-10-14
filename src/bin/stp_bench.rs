@@ -3,6 +3,12 @@
 //!   stp_bench serve --port P [--bind IP] [--advertise IP] [--seed-key HEX64]
 //!   stp_bench send  --to STPADDR [--seed N] [--count N] [--min 100] [--max 50000000]
 //!                   [--timeout 600] [--idle 10] [--out report.json] [--fec-pct 0]
+//!                   [--giant 256M|1G] (one whole framed message, binary units; use FEC)
+//!                   [--giant-warmup S] (wait up to S seconds for TU stabilization; giant default 5)
+//! Report: udp_payload_tu, fec_block_bytes_by_id, receiver_fec_decode_last_tail_ms.
+//! Decode tail uses the receiver clock: last accepted FEC block to delivery, excludes surplus repairs.
+//! Giant demo: send --to STPADDR --giant 1G --fec-pct 3 --timeout 600 --idle 30.
+//! Both endpoints must support extended FEC kind 2 for messages above 64000 source blocks.
 //!
 //! Both: [--queue-us 1000000] [--queue-min 4194304] [--queue-max 67108864] [--max-pps N]
 //! (the send_buffer_params and max_pps given to the STP network thread).
@@ -113,6 +119,7 @@ impl RxReport {
         v.extend_from_slice(&[t.kernel_rx_drops.unwrap_or(u64::MAX), t.max_loop_gap_ns, t.loop_gaps_over_1ms, t.loop_gaps_over_10ms, t.loop_gaps_over_100ms,
             t.loop_iterations, t.recv_queue_dropped_messages, self.cpu_user_us, self.cpu_sys_us,
             s.rx_messages_completed, s.rx_partial_evicted, s.rx_partial_evicted_bytes, s.rx_insert_failures, s.rx_stale_fragments]);
+        v.extend_from_slice(&[s.fec_decode_last_tail_ns, s.fec_decode_max_tail_ns, s.fec_ingress_dropped_blocks, s.udp_payload_tu]);
         v
     }
     const WORDS: usize = 28;
@@ -120,6 +127,10 @@ impl RxReport {
         if w.len() < Self::WORDS { return None; }
         let mut st = ConnectionStats { rx_packets: w[0], rx_seq_span: w[1], rx_lost: w[2], rx_reordered: w[3], rx_late_beyond_window: w[4], rx_duplicates: w[5], rx_bursts: w[6], ..Default::default() };
         st.rx_burst_hist.copy_from_slice(&w[7..14]);
+        st.fec_decode_last_tail_ns = w.get(28).copied().unwrap_or(0);
+        st.fec_decode_max_tail_ns = w.get(29).copied().unwrap_or(0);
+        st.fec_ingress_dropped_blocks = w.get(30).copied().unwrap_or(0);
+        st.udp_payload_tu = w.get(31).copied().unwrap_or(0);
         (st.rx_messages_completed, st.rx_partial_evicted, st.rx_partial_evicted_bytes, st.rx_insert_failures, st.rx_stale_fragments) = (w[23], w[24], w[25], w[26], w[27]);
         let th = NetworkThreadStats { kernel_rx_drops: if w[14] == u64::MAX { None } else { Some(w[14]) }, max_loop_gap_ns: w[15], loop_gaps_over_1ms: w[16],
             loop_gaps_over_10ms: w[17], loop_gaps_over_100ms: w[18], loop_iterations: w[19], recv_queue_dropped_messages: w[20] };
@@ -312,6 +323,19 @@ fn pct(sorted: &[f64], p: f64) -> Option<f64> {
 
 fn jnum(v: Option<f64>) -> String { v.map(|x| format!("{x:.3}")).unwrap_or("null".into()) }
 
+/// Demo sizes are whole framed messages, not an extra 40-byte header on top.
+fn giant_size(s: &str) -> Option<usize> {
+    let (number, scale) = match s.strip_suffix('G').or_else(|| s.strip_suffix("GiB")) {
+        Some(n) => (n, 1usize << 30),
+        None => match s.strip_suffix('M').or_else(|| s.strip_suffix("MiB")) {
+            Some(n) => (n, 1usize << 20),
+            None => (s, 1),
+        },
+    };
+    let bytes = number.parse::<usize>().ok()?.checked_mul(scale)?;
+    (HEADER..=MAX_JUMBOGRAM_LEN).contains(&bytes).then_some(bytes)
+}
+
 type Outbox = Vec<(ConnectionKey, Vec<u8>)>;
 type Wanted = Vec<(STPAddress, [u8; 64])>;
 
@@ -325,9 +349,10 @@ fn poll(handle: &NetworkThreadHandle, outbox: &mut Outbox, wanted: &mut Wanted) 
 fn send(a: &Args) {
     let to = STPAddress::parse(a.str("to").unwrap_or_else(|| die("send needs --to STPADDR"))).unwrap_or_else(|| die("bad --to address"));
     let seed: u64 = a.num("seed", 1);
-    let count: u32 = a.num("count", 60);
-    let mut min: usize = a.num("min", 100);
-    let max: usize = a.num("max", 50_000_000);
+    let giant = a.str("giant").map(|s| giant_size(s).unwrap_or_else(|| die("--giant needs a byte count, 256M or 1G (binary units, whole framed message)")));
+    let count: u32 = if giant.is_some() { 1 } else { a.num("count", 60) };
+    let mut min: usize = giant.unwrap_or_else(|| a.num("min", 100));
+    let max: usize = giant.unwrap_or_else(|| a.num("max", 50_000_000));
     let timeout = Duration::from_secs(a.num("duration", a.num("timeout", 600)));
     let idle = Duration::from_secs(a.num("idle", 10));
     let out = a.str("out").unwrap_or("stp_bench_report.json").to_string();
@@ -369,7 +394,8 @@ fn send(a: &Args) {
     // Sizes are log-uniform in [min, max] (whole framed message), deterministic from the seed;
     // the send order is a seeded shuffle of the ids.
     let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(seed);
-    let classes: Option<Vec<(usize, u32)>> = match a.str("mix").unwrap_or("loguniform") {
+    let classes: Option<Vec<(usize, u32)>> = match if giant.is_some() { "giant" } else { a.str("mix").unwrap_or("loguniform") } {
+        "giant" => Some(vec![(giant.unwrap(), 1)]),
         "loguniform" => None,
         "classes" => Some(a.str("classes").unwrap_or("1000:200,65536:200,1048576:50,5242880:20,52428800:5").split(',').map(|c| {
             let (sz, n) = c.split_once(':').unwrap_or_else(|| die("bad --classes"));
@@ -463,6 +489,25 @@ fn send(a: &Args) {
     let (rtt_min_ns, offset) = pings.first().copied().unwrap_or_else(|| die("no ping replies"));
     let rtt_median_ns = pings[pings.len() / 2].0;
     println!("idle RTT: min {:.3} ms, median {:.3} ms ({} of {} pings answered)", rtt_min_ns as f64 / 1e6, rtt_median_ns as f64 / 1e6, pings.len(), sent_pings);
+
+    // A giant fixes its symbol size for the entire transfer. Observe TU stabilization
+    // before encoding so cold 1200B symbols do not cap per-packet throughput on a 1472B path.
+    let warmup_s: f64 = a.num("giant-warmup", if giant.is_some() { 5.0 } else { 0.0 });
+    if !warmup_s.is_finite() || !(0.0..=60.0).contains(&warmup_s) { die("--giant-warmup must be in 0..=60 seconds"); }
+    let warm_start = Instant::now();
+    let mut tu_changed = warm_start;
+    let mut observed_tu = 0;
+    let stable_for = Duration::from_nanos((3 * rtt_median_ns).max(500_000_000));
+    while warm_start.elapsed() < Duration::from_secs_f64(warmup_s) {
+        let p = poll(&handle, &mut outbox, &mut wanted);
+        if let Some((_, st)) = p.connection_stats.iter().find(|(k, _)| *k == key) {
+            if st.udp_payload_tu != observed_tu { observed_tu = st.udp_payload_tu; tu_changed = Instant::now(); }
+        }
+        if warm_start.elapsed() >= Duration::from_secs(1) && tu_changed.elapsed() >= stable_for { break; }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let warmup_elapsed_s = warm_start.elapsed().as_secs_f64();
+    if warmup_s > 0.0 { println!("TU warm-up: {warmup_elapsed_s:.3}s, UDP payload TU {observed_tu}B"); }
 
     // Back-pressured send loop: hand over only what the connection's queue reports room for
     // (one message when it is empty, whatever its size); anything rejected goes back in front.
@@ -661,7 +706,7 @@ fn send(a: &Args) {
     println!("all       latency p50 {} ms, p99 {} ms", jnum(pct(&all_lat, 50.0)), jnum(pct(&all_lat, 99.0)));
 
     let sbp = send_buffer_params(a);
-    let json = format!(concat!("{{\"to\":\"{:?}\",\"seed\":{},\"min\":{},\"max\":{},\"send_buffer_params\":[{},{},{}],\"fec_pct\":{},\"fec_mode\":\"{}\",\"fec_adaptive\":\"{}\",\"drop_schedule\":\"{}\",",
+    let mut json = format!(concat!("{{\"to\":\"{:?}\",\"seed\":{},\"min\":{},\"max\":{},\"send_buffer_params\":[{},{},{}],\"fec_pct\":{},\"fec_mode\":\"{}\",\"fec_adaptive\":\"{}\",\"drop_schedule\":\"{}\",",
         "\"total_messages\":{},\"total_bytes\":{},\"delivered\":{},\"delivered_bytes\":{},\"corrupt\":{},\"lost\":{},\"stop_reason\":\"{}\",",
         "\"data_start_unix_seconds\":{:.6},\"wall_seconds\":{:.6},\"status_confirmed_seconds\":{:.6},\"goodput_MBps\":{:.3},\"goodput_Mbitps\":{:.3},",
         "\"rtt_ms_min\":{:.3},\"rtt_ms_median\":{:.3},\"rejected_submissions\":{},\"generator_wait_seconds\":{:.6},",
@@ -691,6 +736,11 @@ fn send(a: &Args) {
         rx.st.rx_messages_completed, rx.st.rx_partial_evicted, rx.st.rx_partial_evicted_bytes, rx.st.rx_insert_failures, rx.st.rx_stale_fragments,
         bucket_json.join(","),
         series.iter().map(|x| format!("[{:.1},{:.5},{:.5},{},{},{},{}]", x.0, x.1, x.2, x.3, x.4, x.5, x.6)).collect::<Vec<_>>().join(","), cc_options(a));
+    let block_sizes = fec_info.iter().map(|(&id, &(k, _, _, _))| format!("\"{id}\":{}", sizes[id as usize].div_ceil(k as usize))).collect::<Vec<_>>().join(",");
+    json.insert_str(json.len() - 2, &format!(",\"udp_payload_tu\":{},\"fec_block_bytes_by_id\":{{{block_sizes}}},\"tu_warmup_seconds\":{warmup_elapsed_s:.6},\"receiver_fec_decode_last_tail_ms\":{:.3},\"receiver_fec_decode_max_tail_ms\":{:.3},\"receiver_fec_ingress_dropped_blocks\":{}",
+        stats.udp_payload_tu, rx.st.fec_decode_last_tail_ns as f64 / 1e6, rx.st.fec_decode_max_tail_ns as f64 / 1e6, rx.st.fec_ingress_dropped_blocks));
+    println!("UDP TU {}B | FEC blocks {{{block_sizes}}}B | receiver FEC last/max decode tail {:.3}/{:.3}ms | ingress erased {} blocks",
+        stats.udp_payload_tu, rx.st.fec_decode_last_tail_ns as f64 / 1e6, rx.st.fec_decode_max_tail_ns as f64 / 1e6, rx.st.fec_ingress_dropped_blocks);
     std::fs::write(&out, json).unwrap_or_else(|e| die(&format!("writing {out}: {e}")));
     println!("report written to {out}");
     std::process::exit(if delivered == count as u64 { 0 } else { 1 });

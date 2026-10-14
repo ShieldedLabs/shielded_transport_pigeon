@@ -464,8 +464,8 @@ pub struct FecSendSlot {
 }
 
 enum FecEncoderState {
-    Pending(std::sync::mpsc::Receiver<Option<crate::fec::Encoder>>),
-    Ready(crate::fec::Encoder),
+    Pending(std::sync::mpsc::Receiver<Option<crate::fec::MessageEncoder>>),
+    Ready(crate::fec::MessageEncoder),
     Failed,
 }
 
@@ -481,6 +481,8 @@ impl std::fmt::Debug for FecSendSlot {
 ///   word1: bits 0..32 message length, bits 32..48 block bytes, bits 48..56 kind (1 = FEC), rest 0
 pub const STP_FEC_FRAGMENT_HEADER_SIZE: usize = 16;
 pub const STP_EXT_KIND_FEC: u64 = 1;
+/// Balanced groups of <=32000 blocks, inferred from length/block size; same 16-byte header.
+pub const STP_EXT_KIND_GROUPED_FEC: u64 = 2;
 /// Redundancy is capped at 100% (n = 2k).
 pub const MAX_FEC_REDUNDANCY_PPM: u32 = 1_000_000;
 /// Messages with at most this many blocks have their Wirehair encoder/decoder run inline on
@@ -519,8 +521,14 @@ impl UnreliableSendBuffer {
         f.lost += 1;
         if let Some(a) = &self.fec_adaptive {
             if a.tracker.config().topup {
-                let n = a.topped_up_blocks(f.k as u64, f.lost as u64, f.loss_estimate).min(u32::MAX as u64) as u32;
-                f.n = f.n.max(n);
+                let layout = crate::fec::MessageLayout::new(f.message.len(), f.block_bytes).unwrap();
+                let group_k = layout.group(0).1 as u64;
+                // Interleaving spreads aggregate erasures across groups. Size the variance
+                // margin at group K, not whole-message K, and protect each group equally.
+                let group_lost = (f.lost as u64).div_ceil(layout.groups as u64);
+                let group_n = a.topped_up_blocks(group_k, group_lost, f.loss_estimate);
+                let n = f.k as u64 + group_n.saturating_sub(group_k) * layout.groups as u64;
+                f.n = f.n.max(layout.round_plan(n.min(u32::MAX as u64) as u32));
             }
         }
     }
@@ -600,8 +608,14 @@ impl UnreliableSendBuffer {
                     tag[..l].copy_from_slice(&f.message[..l]);
                     rec.push(crate::fec_adapt::FecMessageInfo { tag: u64::from_le_bytes(tag), message_len: f.message.len(), k: f.k, n_planned: f.n_planned, n_sent: f.next_id, loss_estimate: f.loss_estimate, lost_during_send: f.lost });
                 }
-                self.queue_bytes_filled -= f.message.len();
-                self.fec_send_slot = None;
+                let message_len = f.message.len();
+                self.queue_bytes_filled -= message_len;
+                let finished = self.fec_send_slot.take();
+                // Giant codec arenas can take seconds to free under allocator contention.
+                // Do not stop ACK processing while returning them (and the source Arc).
+                if message_len > MAX_RECV_QUEUE_BYTES {
+                    let _ = std::thread::Builder::new().name("stp-fec-release".into()).spawn(move || drop(finished));
+                }
                 self.send_package_id = self.send_package_id.wrapping_add(1);
             }
         }
@@ -609,38 +623,41 @@ impl UnreliableSendBuffer {
 
     /// Block size for an FEC message started in a packet with `payload_len` bytes of payload:
     /// one block plus its header fills the packet. None if the message should go plain (FEC
-    /// off, or fewer than 2 / more than 64000 blocks).
+    /// off, fewer than 2 blocks, or outside the grouped wire length limit).
     fn fec_block_bytes(&self, message_len: usize, payload_len: usize) -> Option<usize> {
         if self.fec_redundancy_ppm == 0 { return None; }
         let block_bytes = payload_len.checked_sub(STP_FEC_FRAGMENT_HEADER_SIZE)?.min(0x3fff);
-        crate::fec::block_count(message_len, block_bytes)?;
+        crate::fec::MessageLayout::new(message_len, block_bytes)?;
         Some(block_bytes)
     }
 
     fn start_fec(&mut self, message: std::sync::Arc<Vec<u8>>, block_bytes: usize) {
-        let k = crate::fec::block_count(message.len(), block_bytes).unwrap() as u32;
+        let layout = crate::fec::MessageLayout::new(message.len(), block_bytes).unwrap();
+        let k = layout.k as u32;
+        let group_k = layout.group(0).1 as u32;
         let (n, loss_estimate) = match &self.fec_adaptive {
-            Some(a) => (k + a.repair_blocks(k as u64).min(k as u64) as u32, a.p),
+            Some(a) => (k + a.repair_blocks(group_k as u64).min(group_k as u64) as u32 * layout.groups as u32, a.p),
             None => {
                 let ppm = self.fec_redundancy_ppm.min(MAX_FEC_REDUNDANCY_PPM) as u64;
                 (k + ((k as u64 * ppm + 999_999) / 1_000_000) as u32, 0.0)
             }
         };
+        let n = layout.round_plan(n);
         let encoder = if k as usize <= FEC_INLINE_MAX_BLOCKS {
-            match crate::fec::encode(message.clone(), block_bytes) { Some(e) => FecEncoderState::Ready(e), None => FecEncoderState::Failed }
+            match crate::fec::encode_message(message.clone(), block_bytes) { Some(e) => FecEncoderState::Ready(e), None => FecEncoderState::Failed }
         } else {
             let (tx, rx) = std::sync::mpsc::sync_channel(1);
             let m = message.clone();
-            match std::thread::Builder::new().name("stp-fec-encode".into()).spawn(move || { let _ = tx.send(crate::fec::encode(m, block_bytes)); }) {
+            match std::thread::Builder::new().name("stp-fec-encode".into()).spawn(move || { let _ = tx.send(crate::fec::encode_message(m, block_bytes)); }) {
                 Ok(_) => FecEncoderState::Pending(rx),
-                Err(_) => match crate::fec::encode(message.clone(), block_bytes) { Some(e) => FecEncoderState::Ready(e), None => FecEncoderState::Failed },
+                Err(_) => match crate::fec::encode_message(message.clone(), block_bytes) { Some(e) => FecEncoderState::Ready(e), None => FecEncoderState::Failed },
             }
         };
         self.fec_send_slot = Some(FecSendSlot { message, block_bytes, k, n, next_id: 0, encoder, block_buf: vec![0u8; block_bytes], first_seq: self.next_packet_seq, lost: 0, n_planned: n, loss_estimate });
     }
 
-    /// Starts `msg` as the message being sent: FEC-coded if enabled and it has 2..=64000 blocks
-    /// at this packet size, plain otherwise.
+    /// Starts `msg` as the message being sent: grouped FEC if enabled and its length fits
+    /// the wire format with at least two blocks at this packet size, plain otherwise.
     fn start_message(&mut self, msg: Vec<u8>, payload_len: usize) {
         match self.fec_block_bytes(msg.len(), payload_len) {
             Some(block_bytes) => self.start_fec(std::sync::Arc::new(msg), block_bytes),
@@ -658,7 +675,7 @@ impl UnreliableSendBuffer {
             self.start_message(front_msg, payload_len);
         }
         if self.fec_send_slot.is_some() {
-            let need = { let f = self.fec_send_slot.as_ref().unwrap(); STP_FEC_FRAGMENT_HEADER_SIZE + crate::fec::block_len(f.message.len(), f.block_bytes, f.next_id) };
+            let need = { let f = self.fec_send_slot.as_ref().unwrap(); STP_FEC_FRAGMENT_HEADER_SIZE + crate::fec::block_len(f.message.len(), f.block_bytes, crate::fec::MessageLayout::new(f.message.len(), f.block_bytes).unwrap().wire_id(f.next_id)) };
             if need > space {
                 if space < payload_len { return None; } // the next packet has room
                 // The transmission unit shrank below the block size (black hole fallback; it
@@ -696,7 +713,7 @@ impl UnreliableSendBuffer {
             let f = self.fec_send_slot.as_ref().unwrap();
             if f.next_id >= f.n { return self.next_fragment(payload_len, space); }
             let f = self.fec_send_slot.as_mut().unwrap();
-            let id = f.next_id;
+            let id = crate::fec::MessageLayout::new(f.message.len(), f.block_bytes).unwrap().wire_id(f.next_id);
             if let Some(len) = repair_len {
                 f.next_id += 1;
                 return Some(UnreliableFragment::Fec { package_id, message_len: f.message.len() as u32, block_bytes: f.block_bytes as u16, block_id: id, data: &f.block_buf[..len] });
@@ -768,7 +785,9 @@ impl ReceiveQueue {
     }
 }
 
-fn fill_packet_payload_with_unreliable_fragments(payload: &mut [u8], unreliable_send_buffer: &mut UnreliableSendBuffer) -> bool {
+/// Returns the used payload length (0 when there is nothing to send). Real data
+/// payloads are at least 517 bytes: exactly 516 is reserved for size-identified ACKs.
+fn fill_packet_payload_with_unreliable_fragments(payload: &mut [u8], unreliable_send_buffer: &mut UnreliableSendBuffer) -> usize {
     let mut send = false;
     let mut cursor = 0;
     let payload_len = payload.len();
@@ -783,7 +802,8 @@ fn fill_packet_payload_with_unreliable_fragments(payload: &mut [u8], unreliable_
             }
             UnreliableFragment::Fec { package_id, message_len, block_bytes, block_id, data } => {
                 let word0 = 1 | ((package_id as u64) << 2) | ((data.len() as u64 & 0x3fff) << 18) | ((block_id as u64) << 32);
-                let word1 = message_len as u64 | ((block_bytes as u64) << 32) | (STP_EXT_KIND_FEC << 48);
+                let kind = if message_len as usize > crate::fec::MAX_BLOCKS * block_bytes as usize { STP_EXT_KIND_GROUPED_FEC } else { STP_EXT_KIND_FEC };
+                let word1 = message_len as u64 | ((block_bytes as u64) << 32) | (kind << 48);
                 store_u64(&mut payload[cursor..cursor+8], word0);
                 store_u64(&mut payload[cursor+8..cursor+16], word1);
                 data.write_to(&mut payload[cursor+STP_FEC_FRAGMENT_HEADER_SIZE..]);
@@ -791,12 +811,10 @@ fn fill_packet_payload_with_unreliable_fragments(payload: &mut [u8], unreliable_
             }
         }
     }
-    if send == false { return false; }
-    while cursor < payload.len() {
-        payload[cursor] = 0xff;
-        cursor += 1;
-    }
-    return true;
+    if send == false { return 0; }
+    let used = cursor.max(517).min(payload.len());
+    payload[cursor..].fill(0xff);
+    used
 }
 
 #[derive(Debug)]
@@ -1010,6 +1028,8 @@ pub const RATE_FLOOR_UPPS: u64 = 100 * 1_000_000;
 pub struct ConnectionStats {
     /// Current smoothed RTT in microseconds (0 until sampled).
     pub rtt_us: u64,
+    /// Current path transmission unit, including STP header/tag inside the UDP payload.
+    pub udp_payload_tu: u64,
     /// Sequenced packets sent (data and keepalive), and their UDP payload bytes. Acks,
     /// handshake packets and transmission-unit probes are not counted.
     pub packets_sent: u64,
@@ -1063,6 +1083,12 @@ pub struct ConnectionStats {
     pub rx_insert_failures: u64,
     /// Fragments of a package older than the one holding their slot (dropped).
     pub rx_stale_fragments: u64,
+    /// Worker delivery minus its last successfully enqueued FEC fragment, on receiver's
+    /// monotonic clock. Completion can precede surplus repair packets arriving.
+    pub fec_decode_last_tail_ns: u64,
+    pub fec_decode_max_tail_ns: u64,
+    /// Authenticated FEC fragments erased by the bounded decoder ingress queue.
+    pub fec_ingress_dropped_blocks: u64,
 }
 
 /// Burst-length class boundaries of `ConnectionStats::rx_burst_hist` (inclusive upper bounds).
@@ -1451,6 +1477,8 @@ pub struct FecRecvSlot {
     state: FecRecvState,
     /// Blocks handed to this slot's decoder (for loss accounting on eviction).
     blocks_received: u32,
+    last_block_ns: u64,
+    ingress_dropped: u64,
 }
 
 #[derive(Default)]
@@ -1458,11 +1486,10 @@ enum FecRecvState {
     #[default]
     Empty,
     /// Small message: decoded on the network thread.
-    Inline(crate::fec::Decoder),
-    /// Big message: blocks are handed to a decoder thread, which delivers the message through
-    /// the network thread's completion channel. Dropping the sender (eviction, disconnect)
-    /// ends that thread and frees the decoder.
-    Worker { tx: std::sync::mpsc::Sender<(u32, Vec<u8>)>, message_len: usize, block_bytes: usize },
+    Inline(crate::fec::MessageDecoder),
+    /// Big message: a byte-bounded, nonblocking ingress queue feeds a decoder thread.
+    /// Dropping the sender (eviction, disconnect) ends it and frees the decoder.
+    Worker { tx: std::sync::mpsc::SyncSender<(u32, Vec<u8>)>, message_len: usize, block_bytes: usize },
     /// Delivered (or given up): late surplus blocks of this package are ignored.
     Done,
 }
@@ -1490,13 +1517,21 @@ impl FecRecvSlot {
     }
 }
 
-/// Decoder threads per network thread; past this, big messages are decoded inline (slower for
-/// the network thread, but bounded in threads).
+/// Decoder threads per network thread; overload drops a new large message, never
+/// runs a giant solve on the network thread. Small (<=256-block) messages stay inline.
 pub const MAX_FEC_DECODE_WORKERS: usize = 8;
+/// Process-wide admission budget, conservatively charging 3x message bytes for output
+/// plus Wirehair working buffers. Ingress queues are separately capped at 32 MiB/worker.
+pub const MAX_FEC_DECODE_RESERVED_BYTES: usize = 3 << 30;
+pub const MAX_FEC_INGRESS_BYTES: usize = 32 << 20;
+static FEC_DECODE_RESERVED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-struct FecWorkerGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+struct FecWorkerGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>, usize);
 impl Drop for FecWorkerGuard {
-    fn drop(&mut self) { self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel); }
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        FEC_DECODE_RESERVED.fetch_sub(self.1, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 /// Handles one received FEC fragment for the package in `slot` (the caller has already made
@@ -1510,7 +1545,7 @@ fn fec_receive_block(
     if matches!(slot.state, FecRecvState::Done) { return None; }
     slot.blocks_received += 1;
     // A block of the wrong length can never decode; drop it.
-    let k = block_count(message_len, block_bytes)?;
+    let k = MessageLayout::new(message_len, block_bytes)?.k;
     let expect = if (block_id as usize) < k { block_len(message_len, block_bytes, block_id) } else { block_bytes };
     if data.len() != expect { return None; }
     if slot.params().is_some_and(|p| p != (message_len, block_bytes)) {
@@ -1518,32 +1553,29 @@ fn fec_receive_block(
         slot.state = FecRecvState::Empty;
     }
     if !slot.in_use() {
-        let use_worker = k > FEC_INLINE_MAX_BLOCKS && workers.load(std::sync::atomic::Ordering::Acquire) < MAX_FEC_DECODE_WORKERS;
+        let reserve = message_len.checked_mul(3)?;
+        let use_worker = k > FEC_INLINE_MAX_BLOCKS && workers.load(std::sync::atomic::Ordering::Acquire) < MAX_FEC_DECODE_WORKERS
+            && FEC_DECODE_RESERVED.fetch_update(std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire,
+                |used| used.checked_add(reserve).filter(|&next| next <= MAX_FEC_DECODE_RESERVED_BYTES)).is_ok();
         let mut spawned = None;
         if use_worker {
-            let (tx, rx) = std::sync::mpsc::channel::<(u32, Vec<u8>)>();
+            let (tx, rx) = std::sync::mpsc::sync_channel::<(u32, Vec<u8>)>((MAX_FEC_INGRESS_BYTES / block_bytes).max(1));
             let done_tx = done_tx.clone();
             workers.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-            let guard = FecWorkerGuard(workers.clone());
+            let guard = FecWorkerGuard(workers.clone(), reserve);
             let r = std::thread::Builder::new().name("stp-fec-decode".into()).spawn(move || {
                 let _guard = guard;
-                let Some(mut dec) = Decoder::new(message_len, block_bytes) else { return; };
-                while let Ok((id, block)) = rx.recv() {
-                    match dec.add(id, &block) {
-                        Ok(DecodeStatus::NeedMore) | Err(DecodeError::BadBlock) => {}
-                        Ok(DecodeStatus::Done) => {
-                            if let Some(m) = dec.recover() { let _ = done_tx.send((connection_key, package_id, m)); }
-                            return;
-                        }
-                        Err(DecodeError::Failed(_)) => return,
-                    }
+                let Some(layout) = MessageLayout::new(message_len, block_bytes) else { return; };
+                if let Some(m) = decode_message_blocks(layout, rx, MAX_FEC_INGRESS_BYTES) {
+                    let _ = done_tx.send((connection_key, package_id, m));
                 }
             });
             if r.is_ok() { spawned = Some(tx); }
         }
         slot.state = match spawned {
             Some(tx) => FecRecvState::Worker { tx, message_len, block_bytes },
-            None => match Decoder::new(message_len, block_bytes) { Some(d) => FecRecvState::Inline(d), None => FecRecvState::Done },
+            None if k <= FEC_INLINE_MAX_BLOCKS => match MessageDecoder::new(message_len, block_bytes) { Some(d) => FecRecvState::Inline(d), None => FecRecvState::Done },
+            None => FecRecvState::Done,
         };
     }
     match &mut slot.state {
@@ -1554,7 +1586,11 @@ fn fec_receive_block(
         },
         FecRecvState::Worker { tx, .. } => {
             // The worker is gone once it has decoded (or failed): nothing more to do.
-            if tx.send((block_id, data.to_vec())).is_err() { slot.state = FecRecvState::Done; }
+            match tx.try_send((block_id, data.to_vec())) {
+                Ok(()) => slot.last_block_ns = monotonic_clock_ns(),
+                Err(std::sync::mpsc::TrySendError::Full(_)) => slot.ingress_dropped += 1, // an erasure, not a network-thread stall
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => slot.state = FecRecvState::Done,
+            }
             None
         }
         _ => None,
@@ -1562,8 +1598,9 @@ fn fec_receive_block(
 }
 
 // Largest unreliable message a receiver reassembles; a peer sending a bigger one is disconnected.
-// Was 8 MiB (1 << 23); raised so 50 MB messages can be sent. Both ends need the raised value.
-pub const MAX_JUMBOGRAM_LEN: usize = 1 << 26;
+// u32 lengths and offsets fit 1 GiB; FEC kind 2 partitions it into bounded Wirehair codecs.
+// Both ends need this limit (and kind 2 support for messages above 64000 packets).
+pub const MAX_JUMBOGRAM_LEN: usize = 1 << 30;
 
 pub const ACK_BUFFER_TIME_NS: u64 = 50_000_000;
 
@@ -1863,6 +1900,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                     ConnectionState::Connected(c) => {
                         let mut st = c.stats;
                         st.seq_numbers_used = c.send_sequence_number;
+                        st.udp_payload_tu = c.current_tu;
                         c.rx_tracker.provisional_bursts(&mut st);
                         if let Some(a) = &value.unreliable_send_buffer.fec_adaptive {
                             st.fec_loss_estimate = a.p;
@@ -2411,7 +2449,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     let word1 = load_u64(&remaining_payload[8..16]);
                                     let data = &remaining_payload[STP_FEC_FRAGMENT_HEADER_SIZE..STP_FEC_FRAGMENT_HEADER_SIZE + data_len];
                                     remaining_payload = &remaining_payload[STP_FEC_FRAGMENT_HEADER_SIZE + data_len..];
-                                    if (word1 >> 48) & 0xff != STP_EXT_KIND_FEC { continue; } // unknown kind: skip it
+                                    let kind = (word1 >> 48) & 0xff;
+                                    if kind != STP_EXT_KIND_FEC && kind != STP_EXT_KIND_GROUPED_FEC { continue; } // unknown kind: skip it
                                     let package_id = ((header >> 2) & 0xffff) as u16;
                                     let block_id = (header >> 32) as u32;
                                     let message_len = (word1 & 0xffff_ffff) as usize;
@@ -2421,6 +2460,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                         connections_map.remove(&connection_key);
                                         break 'conn;
                                     }
+                                    let Some(layout) = crate::fec::MessageLayout::new(message_len, block_bytes) else { continue; };
+                                    if (kind == STP_EXT_KIND_GROUPED_FEC) != (layout.groups > 1) { continue; }
                                     let slot_idx = package_id as usize % existing_connection.unreliable_fec.len();
                                     {
                                         // Same eviction rule as plain packages below, across both rings.
@@ -2441,10 +2482,12 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                             *plain = ReassemblySlot::new();
                                         }
                                     }
+                                    let dropped_before = existing_connection.unreliable_fec[slot_idx].ingress_dropped;
                                     if let Some(message) = fec_receive_block(&mut existing_connection.unreliable_fec[slot_idx], connection_key, package_id, message_len, block_bytes, block_id, data, &fec_done_tx, &fec_workers) {
                                         state.stats.rx_messages_completed += 1;
                                         receive_queue.push(connection_key, message, MAX_RECV_QUEUE_BYTES);
                                     }
+                                    state.stats.fec_ingress_dropped_blocks += existing_connection.unreliable_fec[slot_idx].ingress_dropped - dropped_before;
                                     continue;
                                 }
                                 
@@ -2535,8 +2578,14 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                     if let Some(conn) = connections_map.get_mut(&key) {
                         let idx = package_id as usize % conn.unreliable_fec.len();
                         let slot = &mut conn.unreliable_fec[idx];
-                        if slot.package_id == package_id && slot.in_use() { slot.state = FecRecvState::Done; }
-                        if let ConnectionState::Connected(c) = &mut conn.connection_state { c.stats.rx_messages_completed += 1; }
+                        if slot.package_id != package_id || !slot.in_use() { continue; } // evicted worker completion
+                        let tail = monotonic_clock_ns().saturating_sub(slot.last_block_ns);
+                        slot.state = FecRecvState::Done;
+                        if let ConnectionState::Connected(c) = &mut conn.connection_state {
+                            c.stats.rx_messages_completed += 1;
+                            c.stats.fec_decode_last_tail_ns = tail;
+                            c.stats.fec_decode_max_tail_ns = c.stats.fec_decode_max_tail_ns.max(tail);
+                        }
                         receive_queue.push(key, message, MAX_RECV_QUEUE_BYTES);
                     }
                 }
@@ -2938,9 +2987,11 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             }
                             if record_fec_messages && buf.fec_record.is_none() { buf.fec_record = Some(Vec::new()); }
                         }
+                        let mut unreliable_payload_size = 0;
                         while state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY - 1 && packet_send_allowance_now > 0 && state.packets_in_flight < allowed_packets_in_flight && {
                             connection_tracking_data.unreliable_send_buffer.next_packet_seq = state.send_sequence_number;
-                            fill_packet_payload_with_unreliable_fragments(&mut packet_memory_send[0..payload_size], &mut connection_tracking_data.unreliable_send_buffer)
+                            unreliable_payload_size = fill_packet_payload_with_unreliable_fragments(&mut packet_memory_send[0..payload_size], &mut connection_tracking_data.unreliable_send_buffer);
+                            unreliable_payload_size > 0
                         } {
                         
                             let virtual_nonce = state.send_sequence_number;
@@ -2949,11 +3000,11 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
 
                             let packet_len;
                             if let Some(cipher) = &mut state.cipher {
-                                packet_len = cipher.current.write_message(virtual_nonce, &packet_memory_send[0..payload_size], &mut packet_memory_encrypted[6..]).unwrap();
+                                packet_len = cipher.current.write_message(virtual_nonce, &packet_memory_send[0..unreliable_payload_size], &mut packet_memory_encrypted[6..]).unwrap();
                             }
                             else {
-                                (&packet_memory_send[0..payload_size]).write_to(&mut packet_memory_encrypted[6..]);
-                                packet_len = payload_size;
+                                (&packet_memory_send[0..unreliable_payload_size]).write_to(&mut packet_memory_encrypted[6..]);
+                                packet_len = unreliable_payload_size;
                             }
 
                             should_sleep = false;
@@ -3299,7 +3350,7 @@ mod fec_send_tests {
             let pkg = ((h >> 2) & 0xffff) as u16;
             if h & 1 != 0 {
                 let w1 = load_u64(&p[8..16]);
-                assert_eq!(w1 >> 48, STP_EXT_KIND_FEC);
+                assert!(matches!(w1 >> 48, STP_EXT_KIND_FEC | STP_EXT_KIND_GROUPED_FEC));
                 out.push((pkg, Some(((w1 & 0xffff_ffff) as usize, ((w1 >> 32) & 0xffff) as usize, (h >> 32) as u32)), false, 0, p[16..16 + len].to_vec()));
                 p = &p[16 + len..];
             } else {
@@ -3315,7 +3366,7 @@ mod fec_send_tests {
         let mut packets = Vec::new();
         let mut mem = vec![0u8; payload_len];
         while packets.len() < max_packets {
-            if fill_packet_payload_with_unreliable_fragments(&mut mem, buf) {
+            if fill_packet_payload_with_unreliable_fragments(&mut mem, buf) > 0 {
                 packets.push(parse_packet(&mem));
             } else if buf.has_unsent_data() {
                 std::thread::sleep(std::time::Duration::from_millis(1));
@@ -3416,6 +3467,106 @@ mod fec_send_tests {
         check_fec(&rest, 1, &m, 100_000, 0);
         first.clear();
         assert_eq!(b.queue_bytes_filled, 0);
+    }
+
+    #[test]
+    fn trimmed_data_never_uses_ack_size() {
+        let mut payload = vec![0; 9194];
+        for len in [0, 1, 500, 508, 509, 600] {
+            let mut b = new_buf(0);
+            b.submit_messages(vec![vec![7; len]]);
+            let used = fill_packet_payload_with_unreliable_fragments(&mut payload, &mut b);
+            assert_eq!(used, (len + STP_FRAGMENT_HEADER_SIZE).max(517));
+            assert!(used > 516);
+            let f = parse_packet(&payload[..used]);
+            assert_eq!(f[0].4, vec![7; len]);
+        }
+        let mut b = new_buf(100_000);
+        b.submit_messages(vec![vec![9; 200_000]]);
+        let mut small = vec![0; 1162];
+        assert_eq!(fill_packet_payload_with_unreliable_fragments(&mut small, &mut b), 1162);
+        // TU grew after coding started: do not pay 288B of padding per block.
+        let mut grown = vec![0; 1450];
+        assert_eq!(fill_packet_payload_with_unreliable_fragments(&mut grown, &mut b), 1162);
+    }
+
+    #[test]
+    fn grouped_wire_round_trip_and_overload_admission() {
+        let payload_len = 48;
+        let m = msg(64001 * (payload_len - STP_FEC_FRAGMENT_HEADER_SIZE) - 1);
+        let layout = crate::fec::MessageLayout::new(m.len(), 32).unwrap();
+        let mut b = new_buf(50_000);
+        b.submit_messages(vec![m.clone()]);
+        let mut dec = crate::fec::MessageDecoder::new(m.len(), 32).unwrap();
+        let mut packet = vec![0u8; payload_len];
+        let mut sent = 0;
+        let mut complete = false;
+        while b.has_unsent_data() {
+            if fill_packet_payload_with_unreliable_fragments(&mut packet, &mut b) == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            }
+            assert_eq!(load_u64(&packet[8..16]) >> 48, STP_EXT_KIND_GROUPED_FEC);
+            let f = parse_packet(&packet).remove(0);
+            let id = f.1.unwrap().2;
+            assert_eq!(id, layout.wire_id(sent));
+            sent += 1;
+            if sent % 97 == 0 { continue; }
+            if dec.add(id, &f.4).unwrap() == crate::fec::DecodeStatus::Done { complete = true; }
+        }
+        assert!(complete);
+        assert_eq!(dec.recover().unwrap(), m);
+        let mut slot = FecRecvSlot::default();
+        let (done, _) = std::sync::mpsc::channel();
+        let workers = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(MAX_FEC_DECODE_WORKERS));
+        let key = ConnectionKey { ip: std::net::Ipv6Addr::LOCALHOST, port: 1, key_15_bits: 0 };
+        assert!(fec_receive_block(&mut slot, key, 0, 300 * 32, 32, 0, &[0;32], &done, &workers).is_none());
+        assert!(matches!(slot.state, FecRecvState::Done)); // never an inline large solve on overload
+    }
+
+    #[test]
+    fn grouped_adaptive_topup_uses_group_variance() {
+        let mut b = new_buf(10_000);
+        let a = crate::fec_adapt::FecAdaptiveState::new(crate::fec_adapt::AdaptiveFecConfig { topup: true, ..Default::default() }, 0, 0, 0);
+        b.fec_adaptive = Some(a);
+        b.start_fec(std::sync::Arc::new(msg(64001 * 32)), 32);
+        let f = b.fec_send_slot.as_mut().unwrap();
+        let layout = crate::fec::MessageLayout::new(f.message.len(), 32).unwrap();
+        assert_eq!(layout.groups, 3);
+        f.lost = 600;
+        let initial_p = f.loss_estimate;
+        let old_n = layout.round_plan(a.topped_up_blocks(f.k as u64, 601, initial_p) as u32);
+        b.fec_on_packet_lost(0);
+        let f = b.fec_send_slot.as_ref().unwrap();
+        let group_k = layout.group(0).1 as u64;
+        let group_n = a.topped_up_blocks(group_k, 601u64.div_ceil(layout.groups as u64), initial_p);
+        let expected = layout.round_plan((layout.k as u64 + (group_n - group_k) * layout.groups as u64) as u32);
+        assert_eq!(f.n, expected);
+        assert!(f.n > old_n); // Whole-K variance fails to protect each independent solve.
+        assert_eq!((f.n - f.k) as usize % layout.groups, 0);
+    }
+
+    #[test]
+    fn oversized_message_bypasses_only_empty_queues() {
+        let mut b = new_buf(0);
+        b.min_queue_size_bytes = 64;
+        b.max_queue_size_bytes = 64;
+        let m = msg(65);
+        assert_eq!(b.free_bytes(), u64::MAX);
+        assert_eq!(b.submit_messages(vec![m.clone(), vec![1]]), vec![vec![1]]);
+        assert_eq!(b.queue_bytes_filled, 65);
+        assert_eq!(b.free_bytes(), 0);
+        assert_eq!(drain(&mut b, 1000, 2).into_iter().flatten().next().unwrap().4, m);
+        assert_eq!(b.free_bytes(), u64::MAX);
+
+        let mut rx = ReceiveQueue::default();
+        let key = ConnectionKey::default();
+        rx.push(key, vec![1], 64);
+        rx.push(key, m.clone(), 64);
+        assert_eq!(rx.messages.len(), 1);
+        assert_eq!(rx.messages[0].1, m);
+        assert_eq!(rx.dropped_messages, 1);
+        assert!(rx.bytes > 64);
     }
 
     #[test]
