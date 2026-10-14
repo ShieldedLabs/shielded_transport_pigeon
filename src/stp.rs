@@ -691,6 +691,9 @@ pub const FEC_INLINE_MAX_BLOCKS: usize = 256;
 // a peer ACKing every packet; drain until empty, but do not let a flood starve sends.
 const MAX_RECV_PACKETS_PER_TICK: usize = 64;
 const MAX_SEND_PACKETS_PER_TICK: u64 = 64;
+// One million pps, matching the existing startup ceiling. Bound long-lived cubic
+// probing too; this is an arithmetic safety limit, not a congestion signal.
+const MAX_CC_RATE_UPPS: u64 = 1_000_000_000_000;
 // Retain at most 2 ms of quantum-limited catch-up credit. Old scheduling delays
 // must not become an ever-growing burst that stops ACK service and inflates RTT.
 const MAX_SEND_CATCHUP_NS: u64 = 2_000_000;
@@ -698,7 +701,12 @@ const MAX_SEND_CATCHUP_NS: u64 = 2_000_000;
 #[derive(Debug)]
 struct SendPacingGrant { packets: u64, carry_ns: u64 }
 
+fn send_interval_ns(rate_upps: u64) -> u64 {
+    (1_000_000_000_000_000 / rate_upps.max(1)).max(1)
+}
+
 fn send_pacing_grant(elapsed_ns: u64, interval_ns: u64, credit_ns: u64) -> SendPacingGrant {
+    let interval_ns = interval_ns.max(1);
     let budget = elapsed_ns.saturating_add(credit_ns);
     let due = budget / interval_ns;
     let packets = due.min(MAX_SEND_PACKETS_PER_TICK);
@@ -3914,7 +3922,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
 
                         // 1 / (upps * 10^-6) = 10^6 / upps <- seconds
                         // ns = (10^6 / upps) * 10^9 = 10^15 / upps
-                        let time_between_sends_ns = 1_000_000_000_000_000 / allowed_bandwidth_upps.max(1);
+                        let time_between_sends_ns = send_interval_ns(allowed_bandwidth_upps);
                         // This is some Unity Game developer level crap approximation but it will have to do.
                         let elapsed_ns = current_time_now_ns + 1 - state.last_sent_could_have_sent_data_packet.max(state.last_ack_received_time.saturating_sub(ACK_BUFFER_TIME_NS));
                         let grant = send_pacing_grant(elapsed_ns, time_between_sends_ns, state.send_pacer_acc_ns);
@@ -4112,7 +4120,7 @@ fn cubic_rate(t_ns: u64, r_max: u64, k_ns: u64) -> (u64, char) {
 
 /// Internal evaluation with the fixed policy (no application tuning API).
 pub(crate) fn cubic_rate_with_options(t_ns: u64, r_max: u64, k_ns: u64, cc: &CongestionPolicy) -> (u64, char) {
-    if k_ns == 0 { return (r_max, 'R'); }
+    if k_ns == 0 { return (r_max.min(MAX_CC_RATE_UPPS), 'R'); }
     let t = t_ns as f64;
     let r = r_max as f64;
     let k = k_ns as f64;
@@ -4125,7 +4133,7 @@ pub(crate) fn cubic_rate_with_options(t_ns: u64, r_max: u64, k_ns: u64, cc: &Con
     let finish = |rate: u64, mode| {
         let absolute = r * cc.beta + (floor + ceiling) / 1e9 * t;
         let relative = r * cc.beta * (cc.relative_growth_per_rtt * t / (rtt_seconds * 1e9)).exp() + min_growth;
-        (rate.min(relative.min(absolute) as u64), mode)
+        (rate.min(relative.min(absolute) as u64).min(MAX_CC_RATE_UPPS), mode)
     };
 
     // R: p^2 recovery from r*BETA up to r*cc.rate_rp
@@ -4451,7 +4459,7 @@ fn connection_rate(t_ns: u64, anchor_upps: u64, k_ns: u64, cc: &CongestionPolicy
         let rtt_ns = k_ns / cc.recovery_rtts;
         // The sentinel RTT means no sample yet: never ramp on an unknown path.
         let exponent = if rtt_ns == u16::MAX as u64 * 100_000 { 0.0 } else { cc.startup_multiplier.ln() * t_ns as f64 / rtt_ns.max(100_000) as f64 };
-        ((anchor_upps as f64 * exponent.min(30.0).exp()).min(1e12) as u64, 'I')
+        ((anchor_upps as f64 * exponent.min(30.0).exp()).min(MAX_CC_RATE_UPPS as f64) as u64, 'I')
     } else { cubic_rate_with_options(t_ns, anchor_upps, k_ns, cc) }
 }
 
@@ -4575,7 +4583,7 @@ impl LossTimer {
 }
 
 fn local_rate_limit(rate: u64, max_pps: Option<u64>) -> u64 {
-    max_pps.map_or(rate, |limit| rate.min(limit.saturating_mul(1_000_000).max(1)))
+    max_pps.map_or(rate, |limit| rate.min(limit.saturating_mul(1_000_000).max(1))).min(MAX_CC_RATE_UPPS)
 }
 
 fn apply_loss_congestion(state: &mut ConnectionStateConnected, send_time: u64, current_time_now_ns: u64, cc: &CongestionPolicy, max_pps: Option<u64>) {
@@ -6983,5 +6991,36 @@ mod review2_tests {
         }
         assert_eq!(queue.take().into_iter().collect::<Vec<_>>(), vec![(key, vec![])]);
         assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn review2_cubic_rate_bounded_after_weeks_without_congestion() {
+        let cc = &crate::ship::CC;
+        let k = cc.recovery_rtts * 1_000_000;
+        for t in [2_000_000_000_000_000, u64::MAX] {
+            let (rate, _) = connection_rate(t, 200_000_000, k, cc, true);
+            let allowed = local_rate_limit(rate, None);
+            assert_eq!(allowed, MAX_CC_RATE_UPPS);
+            assert_eq!(send_interval_ns(allowed), 1000);
+        }
+        for startup_done in [false, true] {
+            for k in [0, 1, 9_000_000] {
+                assert!(connection_rate(u64::MAX, u64::MAX, k, cc, startup_done).0 <= MAX_CC_RATE_UPPS);
+            }
+        }
+        assert_eq!(local_rate_limit(u64::MAX, Some(u64::MAX)), MAX_CC_RATE_UPPS);
+    }
+
+    #[test]
+    fn review2_pacing_interval_zero_cannot_panic() {
+        for rate in [0, 1, MAX_CC_RATE_UPPS, u64::MAX] {
+            assert!(send_interval_ns(rate) >= 1);
+        }
+        let grant = send_pacing_grant(1_000_000_000, 0, 0);
+        assert_eq!(grant.packets, MAX_SEND_PACKETS_PER_TICK);
+        assert_eq!(grant.carry_ns, MAX_SEND_CATCHUP_NS);
+        let grant = send_pacing_grant(0, 0, 0);
+        assert_eq!(grant.packets, 0);
+        assert_eq!(grant.carry_ns, 0);
     }
 }
