@@ -164,6 +164,7 @@ fn cc_options(a: &Args) -> CongestionControlOptions {
     cc.max_growth_uppsps = a.num("cc-max-growth-ppsps", cc.max_growth_uppsps / 1e6) * 1e6;
     cc.friendly_growth_alpha = a.num("cc-friendly-alpha", cc.friendly_growth_alpha);
     cc.relative_growth_per_rtt = a.num("cc-relative-growth", cc.relative_growth_per_rtt);
+    cc.record_loss_episodes = a.num::<u8>("cc-record-loss-episodes", u8::from(cc.record_loss_episodes)) != 0;
     if let Err(e) = cc.validate() { die(e); }
     cc
 }
@@ -671,6 +672,7 @@ fn send(a: &Args) {
         "\"packets_sent\":{},\"packets_lost\":{},\"packet_loss_pct\":{:.4},\"udp_payload_bytes_sent\":{},\"wire_bytes_per_delivered_byte\":{:.4},",
         "\"latency_method\":\"server receive time mapped to sender clock via min-RTT ping offset (error <= RTT/2) minus first submission\",",
         "\"spurious_losses\":{},\"net_declared_loss_pct\":{:.4},\"test_dropped\":{},\"tu_probes_lost\":{},\"seq_numbers_used\":{},",
+        "\"max_rtt_loss_pct\":{:.4},\"max_rtt_loss_window_packets\":{},",
         "\"sender_kernel_rx_drops\":{},\"sender_max_loop_gap_ms\":{:.3},\"sender_loop_gaps_over_10ms\":{},",
         "\"receiver\":{{\"reported\":{},\"rx_packets\":{},\"rx_seq_span\":{},\"rx_lost\":{},\"path_loss_pct\":{:.4},\"rx_reordered\":{},\"rx_late_beyond_window\":{},\"rx_duplicates\":{},",
         "\"bursts\":{},\"mean_burst_len\":{:.3},\"burst_hist\":{{{}}},\"kernel_rx_drops\":{},\"max_loop_gap_ms\":{:.3},\"loop_gaps_over_1ms\":{},\"loop_gaps_over_10ms\":{},\"loop_gaps_over_100ms\":{},",
@@ -685,6 +687,7 @@ fn send(a: &Args) {
         jnum(pct(&all_lat, 50.0)), jnum(pct(&all_lat, 99.0)),
         stats.packets_sent, stats.packets_lost, loss_pct, stats.bytes_sent, wire_overhead,
         stats.spurious_losses, net_declared_pct, stats.test_dropped, stats.tu_probes_lost, stats.seq_numbers_used,
+        stats.max_rtt_loss_ppm as f64 / 10_000.0, stats.max_rtt_loss_window_packets,
         sender_thread.kernel_rx_drops.map(|d| d.to_string()).unwrap_or("null".into()), sender_thread.max_loop_gap_ns as f64 / 1e6, sender_thread.loop_gaps_over_10ms,
         rx_report.is_some(), rx.st.rx_packets, rx.st.rx_seq_span, rx.st.rx_lost, rx_loss_pct, rx.st.rx_reordered, rx.st.rx_late_beyond_window, rx.st.rx_duplicates,
         rx.st.rx_bursts, mean_burst, RX_BURST_CLASS_NAMES.iter().zip(rx.st.rx_burst_hist.iter()).map(|(n, c)| format!("\"{n}\":{c}")).collect::<Vec<_>>().join(","),

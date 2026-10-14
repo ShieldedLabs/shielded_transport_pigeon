@@ -936,6 +936,7 @@ pub struct ConnectionStateConnected {
     pub stats: ConnectionStats,
     pub loss_window_start_ns: u64,
     pub loss_count_in_window: u64,
+    loss_episodes: LossEpisodes,
     pub is_app_limited: bool,
     pub app_limit_time_offset: u64,
     pub ecn_congestion_received: bool,
@@ -987,6 +988,7 @@ pub fn new_connection_state_connected(cipher: Option<ConnectionCipherTriplet>, m
         stats: ConnectionStats::default(),
         loss_window_start_ns: 0,
         loss_count_in_window: 0,
+        loss_episodes: LossEpisodes::default(),
         is_app_limited: false,
         app_limit_time_offset: 0,
         ecn_congestion_received: false,
@@ -1016,6 +1018,10 @@ pub struct ConnectionStats {
     pub bytes_sent: u64,
     /// Sequenced packets declared lost (never acked in time).
     pub packets_lost: u64,
+    /// Largest declared-loss fraction over four staggered approximately-RTT send-time
+    /// windows (all sequenced packets; TU-probe losses excluded). Instrumentation only.
+    pub max_rtt_loss_ppm: u32,
+    pub max_rtt_loss_window_packets: u64,
     /// Adaptive FEC only (else 0): the floored loss estimate new messages are sized for, and the
     /// latest short-term loss sample it was built from.
     pub fec_loss_estimate: f64,
@@ -1656,6 +1662,8 @@ pub struct CongestionControlOptions {
     /// Optional growth ceiling as a fraction of the anchor rate per RTT (0 disables).
     /// The additive floor remains available even at low anchor rates.
     pub relative_growth_per_rtt: f64,
+    /// Opt-in fixed-memory congestion-episode instrumentation, never alters the rate.
+    pub record_loss_episodes: bool,
 }
 impl CongestionControlOptions {
     pub const fn legacy() -> Self {
@@ -1663,7 +1671,7 @@ impl CongestionControlOptions {
             rate_rp: RATE_RP, rate_pg: RATE_PG, rate_gs: RATE_GS, time_pg: TIME_PG, time_gs: TIME_GS,
             loss_threshold: 2, event_guard_rtts: 0.5, rate_floor_upps: RATE_FLOOR_UPPS, initial_rate_upps: RATE_FLOOR_UPPS,
             min_growth_uppsps: CUBIC_MIN_GROWTH_UPPSPS, max_growth_uppsps: CUBIC_MAX_RATE_UPPS_PER_SEC,
-            friendly_growth_alpha: 0.0, relative_growth_per_rtt: 0.0 }
+            friendly_growth_alpha: 0.0, relative_growth_per_rtt: 0.0, record_loss_episodes: false }
     }
     /// Shorter probe plateau and stronger existing additive term; same R/P/G/S curve.
     pub const fn balanced() -> Self {
@@ -2823,6 +2831,13 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     connection_tracking_data.unreliable_send_buffer.fec_on_packet_lost(state.packets_waiting_ack_tail);
                                 }
                             }
+                            if cc.record_loss_episodes {
+                                let sent_ns = get_send_time_for_sequence_number(state.packets_waiting_ack_tail, &state.send_time_band, state.send_time_band_head_index);
+                                let lost = state.declared_lost_field[(bit_index / 64) as usize] & (1u64 << (bit_index % 64)) != 0;
+                                if sent_ns != 0 && sent_ns != u64::MAX {
+                                    state.loss_episodes.on_packet(sent_ns, lost, state.RTT_mean as u64 * 100_000, &mut state.stats);
+                                }
+                            }
                             state.packets_waiting_ack_field[(bit_index / 64) as usize] &= !(1u64 << (bit_index % 64));
                             state.packets_waiting_ack_tail += 1;
                         }
@@ -3236,9 +3251,55 @@ fn count_congestion_loss(count: &mut u64, eligible: bool, threshold: u64) -> boo
     *count >= threshold
 }
 
+#[derive(Debug, Default)]
+struct LossEpisodeBucket { start_ns: u64, packets: u64, lost: u64 }
+#[derive(Debug, Default)]
+struct LossEpisodes { buckets: [LossEpisodeBucket; 4], initialized: bool }
+impl LossEpisodes {
+    // Four staggered tumbling windows approximate a sliding RTT window without
+    // retaining packet records. Storage is 104 bytes, independent of bandwidth.
+    fn on_packet(&mut self, sent_ns: u64, lost: bool, rtt_ns: u64, stats: &mut ConnectionStats) {
+        let rtt_ns = rtt_ns.max(100_000);
+        if !self.initialized {
+            for (i, b) in self.buckets.iter_mut().enumerate() { b.start_ns = sent_ns + i as u64 * rtt_ns / 4; }
+            self.initialized = true;
+        }
+        for b in &mut self.buckets {
+            if sent_ns < b.start_ns { continue; }
+            if sent_ns - b.start_ns >= rtt_ns {
+                if b.packets >= 8 {
+                    let ppm = (b.lost * 1_000_000 / b.packets) as u32;
+                    if ppm > stats.max_rtt_loss_ppm {
+                        stats.max_rtt_loss_ppm = ppm;
+                        stats.max_rtt_loss_window_packets = b.packets;
+                    }
+                }
+                b.start_ns += ((sent_ns - b.start_ns) / rtt_ns) * rtt_ns;
+                b.packets = 0;
+                b.lost = 0;
+            }
+            b.packets += 1;
+            b.lost += u64::from(lost);
+        }
+    }
+}
+
 #[cfg(test)]
 mod congestion_tests {
     use super::*;
+
+    #[test]
+    fn fixed_memory_episode_meter_finds_short_loss_bursts() {
+        let mut meter = LossEpisodes::default();
+        let mut stats = ConnectionStats::default();
+        for i in 0..1000u64 {
+            meter.on_packet(i * 1_000_000 + 1, (200..250).contains(&i), 100_000_000, &mut stats);
+        }
+        assert_eq!(stats.max_rtt_loss_ppm, 500_000);
+        assert_eq!(stats.max_rtt_loss_window_packets, 100);
+        assert_eq!(std::mem::size_of::<LossEpisodes>(), 104);
+        assert_eq!(stats.packets_lost, 0); // Meter never alters actual loss/CC accounting.
+    }
 
     #[test]
     fn rtt_growth_envelope_is_rate_based_and_option_gated() {
