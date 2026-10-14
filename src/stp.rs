@@ -1163,6 +1163,29 @@ impl UnreliableSendBuffer {
         if let Some(f) = &mut self.fec_send_slot { f.retention_lease = None; }
     }
 
+    // Peek only at FIFO heads. Large messages/symbols may start a packet,
+    // but are never gap fillers. No codec or wire-format changes are needed.
+    fn fill_tier(&mut self, payload_len: usize, space: usize, class: Option<Dscp>) -> Option<u8> {
+        self.reclaim_finished_partial();
+        if class.is_none() { return Some(0); }
+        if self.partial_send_slot.is_none() && (self.fec_send_slot.is_some() ||
+            self.segmented_send.is_some() || self.ready_rescue_package().is_some()) { return None; }
+        let (dscp, len, offset) = if let Some((m, offset)) = &self.partial_send_slot {
+            (self.current_dscp, m.len(), *offset as usize)
+        } else { let (c,m) = self.message_queue.front()?; (*c, m.len(), 0) };
+        if class.is_some_and(|c| c != dscp) || len > payload_len.saturating_sub(STP_WHOLE_HEADER_SIZE) { return None; }
+        if offset == 0 && len + STP_WHOLE_HEADER_SIZE <= space { return Some(1); }
+        let prefix = space.checked_sub(STP_FRAGMENT_HEADER_SIZE)?;
+        if prefix == 0 { return None; }
+        if offset > 0 {
+            // A continuation is indivisible as a filler: never make a third part.
+            return (len - offset <= prefix).then_some(3);
+        }
+        // Whole framing saves four bytes. A near-TU-sized message needs a
+        // sufficient prefix so its eight-byte continuation fits a fresh packet.
+        (len - prefix.min(len) <= payload_len.saturating_sub(STP_FRAGMENT_HEADER_SIZE)).then_some(3)
+    }
+
     /// Next fragment for a packet with `payload_len` bytes of payload, of which `space` are still
     /// free. None: nothing to send, or the next FEC block does not fit in what is left of this
     /// packet (or its repair encoder is still being built); send the packet as it is.
@@ -1285,15 +1308,12 @@ impl UnreliableSendBuffer {
             return Some(UnreliableFragment::Fec { segment: f.segment, package_id, message_len: f.message.len() as u32, block_bytes: f.block_bytes as u16, block_id: id, data: &f.message[start..end] });
         }
         let (msg, start_byte) = self.partial_send_slot.as_ref().unwrap();
-        let whole = *start_byte == 0 && msg.len() <= payload_len.saturating_sub(STP_WHOLE_HEADER_SIZE);
+        let whole = *start_byte == 0 && msg.len() + STP_WHOLE_HEADER_SIZE <= space;
         let frag_size = space.checked_sub(if whole { STP_WHOLE_HEADER_SIZE } else { STP_FRAGMENT_HEADER_SIZE })?;
         let (msg, start_byte) = self.partial_send_slot.as_mut().unwrap();
         let start = *start_byte as usize;
-        // A plain message that fits a fresh packet has exactly one physical erasure event.
-        // Do not fill the preceding packet's tail with a partial prefix of that message.
-        if whole && msg.len() > frag_size {
-            return None;
-        }
+        // Small messages may straddle only after whole-message fillers were exhausted.
+        if frag_size == 0 && !msg.is_empty() { return None; }
         let ret_size = (msg.len() - start).min(frag_size);
         // Both frag_size and msg.len() may be zero.
 
@@ -1425,13 +1445,23 @@ impl SendQueues {
         let mut class = None;
         while cursor + STP_WHOLE_HEADER_SIZE <= payload.len() {
             // Least served eligible queue wins; round-robin breaks equal byte ties.
-            // A full FEC symbol or a whole small message never splits to fill a tail.
-            let candidate = (0..count).map(|step| (self.next_queue + step) % count)
-                .filter(|&i| self.queue_active[i] && blocked & (1u64 << i) == 0)
-                .min_by_key(|&i| self.scheduled_bytes[i]);
+            // Head: byte scheduler. Tail: whole FIFO heads, then small-message chops.
+            // Every tier is charged, including framing, never padding.
+            let mut candidate = None;
+            let mut best = (true, u8::MAX, u64::MAX);
+            for step in 0..count {
+                let i = (self.next_queue + step) % count;
+                if !self.queue_active[i] || blocked & (1u64 << i) != 0 { continue; }
+                if let Some(tier) = self.queues[i].fill_tier(payload.len(), payload.len()-cursor, class) {
+                    // Prefer any fillable queue within one TU of the ready clock,
+                    // even its chop over an indebted queue's whole message. Use
+                    // indebted data only if nobody else can use these bytes.
+                    let debt = class.is_some() && self.scheduled_bytes[i] > self.service_clock + payload.len() as u64;
+                    let key = (debt, tier, self.scheduled_bytes[i]);
+                    if key < best { best = key; candidate = Some(i); }
+                }
+            }
             let Some(i) = candidate else { break; };
-            let next_service = (0..count).filter(|&j| j != i && self.queue_active[j] && blocked & (1u64 << j) == 0)
-                .map(|j| self.scheduled_bytes[j]).min().unwrap_or(u64::MAX);
             self.select_packet_owner(i);
             while cursor + STP_WHOLE_HEADER_SIZE <= payload.len() {
                 let q = &mut self.queues[i];
@@ -1463,7 +1493,7 @@ impl SendQueues {
                 self.scheduled_bytes[i] += used as u64;
                 cursor += used;
                 self.queue_active[i] = q.can_emit();
-                if !self.queue_active[i] || self.scheduled_bytes[i] >= next_service { break; }
+                break; // Re-evaluate all FIFO heads and tiers after every frame.
             }
             if let Some(clock) = (0..count).filter(|&i| self.queue_active[i]).map(|i| self.scheduled_bytes[i]).min() {
                 self.service_clock = self.service_clock.max(clock);
@@ -1579,6 +1609,7 @@ fn fill_packet_payload_with_unreliable_fragments(payload: &mut [u8], buf: &mut U
     buf.packet_dscp = None;
     let mut cursor = 0;
     while cursor + STP_WHOLE_HEADER_SIZE <= payload.len() {
+        if cursor > 0 && buf.fill_tier(payload.len(), payload.len()-cursor, buf.packet_dscp).is_none() { break; }
         let Some(frag) = buf.next_fragment(payload.len(), payload.len() - cursor) else { break; };
         cursor += write_fragment(&mut payload[cursor..], frag);
     }
@@ -5378,7 +5409,7 @@ mod fec_send_tests {
     }
 
     #[test]
-    fn thousand_byte_messages_occupy_one_physical_packet_each() {
+    fn thousand_byte_messages_straddle_at_most_two_packets_and_reassemble() {
         for payload_len in [1162, 1450, 9194] {
             let mut b = new_buf();
             // Leave a tail too short for the next message, followed by many fresh-packet messages.
@@ -5388,13 +5419,18 @@ mod fec_send_tests {
             let packets = drain(&mut b, payload_len, 300);
             for id in 1..=200 {
                 let physical: Vec<_> = packets.iter().filter(|p| p.iter().any(|f| f.0 == id)).collect();
-                assert_eq!(physical.len(), 1, "payload={payload_len}, package={id}");
-                let fragments: Vec<_> = physical[0].iter().filter(|f| f.0 == id).collect();
-                assert_eq!(fragments.len(), 1);
-                let f = fragments[0];
-                assert!(f.1.is_none() && f.2);
-                assert_eq!(f.3, 0);
-                assert_eq!(f.4, messages[id as usize]);
+                assert!((1..=2).contains(&physical.len()), "payload={payload_len}, package={id}");
+                let fragments: Vec<_> = physical.iter().flat_map(|p| p.iter()).filter(|f| f.0 == id).collect();
+                assert_eq!(fragments.len(), physical.len());
+                let mut slot = ReassemblySlot::new();
+                let mut complete = false;
+                for f in fragments {
+                    assert!(f.1.is_none());
+                    let (ok, done) = slot.insert(f.3 as usize, &f.4, f.2);
+                    assert!(ok); complete |= done;
+                }
+                assert!(complete);
+                assert_eq!(slot.take_complete(), messages[id as usize]);
             }
             assert!(!b.has_unsent_data());
             assert_eq!(b.queue_bytes_filled, 0);
@@ -5402,15 +5438,20 @@ mod fec_send_tests {
     }
 
     #[test]
-    fn small_plain_message_defers_tail_and_rechecks_tu() {
+    fn small_plain_message_chops_tail_and_rechecks_tu() {
         let mut b = new_buf();
         assert!(b.submit_messages(vec![msg(1000)]).is_empty());
-        assert!(b.next_fragment(1450, 500).is_none());
-        assert_eq!(b.partial_send_slot.as_ref().unwrap().1, 0);
+        match b.next_fragment(1450, 500).unwrap() {
+            UnreliableFragment::Plain { is_fin, offset, data, .. } => {
+                assert!(!is_fin); assert_eq!((offset, data.len()), (0, 492));
+            }
+            _ => panic!("chopped small message must remain plain"),
+        }
+        assert_eq!(b.partial_send_slot.as_ref().unwrap().1, 492);
         match b.next_fragment(1162, 1162).unwrap() {
             UnreliableFragment::Plain { is_fin, offset, data, .. } => {
                 assert!(is_fin);
-                assert_eq!((offset, data.len()), (0, 1000));
+                assert_eq!((offset, data.len()), (492, 508));
             }
             _ => panic!("one-packet message must remain plain"),
         }
@@ -6223,8 +6264,13 @@ mod review_tests {
             s.submit_messages(0, (0..20000).map(|_| vec![3; 1400]).collect());
             let mut p = vec![0; 1449];
             let t = std::time::Instant::now();
-            for seq in 0..20000 { s.fec_prepare_packet(seq); assert!(s.fill_packet(&mut p) > 0); }
-            let ns = t.elapsed().as_nanos() / 20000;
+            let mut packets = 0;
+            for seq in 0..20000 {
+                s.fec_prepare_packet(seq); if s.fill_packet(&mut p) == 0 { break; }
+                packets += 1;
+            }
+            assert!(!s.has_unsent_data());
+            let ns = t.elapsed().as_nanos() / packets;
             let t = std::time::Instant::now();
             for _ in 0..20000 { s.bound_retention(); std::hint::black_box(s.has_unsent_data()); }
             eprintln!("retained={retained} in q{QQ}: fill_packet {ns} ns/pkt; bound_retention+has_unsent_data {} ns", t.elapsed().as_nanos() / 20000);
@@ -6519,18 +6565,33 @@ mod byte_fair_packing_tests {
                     let mut m = vec![q as u8; len]; m[..4].copy_from_slice(&i.to_le_bytes()); m
                 }).collect());
             }
-            let mut bytes = vec![0usize; n]; let mut seen = vec![0u32; n];
+            let mut seen = vec![0u32; n];
+            let mut slots = HashMap::<u16, ReassemblySlot>::new();
+            let mut wire = 0u64;
             for seq in 0..1000 {
                 s.fec_prepare_packet(seq); let mut p = [0;1162];
                 assert_eq!(s.fill_packet(&mut p), p.len());
-                for (_, header, data) in frames(&p) {
-                    let q = data[4] as usize;
-                    assert_eq!(u32::from_le_bytes(data[..4].try_into().unwrap()), seen[q]);
-                    seen[q] += 1; bytes[q] += header+data.len();
+                let mut cursor = 0;
+                while let Some((h, header)) = read_fragment_header(&p[cursor..]) {
+                    let len = ((h >> 18) & 0x3fff) as usize;
+                    let id = ((h >> 2) & 0xffff) as u16;
+                    let slot = slots.entry(id).or_insert_with(ReassemblySlot::new);
+                    let (ok, complete) = slot.insert((h >> 32) as usize, &p[cursor+header..cursor+header+len], h & 2 != 0);
+                    assert!(ok);
+                    if complete {
+                        let data = slot.take_complete();
+                        let q = data[4] as usize;
+                        assert_eq!(u32::from_le_bytes(data[..4].try_into().unwrap()), seen[q]);
+                        seen[q] += 1;
+                        slots.remove(&id);
+                    }
+                    cursor += header + len;
                 }
+                wire += cursor as u64;
             }
+            let bytes = &s.scheduled_bytes;
             assert!(*bytes.iter().max().unwrap()-*bytes.iter().min().unwrap() <= 2*1162, "{bytes:?}");
-            assert_eq!(bytes.iter().map(|&b| b as u64).collect::<Vec<_>>(), s.scheduled_bytes);
+            assert_eq!(wire, bytes.iter().sum::<u64>());
         }
     }
     #[test]
@@ -6539,7 +6600,8 @@ mod byte_fair_packing_tests {
         s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0));
         for q in 0..2 { s.submit_messages(q, vec![vec![q as u8;80];7]); }
         let mut p = [0;1162]; s.fec_prepare_packet(0); s.fill_packet(&mut p);
-        let f = frames(&p); assert_eq!(f.len(),13);
+        let f = frames(&p); assert_eq!(f.len(),14);
+        assert_eq!(f.last().unwrap().1, STP_FRAGMENT_HEADER_SIZE);
         assert!(f.iter().any(|f| f.2[0] == 0) && f.iter().any(|f| f.2[0] == 1));
         for q in &mut s.queues { q.reclaim_finished_partial(); }
         s.fec_on_packet_finalized(0,true);
@@ -6553,6 +6615,8 @@ mod byte_fair_packing_tests {
         s.fec_prepare_packet(0); s.fill_packet(&mut [0;1162]);
         assert_eq!(s.queues[0].fec_send_slot.as_ref().unwrap().block_bytes,1146);
         s.submit_messages(1,vec![vec![7;80];3]);
+        s.scheduled_bytes[1] = s.scheduled_bytes[0] + 1;
+        s.queue_active[1] = true;
         let mut p = [0;1449]; s.fec_prepare_packet(1); s.fill_packet(&mut p);
         let f = frames(&p);
         assert!(f.iter().any(|f| f.1 == 16 && f.2.len()==1146));
@@ -6748,32 +6812,28 @@ fn stalled_encoder_does_not_bank_service_credit() {
 }
 
 #[test]
-fn multi_owner_multi_symbol_fec_feedback_is_once_each() {
+fn multi_item_fec_plain_feedback_is_once_each() {
+    for lost in [false,true] {
     let mut s = SendQueues::new(2, (1_000_000, 32 << 20, 32 << 20));
     s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0));
-    for q in 0..2 {s.submit_messages(q, vec![vec![q as u8;65536]]);}
-    for seq in 0..2 {s.fec_prepare_packet(seq); s.fill_packet(&mut [0;1162]);}
-    let mut p = [0;9194];
-    s.fec_prepare_packet(2); assert_eq!(s.fill_packet(&mut p), p.len());
-    let mut cursor = 0;
-    let mut count = [0u32;2];
-    while let Some((h, _)) = read_fragment_header(&p[cursor..]) {
-        assert_eq!(h&3,1);
-        let len = ((h >> 18) & 0x3fff) as usize;
-        count[p[cursor+16] as usize] += 1;
-        cursor += 16 + len;
-    }
-    assert_eq!(count, [4,3]);
-    s.fec_on_packet_finalized(2, true);
-    for (q, expected) in s.queues.iter().zip(count) {
-        let f = q.fec_send_slot.as_ref().unwrap();
-        assert_eq!(f.finalized_symbols, expected);
-        assert_eq!(f.lost, expected);
-        assert_eq!(f.group_lost, vec![expected]);
-    }
-    s.fec_on_packet_finalized(2, true);
-    for (q, expected) in s.queues.iter().zip(count) {
-        assert_eq!(q.fec_send_slot.as_ref().unwrap().finalized_symbols, expected);
+    s.submit_messages(0, vec![vec![0;65536]]);
+    s.fec_prepare_packet(0); s.fill_packet(&mut [0;1162]);
+    s.submit_messages(1, vec![vec![1;80];100]);
+    s.scheduled_bytes[1] = s.scheduled_bytes[0] + 1;
+    s.queue_active[1] = true;
+    let mut p = [0;1449];
+    s.fec_prepare_packet(1); assert_eq!(s.fill_packet(&mut p), p.len());
+    let (h, _) = read_fragment_header(&p).unwrap();
+    assert_eq!(h & 3, 1);
+    assert_eq!(s.last_queue, 1, "plain filler switches packet owner after FEC head");
+    s.fec_on_packet_finalized(1, lost);
+    let f = s.queues[0].fec_send_slot.as_ref().unwrap();
+    assert_eq!((f.finalized_symbols, f.lost), (1, u32::from(lost)));
+    assert_eq!(f.group_lost, vec![u32::from(lost)]);
+    assert!(s.queues[1].fec_send_slot.is_none());
+    assert!(s.queues[1].fec_retained.is_empty());
+    s.fec_on_packet_finalized(1, lost);
+    assert_eq!(s.queues[0].fec_send_slot.as_ref().unwrap().finalized_symbols, 1);
     }
 }
 
@@ -7797,5 +7857,170 @@ mod race_outage_pause_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod fill_rule_tests {
+    use super::*;
+    fn sender(n: usize) -> SendQueues { SendQueues::new(n, (1_000_000, 16<<20, 16<<20)) }
+    fn emit(s: &mut SendQueues, seq: u64) -> [u8;1449] {
+        s.fec_prepare_packet(seq); let mut p = [0;1449];
+        assert_eq!(s.fill_packet(&mut p), p.len()); p
+    }
+    fn heads(p: &[u8]) -> Vec<(u64, Vec<u8>)> {
+        let mut out = Vec::new(); let mut c = 0;
+        while let Some((h, header)) = read_fragment_header(&p[c..]) {
+            let header = if h & 1 != 0 { fec_fragment_header_size(&p[c..]).unwrap() } else { header };
+            let len = ((h >> 18) & 0x3fff) as usize;
+            out.push((h, p[c+header..c+header+len].to_vec())); c += header+len;
+        }
+        out
+    }
+    #[test]
+    fn many_choppable_queues_cannot_subsidize_one_filler_forever() {
+        let mut s = sender(6);
+        s.submit_messages(0, vec![vec![0;80];20000]);
+        for q in 1..6 { s.submit_messages(q, vec![vec![q as u8;1000];10000]); }
+        for seq in 0..3000 {
+            emit(&mut s,seq);
+            let low = *s.scheduled_bytes.iter().min().unwrap();
+            let high = *s.scheduled_bytes.iter().max().unwrap();
+            assert!(high-low <= 2*1449, "unbounded filler debt at packet {seq}: {:?}", s.scheduled_bytes);
+        }
+    }
+    #[test]
+    fn continuation_waits_for_head_service_instead_of_a_third_packet() {
+        let mut s = sender(2);
+        s.submit_messages(0,vec![vec![0;1000],vec![7;1000]]);
+        let first = heads(&emit(&mut s,0)).pop().unwrap();
+        assert_eq!(first.1.len(),437);
+        // Idle join ties the current clock and wins the next head by rotation.
+        s.submit_messages(1,vec![vec![9;1000]]);
+        let middle = emit(&mut s,1);
+        assert_eq!(heads(&middle).len(),1);
+        assert!(middle[1004..].iter().all(|&b| b==255));
+        assert_eq!(s.queues[0].partial_send_slot.as_ref().unwrap().1,437);
+        let last = heads(&emit(&mut s,2)).remove(0);
+        assert_eq!(last.0 >> 32,437);
+        assert_eq!(last.1.len(),563);
+        assert_eq!((first.0>>2)&0xffff,(last.0>>2)&0xffff);
+        let mut slot = ReassemblySlot::new();
+        assert_eq!(slot.insert(0,&first.1,false),(true,false));
+        assert_eq!(slot.insert(437,&last.1,true),(true,true));
+        assert_eq!(slot.take_complete(),vec![7;1000]);
+        assert!(!s.has_unsent_data(), "continuation must progress at the next head opportunity");
+    }
+    #[test]
+    fn near_tu_small_message_waits_when_prefix_would_require_three_parts() {
+        let mut s = sender(1);
+        s.submit_messages(0,vec![vec![0;1436],vec![7;1445]]);
+        let first = emit(&mut s,0);
+        assert_eq!(heads(&first).len(),1);
+        assert!(first[1440..].iter().all(|&b| b==255));
+        let second = heads(&emit(&mut s,1));
+        assert_eq!(second.len(),1);
+        assert_eq!(second[0].1.len(),1445);
+        assert_eq!(second[0].0 >> 32,0);
+        assert_eq!(second[0].0 & 2,2);
+        assert!(!s.has_unsent_data());
+    }
+    #[test]
+    fn within_share_chop_beats_indebted_whole_message() {
+        let mut s = sender(3);
+        s.submit_messages(0,vec![vec![0;1000]]);
+        s.submit_messages(1,vec![vec![1;100]]);
+        s.submit_messages(2,vec![vec![2;1000]]);
+        s.scheduled_bytes = vec![0,10000,1];
+        s.queue_active.fill(true);
+        let p = emit(&mut s,0); let f = heads(&p);
+        assert_eq!(f.iter().map(|(_,d)| d[0]).collect::<Vec<_>>(),vec![0,2]);
+        assert_eq!(f[1].1.len(),437);
+        assert_eq!(s.scheduled_bytes,vec![1004,10000,446]);
+        assert_eq!(s.queues[1].message_queue.len(),1);
+    }
+    #[test]
+    fn sole_fillable_indebted_queue_uses_otherwise_unusable_gap() {
+        let mut s = sender(2);
+        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC,0,0,0));
+        s.submit_messages(0,vec![vec![9;65536]]);
+        s.fec_prepare_packet(0); s.fill_packet(&mut [0;1162]);
+        s.submit_messages(1,vec![vec![1;80];100]);
+        s.scheduled_bytes[1] = 100000;
+        s.queue_active[1] = true;
+        let p = emit(&mut s,1); let f = heads(&p);
+        assert_eq!(f.len(),5); // one fixed 1162 B symbol + 3 wholes + 27 B chop
+        assert_eq!(f[0].0 & 3,1);
+        assert_eq!(f.last().unwrap().1.len(),27);
+        assert_eq!(s.scheduled_bytes[1],100287);
+        assert_eq!(s.queues[0].fec_send_slot.as_ref().unwrap().next_id,2);
+    }
+    #[test]
+    fn whole_other_head_precedes_small_chop_and_never_skips_fifo() {
+        let mut s = sender(3);
+        s.submit_messages(0, vec![vec![0;1000],vec![1;800],vec![2;100]]);
+        s.submit_messages(1, vec![vec![3;100]]);
+        s.submit_messages(2, vec![vec![4;900],vec![5;100]]);
+        let p = emit(&mut s,0); let frames = heads(&p);
+        assert_eq!(frames.iter().map(|(_,d)| d[0]).collect::<Vec<_>>(), vec![0,3,4]);
+        assert_eq!(frames[2].0 & 2, 0);
+        assert_eq!(frames[2].1.len(), 333);
+        assert_eq!(s.queues[2].partial_send_slot.as_ref().unwrap().1,333);
+        assert_eq!(s.queues[2].message_queue.front().unwrap().1[0],5, "100 B follower remains behind partially sent 900 B head");
+        assert_eq!(s.queues[0].message_queue.len(),2);
+        assert_eq!(s.scheduled_bytes.iter().sum::<u64>(),1449);
+    }
+    #[test]
+    fn large_symbols_are_never_gap_fillers_even_when_they_fit() {
+        let mut s = sender(2);
+        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC,0,0,0));
+        s.submit_messages(1, vec![vec![9;65536]]);
+        s.fec_prepare_packet(0); s.fill_packet(&mut [0;1162]);
+        let before = s.queues[1].fec_send_slot.as_ref().unwrap().next_id;
+        s.submit_messages(0,vec![vec![1;80]]);
+        s.scheduled_bytes[0] = 0; s.queue_active[0] = true;
+        s.fec_prepare_packet(1); let mut p=[0;9194]; s.fill_packet(&mut p);
+        assert_eq!(heads(&p).len(),1);
+        assert_eq!(s.queues[1].fec_send_slot.as_ref().unwrap().next_id,before);
+        assert!(p[84..].iter().all(|&b| b==255));
+    }
+    #[test]
+    fn class_mismatch_pads_without_skipping_fifo() {
+        let mut s = sender(2);
+        s.submit_messages(0,vec![vec![0;1000]]);
+        s.submit_classified_messages(1,vec![(Dscp::Ef,vec![1;100]),(Dscp::BestEffort,vec![2;100])]);
+        let p=emit(&mut s,0);
+        assert_eq!(heads(&p).len(),1);
+        assert!(p[1004..].iter().all(|&b| b==255));
+        assert_eq!(s.queues[1].message_queue.len(),2);
+        let p=emit(&mut s,1);
+        assert_eq!(s.last_dscp,Dscp::Ef);
+        assert_eq!(heads(&p).len(),1);
+        assert!(p[104..].iter().all(|&b| b==255));
+        eprintln!("DSCP_FILL_BLOCKED packets=2/2 padded_bytes=1790");
+    }
+    #[test]
+    fn chopped_small_requires_both_packets_and_is_never_retried() {
+        let mut s=sender(1);
+        s.fec_adaptive=Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC,0,0,0));
+        s.submit_messages(0,vec![vec![0;1000],vec![7;1000]]);
+        let p0=emit(&mut s,0); let p1=emit(&mut s,1);
+        let a=heads(&p0).pop().unwrap(); let b=heads(&p1).remove(0);
+        assert_eq!((a.0>>2)&0xffff,(b.0>>2)&0xffff);
+        assert_eq!(a.1.len(),437); assert_eq!(b.1.len(),563);
+        for lost in [None,Some(0),Some(1)] {
+            let mut slot=ReassemblySlot::new(); let mut complete=false;
+            for (i,(h,data)) in [&a,&b].into_iter().enumerate() {
+                if lost==Some(i) {continue;}
+                let (ok,done)=slot.insert((h>>32) as usize,data,h&2!=0);
+                assert!(ok); complete|=done;
+            }
+            assert_eq!(complete,lost.is_none());
+            if complete {assert_eq!(slot.take_complete(),vec![7;1000]);}
+        }
+        s.fec_on_packet_finalized(0,true); s.fec_on_packet_finalized(1,true);
+        assert!(!s.has_unsent_data());
+        assert!(s.queues[0].fec_retained.is_empty());
+        s.fec_prepare_packet(2); assert_eq!(s.fill_packet(&mut [0;1449]),0);
     }
 }
