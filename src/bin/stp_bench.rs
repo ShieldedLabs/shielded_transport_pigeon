@@ -162,6 +162,8 @@ fn cc_options(a: &Args) -> CongestionControlOptions {
     cc.initial_rate_upps = a.num::<u64>("cc-start-pps", cc.initial_rate_upps / 1_000_000).checked_mul(1_000_000).unwrap_or_else(|| die("CC start overflows"));
     cc.min_growth_uppsps = a.num("cc-min-growth-ppsps", cc.min_growth_uppsps / 1e6) * 1e6;
     cc.max_growth_uppsps = a.num("cc-max-growth-ppsps", cc.max_growth_uppsps / 1e6) * 1e6;
+    cc.friendly_growth_alpha = a.num("cc-friendly-alpha", cc.friendly_growth_alpha);
+    cc.relative_growth_per_rtt = a.num("cc-relative-growth", cc.relative_growth_per_rtt);
     if let Err(e) = cc.validate() { die(e); }
     cc
 }

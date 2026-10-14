@@ -1651,13 +1651,19 @@ pub struct CongestionControlOptions {
     pub initial_rate_upps: u64,
     pub min_growth_uppsps: f64,
     pub max_growth_uppsps: f64,
+    /// Optional Reno-friendly additive floor: alpha / RTT_seconds^2 pps/s (0 disables).
+    pub friendly_growth_alpha: f64,
+    /// Optional growth ceiling as a fraction of the anchor rate per RTT (0 disables).
+    /// The additive floor remains available even at low anchor rates.
+    pub relative_growth_per_rtt: f64,
 }
 impl CongestionControlOptions {
     pub const fn legacy() -> Self {
         Self { beta: CUBIC_BETA, recovery_rtts: CUBIC_K_RTT_MULTIPLIER,
             rate_rp: RATE_RP, rate_pg: RATE_PG, rate_gs: RATE_GS, time_pg: TIME_PG, time_gs: TIME_GS,
             loss_threshold: 2, event_guard_rtts: 0.5, rate_floor_upps: RATE_FLOOR_UPPS, initial_rate_upps: RATE_FLOOR_UPPS,
-            min_growth_uppsps: CUBIC_MIN_GROWTH_UPPSPS, max_growth_uppsps: CUBIC_MAX_RATE_UPPS_PER_SEC }
+            min_growth_uppsps: CUBIC_MIN_GROWTH_UPPSPS, max_growth_uppsps: CUBIC_MAX_RATE_UPPS_PER_SEC,
+            friendly_growth_alpha: 0.0, relative_growth_per_rtt: 0.0 }
     }
     /// Shorter probe plateau and stronger existing additive term; same R/P/G/S curve.
     pub const fn balanced() -> Self {
@@ -1674,6 +1680,7 @@ impl CongestionControlOptions {
         if !(0.0..=10.0).contains(&self.event_guard_rtts) { return Err("invalid CC guard"); }
         if !(1..=10000).contains(&self.loss_threshold) { return Err("CC loss threshold must be in 1..=10000"); }
         if !(self.rate_floor_upps > 0 && self.initial_rate_upps >= self.rate_floor_upps && self.initial_rate_upps <= 1_000_000_000_000 && self.min_growth_uppsps >= 0.0 && self.min_growth_uppsps.is_finite() && self.max_growth_uppsps > self.min_growth_uppsps && self.max_growth_uppsps <= 1e15) { return Err("invalid CC floor, initial rate or growth limits"); }
+        if !(0.0..=100.0).contains(&self.friendly_growth_alpha) || !(0.0..=10.0).contains(&self.relative_growth_per_rtt) { return Err("invalid CC RTT-scaled growth envelope"); }
         Ok(())
     }
 }
@@ -3081,8 +3088,15 @@ pub fn cubic_rate_with_options(t_ns: u64, r_max: u64, k_ns: u64, cc: &Congestion
     let r = r_max as f64;
     let k = k_ns as f64;
     let drop = r * (1.0 - cc.beta);
-    let min_growth = cc.min_growth_uppsps / 1e9 * t;
-    let linear_cap_slope = cc.max_growth_uppsps / 1e9;
+    let rtt_seconds = k / (cc.recovery_rtts as f64 * 1e9);
+    let floor = if cc.friendly_growth_alpha > 0.0 {
+        cc.min_growth_uppsps.max(cc.friendly_growth_alpha * 1e6 / (rtt_seconds * rtt_seconds)).min(cc.max_growth_uppsps)
+    } else { cc.min_growth_uppsps };
+    let ceiling = if cc.relative_growth_per_rtt > 0.0 {
+        cc.max_growth_uppsps.min(r * cc.relative_growth_per_rtt / rtt_seconds)
+    } else { cc.max_growth_uppsps };
+    let min_growth = floor / 1e9 * t;
+    let linear_cap_slope = ceiling / 1e9;
 
     // R: p^2 recovery from r*BETA up to r*cc.rate_rp
     let r_rp = r * cc.rate_rp; // rate at R→P
@@ -3225,6 +3239,32 @@ fn count_congestion_loss(count: &mut u64, eligible: bool, threshold: u64) -> boo
 #[cfg(test)]
 mod congestion_tests {
     use super::*;
+
+    #[test]
+    fn rtt_growth_envelope_is_rate_based_and_option_gated() {
+        let mut cc = CongestionControlOptions::balanced();
+        cc.max_growth_uppsps = 500e6;
+        let k = 1_800_000_000;
+        let base = cubic_rate_with_options(20 * k, 1_000_000_000, k, &cc).0;
+        cc.relative_growth_per_rtt = 0.02;
+        let slow = cubic_rate_with_options(20 * k, 1_000_000_000, k, &cc).0;
+        assert!(slow < base);
+        cc.relative_growth_per_rtt = 0.0;
+        assert_eq!(cubic_rate_with_options(20 * k, 1_000_000_000, k, &cc).0, base);
+        cc.friendly_growth_alpha = 4.0;
+        assert!(cubic_rate_with_options(k, 1_000_000_000, k, &cc).0 > cubic_rate_with_options(k, 1_000_000_000, k, &CongestionControlOptions::balanced()).0);
+        for rtt in [100_000, 30_000_000, 200_000_000] {
+            let k = cc.recovery_rtts * rtt;
+            let mut prev = 0;
+            for t in (0..50*k).step_by((k/100).max(1) as usize) {
+                let rate = cubic_rate_with_options(t, 1_000_000_000, k, &cc).0;
+                assert!(rate >= prev);
+                prev = rate;
+            }
+        }
+        cc.friendly_growth_alpha = f64::NAN;
+        assert!(cc.validate().is_err());
+    }
 
     #[test]
     fn guarded_losses_do_not_prime_the_next_event() {
