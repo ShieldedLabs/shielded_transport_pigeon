@@ -2389,9 +2389,19 @@ pub(crate) struct CongestionPolicy {
     pub startup_backoff_rtts: f64,
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub struct SentDatagram {
+    kind: &'static str,
+    expected: Option<usize>,
+    bytes: Vec<u8>,
+}
+
 /// Socket binding and optional measurement. The transport policy is fixed internally.
 #[derive(Debug, Clone)]
 pub struct NetworkThreadOptions {
+    #[cfg(test)]
+    pub datagram_log: Option<std::sync::Arc<std::sync::Mutex<Vec<SentDatagram>>>>,
     /// Fixed number of sender-only FIFO queues per connection (1..=64).
     /// Total app capacity is N x max_queue_size_bytes (plus the inherited oversized-alone
     /// exception). Rescue reservations are 64 MiB/N and 4096/N per magazine, no borrowing.
@@ -2410,7 +2420,7 @@ pub struct NetworkThreadOptions {
 }
 
 impl Default for NetworkThreadOptions {
-    fn default() -> Self { Self { send_queue_count: 1, receive_memory: None, bind_ip: None, record_fec_messages: false, record_loss_episodes: false, loss_trace: None } }
+    fn default() -> Self { Self { #[cfg(test)] datagram_log: None, send_queue_count: 1, receive_memory: None, bind_ip: None, record_fec_messages: false, record_loss_episodes: false, loss_trace: None } }
 }
 
 pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_pps: Option<u64>, send_buffer_params: (u32, u32, u32), options: NetworkThreadOptions) -> NetworkThreadHandle {
@@ -2442,7 +2452,20 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
 
     let thread_inner = inner.clone();
 
+    #[cfg(test)]
+    let datagram_log = options.datagram_log;
     let thread = std::thread::spawn(move || {
+        #[cfg(test)]
+        let datagram_expectation = std::cell::Cell::new(("handshake", None::<usize>));
+        // Test builds observe EVERY actual native send, including handshakes. The
+        // UDP relay test cross-checks these exact bytes against socket reception.
+        #[cfg(test)]
+        let udp_send_with_congestion_and_dscp = |socket, ip, port, bytes: &[u8], dscp, ecn| {
+            let sent = crate::native_sockets::udp_send_with_congestion_and_dscp(socket, ip, port, bytes, dscp, ecn);
+            let (kind, expected) = datagram_expectation.replace(("handshake", None));
+            if let Some(log) = &datagram_log { log.lock().unwrap().push(SentDatagram { kind, expected, bytes: bytes.to_vec() }); }
+            sent
+        };
 
         let mut packet_memory_encrypted = new_packet_memory(); // Incoming Encrypted / Outgoing Encrypted
         let mut packet_memory_recv      = new_packet_memory(); // Incoming Decrypted
@@ -3356,6 +3379,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 state.ack_receiver.sent(current_time_now_ns);
                                 state.stats.ack_packets_sent += 1;
                                 state.stats.ack_bytes_sent += o as u64;
+                                #[cfg(test)]
+                                datagram_expectation.set(("ack", Some(crate::ack::ACK_PAYLOAD_LEN + total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(state.magic1).unwrap())));
                                 udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_send[..o], Dscp::Af21, false);
                                 state.ack_timer = u64::MAX;
                             }
@@ -3382,6 +3407,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     packet_memory_encrypted[6..6+data.len()].copy_from_slice(&data);
                                     data.len()
                                 };
+                                #[cfg(test)]
+                                datagram_expectation.set(("outage", Some(state.current_tu as usize)));
                                 let send_time = udp_send_with_congestion_and_dscp(socket,
                                     connection_tracking_data.other_ip, connection_tracking_data.other_port,
                                     &packet_memory_encrypted[..6+packet_len], Dscp::Af21, false);
@@ -3609,6 +3636,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 packet_len = payload_size;
                             }
 
+                            #[cfg(test)]
+                            datagram_expectation.set(("mtu_probe", Some(state.tu_probe_size as usize)));
                             let send_time_ns = udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::Af21, false);
                             connection_tracking_data.unreliable_send_buffer.fec_prepare_packet(state.send_sequence_number);
                             state.account_send(send_time_ns);
@@ -3634,6 +3663,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 packet_len = payload_size;
                             }
 
+                            #[cfg(test)]
+                            datagram_expectation.set(("keepalive", Some(state.current_tu as usize)));
                             let send_time_ns = udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::Af21, false);
                             connection_tracking_data.unreliable_send_buffer.fec_prepare_packet(state.send_sequence_number);
                             state.account_send(send_time_ns);
@@ -3683,6 +3714,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 } && { test_drop_burst_left = test_drop_burst - 1; true }
                             };
                             if test_drop { state.stats.test_dropped += 1; }
+                            #[cfg(test)]
+                            datagram_expectation.set(("data", Some(state.current_tu as usize)));
                             let send_time_ns = if test_drop { monotonic_clock_ns() }
                             else { udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], connection_tracking_data.unreliable_send_buffer.last_dscp, false) };
                             state.account_send(send_time_ns);
@@ -5720,5 +5753,132 @@ mod byte_fair_packing_tests {
         assert!(f.iter().any(|f| f.1 == 16 && f.2.len()==1146));
         assert_eq!(f.iter().filter(|f| f.1 == 4 && f.2.len()==80).count(),3);
         assert_eq!(s.queues[0].fec_send_slot.as_ref().unwrap().block_bytes,1146);
+    }
+}
+
+#[cfg(test)]
+mod uniform_udp_capture_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex, atomic::{AtomicBool, AtomicUsize, Ordering}};
+    use std::time::{Duration, Instant};
+
+    /// A real UDP relay records every encrypted datagram from BOTH peers. It holds
+    /// MTU discovery at 1184, then admits up to 1472, and later blackholes both
+    /// directions. Send-site expectations are cross-checked against actual bytes,
+    /// not just against payload construction or packet counters.
+    #[test]
+    fn every_encrypted_udp_datagram_has_only_current_tu_ack_or_mtu_probe_size() {
+        let port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let server_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let relay = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        relay.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
+        let relay_port = relay.local_addr().unwrap().port();
+        let actual = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let blackout = Arc::new(AtomicBool::new(false));
+        let mtu = Arc::new(AtomicUsize::new(1184));
+        let (observed, stopping, blackholing, allowed) = (actual.clone(), stop.clone(), blackout.clone(), mtu.clone());
+        let forwarder = std::thread::spawn(move || {
+            let mut buf = [0; 10000]; let mut client_addr = None;
+            while !stopping.load(Ordering::Acquire) {
+                match relay.recv_from(&mut buf) {
+                    Ok((len, source)) => {
+                        observed.lock().unwrap().push(buf[..len].to_vec());
+                        let target = if source == server_addr { client_addr } else { client_addr = Some(source); Some(server_addr) };
+                        if !blackholing.load(Ordering::Acquire) && len <= allowed.load(Ordering::Acquire) {
+                            if let Some(target) = target { relay.send_to(&buf[..len], target).unwrap(); }
+                        }
+                    }
+                    Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => (),
+                    Err(e) => panic!("UDP capture relay: {e}"),
+                }
+            }
+        });
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let server_key = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).unwrap();
+        let address = STPAddress { ip: "127.0.0.1".parse::<std::net::Ipv4Addr>().unwrap().to_ipv6_mapped(), port: relay_port, magic1: server_key.magic1, key: server_key.public.clone() };
+        let key = address.to_connection_key();
+        let options = || NetworkThreadOptions { send_queue_count: 2, datagram_log: Some(log.clone()), ..Default::default() };
+        let mut server = new_network_thread_with_options(vec![server_key], port, Some(1000), (1_000_000, 1<<20, 1<<20), options());
+        let mut client = new_network_thread_with_options(vec![new_keypair_from_connect_magic1(address.magic1).unwrap()], 0, Some(1000), (1_000_000, 1<<20, 1<<20), options());
+        server.join_on_drop = true; client.join_on_drop = true;
+        let mut cw = service_connections(&client, NetworkThreadPush { initiate_connections: vec![address], ..Default::default() }).unwrap().current_connections;
+        let mut sw = Vec::new(); let mut received = Vec::new();
+        let poll = |cw: &mut Vec<(STPAddress,[u8;64])>, sw: &mut Vec<(STPAddress,[u8;64])>, received: &mut Vec<Vec<u8>>| {
+            let c = service_connections(&client, NetworkThreadPush { wanted_connections: cw.clone(), ..Default::default() }).unwrap();
+            let tu = c.connection_stats.first().map(|(_,s)| s.udp_payload_tu).unwrap_or(0);
+            *cw = c.current_connections;
+            let s = service_connections(&server, NetworkThreadPush { wanted_connections: sw.clone(), ..Default::default() }).unwrap();
+            *sw = s.current_connections;
+            received.extend(s.received_unreliable_messages.into_iter().map(|(_,m)| m));
+            tu
+        };
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while cw.is_empty() || sw.is_empty() {
+            poll(&mut cw, &mut sw, &mut received);
+            assert!(Instant::now() < deadline, "encrypted connection did not finish handshake");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let mut messages = vec![(key,0,Dscp::BestEffort,vec![3;65536]);2];
+        messages.extend(vec![(key,1,Dscp::BestEffort,vec![1;80]);20]);
+        messages.extend(vec![(key,1,Dscp::BestEffort,vec![2;1000]);10]);
+        service_connections(&client, NetworkThreadPush { wanted_connections: cw.clone(), send_unreliable: messages, ..Default::default() }).unwrap();
+        let growth_time = Instant::now() + Duration::from_millis(200);
+        while Instant::now() < growth_time { poll(&mut cw,&mut sw,&mut received); std::thread::sleep(Duration::from_millis(1)); }
+        mtu.store(1472,Ordering::Release);
+        while received.len() < 32 {
+            poll(&mut cw,&mut sw,&mut received);
+            assert!(Instant::now() < deadline, "mixed messages failed delivery: {}",received.len());
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(received.iter().filter(|m| m.len()==80 && m.iter().all(|&b| b==1)).count(),20);
+        assert_eq!(received.iter().filter(|m| m.len()==1000 && m.iter().all(|&b| b==2)).count(),10);
+        assert_eq!(received.iter().filter(|m| m.len()==65536 && m.iter().all(|&b| b==3)).count(),2);
+        // Timing/CPU load can drain the mixed train before a held MTU probe retries.
+        // Explicitly wait for authenticated TU growth, then send a whole message so
+        // the size-transition assertion does not depend on thread scheduling.
+        let grown_deadline = Instant::now()+Duration::from_secs(15);
+        while poll(&mut cw,&mut sw,&mut received) <= 1184 {
+            assert!(Instant::now()<grown_deadline,"TU did not grow after relay admission changed");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        service_connections(&client, NetworkThreadPush { wanted_connections: cw.clone(), send_unreliable: vec![(key,1,Dscp::BestEffort,vec![6;80])], ..Default::default() }).unwrap();
+        while !received.iter().any(|m| m==&vec![6;80]) {
+            poll(&mut cw,&mut sw,&mut received);
+            assert!(Instant::now()<grown_deadline,"post-growth whole message failed");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Outstanding authenticated traffic triggers outage probes, then resumes.
+        blackout.store(true,Ordering::Release);
+        service_connections(&client, NetworkThreadPush { wanted_connections: cw.clone(), send_unreliable: vec![(key,1,Dscp::BestEffort,vec![4;80])], ..Default::default() }).unwrap();
+        let recovery = Instant::now()+Duration::from_secs(3);
+        while Instant::now()<recovery { poll(&mut cw,&mut sw,&mut received); std::thread::sleep(Duration::from_millis(1)); }
+        blackout.store(false,Ordering::Release);
+        service_connections(&client, NetworkThreadPush { wanted_connections: cw.clone(), send_unreliable: vec![(key,1,Dscp::BestEffort,vec![5;1000])], ..Default::default() }).unwrap();
+        let idle_end = Instant::now()+Duration::from_secs(8);
+        while Instant::now()<idle_end { poll(&mut cw,&mut sw,&mut received); std::thread::sleep(Duration::from_millis(1)); }
+        assert!(received.iter().any(|m| m==&vec![5;1000]),"fresh message failed after outage");
+        drop(client); drop(server);
+        std::thread::sleep(Duration::from_millis(50));
+        stop.store(true,Ordering::Release); forwarder.join().unwrap();
+        let sent = log.lock().unwrap();
+        let mut sent_packets = std::collections::BTreeMap::new();
+        let mut histogram = std::collections::BTreeMap::new();
+        for p in sent.iter() {
+            *sent_packets.entry(p.bytes.clone()).or_insert(0usize) += 1;
+            *histogram.entry((p.kind,p.bytes.len())).or_insert(0usize) += 1;
+            if let Some(expected) = p.expected { assert_eq!(p.bytes.len(),expected,"{} datagram has unexpected size",p.kind); }
+            else { assert_eq!(p.kind,"handshake"); }
+        }
+        let mut actual_packets = std::collections::BTreeMap::new();
+        for packet in actual.lock().unwrap().iter() { *actual_packets.entry(packet.clone()).or_insert(0usize) += 1; }
+        assert!(sent_packets==actual_packets,"native-send recording and actual UDP capture disagree");
+        assert!(histogram.contains_key(&("data",1184)));
+        assert!(histogram.iter().any(|((kind,size),_)| *kind=="data" && *size>1184));
+        for kind in ["ack","mtu_probe","keepalive","outage"] { assert!(histogram.keys().any(|&(k,_)| k==kind),"missing {kind} coverage"); }
+        assert!(histogram.iter().filter(|((k,_),_)| *k=="ack").all(|((_,size),_)| *size==174));
+        println!("UDP_SIZE_HISTOGRAM kind,udp_payload_bytes,count");
+        for ((kind,size),count) in histogram { println!("UDP_SIZE_HISTOGRAM {kind},{size},{count}"); }
+        println!("UDP_SIZE_PROOF encrypted mixed=20x80B+10x1000B+2x65536B MTU=1184->1472 outage=3s idle=8s; every actual datagram matched send-site TU/ACK/probe expectation");
     }
 }
