@@ -29,6 +29,9 @@ pub(crate) struct AdaptiveFecConfig {
 impl Default for AdaptiveFecConfig {
     fn default() -> Self { crate::ship::FEC }
 }
+// Retainable messages have feedback rescue as a delivery backstop. Pre-sent parity
+// targets a 2% chance of needing that extra RTT, not packet-loss-scale reliability.
+const RESCUE_LATENCY_TAIL: f64 = 0.02;
 const LOSS_SIGNAL_SNAPSHOT_NS: u64 = 50_000_000;
 const LOSS_SIGNAL_RING: usize = 64;
 
@@ -291,10 +294,12 @@ impl SpanLossProfile {
     }
     fn margin_blocks_for_groups_with_floor(&self, k: u64, whole_message_k: u64, groups: usize, cfg: &AdaptiveFecConfig, burst_tail: bool) -> u64 {
         let cap = ((k as f64 * cfg.max_redundancy).ceil() as u64).max(1);
-        // The absolute real-trace burst floor protects the final queued message. Interior
-        // messages still get the IID prior and empirical loss tail, not a fixed 12 symbols.
+        // Retainable messages use a latency-tail budget; oversized/unretainable
+        // messages preserve the original size-sensitive reliability target and floor.
         let prior = if self.seen < 4096 { cfg.initial_loss } else { cfg.min_loss };
-        let eps = self.target_failure(whole_message_k, cfg) / groups.max(1) as f64;
+        let message_eps = if burst_tail { self.target_failure(whole_message_k, cfg) }
+            else { RESCUE_LATENCY_TAIL };
+        let eps = message_eps / groups.max(1) as f64;
         let floor = if burst_tail { 12.min(k) } else { 0 };
         let mut r = repair_blocks(k, prior, z_for_eps(eps), eps, cfg.extra_blocks, cfg.max_redundancy).max(floor).min(cap);
         for _ in 0..32 {
@@ -547,6 +552,24 @@ mod tests {
     }
 
     #[test]
+    fn rescue_latency_budget_ignores_rare_loss_blips() {
+        let mut a = FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0);
+        // Six isolated losses in 100,000 packets must not set a reliability-scale tail.
+        for base in (0..100000).step_by(20) {
+            for seq in base..base+20 { a.on_data_sent(seq); }
+            for seq in base..base+20 {
+                a.on_sequence_finalized(seq, seq < 6 * 15000 && seq % 15000 == 0, seq * 1000);
+            }
+        }
+        let r = a.repair_blocks_for_group_at_tail(12, 12, 1, false);
+        assert!(r <= 2, "rare-blip initial margin {r}");
+        let topup = a.extra_repair_blocks_needed_for_group_at_tail(12, 12, 1, 12, 0, 0, false);
+        assert!(topup <= 2, "rare-blip top-up margin {topup}");
+        // Without retained rescue, retain the full 12-symbol protection contract.
+        assert_eq!(a.repair_blocks_for_group_at_tail(12, 12, 1, true), 12);
+    }
+
+    #[test]
     fn interior_margin_keeps_loss_risk_without_absolute_burst_floor() {
         let mut a = FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0);
         for seq in 0..10000 {
@@ -557,11 +580,11 @@ mod tests {
         assert!((1..=5).contains(&r), "clean interior {r}");
         assert_eq!(a.repair_blocks_for_group_at_tail(12, 12, 1, true), 12);
         assert!(a.extra_repair_blocks_needed_for_group_at_tail(12, 12, 1, 12, 0, 0, false) <= 5);
-        // A learned 10-packet cluster must still raise interior protection.
+        // Frequent learned 10-packet clusters exceed the 2% latency-tail budget.
         for base in (10000..20000).step_by(100) {
             for seq in base..base+100 { a.on_data_sent(seq); }
             for seq in base..base+100 {
-                a.on_sequence_finalized(seq, seq % 1000 < 10, seq * 1000);
+                a.on_sequence_finalized(seq, seq % 100 < 10, seq * 1000);
             }
         }
         let clustered = a.repair_blocks_for_group_at_tail(12, 12, 1, false);
