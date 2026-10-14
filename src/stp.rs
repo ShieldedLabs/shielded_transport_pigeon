@@ -499,7 +499,9 @@ impl FecSendSlot {
         }
         self.n = self.n.max(self.next_id.saturating_add(deficit * groups));
     }
-    fn refresh_plan(&mut self, a: &crate::fec_adapt::FecAdaptiveState, burst_tail: bool) {
+    // Rescue supplies a feedback fallback, so even a burst tail needs only learned risk
+    // protection up front; a blind 12-symbol latency floor is no longer necessary.
+    fn refresh_plan(&mut self, a: &crate::fec_adapt::FecAdaptiveState) {
         let layout = crate::fec::MessageLayout::new(self.message.len(), self.block_bytes).unwrap();
         let groups = layout.groups as u64;
         let sources = self.next_id.min(self.k) as u64;
@@ -509,7 +511,7 @@ impl FecSendSlot {
             let k = layout.group(group).1 as u64;
             let source_sent = (sources / groups + u64::from((group as u64) < sources % groups)).min(k);
             let repair_sent = repairs / groups + u64::from((group as u64) < repairs % groups);
-            let total_repairs = repair_sent + a.extra_repair_blocks_needed_for_group_at_tail(k, self.k as u64, layout.groups, source_sent + repair_sent, repair_sent, self.group_lost[group] as u64, burst_tail);
+            let total_repairs = repair_sent + a.extra_repair_blocks_needed_for_group_at_tail(k, self.k as u64, layout.groups, source_sent + repair_sent, repair_sent, self.group_lost[group] as u64, false);
             per_group_repairs = per_group_repairs.max(total_repairs);
         }
         // Equal complete rounds conservatively protect the most affected group, not mean loss.
@@ -651,7 +653,7 @@ impl UnreliableSendBuffer {
                     }
                 }
                 if active && self.fec_rescue_package.is_none() {
-                    if let Some(a) = &self.fec_adaptive { f.refresh_plan(a, self.message_queue.is_empty()); }
+                    if let Some(a) = &self.fec_adaptive { f.refresh_plan(a); }
                 }
             }
             if !active || self.fec_rescue_package.is_some() { f.rescue_plan(); }
@@ -736,13 +738,6 @@ impl UnreliableSendBuffer {
     // A message whose last fragment has gone out still counts against the queue until it is
     // released here.
     fn reclaim_finished_partial(&mut self) {
-        // Queue occupancy may change after the last planned symbol was emitted. Before
-        // discarding the encoder, give the true final queued message its burst-tail floor.
-        if self.message_queue.is_empty() && self.fec_rescue_package.is_none() {
-            if let (Some(a), Some(f)) = (&self.fec_adaptive, &mut self.fec_send_slot) {
-                if f.next_id >= f.n { f.refresh_plan(a, true); }
-            }
-        }
         if let Some((msg, start_byte)) = &self.partial_send_slot {
             if *start_byte as usize >= msg.len() {
                 let msg_len = msg.len();
@@ -851,10 +846,9 @@ impl UnreliableSendBuffer {
                 return Some(UnreliableFragment::Plain { is_fin: true, package_id: package, data: &f.message, offset: 0 });
             }
             if self.fec_rescue_package.is_none() { if let (Some(a), Some(f)) = (&self.fec_adaptive, &mut self.fec_send_slot) {
-                // Decide burst-tail protection only once sources have left: the application
-                // can refill the queue during transmission. Recheck at the final repair.
+                // Refresh learned tail risk at source completion and the final repair.
                 if f.next_id >= f.k && (f.next_id == f.k || f.next_id + 1 >= f.n) {
-                    f.refresh_plan(a, self.message_queue.is_empty());
+                    f.refresh_plan(a);
                 }
             } }
             let need = { let f = self.fec_send_slot.as_ref().unwrap(); STP_FEC_FRAGMENT_HEADER_SIZE + crate::fec::block_len(f.message.len(), f.block_bytes, crate::fec::MessageLayout::new(f.message.len(), f.block_bytes).unwrap().wire_id(f.next_id)) };
@@ -4092,15 +4086,15 @@ mod fec_send_tests {
         f.next_id = f.k; // all sources sent, no repairs yet
         f.group_lost[1] = 900;
         f.lost = 900;
-        f.refresh_plan(&a, true);
-        let expected_repairs = (0..layout.groups).map(|g| a.extra_repair_blocks_needed_for_group(layout.group(g).1 as u64, layout.k as u64, layout.groups, layout.group(g).1 as u64, 0, f.group_lost[g] as u64)).max().unwrap();
+        f.refresh_plan(&a);
+        let expected_repairs = (0..layout.groups).map(|g| a.extra_repair_blocks_needed_for_group_at_tail(layout.group(g).1 as u64, layout.k as u64, layout.groups, layout.group(g).1 as u64, 0, f.group_lost[g] as u64, false)).max().unwrap();
         assert_eq!(f.n, layout.round_plan(f.k + expected_repairs as u32 * layout.groups as u32));
         let eps = a.group_failure_target(layout.k as u64, 1);
         assert_eq!(a.group_failure_target(layout.k as u64, layout.groups) * layout.groups as f64, eps);
-        assert!(expected_repairs >= 900 + 12);
+        assert!(expected_repairs >= 900 + 2);
         let n = f.n;
         f.group_lost[1] = 0;
-        f.refresh_plan(&a, true);
+        f.refresh_plan(&a);
         assert_eq!(f.n, n); // plans never shrink
     }
 
@@ -4258,7 +4252,7 @@ mod fec_closed_loop_tests {
     }
 
     #[test]
-    fn burst_floor_is_deferred_until_source_completion_and_rechecked_before_reclaim() {
+    fn learned_margin_stays_small_for_both_interior_and_tail_messages() {
         let make = || {
             let mut b = UnreliableSendBuffer::new(100000, 1000000, 1000000);
             b.fec_adaptive = Some(FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0));
@@ -4268,21 +4262,21 @@ mod fec_closed_loop_tests {
         let mut b = make();
         assert!(b.next_fragment(1449, 1449).is_some());
         assert!(b.fec_send_slot.as_ref().unwrap().n < 24);
-        // A successor arriving while sources go out avoids the fixed floor.
+        // A successor arriving while sources go out has the same learned-risk floor.
         b.submit_messages(vec![vec![0; 1433 * 12]]);
         for _ in 1..13 { assert!(b.next_fragment(1449, 1449).is_some()); }
         assert!(b.fec_send_slot.as_ref().unwrap().n < 24);
-        // End of planned repairs, but the queue just became empty: do not discard the
-        // encoder before upgrading to the full burst-tail floor.
+        // When the queue becomes empty, retain the encoder without adding 12 blind repairs.
         let f = b.fec_send_slot.as_mut().unwrap();
         f.next_id = f.n;
         b.message_queue.clear();
         b.reclaim_finished_partial();
-        assert_eq!(b.fec_send_slot.as_ref().unwrap().n, 24);
+        assert!(b.fec_send_slot.is_none());
+        assert!(b.fec_retained.front().unwrap().slot.n <= 17);
 
         let mut b = make();
         for _ in 0..13 { assert!(b.next_fragment(1449, 1449).is_some()); }
-        assert_eq!(b.fec_send_slot.as_ref().unwrap().n, 24); // true tail at sources done
+        assert!(b.fec_send_slot.as_ref().unwrap().n <= 17); // true tail at sources done
     }
 
     #[test]
@@ -4303,7 +4297,7 @@ mod fec_closed_loop_tests {
         b.fec_prepare_packet(64);
         assert!(matches!(b.next_fragment(1449, 1449), Some(UnreliableFragment::Fec { block_id: 64, .. })));
         let f = b.fec_send_slot.as_ref().unwrap();
-        assert!(f.n > initial_n && f.n >= 96 && f.n <= 128, "initial={initial_n} n={}", f.n);
+        assert!(f.n > initial_n && f.n >= 86 && f.n <= 128, "initial={initial_n} n={}", f.n);
         // Existing top-up callback also uses the same bounded closed-loop budget.
         b.fec_on_packet_lost(4);
         assert_eq!(b.fec_send_slot.as_ref().unwrap().lost, 21);
