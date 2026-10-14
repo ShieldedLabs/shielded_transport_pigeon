@@ -1781,6 +1781,7 @@ impl ConnectionStateConnected {
         get_send_time_for_sequence_number(sequence, &self.send_time_band, self.send_time_band_head_index)
     }
     fn account_send(&mut self, actual_ns: u64) {
+        self.outage.pending_since_ns.get_or_insert(actual_ns);
         assert!(self.send_sequence_number < crate::sequence::ACK_SPACE - 1, "data nonce space exhausted");
         increment_sequence_number_and_account(actual_ns, &mut self.send_sequence_number,
             &mut self.send_time_band, &mut self.send_time_band_head_index, &mut self.packets_waiting_ack_field);
@@ -2858,15 +2859,10 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     state.peer_ack_delay_us = a.delay_us;
                                     Some(a)
                                 } else { None };
-                                if state.outage.since_ns.is_some() && bitmap_ack.as_ref().is_some_and(|a| {
-                                    a.acknowledged().any(|seq| {
-                                        let bit = seq % PACKETS_WAITING_ACK_CAPACITY;
-                                        seq >= state.packets_waiting_ack_tail && seq < state.send_sequence_number &&
-                                            state.packets_waiting_ack_field[(bit / 64) as usize] & (1 << (bit % 64)) != 0
-                                    })
-                                }) {
-                                    // Only a newly acknowledged outage probe proves round-trip recovery.
-                                    // Replayed/stale ACK contents cannot extend the deadline or resume data.
+                                if state.outage.since_ns.is_some() {
+                                    // Only receipt of a RECENT outage probe proves round-trip recovery.
+                                    // Replayed or withheld old authentic ACKs cannot extend the deadline.
+                                    if !bitmap_ack.as_ref().is_some_and(|a| recent_outage_probe_acked(state, a, timestamp_ns)) { break 'conn; }
                                     resume_outage(state, &mut existing_connection.unreliable_send_buffer,
                                         &mut existing_connection.unreliable_fec, timestamp_ns, max_pps);
                                 }
@@ -2889,6 +2885,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                         if state.packets_waiting_ack_field[(bit_index / 64) as usize] & (1u64 << (bit_index % 64)) != 0 {
                                             state.packets_waiting_ack_field[(bit_index / 64) as usize] &= !(1u64 << (bit_index % 64));
                                             state.last_ack_received_time = timestamp_ns;
+                                            state.outage.pending_since_ns = None;
                                             if let Some(t) = &mut loss_trace { t.outcome('A', existing_connection.two_byte_send_prefix, index, timestamp_ns); }
 
                                             newly_acked = true;
@@ -2920,6 +2917,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                             state.stats.spurious_losses += 1;
                                             newly_acked = true;
                                             state.last_ack_received_time = timestamp_ns;
+                                            state.outage.pending_since_ns = None;
+                                            if index < state.outage.ignore_loss_before_seq { state.outage.ignored_spurious += 1; }
                                             if let Some(t) = &mut loss_trace { t.outcome('A', existing_connection.two_byte_send_prefix, index, timestamp_ns); }
                                         }
                                     }
@@ -3311,7 +3310,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                         }
                         
                         if state.outage.since_ns.is_none() && state.send_sequence_number > state.packets_waiting_ack_tail
-                            && current_time_now_ns.saturating_sub(state.last_ack_received_time) >= OUTAGE_ACK_SILENCE_NS {
+                            && state.outage.pending_since_ns.is_some_and(|start|
+                                current_time_now_ns.saturating_sub(start.max(state.last_ack_received_time)) >= OUTAGE_ACK_SILENCE_NS) {
                             enter_outage(state, &mut connection_tracking_data.unreliable_send_buffer,
                                 current_time_now_ns, connection_tracking_data.two_byte_send_prefix, loss_trace.as_mut());
                         }
@@ -3332,6 +3332,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     connection_tracking_data.other_ip, connection_tracking_data.other_port,
                                     &packet_memory_encrypted[..6+packet_len], Dscp::Af21, false);
                                 state.account_send(send_time);
+                                state.outage.probes[(seq % 8) as usize] = (seq, send_time);
                                 state.packets_in_flight += 1;
                                 state.stats.packets_sent += 1;
                                 state.stats.bytes_sent += (6 + packet_len) as u64;
@@ -3478,6 +3479,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     state.packets_in_flight -= 1;
                                     state.packet_lost_since_last_print += 1;
                                     state.stats.packets_lost += 1;
+                                    if state.packets_waiting_ack_tail < state.outage.ignore_loss_before_seq { state.outage.ignored_losses += 1; }
                                     if let Some(t) = &mut loss_trace { t.outcome('L', connection_tracking_data.two_byte_send_prefix, state.packets_waiting_ack_tail, current_time_now_ns); }
                                     state.declared_lost_field[(bit_index / 64) as usize] |= 1u64 << (bit_index % 64);
                                 }
@@ -3491,8 +3493,10 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             }
                             state.packets_waiting_ack_field[(bit_index / 64) as usize] &= !(1u64 << (bit_index % 64));
                             let lost = state.declared_lost_field[(bit_index / 64) as usize] & (1u64 << (bit_index % 64)) != 0;
-                            if let Some(a) = &mut connection_tracking_data.unreliable_send_buffer.fec_adaptive {
-                                a.on_sequence_finalized(state.packets_waiting_ack_tail, lost, current_time_now_ns);
+                            if state.packets_waiting_ack_tail >= state.outage.ignore_loss_before_seq {
+                                if let Some(a) = &mut connection_tracking_data.unreliable_send_buffer.fec_adaptive {
+                                    a.on_sequence_finalized(state.packets_waiting_ack_tail, lost, current_time_now_ns);
+                                }
                             }
                             connection_tracking_data.unreliable_send_buffer.fec_on_packet_finalized(state.packets_waiting_ack_tail, lost);
                             state.packets_waiting_ack_tail += 1;
@@ -3591,8 +3595,9 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                         connection_tracking_data.unreliable_send_buffer.set_rate(payload_size as u64 * allowed_bandwidth_upps / 1000_000);
                         {
                             let buf = &mut connection_tracking_data.unreliable_send_buffer;
-                            let a = buf.fec_adaptive.get_or_insert_with(|| crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, current_time_now_ns, state.stats.packets_sent, state.stats.packets_lost));
-                            a.on_tick(current_time_now_ns, state.stats.packets_sent, state.stats.packets_lost, state.stats.spurious_losses);
+                            let (lost, spurious) = fec_learning_counters(state);
+                            let a = buf.fec_adaptive.get_or_insert_with(|| crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, current_time_now_ns, state.stats.packets_sent, lost.saturating_sub(spurious)));
+                            a.on_tick(current_time_now_ns, state.stats.packets_sent, lost, spurious);
                             buf.set_overhead();
                             if record_fec_messages && buf.fec_record.is_none() { buf.fec_record = Some(Vec::new()); }
                         }
@@ -3861,10 +3866,28 @@ const OUTAGE_PROBE_PAYLOAD_BYTES: usize = 517;
 #[derive(Debug, Default)]
 struct OutageState {
     since_ns: Option<u64>,
+    pending_since_ns: Option<u64>,
     next_probe_ns: u64,
     probe_interval_ns: u64,
     resume_rate_upps: u64,
     ignore_loss_before_seq: u64,
+    probes: [(u64, u64); 8],
+    max_probe_age_ns: u64,
+    ignored_losses: u64,
+    ignored_spurious: u64,
+}
+fn fec_learning_counters(state: &ConnectionStateConnected) -> (u64, u64) {
+    (state.stats.packets_lost.saturating_sub(state.outage.ignored_losses),
+        state.stats.spurious_losses.saturating_sub(state.outage.ignored_spurious))
+}
+fn recent_outage_probe_acked(state: &ConnectionStateConnected, ack: &crate::ack::BitmapAck, now: u64) -> bool {
+    ack.acknowledged().any(|seq| {
+        let (record_seq, sent) = state.outage.probes[(seq % 8) as usize];
+        let bit = seq % PACKETS_WAITING_ACK_CAPACITY;
+        seq >= state.packets_waiting_ack_tail && seq < state.send_sequence_number &&
+            state.packets_waiting_ack_field[(bit / 64) as usize] & (1 << (bit % 64)) != 0 &&
+            record_seq == seq && sent != 0 && now.saturating_sub(sent) <= state.outage.max_probe_age_ns.max(OUTAGE_MAX_PROBE_NS)
+    })
 }
 impl OutageState {
     fn enter(&mut self, now: u64, rate: u64) {
@@ -3887,7 +3910,8 @@ impl OutageState {
 fn enter_outage(state: &mut ConnectionStateConnected, buf: &mut SendQueues,
     now: u64, prefix: u16, mut trace: Option<&mut crate::loss_trace::LossTrace>) {
     state.outage.enter(now, state.stats.cc_rate_upps.max(1));
-    for q in &mut buf.queues { q.fec_now_ns = now; }
+    state.outage.max_probe_age_ns = OUTAGE_MAX_PROBE_NS.max(2 * state.RTT_mean as u64 * 100_000);
+    for q in &mut buf.queues { q.fec_now_ns = now; q.fec_prune_retained(); }
     // Finalize the stranded train once. FEC retains/rescues its source within the existing
     // source-byte budget; no missing packet here invokes loss-based congestion control.
     while state.packets_waiting_ack_tail < state.send_sequence_number {
@@ -3899,13 +3923,14 @@ fn enter_outage(state: &mut ConnectionStateConnected, buf: &mut SendQueues,
             if lost {
                 state.packets_in_flight = state.packets_in_flight.checked_sub(1).expect("outage flight underflow");
                 state.stats.packets_lost += 1;
+                state.outage.ignored_losses += 1;
                 state.packet_lost_since_last_print += 1;
                 state.declared_lost_field[(bit / 64) as usize] |= 1 << (bit % 64);
                 if let Some(t) = trace.as_deref_mut() { t.outcome('L', prefix, seq, now); }
             } else { state.stats.tu_probes_lost += 1; }
         }
         state.packets_waiting_ack_field[(bit / 64) as usize] &= !(1 << (bit % 64));
-        if let Some(a) = &mut buf.fec_adaptive { a.on_sequence_finalized(seq, lost, now); }
+        // Finalize source tags for rescue, but never teach SpanLossProfile an outage.
         buf.fec_on_packet_finalized(seq, lost);
         state.packets_waiting_ack_tail += 1;
     }
@@ -3920,15 +3945,27 @@ fn resume_outage(state: &mut ConnectionStateConnected, buf: &mut SendQueues,
     slots: &mut [FecRecvSlot], now: u64, max_pps: Option<u64>) {
     let Some(since) = state.outage.since_ns.take() else { return; };
     let paused = now.saturating_sub(since);
-    // Freeze active retention time, not its byte budget or package identity. Objects already
-    // expired before entry are not resurrected; workers with new ingress need no clock shift.
+    // Freeze active retention time, not its byte budget or package identity.
+    // Sources already outside retention at entry are not resurrected.
     for q in &mut buf.queues {
         for retained in q.fec_retained.values_mut() { retained.expires_ns = retained.expires_ns.saturating_add(paused); }
         for slot in [&mut q.fec_send_slot, &mut q.fec_suspended].into_iter().flatten() {
             slot.send_started_ns = slot.send_started_ns.saturating_add(paused);
         }
     }
-    for slot in slots { if slot.last_block_ns <= since { slot.last_block_ns = slot.last_block_ns.saturating_add(paused); } }
+    // A path outage is not a stationary 100%-loss channel. Start a fresh FEC
+    // observation window; source rescue plans above remain intact.
+    if buf.fec_adaptive.is_some() {
+        let (lost, spurious) = fec_learning_counters(state);
+        buf.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC,
+            now, state.stats.packets_sent, lost.saturating_sub(spurious)));
+    }
+    // Receiver-only peers notice the outage later, at their own keepalive. A
+    // partial worker's entire silence must be paused, not only time since that
+    // later entry. Round-trip recovery starts its inactivity grace afresh.
+    for slot in slots {
+        if matches!(slot.state, FecRecvState::Worker { .. }) { slot.last_block_ns = now; }
+    }
     state.outage.ignore_loss_before_seq = state.send_sequence_number;
     state.congestion_event_rate_upps = local_rate_limit(state.outage.resume_rate_upps, max_pps).max(1);
     state.congestion_event_time_ns = now;
@@ -3946,7 +3983,8 @@ fn resume_outage(state: &mut ConnectionStateConnected, buf: &mut SendQueues,
     state.loss_count_in_window = 0;
     state.loss_window_start_ns = now;
     state.app_limit_time_offset = 0;
-    state.current_tu = ASSUMED_UDP_PAYLOAD_SIZE_WITH_GUARANTEED_DELIVERY as u64;
+    // Retained FEC encoders fix block_bytes at creation. Shrinking TU here would
+    // discard their repairs via need > space; keep the authenticated path's TU.
     state.tu_probe_failed_count = 0;
     println!("research outage resumed after {} ms at {} pps", paused / 1_000_000, state.congestion_event_rate_upps / 1_000_000);
 }
@@ -5429,5 +5467,106 @@ mod ring_pressure_rescue_tests {
         s.fec_on_packet_finalized(1024, false);
         s.fec_prepare_packet(1025);
         assert!(s.fill_packet(&mut [0; 1449]) > 0); // the deferred original now has a lease
+    }
+}
+
+#[cfg(test)]
+mod outage_review_repros {
+    use super::*;
+    fn state() -> ConnectionStateConnected {
+        let ConnectionState::Connected(s) = new_connection_state_connected(None, 0, 1, 1_000_000_000) else { unreachable!() }; s
+    }
+    fn buffer() -> SendQueues {
+        let mut b = SendQueues::new(1, (100000, 1000000, 1000000));
+        b.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 1_000_000_000, 0, 0)); b
+    }
+    #[test]
+    fn resume_preserves_ready_fec_rescue_tu() {
+        let mut b = buffer(); let mut s = state(); s.stats.cc_rate_upps = 100_000_000;
+        s.current_tu = 1472;
+        b.queues[0].fec_now_ns = 1_000_000_000;
+        b.submit_messages(0, vec![vec![7; 1433 * 12]]);
+        let mut seq = 0;
+        loop {
+            b.fec_prepare_packet(seq);
+            assert!(b.fill_packet(&mut [0; 1449]) > 0);
+            s.account_send(1_000_000_000 + seq * 1_000_000); s.packets_in_flight += 1;
+            seq += 1;
+            if b.queues[0].fec_send_slot.as_ref().unwrap().next_id >= b.queues[0].fec_send_slot.as_ref().unwrap().n { break; }
+        }
+        b.queues[0].reclaim_finished_partial(); assert_eq!(b.queues[0].fec_retained.len(), 1);
+        enter_outage(&mut s, &mut b, 2_999_000_000, 0, None);
+        assert!(b.queues[0].fec_retained[&0].slot.next_id < b.queues[0].fec_retained[&0].slot.n);
+        resume_outage(&mut s, &mut b, &mut [], 27_000_000_000, None);
+        b.queues[0].fec_now_ns = 27_000_000_000;
+        assert_eq!(s.current_tu, 1472);
+        assert!(b.fill_packet(&mut [0; 1449]) > 0);
+    }
+    #[test]
+    fn receiver_decoder_has_full_grace_after_resume() {
+        let mut s = state(); let mut b = buffer(); s.stats.cc_rate_upps = 100_000_000;
+        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+        let mut slots = [FecRecvSlot { reservation: None, package_id: 0, state: FecRecvState::Worker { tx, message_len: 1_000_000, block_bytes: 1000 }, blocks_received: 1, last_block_ns: 1_000_000_000, ingress_dropped: 0, admission_refused: false }];
+        s.account_send(6_000_000_000); s.packets_in_flight = 1;
+        enter_outage(&mut s, &mut b, 6_001_000_000, 0, None);
+        assert_eq!(retire_inactive_fec_workers(&mut slots, 25_000_000_000, OUTAGE_TIMEOUT_NS, false), 0);
+        // A decoder may receive delayed ingress AFTER the sender-side entry.
+        slots[0].last_block_ns = 8_000_000_000;
+        resume_outage(&mut s, &mut b, &mut slots, 25_000_000_000, None);
+        assert_eq!(slots[0].last_block_ns, 25_000_000_000);
+        assert_eq!(retire_inactive_fec_workers(&mut slots, 25_000_000_000, fec_inactive_grace_ns(s.RTT_mean, false), false), 0);
+        assert!(matches!(slots[0].state, FecRecvState::Worker { .. }));
+    }
+    #[test]
+    fn entry_does_not_resurrect_source_already_outside_retention() {
+        let mut b = buffer(); let mut s = state();
+        b.queues[0].fec_now_ns = 1_000_000_000;
+        b.submit_messages(0, vec![vec![7; 100]]); b.fec_prepare_packet(0);
+        assert!(b.fill_packet(&mut [0; 1449]) > 0); b.queues[0].reclaim_finished_partial();
+        assert_eq!(b.queues[0].fec_retained.len(), 1);
+        s.account_send(1_000_000_000); s.packets_in_flight = 1;
+        enter_outage(&mut s, &mut b, 3_000_000_001, 0, None);
+        // Boundary case: normal loss/rescue ticks were deliberately skipped;
+        // a source already expired at entry is outside retention, not resurrected.
+        assert!(b.queues[0].fec_retained.is_empty());
+    }
+    #[test]
+    fn withheld_probe_ack_cannot_restart_deadline() {
+        let mut s = state();
+        s.outage.enter(3_000_000_000, 100_000_000);
+        s.account_send(3_000_000_000);
+        s.outage.probes[0] = (0, 3_000_000_000);
+        let a = crate::ack::BitmapAck { highest: 0, sample_seq: 0, delay_us: 0, ce_count: 0, bitmap: [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0] };
+        assert!(recent_outage_probe_acked(&s, &a, 3_100_000_000));
+        assert!(!recent_outage_probe_acked(&s, &a, 120_000_000_000));
+        assert_eq!(s.last_ack_received_time, 1_000_000_000);
+    }
+    #[test]
+    fn first_idle_keepalive_waits_for_feedback_before_outage() {
+        let mut s = state();
+        s.account_send(6_000_000_000);
+        let start = s.outage.pending_since_ns.unwrap().max(s.last_ack_received_time);
+        assert_eq!(start, 6_000_000_000);
+        assert!(6_001_000_000u64.saturating_sub(start) < OUTAGE_ACK_SILENCE_NS);
+        s.packets_waiting_ack_tail = s.send_sequence_number; // ordinary retirement empties ring
+        s.account_send(8_000_000_000);
+        assert_eq!(s.outage.pending_since_ns, Some(6_000_000_000));
+        assert_eq!(s.last_ack_received_time, 1_000_000_000); // Sending never refreshes deadline.
+    }
+    #[test]
+    fn outage_cumulative_losses_and_late_corrections_do_not_poison_fec() {
+        let mut s = state(); let mut b = buffer();
+        s.stats.packets_sent = 100;
+        s.stats.packets_lost = 50;
+        s.outage.ignored_losses = 50;
+        s.outage.enter(3_000_000_000, 100_000_000);
+        resume_outage(&mut s, &mut b, &mut [], 27_000_000_000, None);
+        let fresh = crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 27_000_000_000, 100, 0);
+        assert_eq!(b.fec_adaptive.as_ref().unwrap().repair_blocks(128), fresh.repair_blocks(128));
+        assert_eq!(b.fec_adaptive.as_ref().unwrap().p, fresh.p);
+        s.stats.packets_lost += 2; // genuine post-resume loss
+        s.stats.spurious_losses += 3; // late outage ACKs
+        s.outage.ignored_spurious += 3;
+        assert_eq!(fec_learning_counters(&s), (2, 0));
     }
 }
