@@ -445,6 +445,7 @@ pub struct UnreliableSendBuffer {
     fec_retained: VecDeque<RetainedFecSlot>,
     fec_extra_packet_tags: HashMap<u64, Vec<u64>>,
     fec_rescue_package: Option<u16>,
+    fec_suspended: Option<FecSendSlot>,
     fec_now_ns: u64,
     fec_rtt_ns: u64,
     /// Cumulative source/repair progress snapshots, when recording is enabled (Some).
@@ -603,6 +604,7 @@ impl UnreliableSendBuffer {
             fec_retained: VecDeque::new(),
             fec_extra_packet_tags: HashMap::new(),
             fec_rescue_package: None,
+            fec_suspended: None,
             fec_now_ns: 0,
             fec_rtt_ns: 0,
             fec_record: None,
@@ -644,8 +646,10 @@ impl UnreliableSendBuffer {
             if count == 0 { continue; }
             let package = (tag >> 48) as u16;
             let active = self.fec_send_slot.is_some() && package == self.fec_rescue_package.unwrap_or(self.send_package_id);
+            let suspended = self.fec_suspended.is_some() && package == self.send_package_id;
             let retained = self.fec_retained.iter().position(|r| r.package == package);
-            let f = if active && self.fec_send_slot.is_some() { self.fec_send_slot.as_mut() }
+            let f = if active { self.fec_send_slot.as_mut() }
+                else if suspended { self.fec_suspended.as_mut() }
                 else { retained.map(|i| &mut self.fec_retained[i].slot) };
             let Some(f) = f else { continue };
             let first = tag as u32;
@@ -661,11 +665,11 @@ impl UnreliableSendBuffer {
                         f.group_lost[group] = f.group_lost[group].saturating_add(1);
                     }
                 }
-                if active && self.fec_rescue_package.is_none() {
+                if suspended || active && self.fec_rescue_package.is_none() {
                     if let Some(a) = &self.fec_adaptive { f.refresh_plan(a); }
                 }
             }
-            if !active || self.fec_rescue_package.is_some() { f.rescue_plan(); }
+            if !suspended && (!active || self.fec_rescue_package.is_some()) { f.rescue_plan(); }
         }
         self.fec_prune_retained();
     }
@@ -741,7 +745,8 @@ impl UnreliableSendBuffer {
         if let Some(f) = &self.fec_send_slot {
             if f.next_id < f.n { return true; }
         }
-        self.fec_retained.iter().any(|r| r.slot.next_id < r.slot.n)
+        self.fec_suspended.as_ref().is_some_and(|f| f.next_id < f.n) ||
+            self.fec_retained.iter().any(|r| r.slot.next_id < r.slot.n)
     }
 
     // A message whose last fragment has gone out still counts against the queue until it is
@@ -770,6 +775,7 @@ impl UnreliableSendBuffer {
                 if message_len > FEC_RETAIN_SOURCE_BYTES {
                     let _ = std::thread::Builder::new().name("stp-fec-release".into()).spawn(move || drop(finished));
                 } else { self.retain_fec(finished, package); }
+                if rescue.is_some() { self.fec_send_slot = self.fec_suspended.take(); }
             }
         }
     }
@@ -828,20 +834,31 @@ impl UnreliableSendBuffer {
     pub fn next_fragment(&mut self, payload_len: usize, space: usize) -> Option<UnreliableFragment<'_>> {
         self.reclaim_finished_partial();
         self.fec_prune_retained();
-        if self.partial_send_slot.is_none() && self.fec_send_slot.is_none() {
+        // A long original train must not block a ready rescue until its retention expires.
+        // Suspend only at a fragment boundary; packet tags still route its outcome feedback.
+        if self.partial_send_slot.is_none() && self.fec_rescue_package.is_none() {
             if let Some(i) = self.fec_retained.iter().position(|r| r.slot.next_id < r.slot.n) {
                 let r = self.fec_retained.remove(i).unwrap();
+                self.fec_suspended = self.fec_send_slot.take();
                 self.fec_rescue_package = Some(r.package);
                 self.fec_send_slot = Some(r.slot);
-            } else {
-                let front_msg = self.message_queue.pop_front()?;
-                self.start_message(front_msg, payload_len);
             }
+        }
+        if self.partial_send_slot.is_none() && self.fec_send_slot.is_none() {
+            let front_msg = self.message_queue.pop_front()?;
+            self.start_message(front_msg, payload_len);
         }
         if self.fec_send_slot.is_some() {
             if self.fec_send_slot.as_ref().unwrap().k == 1 {
                 let f = self.fec_send_slot.as_ref().unwrap();
-                if f.message.len() + STP_FRAGMENT_HEADER_SIZE > space { return None; }
+                if f.message.len() + STP_FRAGMENT_HEADER_SIZE > space {
+                    if space < payload_len { return None; }
+                    // A TU shrink invalidated the whole-packet K=1 copy. Abandon this
+                    // bounded rescue rather than blocking the suspended original forever.
+                    self.fec_send_slot = self.fec_suspended.take();
+                    self.fec_rescue_package = None;
+                    return self.next_fragment(payload_len, space);
+                }
                 let package = self.fec_rescue_package.unwrap();
                 self.tag_symbol(package, f.next_id);
                 let f = self.fec_send_slot.as_mut().unwrap();
@@ -864,6 +881,7 @@ impl UnreliableSendBuffer {
                 let f = self.fec_send_slot.take().unwrap();
                 drop(f.encoder);
                 if self.fec_rescue_package.take().is_some() {
+                    self.fec_send_slot = self.fec_suspended.take();
                     return self.next_fragment(payload_len, space); // cannot change a retained package's layout
                 }
                 self.send_package_id = self.send_package_id.wrapping_add(1);
@@ -4195,6 +4213,31 @@ mod rx_tracker_tests {
 mod fec_closed_loop_tests {
     use super::*;
     use crate::fec_adapt::{AdaptiveFecConfig, FecAdaptiveState};
+
+    #[test]
+    fn ready_raw_rescue_preempts_original_and_routes_suspended_feedback() {
+        let mut b = UnreliableSendBuffer::new(100000, 1000000, 1000000);
+        b.fec_adaptive = Some(FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0));
+        b.submit_messages(vec![vec![7; 1000], vec![8; 1433 * 512]]);
+        b.fec_prepare_packet(0);
+        assert!(matches!(b.next_fragment(1449, 1449), Some(UnreliableFragment::Plain { package_id: 0, .. })));
+        for seq in 1..=2 {
+            b.fec_prepare_packet(seq);
+            assert!(matches!(b.next_fragment(1449, 1449), Some(UnreliableFragment::Fec { package_id: 1, .. })));
+        }
+        b.fec_on_packet_finalized(0, true);
+        b.fec_prepare_packet(3);
+        assert!(matches!(b.next_fragment(1449, 1449), Some(UnreliableFragment::Plain { package_id: 0, .. })));
+        assert_eq!(b.fec_suspended.as_ref().unwrap().next_id, 2);
+        b.fec_on_packet_finalized(1, true); // original feedback while the raw rescue owns active slot
+        assert_eq!(b.fec_suspended.as_ref().unwrap().lost, 1);
+        b.reclaim_finished_partial();
+        b.fec_on_packet_finalized(3, false);
+        assert!(b.fec_suspended.is_none());
+        b.fec_prepare_packet(4);
+        assert!(matches!(b.next_fragment(1449, 1449), Some(UnreliableFragment::Fec { package_id: 1, block_id: 2, .. })));
+        assert_eq!(b.queue_bytes_filled, 1433 * 512);
+    }
 
     #[test]
     fn oversized_messages_keep_floor_when_feedback_rescue_cannot_retain_them() {
