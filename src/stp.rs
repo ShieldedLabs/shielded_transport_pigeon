@@ -1701,6 +1701,9 @@ pub struct ConnectionStateConnected {
     pub peer_ack_delay_us: u32,
     pub peer_ce_count: u32,
     loss_timer: LossTimer,
+    // Three bitplanes encode control=0 and four data DSCP classes=1..4.
+    // Retained through late ACKs; overwritten only on accepted ring-slot reuse.
+    packet_classes: Box<[u64]>,
     ack_hole: AckHole,
 
     // Note(Sam): HARD ASSUMPTION that no link ever has a greater RTT than 4.295 seconds.
@@ -1772,6 +1775,7 @@ pub fn new_connection_state_connected(cipher: Option<ConnectionCipherTriplet>, m
         peer_ack_delay_us: 0,
         peer_ce_count: 0,
         loss_timer: LossTimer::default(),
+        packet_classes: vec![0; 3 * PACKETS_WAITING_ACK_WORDS].into_boxed_slice(),
         ack_hole: AckHole::default(),
         send_time_band: [0; 1024],
         send_time_band_head_index: 0,
@@ -2054,6 +2058,22 @@ pub fn get_send_time_for_sequence_number(sequence_number: u64, send_time_band: &
 impl ConnectionStateConnected {
     fn send_time(&self, sequence: u64) -> u64 {
         get_send_time_for_sequence_number(sequence, &self.send_time_band, self.send_time_band_head_index)
+    }
+    fn packet_class(&self, seq: u64) -> Option<usize> {
+        let i = seq % PACKETS_WAITING_ACK_CAPACITY;
+        let value = (0..3).fold(0usize, |v, plane| v | (((self.packet_classes[plane * PACKETS_WAITING_ACK_WORDS + (i / 64) as usize] >> (i % 64)) & 1) as usize) << plane);
+        (1..=4).contains(&value).then(|| value - 1)
+    }
+    fn observe_data_ack(&mut self, seq: u64, raw_ns: u64) {
+        if let Some(class) = self.packet_class(seq) { self.loss_timer.data_acked(class, seq, raw_ns); }
+    }
+    fn set_packet_class(&mut self, seq: u64, class: Option<usize>) {
+        let i = seq % PACKETS_WAITING_ACK_CAPACITY;
+        let value = class.map_or(0, |c| c + 1);
+        for plane in 0..3 {
+            let word = &mut self.packet_classes[plane * PACKETS_WAITING_ACK_WORDS + (i / 64) as usize];
+            *word = (*word & !(1 << (i % 64))) | (((value >> plane) & 1) as u64) << (i % 64);
+        }
     }
     fn account_send(&mut self, actual_ns: u64) {
         self.outage.pending_since_ns.get_or_insert(actual_ns);
@@ -3280,6 +3300,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 let mut RTT_acc = 0u64;
                                 let mut RTT_count = 0u64;
                                 let mut ack_latency_ns = 0u64;
+                                let mut spurious_ack = false;
                                 
                                 let mut data_ack_progress = false;
                                 let mut oldest_newly_acked_send_time: u64 = u64::MAX;
@@ -3287,6 +3308,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 let indices = relevant_ack.iter().flat_map(crate::ack::BitmapAck::acknowledged);
                                 for index in indices {
                                     let mut newly_acked = false;
+                                    let mut was_spurious = false;
                                     if index < state.send_sequence_number {
                                         state.highest_peer_acked = Some(state.highest_peer_acked.unwrap_or(index).max(index));
                                     }
@@ -3328,6 +3350,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                             *w &= !(1u64 << (bit_index % 64));
                                             state.stats.spurious_losses += 1;
                                             newly_acked = true;
+                                            was_spurious = true;
                                             state.last_ack_received_time = timestamp_ns;
                                             state.outage.pending_since_ns = None;
                                             if index < state.outage.ignore_loss_before_seq { state.outage.ignored_spurious += 1; }
@@ -3339,6 +3362,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                         if sent_ns != 0 && sent_ns != u64::MAX {
                                             let raw = timestamp_ns.saturating_sub(sent_ns);
                                             ack_latency_ns = ack_latency_ns.max(raw);
+                                            state.observe_data_ack(index, raw);
+                                            spurious_ack |= was_spurious;
                                             // A late sample is still a truthful RTT measurement.
                                             if bitmap_ack.as_ref().is_none_or(|a| index == a.sample_seq) {
                                                 let delay = bitmap_ack.as_ref().map_or(0, |a| a.delay_us as u64 * 1000);
@@ -3350,7 +3375,9 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                         }
                                     }
                                 }
-                                if ack_latency_ns != 0 { state.loss_timer.observe(ack_latency_ns); }
+                                if ack_latency_ns != 0 {
+                                    state.loss_timer.observe(ack_latency_ns, timestamp_ns, spurious_ack);
+                                }
                                 if data_ack_progress {
                                     let before = state.congestion_event_time_ns;
                                     let context = loss_trace.as_ref().map(|_| cc_trace_context(state, timestamp_ns, &cc, max_pps));
@@ -3710,7 +3737,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 &pending.bytes, pending.dscp, false);
                             if let Some(sent) = sent {
                                 commit_connected_send(state, &mut connection_tracking_data.unreliable_send_buffer,
-                                    pending.kind, sent, pending.bytes.len(), &pending.plaintext,
+                                    pending.kind, sent, pending.bytes.len(), &pending.plaintext, pending.dscp,
                                     connection_tracking_data.two_byte_send_prefix, loss_trace.as_mut());
                                 update_app_limit(state, current_time_now_ns,
                                     connection_tracking_data.unreliable_send_buffer.has_unsent_data());
@@ -3867,10 +3894,6 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             println!("congestion event ECN CE ...  rate discovered: {} pps  sent:{send_mode}@{send_t_factor:.2}", state.congestion_event_rate_upps as f64 / 1000000.0);
                         }
 
-                        let time_to_considered_dropped = state.loss_timer.timeout_ns(
-                            state.RTT_mean as u64 * 100_000,
-                            current_time_now_ns.saturating_sub(state.last_ack_received_time), &cc);
-                        
                         connection_tracking_data.unreliable_send_buffer.set_time(current_time_now_ns, state.RTT_mean as u64 * 100_000);
                         // every send site (data loop, tu probe, keepalive, both ack paths) gates on ring space, so head never laps tail
                         assert!(state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY);
@@ -3880,6 +3903,10 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             state.declared_lost_field[(bit_index / 64) as usize] &= !(1u64 << (bit_index % 64));
                             if state.packets_waiting_ack_field[(bit_index / 64) as usize] & (1u64 << (bit_index % 64)) != 0 {
                                 let mut send_time = state.send_time(state.packets_waiting_ack_tail);
+                                let time_to_considered_dropped = state.loss_timer.class_packet_timeout_ns(
+                                    state.RTT_mean as u64 * 100_000,
+                                    current_time_now_ns.saturating_sub(state.last_ack_received_time), current_time_now_ns,
+                                    state.packets_waiting_ack_tail, state.packet_class(state.packets_waiting_ack_tail), &cc);
                                 if send_time != 0 && (state.RTT_mean == 0 || (current_time_now_ns - send_time) < time_to_considered_dropped) {
                                     break;
                                 }
@@ -4497,7 +4524,7 @@ fn finish_connected_send(state: &mut ConnectionStateConnected, buf: &mut SendQue
     kind: PendingSendKind, sent: Option<u64>, now: u64, bytes: &[u8], plaintext: &[u8],
     dscp: Dscp, prefix: u16, trace: Option<&mut crate::loss_trace::LossTrace>) -> bool {
     if let Some(sent) = sent {
-        commit_connected_send(state, buf, kind, sent, bytes.len(), plaintext, prefix, trace);
+        commit_connected_send(state, buf, kind, sent, bytes.len(), plaintext, dscp, prefix, trace);
         if kind == PendingSendKind::Ack { update_app_limit(state, now, buf.has_unsent_data()); }
         true
     } else {
@@ -4512,7 +4539,7 @@ fn finish_connected_send(state: &mut ConnectionStateConnected, buf: &mut SendQue
 }
 
 fn commit_connected_send(state: &mut ConnectionStateConnected, buf: &mut SendQueues,
-    kind: PendingSendKind, sent: u64, len: usize, plaintext: &[u8], prefix: u16,
+    kind: PendingSendKind, sent: u64, len: usize, plaintext: &[u8], dscp: Dscp, prefix: u16,
     trace: Option<&mut crate::loss_trace::LossTrace>) {
     state.locally_blocked = false;
     if kind == PendingSendKind::Ack {
@@ -4525,11 +4552,13 @@ fn commit_connected_send(state: &mut ConnectionStateConnected, buf: &mut SendQue
     }
     let seq = state.send_sequence_number;
     if kind != PendingSendKind::Data { buf.fec_prepare_packet(seq); }
+    state.set_packet_class(seq, (kind == PendingSendKind::Data).then(|| dscp_class(dscp)));
     state.account_send(sent);
     state.packet_since_last_print += 1;
     if kind == PendingSendKind::MtuProbe {
         state.tu_probe_sequence_number = seq;
         state.last_sent_tu_probe_time_ns = sent;
+        if let Some(t) = trace { t.control_sent(prefix, seq, sent, plaintext.len(), dscp as u8); }
         return;
     }
     if kind == PendingSendKind::Data {
@@ -4539,8 +4568,9 @@ fn commit_connected_send(state: &mut ConnectionStateConnected, buf: &mut SendQue
         state.outage.probes[(seq % 8) as usize] = (seq, sent);
         state.outage.probe_sent(sent);
     }
-    if matches!(kind, PendingSendKind::Data | PendingSendKind::Outage) {
-        if let Some(t) = trace { t.sent(prefix, seq, sent, plaintext); }
+    if let Some(t) = trace {
+        if kind == PendingSendKind::Data { t.sent(prefix, seq, sent, plaintext, dscp as u8); }
+        else { t.control_sent(prefix, seq, sent, plaintext.len(), dscp as u8); }
     }
     state.last_sent_data_packet = sent;
     state.packets_in_flight += 1;
@@ -4671,17 +4701,48 @@ fn observe_ack_hole(state: &mut ConnectionStateConnected, now: u64, cc: &Congest
     cut
 }
 
-/// Loss timing observes full ACK latency (including receiver batching), independently
-/// of the delay-corrected RTT used by CC. One sample per ACK, not per bitmap bit.
-/// Late ACKs must participate: censoring them leaves a low-rate sender blind to jitter.
+/// Loss timing uses raw ACK latency, including receiver batching. It never
+/// supplies a delay-based congestion signal. Early ACK holes keep their separate
+/// congestion-only grace; this model decides final packet/FEC retirement.
 #[derive(Debug, Default)]
 struct LossTimer {
+    data_rtt: [(u64, u64); 4], // highest DATA ACK sequence and its raw RTT, per DSCP
     srtt_ns: u64,
     rttvar_ns: u64,
+    // Four one-second epoch maxima, rounded up to log2 RTT bucket edges.
+    // Time weighting prevents a burst of fast ACKs from erasing the Wi-Fi tail.
+    tail: [(u64, u64); 4],
+    feedback_ns: u64,
+    feedback_time_ns: u64,
+}
+
+fn dscp_class(dscp: Dscp) -> usize {
+    match dscp { Dscp::BestEffort => 0, Dscp::Af11 => 1, Dscp::Af21 => 2, Dscp::Ef => 3 }
 }
 
 impl LossTimer {
-    fn observe(&mut self, latency_ns: u64) {
+    fn data_acked(&mut self, class: usize, seq: u64, raw_ns: u64) {
+        let slot = &mut self.data_rtt[class];
+        // ACKs for older reordered data must not replace newer-send RACK evidence.
+        if seq >= slot.0 { *slot = (seq, raw_ns.max(100_000)); }
+    }
+
+    fn class_packet_timeout_ns(&self, rtt_ns: u64, since_ack_ns: u64, now_ns: u64,
+        seq: u64, class: Option<usize>, cc: &CongestionPolicy) -> u64 {
+        let fallback = self.timeout_ns(rtt_ns, since_ack_ns, now_ns, cc);
+        let Some(class) = class else { return fallback; };
+        let (highest, latest) = self.data_rtt[class];
+        if highest <= seq || latest == 0 { return fallback; }
+        let reorder = (rtt_ns / 4).max(self.feedback_ns(now_ns));
+        fallback.min(latest.saturating_add(reorder)
+            .saturating_add(crate::ship::ACK.max_delay_us as u64 * 1000).max(1_000_000))
+    }
+    fn feedback_ns(&self, now_ns: u64) -> u64 {
+        let age = now_ns.saturating_sub(self.feedback_time_ns) / 4_000_000_000;
+        self.feedback_ns >> age.min(63)
+    }
+
+    fn observe(&mut self, latency_ns: u64, now_ns: u64, spurious: bool) {
         let sample = latency_ns.max(100_000);
         if self.srtt_ns == 0 {
             self.srtt_ns = sample;
@@ -4690,16 +4751,30 @@ impl LossTimer {
             self.rttvar_ns = (3 * self.rttvar_ns + self.srtt_ns.abs_diff(sample)) / 4;
             self.srtt_ns = (7 * self.srtt_ns + sample) / 8;
         }
+        let epoch = now_ns / 1_000_000_000;
+        let slot = &mut self.tail[(epoch % 4) as usize];
+        let upper = sample.checked_next_power_of_two().unwrap_or(u64::MAX);
+        if slot.0 != epoch { *slot = (epoch, upper); }
+        else { slot.1 = slot.1.max(upper); }
+        if spurious {
+            self.feedback_ns = self.feedback_ns(now_ns).max(sample.saturating_mul(2));
+            self.feedback_time_ns = now_ns;
+        }
     }
 
-    fn timeout_ns(&self, rtt_ns: u64, since_ack_ns: u64, cc: &CongestionPolicy) -> u64 {
-        // Keep the shipped two-RTT minimum and blackhole grace. ACK delay is
-        // included in raw samples; reserve the policy cap even before a sample.
-        let minimum = (rtt_ns as f64 * cc.loss_timeout_rtts) as u64
-            + crate::ship::ACK.max_delay_us as u64 * 1000;
+    fn timeout_ns(&self, rtt_ns: u64, since_ack_ns: u64, now_ns: u64, cc: &CongestionPolicy) -> u64 {
+        let ack_delay = crate::ship::ACK.max_delay_us as u64 * 1000;
+        let minimum = (rtt_ns as f64 * cc.loss_timeout_rtts) as u64 + ack_delay;
+        let epoch = now_ns / 1_000_000_000;
+        let tail = self.tail.iter().filter(|(e, _)| *e <= epoch && epoch - *e < 4)
+            .map(|(_, value)| *value).max().unwrap_or(0);
         minimum.max(self.srtt_ns.saturating_add((4 * self.rttvar_ns).max(1_000_000)))
+            .max(tail.saturating_mul(2).saturating_add(ack_delay))
+            .max(self.feedback_ns(now_ns))
             .max(since_ack_ns.saturating_mul(2).min(1_000_000_000))
     }
+
+
 }
 
 fn local_rate_limit(rate: u64, max_pps: Option<u64>) -> u64 {
@@ -4929,7 +5004,7 @@ mod congestion_tests {
         data_receipt(&mut s, 7);
         let bits = s.packets_waiting_ack_field;
         let flight = s.packets_in_flight;
-        let timeout = s.loss_timer.timeout_ns(100_000_000, 0, &crate::ship::CC);
+        let timeout = s.loss_timer.timeout_ns(100_000_000, 0, 1_130_000_000, &crate::ship::CC);
         observe_ack_hole(&mut s, 1_130_000_000, &crate::ship::CC, None);
         assert!(s.cc_startup_done);
         assert_eq!(s.packets_waiting_ack_field, bits);
@@ -4939,7 +5014,7 @@ mod congestion_tests {
         assert_eq!(s.stats.spurious_losses, 0);
         assert_eq!(fec_learning_counters(&s), (0, 0));
         assert!(s.declared_lost_field.iter().all(|&w| w == 0));
-        assert_eq!(s.loss_timer.timeout_ns(100_000_000, 0, &crate::ship::CC), timeout);
+        assert_eq!(s.loss_timer.timeout_ns(100_000_000, 0, 1_130_000_000, &crate::ship::CC), timeout);
         let sent = s.send_time(0);
         assert!(1_130_000_000 - sent < timeout); // not eligible for final loss yet
         assert!(sent + timeout >= 1_200_000_000); // unchanged conservative deadline
@@ -5011,34 +5086,107 @@ mod congestion_tests {
     }
 
     #[test]
+    fn loss_timer_probe_and_different_class_ack_cannot_erase_queued_be() {
+        for overtaker in [PendingSendKind::MtuProbe, PendingSendKind::Keepalive,
+            PendingSendKind::Outage, PendingSendKind::Data] {
+            let ConnectionState::Connected(mut s) = new_connection_state_connected(None, 0, 1, 1) else { unreachable!() };
+            let mut b = SendQueues::new(1, (100, 1000, 100));
+            s.RTT_mean = 500; // 50ms path
+            for _ in 0..100 { s.loss_timer.observe(60_000_000, 1_000_000_000, false); }
+            for seq in 0..2 {
+                commit_connected_send(&mut s, &mut b, PendingSendKind::Data, 1_000_000_000 + seq * 1000,
+                    1184, &[], Dscp::BestEffort, 0, None);
+            }
+            commit_connected_send(&mut s, &mut b, overtaker, 1_010_000_000, 1184, &[], Dscp::Ef, 0, None);
+            s.observe_data_ack(2, 1_000_000);
+            s.loss_timer.observe(1_000_000, 1_011_000_000, false);
+            assert_eq!(s.loss_timer.data_rtt[0], (0, 0), "{overtaker:?}");
+            for seq in 0..2 {
+                let deadline = s.loss_timer.class_packet_timeout_ns(50_000_000, 19_000_000,
+                    1_030_000_000, seq, s.packet_class(seq), &crate::ship::CC);
+                assert!(1_030_000_000 - s.send_time(seq) < deadline, "{overtaker:?} erased BE seq{seq}");
+            }
+            if overtaker == PendingSendKind::Data {
+                assert_eq!(s.loss_timer.data_rtt[3], (2, 1_000_000));
+            } else { assert!(s.loss_timer.data_rtt.iter().all(|&r| r == (0, 0))); }
+            // Ring-slot reuse replaces provenance; a control can never inherit DATA class.
+            s.set_packet_class(PACKETS_WAITING_ACK_CAPACITY, None);
+            assert_eq!(s.packet_class(0), None);
+        }
+    }
+
+    #[test]
+    fn loss_timer_same_class_dense_loss_and_memory_bound() {
+        let cc = crate::ship::CC;
+        let mut timer = LossTimer::default();
+        for _ in 0..100 { timer.observe(60_000_000, 1_000_000_000, false); }
+        timer.data_acked(0, 10, 60_000_000);
+        assert_eq!(timer.class_packet_timeout_ns(50_000_000, 0, 1_000_000_000, 9, Some(0), &cc), 82_500_000);
+        assert!(timer.class_packet_timeout_ns(50_000_000, 0, 1_000_000_000, 9, Some(3), &cc) > 100_000_000);
+        timer.data_acked(0, 8, 1_000_000); // reordered older ACK does not replace RACK evidence
+        assert_eq!(timer.data_rtt[0], (10, 60_000_000));
+        let ConnectionState::Connected(s) = new_connection_state_connected(None, 0, 1, 1) else { unreachable!() };
+        assert_eq!(s.packet_classes.len() * 8, 96 * 1024);
+        let after = std::mem::size_of::<ConnectionStateConnected>();
+        let before = after - (std::mem::size_of::<LossTimer>() - 16) - std::mem::size_of::<Box<[u64]>>();
+        println!("LOSS_MODEL_MEMORY connected_inline_before={before} after={after} added_class_ring={} existing_fec_tag_ring={} existing_owner_ring={}",
+            s.packet_classes.len() * 8, PACKETS_WAITING_ACK_CAPACITY * 8, PACKETS_WAITING_ACK_CAPACITY);
+    }
+
+    #[test]
     fn loss_timer_keeps_ack_delay_at_the_rate_floor() {
         let cc = crate::ship::CC;
         let mut timer = LossTimer::default();
         // At 100 pps the count trigger takes 80 ms, but the delay cap flushes
         // after 10 ms. Stable 50 ms path + 10 ms ACK delay is not a loss.
-        for _ in 0..100 { timer.observe(60_000_000); }
-        let timeout = timer.timeout_ns(50_000_000, 0, &cc);
+        for _ in 0..100 { timer.observe(60_000_000, 1_000_000_000, false); }
+        let timeout = timer.timeout_ns(50_000_000, 0, 1_000_000_000, &cc);
         assert!(timeout >= 110_000_000);
         assert!(timeout < 200_000_000); // genuine losses still retire promptly
     }
 
     #[test]
-    fn loss_timer_learns_late_ack_without_censoring_and_recovers() {
+    fn loss_timer_keeps_heavy_tail_through_fast_ack_bursts_then_expires() {
         let cc = crate::ship::CC;
         let mut timer = LossTimer::default();
-        for _ in 0..100 { timer.observe(50_000_000); }
-        assert!(timer.timeout_ns(50_000_000, 0, &cc) < 150_000_000);
-        // The old two-mean-RTT detector already declared this packet lost.
-        // Its late ACK must increase the timer, not just the spurious counter.
-        timer.observe(160_000_000);
-        assert!(timer.timeout_ns(50_000_000, 0, &cc) > 160_000_000);
-        for i in 0..500 {
-            timer.observe(if i % 4 == 0 { 160_000_000 } else { 50_000_000 });
-            assert!(timer.timeout_ns(50_000_000, 0, &cc) > 160_000_000);
-        }
-        for _ in 0..100 { timer.observe(50_000_000); }
-        assert!(timer.timeout_ns(50_000_000, 0, &cc) < 120_000_000);
-        assert_eq!(timer.timeout_ns(50_000_000, 600_000_000, &cc), 1_000_000_000);
+        timer.observe(120_000_000, 1_000_000_000, false);
+        for i in 0..1000 { timer.observe(1_000_000, 1_001_000_000 + i * 1000, false); }
+        assert!(timer.timeout_ns(1_000_000, 0, 1_100_000_000, &cc) >= 250_000_000);
+        // The model ages by time, not ACK count, without resurrecting an old slot.
+        for i in 0..100 { timer.observe(1_000_000, 6_000_000_000 + i * 1000, false); }
+        assert!(timer.timeout_ns(1_000_000, 0, 6_100_000_000, &cc) < 20_000_000);
+        assert!(std::mem::size_of::<LossTimer>() <= 176);
+    }
+
+    #[test]
+    fn loss_timer_spurious_feedback_inflates_rack_and_decays_without_resurrection() {
+        let cc = crate::ship::CC;
+        let mut timer = LossTimer::default();
+        for _ in 0..100 { timer.observe(1_000_000, 1_000_000_000, false); }
+        timer.data_acked(0, 10, 1_000_000);
+        let before = timer.class_packet_timeout_ns(1_000_000, 0, 1_000_000_000, 9, Some(0), &cc);
+        assert!(before < 120_000_000);
+        timer.observe(120_000_000, 1_002_000_000, true);
+        assert!(timer.class_packet_timeout_ns(1_000_000, 0, 1_003_000_000, 9, Some(0), &cc) >= 240_000_000);
+        timer.observe(100_000_000, 21_002_000_000, true);
+        assert_eq!(timer.feedback_ns, 200_000_000);
+        assert_eq!(timer.feedback_ns(25_002_000_000), 100_000_000);
+        for _ in 0..100 { timer.observe(1_000_000, 61_002_000_000, false); }
+        assert!(timer.class_packet_timeout_ns(1_000_000, 0, 61_002_000_000, 9, Some(0), &cc) < 20_000_000);
+    }
+
+    #[test]
+    fn loss_timer_dense_loss_has_rack_deadline_and_no_progress_has_fallback() {
+        let cc = crate::ship::CC;
+        let mut timer = LossTimer::default();
+        for _ in 0..100 { timer.observe(60_000_000, 1_000_000_000, false); }
+        timer.data_acked(0, 10, 60_000_000);
+        let deadline = timer.class_packet_timeout_ns(50_000_000, 0, 1_000_000_000, 9, Some(0), &cc);
+        assert_eq!(deadline, 82_500_000); // 1.65 path RTT, including ACK delay
+        assert!(timer.class_packet_timeout_ns(50_000_000, 0, 1_000_000_000, 10, Some(0), &cc) < 200_000_000);
+        assert_eq!(timer.class_packet_timeout_ns(50_000_000, 600_000_000, 1_600_000_000, 10, Some(0), &cc), 1_000_000_000);
+        assert!(600_000_000u64 < OUTAGE_ACK_SILENCE_NS);
+        assert_eq!(OUTAGE_ACK_SILENCE_NS, 2_000_000_000);
     }
 
     #[test]
@@ -7342,7 +7490,7 @@ mod local_backpressure_tests {
                 assert_eq!(s.pending_send.as_ref().unwrap().bytes, bytes);
             }
             let p = s.pending_send.take().unwrap();
-            commit_connected_send(&mut s, &mut b, p.kind, 100_000_001_000, p.bytes.len(), &p.plaintext, 0, None);
+            commit_connected_send(&mut s, &mut b, p.kind, 100_000_001_000, p.bytes.len(), &p.plaintext, p.dscp, 0, None);
             assert_eq!(s.stats.packets_lost, 0);
             assert_eq!(s.send_sequence_number, 1);
             assert_eq!(s.send_ack_sequence_number, ack_nonce);
@@ -7401,7 +7549,7 @@ mod local_backpressure_tests {
         assert_eq!(s.outage.next_probe_ns, 1_000_000_000);
         assert_eq!(s.outage.probe_interval_ns, OUTAGE_FIRST_PROBE_NS);
         let p = s.pending_send.take().unwrap();
-        commit_connected_send(&mut s, &mut b, p.kind, 6_000_000_000, p.bytes.len(), &[], 0, None);
+        commit_connected_send(&mut s, &mut b, p.kind, 6_000_000_000, p.bytes.len(), &[], p.dscp, 0, None);
         assert!(!s.outage.probe_due(6_000_000_000));
         assert_eq!(s.outage.next_probe_ns, 6_000_000_000 + OUTAGE_FIRST_PROBE_NS);
         assert_eq!(s.outage.probe_interval_ns, 2 * OUTAGE_FIRST_PROBE_NS);
@@ -7514,7 +7662,7 @@ mod local_backpressure_tests {
         let p = s.pending_send.take().unwrap();
         assert_eq!(p.plaintext, plain);
         assert_eq!(b.fec_packet_tags.as_ref().unwrap()[0], tag);
-        commit_connected_send(&mut s, &mut b, p.kind, 3_000_000_001, p.bytes.len(), &p.plaintext, 0, None);
+        commit_connected_send(&mut s, &mut b, p.kind, 3_000_000_001, p.bytes.len(), &p.plaintext, p.dscp, 0, None);
         assert_eq!(b.fec_packet_tags.as_ref().unwrap()[0], tag, "success must not prepare/clear consumed data tags");
         assert_eq!(s.send_sequence_number, 1);
         b.fec_on_packet_finalized(0, false);
