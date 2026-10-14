@@ -1557,6 +1557,7 @@ const RECEIVE_CONNECTION_BYTES: usize = 512 << 10;
 #[derive(Debug)]
 pub struct ConnectionTrackingData {
     receive_reservation: crate::receive_memory::Reservation,
+    receive_budget: std::sync::Arc<crate::receive_memory::ReceiveMemoryBudget>,
     pub creation_time_ns: u64,
     pub my_ip: Ipv6Addr, // TODO: use an ipv6 type that supports Default!
     pub my_transport_identity_keypair: IdentityKeyPair,
@@ -2103,6 +2104,7 @@ pub fn connect_to_endpoint(
             ConnectionKey::from(endpoint),
             ConnectionTrackingData {
                 receive_reservation,
+                receive_budget: crate::receive_memory::ReceiveMemoryBudget::connection_share(budget),
                 creation_time_ns: monotonic_clock_ns(),
                 my_ip,
                 my_transport_identity_keypair: my_connect_keypair.clone(),
@@ -2137,6 +2139,7 @@ pub fn connect_to_endpoint(
             ConnectionKey::from(endpoint),
             ConnectionTrackingData {
                 receive_reservation,
+                receive_budget: crate::receive_memory::ReceiveMemoryBudget::connection_share(budget),
                 creation_time_ns: monotonic_clock_ns(),
                 my_ip,
                 my_transport_identity_keypair: my_connect_keypair.clone(),
@@ -2167,6 +2170,8 @@ pub struct ReassemblySlot {
     pub received: Vec<(u32, u32)>, // sorted non-overlapping non-adjacent ranges: [start, end)
     pub package_id: u16,
     completed: bool,
+    segment_parts: Option<Vec<(u32, Vec<u8>)>>,
+    last_segment_ns: u64,
 }
 
 impl ReassemblySlot {
@@ -2178,11 +2183,16 @@ impl ReassemblySlot {
             received: Vec::new(),
             package_id: 0,
             completed: false,
+            segment_parts: None,
+            last_segment_ns: 0,
         }
     }
     
     /// Message bytes received so far.
-    pub fn bytes_received(&self) -> u64 { self.received.iter().map(|&(s, e)| (e - s) as u64).sum() }
+    pub fn bytes_received(&self) -> u64 {
+        self.segment_parts.as_ref().map_or_else(|| self.received.iter().map(|&(s, e)| (e - s) as u64).sum(),
+            |parts| parts.iter().map(|(_, bytes)| bytes.len() as u64).sum())
+    }
 
     pub fn new_ring(size: usize) -> Vec<ReassemblySlot> {
         let mut vec = Vec::with_capacity(size);
@@ -2194,6 +2204,7 @@ impl ReassemblySlot {
     /// Geometric growth is explicit so Vec cannot silently exceed the admitted capacity.
     fn admit(&mut self, offset: usize, len: usize, budget: &std::sync::Arc<crate::receive_memory::ReceiveMemoryBudget>) -> bool {
         if self.completed { return true; }
+        if self.segment_parts.is_some() { return false; }
         let Some(end) = offset.checked_add(len).filter(|&n| n <= MAX_JUMBOGRAM_LEN) else { return false; };
         let buf_cap = if end > self.buf.capacity() { end.max(self.buf.capacity().saturating_mul(2)).max(8) } else { self.buf.capacity() };
         let range_cap = if self.received.len() == self.received.capacity() { (self.received.capacity() * 2).max(4) } else { self.received.capacity() };
@@ -2207,27 +2218,29 @@ impl ReassemblySlot {
         true
     }
 
-    fn admit_segment(&mut self, segment: FecSegment,
+    fn admit_segment(&mut self, segment: FecSegment, layout: crate::fec::MessageLayout,
+        block_id: u32, data_len: usize, now_ns: u64,
         budget: &std::sync::Arc<crate::receive_memory::ReceiveMemoryBudget>) -> bool {
+        // Do not charge even metadata for a header without a valid symbol.
+        if !segment.valid(layout.len) || segment.total as usize > budget.limit() ||
+            !valid_fec_symbol(layout, block_id, data_len) { return false; }
         let in_use = self.completed || self.total_len.is_some() || !self.received.is_empty();
         if in_use && self.package_id != segment.root {
             if (segment.root.wrapping_sub(self.package_id) as i16) < 0 { return false; }
-            *self = Self::new();
+            *self = Self::new(); // eviction drops sparse parts and their charge
         }
         self.package_id = segment.root;
         if self.completed { return true; }
-        if self.total_len.is_some_and(|n| n != segment.total) { return false; }
+        if self.total_len.is_some_and(|n| n != segment.total) ||
+            (!self.buf.is_empty() || !self.received.is_empty()) { return false; }
         if self.reservation.is_none() {
-            let total = segment.total as usize;
-            let ranges = total.div_ceil(FEC_SEGMENT_BYTES);
-            let Some(r) = budget.reserve(total + ranges * 8 + 256) else { return false; };
+            let groups = (segment.total as usize).div_ceil(FEC_SEGMENT_BYTES);
+            let Some(r) = budget.reserve(256 + groups * 64) else { return false; };
             self.reservation = Some(r);
-            // Reserve address space once, but zero/fill only ranges as groups finish.
-            // No exponential Vec growth can exceed the admission charge.
-            self.buf.reserve_exact(total);
-            self.received.reserve_exact(ranges);
+            self.segment_parts = Some(Vec::with_capacity(groups));
             self.total_len = Some(segment.total);
         }
+        self.last_segment_ns = now_ns;
         true
     }
 
@@ -2235,10 +2248,32 @@ impl ReassemblySlot {
         -> Option<(Vec<u8>, crate::receive_memory::Reservation)> {
         if self.package_id != segment.root || self.completed || self.total_len != Some(segment.total) ||
             !segment.valid(message.len()) { return None; }
-        let (ok, complete) = self.insert(segment.offset as usize, message, false);
-        if !ok || !complete { return None; }
-        let reservation = self.reservation.take()?;
-        Some((self.take_complete(), reservation))
+        let parts = self.segment_parts.as_mut()?;
+        let groups = (segment.total as usize).div_ceil(FEC_SEGMENT_BYTES);
+        let metadata = 256 + groups * 64;
+        let reservation = self.reservation.as_mut()?;
+        let mut bytes: usize = parts.iter().map(|(_, bytes)| bytes.capacity()).sum();
+        if !parts.iter().any(|(offset, _)| *offset == segment.offset) {
+            if !reservation.grow(metadata + bytes + message.len()) { return None; }
+            parts.push((segment.offset, message.to_vec()));
+            bytes += message.len();
+        }
+        if parts.len() != groups { return None; }
+        parts.sort_unstable_by_key(|(offset, _)| *offset);
+        // Concatenation's temporary second allocation is admitted too; no sparse
+        // high-water allocation from an unmaterialised claimed total or offset.
+        let total = segment.total as usize;
+        let first_cap = parts[0].1.capacity();
+        if !reservation.grow(metadata + bytes + total - first_cap) { return None; }
+        let mut parts = self.segment_parts.take().unwrap().into_iter();
+        let mut message = parts.next().unwrap().1;
+        message.reserve_exact(total - message.len());
+        for (_, part) in parts { message.extend_from_slice(&part); }
+        let mut reservation = self.reservation.take().unwrap();
+        reservation.shrink(message.capacity() + 256);
+        self.completed = true;
+        self.total_len = None;
+        Some((message, reservation))
     }
 
     fn take_complete(&mut self) -> Vec<u8> {
@@ -2383,6 +2418,22 @@ fn fec_inactive_grace_ns(rtt: u16, pressure: bool) -> u64 {
     }
 }
 
+/// Incomplete roots follow symbol inactivity, not connection keepalive ACKs.
+fn retire_inactive_segment_roots(slots: &mut [ReassemblySlot], now_ns: u64, grace_ns: u64) {
+    for slot in slots {
+        if slot.segment_parts.is_some() && now_ns.saturating_sub(slot.last_segment_ns) > grace_ns {
+            *slot = ReassemblySlot::new();
+        }
+    }
+}
+
+fn valid_fec_symbol(layout: crate::fec::MessageLayout, block_id: u32, data_len: usize) -> bool {
+    let expect = if (block_id as usize) < layout.k {
+        crate::fec::block_len(layout.len, layout.block_bytes, block_id)
+    } else { layout.block_bytes };
+    data_len == expect
+}
+
 /// Closing ingress lets the worker finish queued work and release its admission
 /// guard. Never decrement its counters here: it may still be inside Wirehair.
 /// A completed queued decode may still deliver before this package is evicted.
@@ -2425,8 +2476,7 @@ fn fec_receive_block(
     if matches!(slot.state, FecRecvState::Done) { return None; }
     slot.blocks_received = slot.blocks_received.saturating_add(1);
     let layout = MessageLayout::new(message_len, block_bytes)?;
-    let expect = if (block_id as usize) < layout.k { block_len(message_len, block_bytes, block_id) } else { block_bytes };
-    if data.len() != expect { return None; }
+    if !valid_fec_symbol(layout, block_id, data.len()) { return None; }
     if slot.params().is_some_and(|p| p != (message_len, block_bytes)) {
         slot.state = FecRecvState::Empty;
         slot.reservation = None;
@@ -2913,6 +2963,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                                 connection_key,
                                                 ConnectionTrackingData {
                                                     receive_reservation,
+                                                    receive_budget: crate::receive_memory::ReceiveMemoryBudget::connection_share(&receive_memory),
                                                     creation_time_ns: monotonic_clock_ns(),
                                                     my_ip,
                                                     my_transport_identity_keypair: my_kp.clone(),
@@ -2996,6 +3047,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                                     connection_key,
                                                     ConnectionTrackingData {
                                                         receive_reservation,
+                                                        receive_budget: crate::receive_memory::ReceiveMemoryBudget::connection_share(&receive_memory),
                                                         creation_time_ns: monotonic_clock_ns(),
                                                         my_ip,
                                                         my_transport_identity_keypair: my_kp.clone(),
@@ -3328,6 +3380,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                         break 'conn;
                                     }
                                     let Some(layout) = crate::fec::MessageLayout::new(message_len, block_bytes) else { continue; };
+                                    if !valid_fec_symbol(layout, block_id, data.len()) { continue; }
                                     if (kind == STP_EXT_KIND_GROUPED_FEC) != (layout.groups > 1) { continue; }
                                     if let Some(segment) = segment {
                                         if !segment.valid(message_len) || segment.root == package_id ||
@@ -3338,7 +3391,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                             if (segment.root.wrapping_sub(fec_root.package_id) as i16) < 0 { continue; }
                                             *fec_root = FecRecvSlot::default();
                                         }
-                                        if !existing_connection.unreliable_reassembly[root_idx].admit_segment(segment, &receive_memory) {
+                                        if !existing_connection.unreliable_reassembly[root_idx].admit_segment(segment, layout, block_id, data.len(), timestamp_ns, &existing_connection.receive_budget) {
                                             memory_erased = true; continue;
                                         }
                                     }
@@ -3371,9 +3424,10 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     }
                                     let refused_before = existing_connection.unreliable_fec[slot_idx].admission_refused;
                                     let dropped_before = existing_connection.unreliable_fec[slot_idx].ingress_dropped;
-                                    if let Some((message, _reservation)) = fec_receive_block(&mut existing_connection.unreliable_fec[slot_idx], connection_key, package_id, message_len, block_bytes, block_id, data, &fec_done_tx, &fec_workers, &receive_memory) {
+                                    if let Some((message, mut _reservation)) = fec_receive_block(&mut existing_connection.unreliable_fec[slot_idx], connection_key, package_id, message_len, block_bytes, block_id, data, &fec_done_tx, &fec_workers, &existing_connection.receive_budget) {
                                         let completed = if let Some(segment) = segment {
                                             let root_idx = segment.root as usize % existing_connection.unreliable_reassembly.len();
+                                            _reservation.shrink(message.capacity());
                                             existing_connection.unreliable_reassembly[root_idx].finish_segment(segment, &message)
                                         } else { Some((message, _reservation)) };
                                         if let Some((message, reservation)) = completed {
@@ -3450,13 +3504,13 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     }
                                 }
 
-                                if !existing_connection.unreliable_reassembly[slot_idx].admit(frag_offset as usize, frag_data.len(), &receive_memory) { memory_erased = true; continue; }
+                                if !existing_connection.unreliable_reassembly[slot_idx].admit(frag_offset as usize, frag_data.len(), &existing_connection.receive_budget) { memory_erased = true; continue; }
                                 let (mut success, mut complete) = existing_connection.unreliable_reassembly[slot_idx].insert(frag_offset as usize, frag_data, is_fin);
                                 if !success {
                                     state.stats.rx_insert_failures += 1;
                                     existing_connection.unreliable_reassembly[slot_idx] = ReassemblySlot::new();
                                     existing_connection.unreliable_reassembly[slot_idx].package_id = package_id;
-                                    if !existing_connection.unreliable_reassembly[slot_idx].admit(frag_offset as usize, frag_data.len(), &receive_memory) { memory_erased = true; continue; }
+                                    if !existing_connection.unreliable_reassembly[slot_idx].admit(frag_offset as usize, frag_data.len(), &existing_connection.receive_budget) { memory_erased = true; continue; }
                                     (success, complete) = existing_connection.unreliable_reassembly[slot_idx].insert(frag_offset as usize, frag_data, is_fin);
                                     assert!(success);
                                 }
@@ -3479,7 +3533,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
 //////// END RECEIVE ////////////////////////////////////////////////////////////////////////
 
                 // Messages finished by FEC decoder threads.
-                while let Ok((key, package_id, message, _reservation)) = fec_done_rx.try_recv() {
+                while let Ok((key, package_id, message, mut _reservation)) = fec_done_rx.try_recv() {
                     if let Some(conn) = connections_map.get_mut(&key) {
                         let idx = package_id as usize % conn.unreliable_fec.len();
                         let slot = &mut conn.unreliable_fec[idx];
@@ -3488,6 +3542,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                         slot.state = FecRecvState::Done;
                         let completed = if let Some(segment) = slot.segment {
                             let root_idx = segment.root as usize % conn.unreliable_reassembly.len();
+                            _reservation.shrink(message.capacity());
                             conn.unreliable_reassembly[root_idx].finish_segment(segment, &message)
                         } else { Some((message, _reservation)) };
                         if let ConnectionState::Connected(c) = &mut conn.connection_state {
@@ -3512,6 +3567,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 OUTAGE_TIMEOUT_NS
                             } else { fec_inactive_grace_ns(c.RTT_mean, false) };
                             c.stats.fec_decode_timeouts += retire_inactive_fec_workers(&mut conn.unreliable_fec, current_time_now_ns, grace, false);
+                            retire_inactive_segment_roots(&mut conn.unreliable_reassembly, current_time_now_ns, grace);
                         }
                     }
                     fec_sweep_ns = current_time_now_ns;
@@ -6301,7 +6357,7 @@ mod lazy_fec_segment_tests {
                 let segment = FecSegment {root:load_u16(&p[cursor+16..cursor+18]),
                     total:load_u32(&p[cursor+18..cursor+22]),offset:load_u32(&p[cursor+22..cursor+26])};
                 assert!(segment.valid(message_len));
-                assert!(root.admit_segment(segment,&budget));
+                assert!(root.admit_segment(segment, crate::fec::MessageLayout::new(message_len, width).unwrap(), id, len, seq, &budget));
                 let first = *first_package.get_or_insert(package);
                 assert_eq!(width,if package==first {1136} else {1424});
                 widths.insert(segment.offset,width);
@@ -6336,17 +6392,17 @@ mod lazy_fec_segment_tests {
     #[test]
     fn segment_root_admission_is_before_ack_and_survives_out_of_order_completion() {
         let budget=crate::receive_memory::ReceiveMemoryBudget::new(8<<20);
-        let refused=crate::receive_memory::ReceiveMemoryBudget::new(2<<20);
+        let refused=crate::receive_memory::ReceiveMemoryBudget::new(256);
         let total=4<<20;
         let first=FecSegment{root:13,total,offset:0};
         let second=FecSegment{offset:2<<20,..first};
         let mut slot=ReassemblySlot::new();
-        assert!(!slot.admit_segment(first,&refused));
+        assert!(!slot.admit_segment(first, crate::fec::MessageLayout::new(2<<20, 1000).unwrap(), 0, 1000, 1, &refused));
         assert_eq!(refused.used(),0); assert!(slot.buf.is_empty());
-        assert!(slot.admit_segment(second,&budget));
-        let charge=budget.used(); assert!(charge>=total as usize);
+        assert!(slot.admit_segment(second, crate::fec::MessageLayout::new(2<<20, 1000).unwrap(), 0, 1000, 1, &budget));
+        let charge=budget.used(); assert_eq!(charge, 256 + 2 * 64);
         assert!(slot.finish_segment(second,&vec![2;2<<20]).is_none());
-        assert!(slot.admit_segment(first,&budget)); assert_eq!(budget.used(),charge);
+        assert!(slot.admit_segment(first, crate::fec::MessageLayout::new(2<<20, 1000).unwrap(), 0, 1000, 1, &budget)); assert_eq!(budget.used(),charge + (2<<20));
         let (message,reservation)=slot.finish_segment(first,&vec![1;2<<20]).unwrap();
         assert_eq!(&message[..2<<20],&vec![1;2<<20]);
         assert_eq!(&message[2<<20..],&vec![2;2<<20]);
@@ -6406,6 +6462,72 @@ mod lazy_fec_segment_tests {
         assert!(rx.recv_timeout(std::time::Duration::from_secs(5)).is_err());
         assert_eq!(workers.load(std::sync::atomic::Ordering::Acquire),0);
         assert_eq!(budget.used(),0);
+    }
+
+    #[test]
+    fn review_segment_root_pin_survives_bad_data_and_worker_retirement() {
+        let budget = crate::receive_memory::ReceiveMemoryBudget::new(4 << 30);
+        let segment = FecSegment { root: 4, total: MAX_JUMBOGRAM_LEN as u32, offset: 0 };
+        let layout = crate::fec::MessageLayout::new(2 << 20, 1000).unwrap();
+        let mut roots = ReassemblySlot::new_ring(1024);
+        let mut fec = FecRecvSlot::new_ring(1024);
+        let workers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (done, rx) = std::sync::mpsc::channel();
+        assert!(segment.valid(layout.len));
+        // A 26-byte header without its symbol cannot charge the root.
+        assert!(!roots[4].admit_segment(segment, layout, 0, 0, 1, &budget));
+        assert_eq!(budget.used(), 0);
+        assert!(roots[4].segment_parts.is_none());
+        assert!(fec_receive_block(&mut fec[5], ConnectionKey::default(), 5,
+            2 << 20, 1000, 0, &[], &done, &workers, &budget).is_none());
+        assert_eq!(workers.load(std::sync::atomic::Ordering::Acquire), 0);
+        assert!(!fec[5].in_use());
+        assert_eq!(budget.used(), 0);
+        // A valid symbol charges only root metadata plus the bounded decoder,
+        // never the claimed 1 GiB application message.
+        assert!(roots[4].admit_segment(segment, layout, 0, 1000, 1, &budget));
+        let metadata = 256 + 512 * 64;
+        assert_eq!(budget.used(), metadata);
+        assert_eq!(roots[4].buf.capacity(), 0);
+        fec[5].package_id = 5;
+        fec[5].segment = Some(segment);
+        assert!(fec_receive_block(&mut fec[5], ConnectionKey::default(), 5,
+            2 << 20, 1000, 0, &[0;1000], &done, &workers, &budget).is_none());
+        assert_eq!(workers.load(std::sync::atomic::Ordering::Acquire), 1);
+        fec[5].last_block_ns = 1;
+        let grace = fec_inactive_grace_ns(0, false);
+        retire_inactive_segment_roots(&mut roots, 1 + grace, grace);
+        assert!(roots[4].segment_parts.is_some());
+        assert_eq!(retire_inactive_fec_workers(&mut fec, 2 + grace, grace, false), 1);
+        retire_inactive_segment_roots(&mut roots, 2 + grace, grace);
+        drop(done);
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(5)).is_err());
+        assert_eq!(workers.load(std::sync::atomic::Ordering::Acquire), 0);
+        assert_eq!(budget.used(), 0);
+        // A late completed group is sparse: even the highest offset materialises
+        // only its own bytes. Expiry, ring eviction and close all release it.
+        let last = FecSegment { offset: (MAX_JUMBOGRAM_LEN - (2 << 20)) as u32, ..segment };
+        assert!(roots[4].admit_segment(last, layout, 0, 1000, 10, &budget));
+        assert!(roots[4].finish_segment(last, &vec![7; 2 << 20]).is_none());
+        assert_eq!(roots[4].buf.capacity(), 0);
+        assert_eq!(roots[4].bytes_received(), 2 << 20);
+        assert_eq!(budget.used(), metadata + (2 << 20));
+        let next = FecSegment { root: 1028, total: 4 << 20, offset: 0 };
+        assert!(roots[4].admit_segment(next, layout, 0, 1000, 11, &budget));
+        assert_eq!(budget.used(), 256 + 2 * 64);
+        assert!(roots[4].finish_segment(next, &vec![8; 2 << 20]).is_none());
+        retire_inactive_segment_roots(&mut roots, 12 + grace, grace);
+        assert_eq!(budget.used(), 0);
+        assert!(roots[4].admit_segment(next, layout, 0, 1000, 13, &budget));
+        assert!(roots[4].finish_segment(next, &vec![8; 2 << 20]).is_none());
+        drop(roots); drop(fec);
+        assert_eq!(budget.used(), 0);
+        let smaller_process = crate::receive_memory::ReceiveMemoryBudget::new(512 << 20);
+        let share = crate::receive_memory::ReceiveMemoryBudget::connection_share(&smaller_process);
+        let over_share = FecSegment { total: 256 << 20, ..segment };
+        assert!(over_share.valid(layout.len)); // valid wire length, outside peer share
+        assert!(!ReassemblySlot::new().admit_segment(over_share, layout, 0, 1000, 1, &share));
+        assert_eq!(smaller_process.used(), 0);
     }
 
     #[test]
