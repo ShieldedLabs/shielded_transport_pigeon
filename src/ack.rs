@@ -53,6 +53,25 @@ impl BitmapAck {
         let bit = seq - self.base();
         self.bitmap[(bit / 64) as usize] & (1 << (bit % 64)) != 0
     }
+    /// Intersect receipt words with sender pending/lost rings before set-bit iteration.
+    /// Repeated receipt bits are normally already cleared; skipping whole words keeps
+    /// sender work near O(16 + newly acknowledged packets), not O(1024) per ACK.
+    pub fn relevant(&self, waiting: &[u64], lost: &[u64]) -> Self {
+        debug_assert_eq!(waiting.len(), lost.len());
+        let mut a = self.clone();
+        let base = self.base();
+        let shift = base % 64;
+        for (i, w) in a.bitmap.iter_mut().enumerate() {
+            let slot = (base / 64 + i as u64) as usize % waiting.len();
+            let mut mask = (waiting[slot] | lost[slot]) >> shift;
+            if shift != 0 {
+                let next = (slot + 1) % waiting.len();
+                mask |= (waiting[next] | lost[next]) << (64 - shift);
+            }
+            *w &= mask;
+        }
+        a
+    }
     /// Set-bit iteration; missing bits never constitute a loss declaration.
     pub fn acknowledged(&self) -> impl Iterator<Item=u64> + '_ {
         self.bitmap.iter().enumerate().flat_map(move |(i, &word)| {
@@ -220,6 +239,22 @@ mod tests {
         assert!(BitmapAck::decode(&a.encode()).is_none());
         a.bitmap[0] = u64::MAX;
         assert_eq!(BitmapAck::decode(&a.encode()).unwrap().acknowledged().collect::<Vec<_>>(), vec![0, 1]);
+    }
+    #[test]
+    fn relevant_masks_align_across_ring_wrap_and_keep_late_losses() {
+        for highest in [1030, 4000, 262150] {
+            let mut r = AckReceiver::default();
+            for s in highest-1023..=highest { recv(&mut r, s, s, false); }
+            let a = r.ack(highest+1);
+            let mut waiting = [0u64; 4096]; let mut lost = [0u64; 4096];
+            let keep = [highest-1000, highest-800, highest-63, highest];
+            for (i, &s) in keep.iter().enumerate() {
+                let ring = if i%2 == 0 { &mut waiting } else { &mut lost };
+                ring[(s%262144/64) as usize] |= 1 << (s%64);
+            }
+            assert_eq!(a.relevant(&waiting, &lost).acknowledged().collect::<Vec<_>>(), keep);
+            assert_eq!(a.relevant(&[0; 4096], &[0; 4096]).acknowledged().collect::<Vec<_>>(), vec![highest]);
+        }
     }
     #[test]
     fn size_cannot_collide_with_data_keepalive_or_probe() {

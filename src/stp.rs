@@ -2256,7 +2256,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     let base = ack.field_base as u64;
                                     (base..base+4096).filter(move |&seq| ack.field[((seq-base)/64) as usize] & (1 << ((seq-base)%64)) != 0)
                                 });
-                                let indices = legacy_indices.chain(bitmap_ack.iter().flat_map(crate::ack::BitmapAck::acknowledged));
+                                let relevant_ack = bitmap_ack.as_ref().map(|a| a.relevant(&state.packets_waiting_ack_field, &state.declared_lost_field[..]));
+                                let indices = legacy_indices.chain(relevant_ack.iter().flat_map(crate::ack::BitmapAck::acknowledged));
                                 for index in indices {
                                     if index < state.send_sequence_number {
                                         state.highest_peer_acked = Some(state.highest_peer_acked.unwrap_or(index).max(index));
