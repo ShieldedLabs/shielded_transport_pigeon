@@ -508,8 +508,8 @@ impl FecSendSlot {
             loss_estimate: self.loss_estimate, lost_during_send: self.lost }
     }
 
-    // Rescue supplies a feedback fallback, so even a burst tail needs only learned risk
-    // protection up front; a blind 12-symbol latency floor is no longer necessary.
+    // Retainable messages get a feedback fallback and need only learned risk up front.
+    // Oversized messages cannot be rescued, so keep their original blind floor.
     fn refresh_plan(&mut self, a: &crate::fec_adapt::FecAdaptiveState) {
         let layout = crate::fec::MessageLayout::new(self.message.len(), self.block_bytes).unwrap();
         let groups = layout.groups as u64;
@@ -520,7 +520,7 @@ impl FecSendSlot {
             let k = layout.group(group).1 as u64;
             let source_sent = (sources / groups + u64::from((group as u64) < sources % groups)).min(k);
             let repair_sent = repairs / groups + u64::from((group as u64) < repairs % groups);
-            let total_repairs = repair_sent + a.extra_repair_blocks_needed_for_group_at_tail(k, self.k as u64, layout.groups, source_sent + repair_sent, repair_sent, self.group_lost[group] as u64, false);
+            let total_repairs = repair_sent + a.extra_repair_blocks_needed_for_group_at_tail(k, self.k as u64, layout.groups, source_sent + repair_sent, repair_sent, self.group_lost[group] as u64, self.message.len() > FEC_RETAIN_SOURCE_BYTES);
             per_group_repairs = per_group_repairs.max(total_repairs);
         }
         // Equal complete rounds conservatively protect the most affected group, not mean loss.
@@ -788,7 +788,7 @@ impl UnreliableSendBuffer {
         let layout = crate::fec::MessageLayout::new(message.len(), block_bytes).unwrap();
         let k = layout.k as u32;
         let a = self.fec_adaptive.as_ref().expect("adaptive FEC initialized before coding");
-        let repairs = (0..layout.groups).map(|g| a.repair_blocks_for_group_at_tail(layout.group(g).1 as u64, k as u64, layout.groups, false)).max().unwrap_or(0);
+        let repairs = (0..layout.groups).map(|g| a.repair_blocks_for_group_at_tail(layout.group(g).1 as u64, k as u64, layout.groups, message.len() > FEC_RETAIN_SOURCE_BYTES)).max().unwrap_or(0);
         let (n, loss_estimate) = (k + repairs as u32 * layout.groups as u32, a.p);
         let n = layout.round_plan(n);
         let encoder = if k as usize <= FEC_INLINE_MAX_BLOCKS {
@@ -4195,6 +4195,24 @@ mod rx_tracker_tests {
 mod fec_closed_loop_tests {
     use super::*;
     use crate::fec_adapt::{AdaptiveFecConfig, FecAdaptiveState};
+
+    #[test]
+    fn oversized_messages_keep_floor_when_feedback_rescue_cannot_retain_them() {
+        let mut a = FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0);
+        for seq in 0..10000 {
+            a.on_data_sent(seq);
+            a.on_sequence_finalized(seq, false, seq * 1000);
+        }
+        let message = std::sync::Arc::new(vec![0; FEC_RETAIN_SOURCE_BYTES + 1]);
+        let layout = crate::fec::MessageLayout::new(message.len(), 1433).unwrap();
+        let k = layout.k as u32;
+        let mut f = FecSendSlot { message, block_bytes: 1433, k, n: k, next_id: k,
+            encoder: FecEncoderState::Failed, block_buf: Vec::new(), first_seq: 0,
+            lost: 0, group_lost: vec![0; layout.groups], n_planned: k,
+            loss_estimate: 0.0, finalized_symbols: 0 };
+        f.refresh_plan(&a);
+        assert!(f.n >= k + 12 * layout.groups as u32);
+    }
 
     #[test]
     fn completed_raw_package_deduplicates_fresh_nonce_rescue() {
