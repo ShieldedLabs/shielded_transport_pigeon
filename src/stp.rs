@@ -3171,7 +3171,15 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             _ => None,
                         }).min().unwrap_or(cadence).min(cadence)
                     } else { 150_000 };
-                    if sleep_ns != 0 { std::thread::sleep(std::time::Duration::from_nanos(sleep_ns)); }
+                    if sleep_ns != 0 {
+                        if curve_cadence_ns.is_some() {
+                            // An application push wakes the shared network thread,
+                            // not the data pacer: send ticks stay cadence-gated.
+                            std::thread::park_timeout(std::time::Duration::from_nanos(sleep_ns));
+                        } else {
+                            std::thread::sleep(std::time::Duration::from_nanos(sleep_ns));
+                        }
+                    }
                 }
             }
         }
@@ -3334,6 +3342,7 @@ pub fn service_connections(network_thread_handle: &NetworkThreadHandle, mut req:
     }
 
     network_thread_handle.inner.state.store(1, std::sync::atomic::Ordering::Release);
+    network_thread_handle.thread.thread().unpark();
 
     while network_thread_handle.inner.state.load(std::sync::atomic::Ordering::Acquire) != 0 {
         if std::time::Instant::now() >= deadline {
