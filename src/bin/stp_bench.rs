@@ -17,6 +17,8 @@
 //! --cc-time-gs, --cc-rate-rp, --cc-rate-pg, --cc-rate-gs, --cc-loss-threshold,
 //! --cc-floor-pps, --cc-start-pps, --cc-min-growth-ppsps, --cc-max-growth-ppsps,
 //! --cc-guard-rtts.
+//! Pacer: --pacer precise|poly1|poly2|poly5|poly10, or --pacer poly --cadence-ms 2.
+//! --burst-budget-ms 0 disables the polynomial burst wall-time budget (re-anchor only).
 //! ACK: --ack legacy|bitmap|adaptive (default legacy), on both endpoints.
 //! Bitmap: --ack-every 8 --ack-delay-us 1000; Adaptive defaults to 8/10000 us.
 //! --duration S: saturated measurement for S seconds; requests receiver status while sending.
@@ -185,6 +187,16 @@ fn ack_options(a: &Args) -> shielded_transport_pigeon::ack::AckOptions {
         _ => die("--ack needs legacy, bitmap or adaptive"),
     }
 }
+#[test]
+fn polynomial_pacer_shorthands() {
+    for cadence_ms in [1, 2, 5, 10] {
+        let a = Args::parse(["--pacer".to_owned(), format!("poly{cadence_ms}")].into_iter());
+        assert!(matches!(pacing_options(&a), PacingOptions::Polynomial { cadence_ms: n } if n == cadence_ms));
+    }
+    let a = Args::parse(["--pacer", "poly", "--cadence-ms", "2"].into_iter().map(str::to_owned));
+    assert!(matches!(pacing_options(&a), PacingOptions::Polynomial { cadence_ms: 2 }));
+}
+
 fn pacing_options(a: &Args) -> PacingOptions {
     match a.str("pacer").unwrap_or("precise") {
         "precise" => PacingOptions::Precise,
@@ -193,7 +205,11 @@ fn pacing_options(a: &Args) -> PacingOptions {
             if ![1,2,5,10].contains(&cadence_ms) { die("--cadence-ms must be 1, 2, 5 or 10"); }
             PacingOptions::Polynomial { cadence_ms }
         },
-        _ => die("--pacer needs precise or poly"),
+        "poly1" => PacingOptions::Polynomial { cadence_ms: 1 },
+        "poly2" => PacingOptions::Polynomial { cadence_ms: 2 },
+        "poly5" => PacingOptions::Polynomial { cadence_ms: 5 },
+        "poly10" => PacingOptions::Polynomial { cadence_ms: 10 },
+        _ => die("--pacer needs precise, poly or poly{1,2,5,10}"),
     }
 }
 fn pacing_burst_budget_ns(a: &Args) -> Option<u64> {
