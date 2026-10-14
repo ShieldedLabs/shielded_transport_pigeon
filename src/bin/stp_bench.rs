@@ -28,6 +28,9 @@
 //! ACK: --ack legacy|bitmap|adaptive|nack (default legacy), on both endpoints.
 //! Bitmap: --ack-every 8 --ack-delay-us 1000; Adaptive defaults to 8/10000 us.
 //! --duration S: saturated measurement for S seconds; requests receiver status while sending.
+//! --duplex 1 on BOTH roles: one same-connection fixed-size class workload (default16384:200000),
+//! seeded identically; duration plus8s drain; JSON local+peer counters and active-window receive goodput.
+//! Duplex RTT p50/p99 are100Hz time samples of the transport's smoothed RTT, not raw ACK sample percentiles.
 //! --status-every-ms N (default1000): research-only control-report interval; increase for reverse bottleneck tests.
 //! --send-on-ms N --send-off-ms N: application submission duty cycle (queued packets drain normally).
 //! estimator_series rows: [seconds, FEC estimate, sample, sent packets, losses, UDP bytes, RTT us, CC pps, app-limited entries].
@@ -290,11 +293,163 @@ fn to_v6(ip: std::net::IpAddr) -> std::net::Ipv6Addr {
     match ip { std::net::IpAddr::V4(v4) => v4.to_ipv6_mapped(), std::net::IpAddr::V6(v6) => v6 }
 }
 
+// Research-only symmetric endpoint runner. Both roles use ONE connection and
+// the same seeded fixed-size workload; ACKs and data therefore share the qdisc.
+fn duplex_frame(seed: u64, id: u32, size: usize) -> Vec<u8> {
+    let mut r = rand_chacha::ChaCha20Rng::seed_from_u64(seed ^ (id as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    frame(id, size - HEADER, |b| r.fill_bytes(b))
+}
+
+fn duplex_endpoint(a: &Args, server: bool) {
+    use shielded_transport_pigeon::fec_adapt::{AdaptiveFecConfig, LossEstimatorKind, SpanFloorKind};
+    const READY: u32 = CTRL_BASE + 4;
+    const FINAL: u32 = CTRL_BASE + 5;
+    let class = a.str("classes").unwrap_or("16384:200000");
+    let (sz, n) = class.split_once(':').unwrap_or_else(|| die("duplex needs one --classes SIZE:COUNT"));
+    let size: usize = sz.parse().unwrap_or_else(|_| die("bad duplex size"));
+    let count: u32 = n.parse().unwrap_or_else(|_| die("duplex supports one fixed-size class"));
+    if size < HEADER || size > MAX_JUMBOGRAM_LEN || count == 0 || count >= CTRL_BASE { die("bad duplex workload"); }
+    let seed = a.num::<u64>("seed", 1);
+    let duration = Duration::from_secs(a.num::<u64>("duration", 40));
+    if duration.is_zero() { die("duplex duration must be positive"); }
+    let bind: Option<std::net::IpAddr> = a.str("bind").map(|s| s.parse().unwrap_or_else(|_| die("bad --bind")));
+    let to = if server { None } else { Some(STPAddress::parse(a.str("to").unwrap_or_else(|| die("duplex send needs --to"))).unwrap_or_else(|| die("bad --to"))) };
+    let kp = if server {
+        new_keypair_from_connect_magic1_with_seed(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, *blake3::hash(b"stp_bench default server key").as_bytes()).unwrap()
+    } else { new_keypair_from_connect_magic1(to.as_ref().unwrap().magic1).unwrap() };
+    let fec_pct = a.num::<f64>("fec-pct", 0.0);
+    if !(0.0..=100.0).contains(&fec_pct) { die("bad duplex FEC percent"); }
+    let fec_adaptive = match a.str("fec").unwrap_or("fixed") {
+        "fixed" => None,
+        "adaptive:span" => Some(AdaptiveFecConfig { kind: LossEstimatorKind::SpanTail, eps: a.num("fec-eps", 0.5),
+            topup: a.num::<u32>("fec-topup", 0) != 0, closed_loop: a.num::<u32>("fec-closed-loop", 0) != 0,
+            span_floor: match a.str("fec-span-floor").unwrap_or("none") { "none" => SpanFloorKind::None, "real" => SpanFloorKind::Real, _ => die("duplex span floor supports none or real") },
+            ..Default::default() }),
+        _ => die("duplex supports fixed or adaptive:span FEC"),
+    };
+    let port = if server { a.num::<u16>("port", 0) } else { 0 };
+    if server && port == 0 { die("duplex serve needs --port"); }
+    if server {
+        println!("STP address: {:?}", STPAddress::from(to_v6(bind.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))), port, &kp));
+    }
+    let handle = new_network_thread_with_options(vec![kp], port, max_pps(a), send_buffer_params(a), NetworkThreadOptions {
+        bind_ip: bind, congestion_control: cc_options(a), acknowledgements: ack_options(a), pacing: pacing_options(a),
+        polynomial_burst_budget_ns: pacing_burst_budget_ns(a), fec_redundancy_ppm: (fec_pct * 10_000.0).round() as u32,
+        fec_adaptive, loss_trace: a.str("loss-trace").map(std::path::PathBuf::from), ..Default::default()
+    });
+    let (tx, rx) = std::sync::mpsc::sync_channel(4);
+    std::thread::spawn(move || {
+        let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(seed);
+        let mut order: Vec<u32> = (0..count).collect(); order.shuffle(&mut rng);
+        for id in order { if tx.send(duplex_frame(seed, id, size)).is_err() { return; } }
+    });
+    let mut wanted = Vec::new();
+    if let Some(to) = to {
+        wanted = service_connections(&handle, NetworkThreadPush { initiate_connections: vec![to], ..Default::default() }).unwrap().current_connections;
+    }
+    let mut outbox = Vec::new(); let mut pending = VecDeque::new();
+    let mut seen = vec![false; count as usize];
+    let mut received = 0u64; let mut active_received = 0u64; let mut corrupt = 0u64;
+    let mut submitted = 0u64;
+    let mut start: Option<Instant> = None;
+    let connect_start = Instant::now();
+    let load_start = load_average();
+    let mut last_ready = Instant::now() - Duration::from_secs(1);
+    let mut last_final = Instant::now() - Duration::from_secs(1);
+    let mut last_sample = Instant::now(); let mut rtts = Vec::new();
+    let mut stats = ConnectionStats::default(); let mut deadline_stats = None;
+    let mut cpu_start = cpu_us(); let mut deadline_cpu = None;
+    let mut own_report: Option<String> = None; let mut peer_report: Option<String> = None;
+    loop {
+        let p = poll(&handle, &mut outbox, &mut wanted);
+        let Some(key) = wanted.first().map(|x| x.0.connection_key()) else {
+            if connect_start.elapsed() > Duration::from_secs(30) { die("duplex connection failed/lost"); }
+            std::thread::sleep(Duration::from_micros(300)); continue;
+        };
+        for (_, m) in p.send_unreliable_rejected { if u32_at(&m, 0) < CTRL_BASE { submitted -= 1; pending.push_front(m); } }
+        if let Some((_, st)) = p.connection_stats.iter().find(|(k, _)| *k == key) { stats = *st; }
+        for (_, data) in p.received_unreliable_messages {
+            match parse(&data) {
+                Parsed::Ok(READY, b) if b.len() == 16 => {
+                    if u64_at(b, 0) != seed || u32_at(b, 8) != size as u32 || u32_at(b, 12) != count { die("duplex endpoint workload mismatch"); }
+                    if start.is_none() { start = Some(Instant::now()); cpu_start = cpu_us(); }
+                }
+                Parsed::Ok(FINAL, b) if b.len() < 16384 => { if let Ok(s) = std::str::from_utf8(b) { peer_report = Some(s.to_owned()); } }
+                Parsed::Ok(id, _) if id < count && data.len() == size => {
+                    if !seen[id as usize] { seen[id as usize] = true; received += 1;
+                        if start.is_some_and(|s| s.elapsed() < duration) { active_received += 1; }
+                    }
+                }
+                Parsed::Corrupt(_) | Parsed::Malformed => corrupt += 1,
+                _ => {}
+            }
+        }
+        if (start.is_none() || start.is_some_and(|s| s.elapsed() < Duration::from_secs(5))) && last_ready.elapsed() >= Duration::from_millis(100) {
+            let mut b = seed.to_le_bytes().to_vec(); b.extend_from_slice(&(size as u32).to_le_bytes()); b.extend_from_slice(&count.to_le_bytes());
+            outbox.push((key, ctrl(READY, &b))); last_ready = Instant::now();
+        }
+        if let Some(s) = start {
+            let elapsed = s.elapsed();
+            if elapsed < duration {
+                if last_sample.elapsed() >= Duration::from_millis(10) { rtts.push(stats.rtt_us); last_sample = Instant::now(); }
+                while pending.len() < 4 { match rx.try_recv() { Ok(m) => pending.push_back(m), Err(_) => break } }
+                let mut budget = p.unreliable_send_free_bytes.iter().find(|(k, _)| *k == key).map(|x| x.1).unwrap_or(0);
+                while let Some(m) = pending.front() {
+                    if budget != u64::MAX && m.len() as u64 > budget { break; }
+                    if budget == u64::MAX { budget = 0; } else { budget -= m.len() as u64; }
+                    outbox.push((key, pending.pop_front().unwrap())); submitted += 1;
+                }
+            } else {
+                if deadline_stats.is_none() { deadline_stats = Some(stats); deadline_cpu = Some(cpu_us()); }
+                // Keep servicing the SAME connection through a six-second data
+                // drain, then repeat the endpoint report on the now-quiet path.
+                if elapsed >= duration + Duration::from_secs(6) && own_report.is_none() {
+                    rtts.sort_unstable();
+                    let q = |p: usize| rtts.get(rtts.len().saturating_sub(1)*p/100).copied().unwrap_or(0) as f64/1000.0;
+                    let st: ConnectionStats = deadline_stats.unwrap(); let (u, sy) = deadline_cpu.unwrap();
+                    own_report = Some(format!(concat!("{{\"role\":\"{}\",\"duration_seconds\":{},\"message_size\":{},\"intended_total\":{},\"submitted\":{},",
+                        "\"incoming_delivered_during_measurement\":{},\"incoming_delivered_after_drain\":{},\"incoming_goodput_mbps\":{},\"corrupt\":{},",
+                        "\"data_packets_sent\":{},\"data_wire_bytes_sent\":{},\"declared_loss_pct\":{},\"spurious_losses_after_drain\":{},",
+                        "\"data_packets_sent_after_drain\":{},\"data_wire_bytes_after_drain\":{},\"declared_loss_pct_after_drain\":{},",
+                        "\"feedback_packets_sent\":{},\"feedback_bytes_sent\":{},\"rtt_p50_ms\":{},\"rtt_p99_ms\":{},\"rtt_sample_count\":{},",
+                        "\"nack_losses_declared\":{},\"false_nacks_after_drain\":{},\"late_cache_overflows\":{},\"cc_loss_events\":{},\"cc_ecn_events\":{},",
+                        "\"cpu_user_s\":{},\"cpu_sys_s\":{},\"kernel_rx_drops\":{},\"max_loop_gap_ms\":{}}}"),
+                        if server { "server" } else { "client" }, duration.as_secs_f64(), size, count, submitted,
+                        active_received, received, active_received as f64*size as f64*8.0/duration.as_secs_f64()/1e6, corrupt,
+                        st.packets_sent, st.bytes_sent, 100.0*st.packets_lost as f64/st.packets_sent.max(1) as f64, stats.spurious_losses,
+                        stats.packets_sent, stats.bytes_sent, 100.0*stats.packets_lost as f64/stats.packets_sent.max(1) as f64,
+                        st.ack_packets_sent, st.ack_bytes_sent, q(50), q(99), rtts.len(),
+                        stats.nack_losses_declared, stats.false_nacks, stats.nack_late_cache_overflows, st.congestion_loss_events, st.congestion_ecn_events,
+                        u.saturating_sub(cpu_start.0) as f64/1e6, sy.saturating_sub(cpu_start.1) as f64/1e6,
+                        p.thread_stats.kernel_rx_drops.map(|d| d.to_string()).unwrap_or("null".into()), p.thread_stats.max_loop_gap_ns as f64/1e6));
+                }
+                if let Some(r) = &own_report && last_final.elapsed() >= Duration::from_millis(500) { outbox.push((key, ctrl(FINAL, r.as_bytes()))); last_final = Instant::now(); }
+                if elapsed >= duration + Duration::from_secs(8) { break; }
+            }
+        } else if connect_start.elapsed() > Duration::from_secs(40) { die("duplex READY handshake failed"); }
+        std::thread::sleep(Duration::from_micros(300));
+    }
+    let report = format!("{{\"duplex\":true,\"local\":{},\"peer\":{},\"load_start\":[{}],\"load_end\":[{}]}}\n", own_report.unwrap(), peer_report.unwrap_or("null".into()), load_start, load_average());
+    let out = a.str("out").unwrap_or(if server { "duplex-server.json" } else { "duplex-client.json" });
+    std::fs::write(out, report).unwrap_or_else(|e| die(&format!("write duplex report: {e}")));
+    println!("duplex report written to {out}");
+}
+
+#[test]
+fn duplex_seeded_frame_matches_oneway_payload_and_verifies() {
+    let a = duplex_frame(1, 42, 16384); let b = duplex_frame(1, 42, 16384);
+    assert_eq!(a,b); assert!(matches!(parse(&a), Parsed::Ok(42,_)));
+    assert_ne!(a,duplex_frame(2,42,16384));
+    let mut bad = a; bad[100] ^= 1; assert!(matches!(parse(&bad),Parsed::Corrupt(42)));
+}
+
 fn main() {
     let mut argv = std::env::args().skip(1);
     let mode = argv.next().unwrap_or_default();
     let args = Args::parse(argv);
     match mode.as_str() {
+        "serve" if args.num::<u32>("duplex", 0) != 0 => duplex_endpoint(&args, true),
+        "send" if args.num::<u32>("duplex", 0) != 0 => duplex_endpoint(&args, false),
         "serve" => serve(&args),
         "send" => send(&args),
         _ => die("usage: stp_bench serve --port P [--bind IP] [--advertise IP] [--seed-key HEX64] | stp_bench send --to STPADDR [--seed N] [--count N] [--min B] [--max B] [--timeout S] [--idle S] [--out FILE] [--fec-pct X]"),
