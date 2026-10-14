@@ -5,7 +5,7 @@ const HISTORY_BITS: u64 = 4096;
 
 #[derive(Debug, Clone, Copy)]
 pub enum AckOptions {
-    /// Original 516-byte bitmap and 50 ms timer; for old peers and comparisons.
+    /// Original 516-byte bitmap and 50 ms timer; default for compatibility with old peers.
     Legacy,
     /// ACK at this packet count or delay, whichever comes first. Gaps, reordering,
     /// duplicates and CE schedule an immediate ACK.
@@ -17,7 +17,7 @@ pub enum AckOptions {
     Adaptive { every_packets: u16, max_delay_us: u32 },
 }
 impl Default for AckOptions {
-    fn default() -> Self { Self::LowLatency { every_packets: 8, max_delay_us: 1000 } }
+    fn default() -> Self { Self::Legacy }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,9 +225,22 @@ pub fn update_ce_count(previous: &mut u32, incoming: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    const LOW_LATENCY: AckOptions = AckOptions::LowLatency { every_packets: 8, max_delay_us: 1000 };
+
+    #[test]
+    fn default_preserves_legacy_peer_compatibility() {
+        assert!(matches!(AckOptions::default(), AckOptions::Legacy));
+        assert!(matches!(crate::stp::NetworkThreadOptions::default().acknowledgements, AckOptions::Legacy));
+        let mut r = AckReceiver::default();
+        let mut timer = u64::MAX;
+        assert!(!r.receive(0, 0, false, AckOptions::default(), &mut timer));
+        assert_eq!(timer, u64::MAX); // Legacy reception/feedback stays on the original path.
+        assert!(r.highest.is_none());
+    }
+
     fn recv(r: &mut AckReceiver, seq: u64, t: u64, ce: bool) -> (bool, u64) {
         let mut timer = u64::MAX;
-        let ok = r.receive(seq, t, ce, AckOptions::default(), &mut timer);
+        let ok = r.receive(seq, t, ce, LOW_LATENCY, &mut timer);
         (ok, timer)
     }
     #[test]
@@ -260,13 +273,13 @@ mod tests {
     #[test]
     fn count_timer_duplicates_and_ce_are_idempotent() {
         let mut r = AckReceiver::default(); let mut timer = u64::MAX;
-        r.receive(0, 0, false, AckOptions::default(), &mut timer);
+        r.receive(0, 0, false, LOW_LATENCY, &mut timer);
         r.sent(0); timer = u64::MAX;
-        for s in 1..8 { assert!(r.receive(s, s*100, false, AckOptions::default(), &mut timer)); }
+        for s in 1..8 { assert!(r.receive(s, s*100, false, LOW_LATENCY, &mut timer)); }
         assert_eq!(timer, 1_000_100);
-        r.receive(8, 800, false, AckOptions::default(), &mut timer);
+        r.receive(8, 800, false, LOW_LATENCY, &mut timer);
         assert_eq!(timer, 800);
-        assert!(!r.receive(8, 900, true, AckOptions::default(), &mut timer));
+        assert!(!r.receive(8, 900, true, LOW_LATENCY, &mut timer));
         assert_eq!(r.ack(1000).ce_count, 0);
         let mut ce = 0;
         assert!(update_ce_count(&mut ce, 2));

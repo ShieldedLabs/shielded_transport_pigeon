@@ -17,7 +17,8 @@
 //! --cc-time-gs, --cc-rate-rp, --cc-rate-pg, --cc-rate-gs, --cc-loss-threshold,
 //! --cc-floor-pps, --cc-start-pps, --cc-min-growth-ppsps, --cc-max-growth-ppsps,
 //! --cc-guard-rtts.
-//! ACK: --ack legacy|bitmap|adaptive [--ack-every 8] [--ack-delay-us 1000], on both endpoints.
+//! ACK: --ack legacy|bitmap|adaptive (default legacy), on both endpoints.
+//! Bitmap: --ack-every 8 --ack-delay-us 1000; Adaptive defaults to 8/10000 us.
 //! --duration S: saturated measurement for S seconds; requests receiver status while sending.
 //! --send-on-ms N --send-off-ms N: application submission duty cycle (queued packets drain normally).
 //! estimator_series rows: [seconds, FEC estimate, sample, sent packets, losses, UDP bytes, RTT us].
@@ -164,9 +165,20 @@ fn send_buffer_params(a: &Args) -> (u32, u32, u32) {
 
 fn max_pps(a: &Args) -> Option<u64> { a.str("max-pps").map(|s| s.parse().unwrap_or_else(|_| die("bad --max-pps"))) }
 
+#[test]
+fn ack_default_and_explicit_modes() {
+    use shielded_transport_pigeon::ack::AckOptions;
+    let args = |flags: &[&str]| Args::parse(flags.iter().map(|s| (*s).to_owned()));
+    assert!(matches!(ack_options(&args(&[])), AckOptions::Legacy));
+    assert!(matches!(ack_options(&args(&["--ack", "adaptive"])),
+        AckOptions::Adaptive { every_packets: 8, max_delay_us: 10000 }));
+    assert!(matches!(ack_options(&args(&["--ack", "bitmap"])),
+        AckOptions::LowLatency { every_packets: 8, max_delay_us: 1000 }));
+}
+
 fn ack_options(a: &Args) -> shielded_transport_pigeon::ack::AckOptions {
     use shielded_transport_pigeon::ack::AckOptions;
-    match a.str("ack").unwrap_or("bitmap") {
+    match a.str("ack").unwrap_or("legacy") {
         "legacy" => AckOptions::Legacy,
         "bitmap" => AckOptions::LowLatency { every_packets: a.num("ack-every", 8), max_delay_us: a.num("ack-delay-us", 1000) },
         "adaptive" => AckOptions::Adaptive { every_packets: a.num("ack-every", 8), max_delay_us: a.num("ack-delay-us", 10000) },
