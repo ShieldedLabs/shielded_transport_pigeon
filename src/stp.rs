@@ -447,7 +447,7 @@ pub struct UnreliableSendBuffer {
     fec_rescue_package: Option<u16>,
     fec_now_ns: u64,
     fec_rtt_ns: u64,
-    /// Finished FEC messages, when recording is enabled (Some); drained by the network thread.
+    /// Cumulative source/repair progress snapshots, when recording is enabled (Some).
     pub fec_record: Option<Vec<crate::fec_adapt::FecMessageInfo>>,
 }
 
@@ -499,6 +499,15 @@ impl FecSendSlot {
         }
         self.n = self.n.max(self.next_id.saturating_add(deficit * groups));
     }
+    fn progress_info(&self) -> crate::fec_adapt::FecMessageInfo {
+        let mut tag = [0u8; 8];
+        let l = self.message.len().min(8);
+        tag[..l].copy_from_slice(&self.message[..l]);
+        crate::fec_adapt::FecMessageInfo { tag: u64::from_le_bytes(tag), message_len: self.message.len(),
+            k: self.k, n_planned: self.n_planned, n_sent: self.next_id,
+            loss_estimate: self.loss_estimate, lost_during_send: self.lost }
+    }
+
     // Rescue supplies a feedback fallback, so even a burst tail needs only learned risk
     // protection up front; a blind 12-symbol latency floor is no longer necessary.
     fn refresh_plan(&mut self, a: &crate::fec_adapt::FecAdaptiveState) {
@@ -748,12 +757,6 @@ impl UnreliableSendBuffer {
         }
         if let Some(f) = &self.fec_send_slot {
             if f.next_id >= f.n {
-                if self.fec_rescue_package.is_none() { if let Some(rec) = &mut self.fec_record {
-                    let mut tag = [0u8; 8];
-                    let l = f.message.len().min(8);
-                    tag[..l].copy_from_slice(&f.message[..l]);
-                    rec.push(crate::fec_adapt::FecMessageInfo { tag: u64::from_le_bytes(tag), message_len: f.message.len(), k: f.k, n_planned: f.n_planned, n_sent: f.next_id, loss_estimate: f.loss_estimate, lost_during_send: f.lost });
-                } }
                 let message_len = f.message.len();
                 let rescue = self.fec_rescue_package.take();
                 let package = rescue.unwrap_or(self.send_package_id);
@@ -843,6 +846,7 @@ impl UnreliableSendBuffer {
                 self.tag_symbol(package, f.next_id);
                 let f = self.fec_send_slot.as_mut().unwrap();
                 f.next_id += 1;
+                if let Some(rec) = &mut self.fec_record { rec.push(f.progress_info()); }
                 return Some(UnreliableFragment::Plain { is_fin: true, package_id: package, data: &f.message, offset: 0 });
             }
             if self.fec_rescue_package.is_none() { if let (Some(a), Some(f)) = (&self.fec_adaptive, &mut self.fec_send_slot) {
@@ -896,9 +900,13 @@ impl UnreliableSendBuffer {
             let id = crate::fec::MessageLayout::new(f.message.len(), f.block_bytes).unwrap().wire_id(f.next_id);
             if let Some(len) = repair_len {
                 f.next_id += 1;
+                if let Some(rec) = &mut self.fec_record { rec.push(f.progress_info()); }
                 return Some(UnreliableFragment::Fec { package_id, message_len: f.message.len() as u32, block_bytes: f.block_bytes as u16, block_id: id, data: &f.block_buf[..len] });
             }
             f.next_id += 1;
+            if f.next_id == 1 || f.next_id == f.k {
+                if let Some(rec) = &mut self.fec_record { rec.push(f.progress_info()); }
+            }
             let start = id as usize * f.block_bytes;
             let end = (start + f.block_bytes).min(f.message.len());
             return Some(UnreliableFragment::Fec { package_id, message_len: f.message.len() as u32, block_bytes: f.block_bytes as u16, block_id: id, data: &f.message[start..end] });
@@ -909,6 +917,7 @@ impl UnreliableSendBuffer {
             if let Some(r) = self.fec_retained.iter_mut().find(|r| r.package == self.send_package_id && r.slot.k == 1) {
                 r.slot.next_id = 1;
                 r.slot.first_seq = self.next_packet_seq;
+                if let Some(rec) = &mut self.fec_record { rec.push(r.slot.progress_info()); }
                 self.tag_symbol(self.send_package_id, 0);
             }
         }
@@ -1903,8 +1912,8 @@ pub struct NetworkThreadPull {
     pub unreliable_send_free_bytes: Vec<(ConnectionKey, u64)>,
     /// Cumulative counters for every connected connection.
     pub connection_stats: Vec<(ConnectionKey, ConnectionStats)>,
-    /// FEC messages whose last block went out since the previous call (only with
-    /// `NetworkThreadOptions::record_fec_messages`).
+    /// Cumulative progress snapshots at first source, source completion and every repair
+    /// (including K=1 raw rescue), only with `NetworkThreadOptions::record_fec_messages`.
     pub fec_messages: Vec<(ConnectionKey, crate::fec_adapt::FecMessageInfo)>,
     /// Network-thread-wide counters (kernel drops, loop starvation).
     pub thread_stats: NetworkThreadStats,
@@ -1976,7 +1985,7 @@ pub(crate) struct CongestionPolicy {
 pub struct NetworkThreadOptions {
     /// See `new_network_thread_with_bind`.
     pub bind_ip: Option<std::net::IpAddr>,
-    /// Report finished FEC messages in `NetworkThreadPull::fec_messages`.
+    /// Report cumulative source/repair progress in `NetworkThreadPull::fec_messages`.
     pub record_fec_messages: bool,
     /// Record loss-episode statistics only; never changes congestion control.
     pub record_loss_episodes: bool,
@@ -4225,6 +4234,7 @@ mod fec_closed_loop_tests {
     fn retained_encoder_rescues_after_feedback_and_retires_after_success() {
         let mut b = UnreliableSendBuffer::new(100000, 1000000, 1000000);
         b.fec_adaptive = Some(FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0));
+        b.fec_record = Some(Vec::new());
         b.submit_messages(vec![vec![7; 1433 * 12], vec![8; 1433 * 12]]);
         let mut seq = 0;
         loop {
@@ -4236,6 +4246,8 @@ mod fec_closed_loop_tests {
         }
         b.reclaim_finished_partial();
         assert!(b.fec_send_slot.is_none());
+        assert_eq!(b.fec_record.as_ref().unwrap().first().unwrap().n_sent, 1);
+        assert_eq!(b.fec_record.as_ref().unwrap().last().unwrap().n_sent, seq as u32);
         let initial = seq;
         for s in 0..initial { b.fec_on_packet_finalized(s, true); }
         let r = b.fec_retained.front().unwrap();
@@ -4250,6 +4262,7 @@ mod fec_closed_loop_tests {
         b.reclaim_finished_partial();
         for s in initial..seq { b.fec_on_packet_finalized(s, false); }
         assert!(!b.fec_retained.iter().any(|r| r.package == 0));
+        assert_eq!(b.fec_record.as_ref().unwrap().last().unwrap().n_sent, seq as u32);
         assert_eq!(b.queue_bytes_filled, 1433 * 12); // rescue never charges application queue
     }
 
@@ -4257,6 +4270,7 @@ mod fec_closed_loop_tests {
     fn packed_raw_messages_share_feedback_and_retry_only_on_loss() {
         let mut b = UnreliableSendBuffer::new(100000, 1000000, 1000000);
         b.fec_adaptive = Some(FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0));
+        b.fec_record = Some(Vec::new());
         b.submit_messages(vec![vec![7; 100], vec![8; 100]]);
         b.fec_prepare_packet(0);
         for package in 0..2 {
@@ -4274,6 +4288,9 @@ mod fec_closed_loop_tests {
         assert!(!b.has_unsent_data());
         assert!(b.fec_retained.is_empty());
         assert_eq!(b.queue_bytes_filled, 0);
+        let rec = b.fec_record.as_ref().unwrap();
+        assert_eq!(rec.len(), 4);
+        assert_eq!(rec.iter().map(|r| r.n_sent).collect::<Vec<_>>(), vec![1, 1, 2, 2]);
     }
 
     #[test]

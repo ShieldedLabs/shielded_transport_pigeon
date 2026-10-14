@@ -336,6 +336,19 @@ fn poll(handle: &NetworkThreadHandle, outbox: &mut Outbox, wanted: &mut Wanted) 
     p
 }
 
+fn mean_transmitted_redundancy(sum_repair_ratios: f64, sent_messages: u64) -> f64 {
+    if sent_messages == 0 { 0.0 } else { 100.0 * sum_repair_ratios / sent_messages as f64 }
+}
+
+#[test]
+fn redundancy_is_not_diluted_by_unsent_workload() {
+    // 10 sent K=12,N=24 messages in a nominal 1000-message timeout workload.
+    assert_eq!(mean_transmitted_redundancy(10.0, 10), 100.0);
+    assert_eq!(mean_transmitted_redundancy(0.0, 0), 0.0);
+    // Cumulative rescue raises N to30, i.e.18 actually sent repair symbols.
+    assert_eq!(mean_transmitted_redundancy(18.0 / 12.0, 1), 150.0);
+}
+
 fn send_duty_off(elapsed_ns: u64, on_ns: u64, off_ns: u64) -> bool {
     off_ns != 0 && elapsed_ns % (on_ns + off_ns) >= on_ns
 }
@@ -613,17 +626,22 @@ fn send(a: &Args) {
     let mut last_recv = start_ns as f64;
     let (mut b_count, mut b_deliv, mut b_bytes) = (vec![0u64; ngroups], vec![0u64; ngroups], vec![0u64; ngroups]);
     let mut b_lat: Vec<Vec<f64>> = vec![Vec::new(); ngroups];
-    // Per group: sum of sent redundancy (n_sent - k) / k and of planned, over all messages (0 when uncoded), coded count.
+    // Cumulative on-wire repair snapshots, including late rescue. Never dilute a saturated
+    // run's FEC ratio with workload messages that were not transmitted before its timeout.
     let (mut b_red, mut b_red_plan, mut b_coded) = (vec![0f64; ngroups], vec![0f64; ngroups], vec![0u64; ngroups]);
+    let (mut b_sent, mut b_repairs) = (vec![0u64; ngroups], vec![0u64; ngroups]);
     let mut all_lat = Vec::new();
     for id in 0..count {
         let size = sizes[id as usize];
         let b = group_of(size);
         b_count[b] += 1; b_bytes[b] += size as u64;
         if let Some(&(k, n, np, _)) = fec_info.get(&id) {
-            b_coded[b] += 1;
-            b_red[b] += (n - k) as f64 / k as f64;
-            b_red_plan[b] += (np - k) as f64 / k as f64;
+            b_sent[b] += 1;
+            b_coded[b] += u64::from(k > 1);
+            let repairs = n.saturating_sub(k);
+            b_repairs[b] += repairs as u64;
+            b_red[b] += repairs as f64 / k as f64;
+            b_red_plan[b] += np.saturating_sub(k) as f64 / k as f64;
         }
         match recs.get(&id) {
             Some(&(true, t)) => {
@@ -687,15 +705,15 @@ fn send(a: &Args) {
     let mut bucket_json = Vec::new();
     for b in 0..ngroups {
         if b_count[b] == 0 { continue; }
-        let red = 100.0 * b_red[b] / b_count[b] as f64;
-        let red_plan = 100.0 * b_red_plan[b] / b_count[b] as f64;
+        let red = mean_transmitted_redundancy(b_red[b], b_sent[b]);
+        let red_plan = mean_transmitted_redundancy(b_red_plan[b], b_sent[b]);
         b_lat[b].sort_by(|x, y| x.partial_cmp(y).unwrap());
         let rate = if b_count[b] > 0 { Some(b_deliv[b] as f64 / b_count[b] as f64) } else { None };
         let (p50, p99) = (pct(&b_lat[b], 50.0), pct(&b_lat[b], 99.0));
         println!("{:<9} {:>6} {:>9} {:>8} {:>12} {:>12} {:>7} {:>9.2} {:>9.2}", group_names[b], b_count[b], b_deliv[b],
             rate.map(|r| format!("{:.1}%", r * 100.0)).unwrap_or("-".into()), jnum(p50), jnum(p99), b_coded[b], red, red_plan);
-        bucket_json.push(format!("{{\"bucket\":\"{}\",\"count\":{},\"bytes\":{},\"delivered\":{},\"delivery_rate\":{},\"latency_ms_p50\":{},\"latency_ms_p99\":{},\"fec_coded\":{},\"mean_redundancy_pct\":{:.4},\"mean_planned_redundancy_pct\":{:.4}}}",
-            group_names[b], b_count[b], b_bytes[b], b_deliv[b], jnum(rate), jnum(p50), jnum(p99), b_coded[b], red, red_plan));
+        bucket_json.push(format!("{{\"bucket\":\"{}\",\"count\":{},\"bytes\":{},\"delivered\":{},\"delivery_rate\":{},\"latency_ms_p50\":{},\"latency_ms_p99\":{},\"fec_coded\":{},\"sent_messages\":{},\"repair_blocks_sent\":{},\"mean_redundancy_pct\":{:.4},\"mean_planned_redundancy_pct\":{:.4}}}",
+            group_names[b], b_count[b], b_bytes[b], b_deliv[b], jnum(rate), jnum(p50), jnum(p99), b_coded[b], b_sent[b], b_repairs[b], red, red_plan));
     }
     all_lat.sort_by(|x, y| x.partial_cmp(y).unwrap());
     println!("all       latency p50 {} ms, p99 {} ms", jnum(pct(&all_lat, 50.0)), jnum(pct(&all_lat, 99.0)));
