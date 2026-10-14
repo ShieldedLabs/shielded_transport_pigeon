@@ -439,6 +439,9 @@ pub struct UnreliableSendBuffer {
     /// Sequence number of the packet the next fragment goes into (set by the network thread), so
     /// an FEC message knows which packets are its own when they are declared lost.
     pub next_packet_seq: u64,
+    /// Lazy fixed 2 MiB nonce ring: package id (16), symbol count (16), first ordinal (32).
+    /// One ring per connection, reused across messages; ACK/probe/keepalive slots are empty.
+    fec_packet_tags: Option<Box<[u64]>>,
     /// Finished FEC messages, when recording is enabled (Some); drained by the network thread.
     pub fec_record: Option<Vec<crate::fec_adapt::FecMessageInfo>>,
 }
@@ -459,8 +462,33 @@ pub struct FecSendSlot {
     /// count planned at the start, and the loss rate the plan was sized for (0 for fixed ppm).
     pub first_seq: u64,
     pub lost: u32,
+    pub group_lost: Vec<u32>,
     pub n_planned: u32,
     pub loss_estimate: f64,
+}
+
+impl FecSendSlot {
+    fn refresh_plan(&mut self, a: &crate::fec_adapt::FecAdaptiveState) {
+        let layout = crate::fec::MessageLayout::new(self.message.len(), self.block_bytes).unwrap();
+        let groups = layout.groups as u64;
+        let sources = self.next_id.min(self.k) as u64;
+        let repairs = self.next_id.saturating_sub(self.k) as u64;
+        let mut per_group_repairs = 0;
+        for group in 0..layout.groups {
+            let k = layout.group(group).1 as u64;
+            let source_sent = (sources / groups + u64::from((group as u64) < sources % groups)).min(k);
+            let repair_sent = repairs / groups + u64::from((group as u64) < repairs % groups);
+            let total_repairs = if a.closed_loop_enabled() {
+                repair_sent + a.extra_repair_blocks_needed_for_group(k, self.k as u64, layout.groups, source_sent + repair_sent, repair_sent, self.group_lost[group] as u64)
+            } else {
+                a.topped_up_blocks_for_group(k, self.k as u64, layout.groups, self.group_lost[group] as u64, self.loss_estimate).saturating_sub(k)
+            };
+            per_group_repairs = per_group_repairs.max(total_repairs);
+        }
+        // Equal complete rounds conservatively protect the most affected group, not mean loss.
+        let n = self.k as u64 + per_group_repairs * groups;
+        self.n = self.n.max(layout.round_plan(n.min(u32::MAX as u64) as u32));
+    }
 }
 
 enum FecEncoderState {
@@ -509,30 +537,35 @@ impl UnreliableSendBuffer {
             fec_send_slot: None,
             fec_adaptive: None,
             next_packet_seq: 0,
+            fec_packet_tags: None,
             fec_record: None,
         }
     }
 
-    /// The sender declared packet `seq` lost. If it belongs to the FEC message being sent, count
-    /// it, and with adaptive top-up grow that message's block count to cover it.
+    /// Start ANY connected nonce (including control). Clear a reused ring entry before fill.
+    pub fn fec_prepare_packet(&mut self, seq: u64) {
+        self.next_packet_seq = seq;
+        if let Some(tags) = &mut self.fec_packet_tags { tags[(seq % PACKETS_WAITING_ACK_CAPACITY) as usize] = 0; }
+    }
+
+    /// Count only this active message's actually transmitted symbols, never nonce gaps.
     pub fn fec_on_packet_lost(&mut self, seq: u64) {
         let Some(f) = &mut self.fec_send_slot else { return };
-        if seq < f.first_seq || f.next_id >= f.n { return; }
-        f.lost += 1;
+        if seq < f.first_seq || seq > self.next_packet_seq || self.next_packet_seq - seq >= PACKETS_WAITING_ACK_CAPACITY || f.next_id >= f.n { return; }
+        let Some(tags) = &mut self.fec_packet_tags else { return };
+        let tag = std::mem::take(&mut tags[(seq % PACKETS_WAITING_ACK_CAPACITY) as usize]);
+        let count = ((tag >> 32) & 0xffff) as u32;
+        if count == 0 || tag >> 48 != self.send_package_id as u64 { return; }
+        let first = tag as u32;
+        if first.saturating_add(count) > f.next_id { return; }
+        let layout = crate::fec::MessageLayout::new(f.message.len(), f.block_bytes).unwrap();
+        for ordinal in first..first + count {
+            let group = layout.local_id(layout.wire_id(ordinal)).0;
+            f.group_lost[group] = f.group_lost[group].saturating_add(1);
+        }
+        f.lost = f.lost.saturating_add(count);
         if let Some(a) = &self.fec_adaptive {
-            if a.tracker.config().topup {
-                let layout = crate::fec::MessageLayout::new(f.message.len(), f.block_bytes).unwrap();
-                let n = if a.closed_loop_enabled() {
-                    let repair_sent = f.next_id.saturating_sub(f.k) as u64;
-                    f.k as u64 + repair_sent + a.extra_repair_blocks_needed_now(f.k as u64, f.next_id as u64, repair_sent, f.lost as u64)
-                } else {
-                    let group_k = layout.group(0).1 as u64;
-                    let group_lost = (f.lost as u64).div_ceil(layout.groups as u64);
-                    let group_n = a.topped_up_blocks(group_k, group_lost, f.loss_estimate);
-                    f.k as u64 + group_n.saturating_sub(group_k) * layout.groups as u64
-                };
-                f.n = f.n.max(layout.round_plan(n.min(u32::MAX as u64) as u32));
-            }
+            if a.tracker.config().topup { f.refresh_plan(a); }
         }
     }
 
@@ -637,9 +670,11 @@ impl UnreliableSendBuffer {
     fn start_fec(&mut self, message: std::sync::Arc<Vec<u8>>, block_bytes: usize) {
         let layout = crate::fec::MessageLayout::new(message.len(), block_bytes).unwrap();
         let k = layout.k as u32;
-        let group_k = layout.group(0).1 as u32;
         let (n, loss_estimate) = match &self.fec_adaptive {
-            Some(a) => (k + a.repair_blocks(group_k as u64).min(group_k as u64) as u32 * layout.groups as u32, a.p),
+            Some(a) => {
+                let repairs = (0..layout.groups).map(|g| a.repair_blocks_for_group(layout.group(g).1 as u64, k as u64, layout.groups)).max().unwrap_or(0);
+                (k + repairs as u32 * layout.groups as u32, a.p)
+            },
             None => {
                 let ppm = self.fec_redundancy_ppm.min(MAX_FEC_REDUNDANCY_PPM) as u64;
                 (k + ((k as u64 * ppm + 999_999) / 1_000_000) as u32, 0.0)
@@ -656,7 +691,8 @@ impl UnreliableSendBuffer {
                 Err(_) => match crate::fec::encode_message(message.clone(), block_bytes) { Some(e) => FecEncoderState::Ready(e), None => FecEncoderState::Failed },
             }
         };
-        self.fec_send_slot = Some(FecSendSlot { message, block_bytes, k, n, next_id: 0, encoder, block_buf: vec![0u8; block_bytes], first_seq: self.next_packet_seq, lost: 0, n_planned: n, loss_estimate });
+        self.fec_packet_tags.get_or_insert_with(|| vec![0u64; PACKETS_WAITING_ACK_CAPACITY as usize].into_boxed_slice());
+        self.fec_send_slot = Some(FecSendSlot { group_lost: vec![0; layout.groups], message, block_bytes, k, n, next_id: 0, encoder, block_buf: vec![0u8; block_bytes], first_seq: self.next_packet_seq, lost: 0, n_planned: n, loss_estimate });
     }
 
     /// Starts `msg` as the message being sent: grouped FEC if enabled and its length fits
@@ -681,10 +717,7 @@ impl UnreliableSendBuffer {
             if let (Some(a), Some(f)) = (&self.fec_adaptive, &mut self.fec_send_slot) {
                 // Refresh at source completion and the final planned repair, without tail waiting.
                 if a.closed_loop_enabled() && f.next_id >= f.k && (f.next_id == f.k || f.next_id + 1 >= f.n) {
-                    let layout = crate::fec::MessageLayout::new(f.message.len(), f.block_bytes).unwrap();
-                    let repair_sent = f.next_id.saturating_sub(f.k) as u64;
-                    let extra = a.extra_repair_blocks_needed_now(f.k as u64, f.next_id as u64, repair_sent, f.lost as u64);
-                    f.n = f.n.max(layout.round_plan((f.k as u64 + repair_sent + extra).min(u32::MAX as u64) as u32));
+                    f.refresh_plan(a);
                 }
             }
             let need = { let f = self.fec_send_slot.as_ref().unwrap(); STP_FEC_FRAGMENT_HEADER_SIZE + crate::fec::block_len(f.message.len(), f.block_bytes, crate::fec::MessageLayout::new(f.message.len(), f.block_bytes).unwrap().wire_id(f.next_id)) };
@@ -726,6 +759,14 @@ impl UnreliableSendBuffer {
             if f.next_id >= f.n { return self.next_fragment(payload_len, space); }
             let f = self.fec_send_slot.as_mut().unwrap();
             let id = crate::fec::MessageLayout::new(f.message.len(), f.block_bytes).unwrap().wire_id(f.next_id);
+            let tag = &mut self.fec_packet_tags.as_mut().unwrap()[(self.next_packet_seq % PACKETS_WAITING_ACK_CAPACITY) as usize];
+            let count = ((*tag >> 32) & 0xffff) as u16;
+            if count == 0 || *tag >> 48 != package_id as u64 {
+                *tag = ((package_id as u64) << 48) | (1u64 << 32) | f.next_id as u64;
+            } else {
+                assert!(count < u16::MAX);
+                *tag += 1u64 << 32;
+            }
             if let Some(len) = repair_len {
                 f.next_id += 1;
                 return Some(UnreliableFragment::Fec { package_id, message_len: f.message.len() as u32, block_bytes: f.block_bytes as u16, block_id: id, data: &f.block_buf[..len] });
@@ -2585,6 +2626,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     {
                                         let bit_index = state.send_sequence_number % PACKETS_WAITING_ACK_CAPACITY;
                                         state.packets_waiting_ack_field[(bit_index / 64) as usize] &= !(1u64 << (bit_index % 64));
+                                        existing_connection.unreliable_send_buffer.fec_prepare_packet(state.send_sequence_number);
                                         state.send_sequence_number += 1;
                                         if let Some(p) = &mut state.curve_pacer { p.skip_ack(); }
                                     }
@@ -2889,6 +2931,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 {
                                     let bit_index = state.send_sequence_number % PACKETS_WAITING_ACK_CAPACITY;
                                     state.packets_waiting_ack_field[(bit_index / 64) as usize] &= !(1u64 << (bit_index % 64));
+                                    connection_tracking_data.unreliable_send_buffer.fec_prepare_packet(state.send_sequence_number);
                                     state.send_sequence_number += 1;
                                     if let Some(p) = &mut state.curve_pacer { p.skip_ack(); }
                                 }
@@ -3200,6 +3243,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
 
                             let send_time_ns = if let Some(ns) = &connection_tracking_data.nym_sock { nym_udp_send_with_congestion_and_dscp(ns, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::Af21, false) }
                             else { udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::Af21, false) };
+                            connection_tracking_data.unreliable_send_buffer.fec_prepare_packet(state.send_sequence_number);
                             state.account_send(send_time_ns);
                             state.last_sent_tu_probe_time_ns = send_time_ns;
                             if curve_cadence_ns.is_some() { packet_send_allowance_now = packet_send_allowance_now.saturating_sub(1); }
@@ -3226,6 +3270,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
 
                             let send_time_ns = if let Some(ns) = &connection_tracking_data.nym_sock { nym_udp_send_with_congestion_and_dscp(ns, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::Af21, false) }
                             else { udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::Af21, false) };
+                            connection_tracking_data.unreliable_send_buffer.fec_prepare_packet(state.send_sequence_number);
                             state.account_send(send_time_ns);
                             state.last_sent_data_packet = current_time_now_ns; // We use the older time here so the pacer skips less packets.
                             state.packets_in_flight += 1;
@@ -3259,7 +3304,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             curve_cpu_late = curve_burst_budget_ns.is_some_and(|budget| monotonic_clock_ns() >= curve_tick_ns.saturating_add(budget));
                             !curve_cpu_late
                         } && {
-                            connection_tracking_data.unreliable_send_buffer.next_packet_seq = state.send_sequence_number;
+                            connection_tracking_data.unreliable_send_buffer.fec_prepare_packet(state.send_sequence_number);
                             unreliable_payload_size = fill_packet_payload_with_unreliable_fragments(&mut packet_memory_send[0..payload_size], &mut connection_tracking_data.unreliable_send_buffer);
                             unreliable_payload_size > 0
                         } {
@@ -3913,6 +3958,7 @@ mod fec_send_tests {
         let mut packets = Vec::new();
         let mut mem = vec![0u8; payload_len];
         while packets.len() < max_packets {
+            buf.fec_prepare_packet(packets.len() as u64);
             if fill_packet_payload_with_unreliable_fragments(&mut mem, buf) > 0 {
                 packets.push(parse_packet(&mem));
             } else if buf.has_unsent_data() {
@@ -4088,6 +4134,7 @@ mod fec_send_tests {
         let mut sent = 0;
         let mut complete = false;
         while b.has_unsent_data() {
+            b.fec_prepare_packet(sent as u64);
             if fill_packet_payload_with_unreliable_fragments(&mut packet, &mut b) == 0 {
                 std::thread::sleep(std::time::Duration::from_millis(1));
                 continue;
@@ -4111,25 +4158,86 @@ mod fec_send_tests {
     }
 
     #[test]
-    fn grouped_adaptive_topup_uses_group_variance() {
+    fn grouped_adaptive_topup_uses_owned_group_losses() {
         let mut b = new_buf(10_000);
         let a = crate::fec_adapt::FecAdaptiveState::new(crate::fec_adapt::AdaptiveFecConfig { topup: true, ..Default::default() }, 0, 0, 0);
         b.fec_adaptive = Some(a.clone());
         b.start_fec(std::sync::Arc::new(msg(64001 * 32)), 32);
+        // One real group-zero source, followed by a control nonce that is NOT a symbol.
+        b.fec_prepare_packet(0);
+        assert!(matches!(b.next_fragment(48, 48), Some(UnreliableFragment::Fec { block_id: 0, .. })));
+        b.fec_prepare_packet(1);
         let f = b.fec_send_slot.as_mut().unwrap();
         let layout = crate::fec::MessageLayout::new(f.message.len(), 32).unwrap();
         assert_eq!(layout.groups, 3);
         f.lost = 600;
+        f.group_lost[0] = 600;
         let initial_p = f.loss_estimate;
-        let old_n = layout.round_plan(a.topped_up_blocks(f.k as u64, 601, initial_p) as u32);
+        b.fec_on_packet_lost(1); // ACK/probe/keepalive gap must not own a group.
+        assert_eq!(b.fec_send_slot.as_ref().unwrap().lost, 600);
         b.fec_on_packet_lost(0);
+        b.fec_on_packet_lost(0); // repeated declaration must not count twice.
         let f = b.fec_send_slot.as_ref().unwrap();
+        assert_eq!(f.group_lost, vec![601, 0, 0]);
+        assert_eq!(f.lost, 601);
         let group_k = layout.group(0).1 as u64;
-        let group_n = a.topped_up_blocks(group_k, 601u64.div_ceil(layout.groups as u64), initial_p);
+        let group_n = a.topped_up_blocks_for_group(group_k, layout.k as u64, layout.groups, 601, initial_p);
         let expected = layout.round_plan((layout.k as u64 + (group_n - group_k) * layout.groups as u64) as u32);
         assert_eq!(f.n, expected);
-        assert!(f.n > old_n); // Whole-K variance fails to protect each independent solve.
+        let averaged = a.topped_up_blocks_for_group(group_k, layout.k as u64, layout.groups, 601u64.div_ceil(layout.groups as u64), initial_p);
+        assert!(group_n > averaged); // Concentrated erasures must not be averaged away.
         assert_eq!((f.n - f.k) as usize % layout.groups, 0);
+        assert_eq!(a.group_failure_target(layout.k as u64, layout.groups), a.tracker.config().eps / layout.groups as f64);
+    }
+
+    #[test]
+    fn fec_nonce_ring_tracks_multi_group_packets_wrap_and_slot_generation() {
+        let mut b = new_buf(30_000);
+        assert!(b.fec_packet_tags.is_none());
+        b.start_fec(std::sync::Arc::new(msg(64001 * 32)), 32);
+        let allocation = b.fec_packet_tags.as_ref().unwrap().as_ptr();
+        assert_eq!(b.fec_packet_tags.as_ref().unwrap().len() * std::mem::size_of::<u64>(), 2 * 1024 * 1024);
+        b.fec_prepare_packet(5);
+        // TU growth packs three sequential transmission ordinals (three groups) in one packet.
+        for _ in 0..3 { assert!(b.next_fragment(144, 48).is_some()); }
+        b.fec_on_packet_lost(5);
+        assert_eq!(b.fec_send_slot.as_ref().unwrap().group_lost, vec![1, 1, 1]);
+        b.fec_prepare_packet(6);
+        assert!(b.next_fragment(48, 48).is_some());
+        // A non-FEC nonce reuses the same ring position: its loss cannot inherit old symbols.
+        b.fec_prepare_packet(6 + PACKETS_WAITING_ACK_CAPACITY);
+        b.fec_on_packet_lost(6 + PACKETS_WAITING_ACK_CAPACITY);
+        b.fec_on_packet_lost(6); // outside fixed history horizon
+        assert_eq!(b.fec_send_slot.as_ref().unwrap().lost, 3);
+        b.send_package_id = b.send_package_id.wrapping_add(1);
+        b.start_fec(std::sync::Arc::new(msg(64001 * 32)), 32);
+        assert_eq!(b.fec_packet_tags.as_ref().unwrap().as_ptr(), allocation);
+        b.fec_on_packet_lost(5); // former message never contributes to this slot
+        assert_eq!(b.fec_send_slot.as_ref().unwrap().group_lost, vec![0, 0, 0]);
+    }
+
+    #[test]
+    fn grouped_closed_loop_sizes_each_owned_tail_with_union_bound() {
+        use crate::fec_adapt::*;
+        let mut b = new_buf(10_000);
+        let a = FecAdaptiveState::new(AdaptiveFecConfig { kind: LossEstimatorKind::SpanTail, eps: 0.5, topup: true, closed_loop: true, ..Default::default() }, 0, 0, 0);
+        b.fec_adaptive = Some(a.clone());
+        b.start_fec(std::sync::Arc::new(msg(64001 * 32)), 32);
+        let f = b.fec_send_slot.as_mut().unwrap();
+        let layout = crate::fec::MessageLayout::new(f.message.len(), 32).unwrap();
+        f.next_id = f.k; // all sources sent, no repairs yet
+        f.group_lost[1] = 900;
+        f.lost = 900;
+        f.refresh_plan(&a);
+        let expected_repairs = (0..layout.groups).map(|g| a.extra_repair_blocks_needed_for_group(layout.group(g).1 as u64, layout.k as u64, layout.groups, layout.group(g).1 as u64, 0, f.group_lost[g] as u64)).max().unwrap();
+        assert_eq!(f.n, layout.round_plan(f.k + expected_repairs as u32 * layout.groups as u32));
+        let eps = a.group_failure_target(layout.k as u64, 1);
+        assert_eq!(a.group_failure_target(layout.k as u64, layout.groups) * layout.groups as f64, eps);
+        assert!(expected_repairs >= 900 + 12);
+        let n = f.n;
+        f.group_lost[1] = 0;
+        f.refresh_plan(&a);
+        assert_eq!(f.n, n); // plans never shrink
     }
 
     #[test]

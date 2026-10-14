@@ -458,11 +458,14 @@ impl SpanLossProfile {
         self.margin_blocks(k, k, cfg)
     }
     fn margin_blocks(&self, k: u64, whole_message_k: u64, cfg: &AdaptiveFecConfig) -> u64 {
+        self.margin_blocks_for_groups(k, whole_message_k, 1, cfg)
+    }
+    fn margin_blocks_for_groups(&self, k: u64, whole_message_k: u64, groups: usize, cfg: &AdaptiveFecConfig) -> u64 {
         let cap = ((k as f64 * cfg.max_redundancy).ceil() as u64).max(1);
         // Explicit prior/floor protects against unobserved loss. It cannot predict a new queue
         // overflow event; fixing CC is preferable to paying for a pathological startup prior.
         let prior = if self.seen < 4096 { cfg.initial_loss } else { cfg.min_loss };
-        let eps = self.target_failure(whole_message_k, cfg);
+        let eps = self.target_failure(whole_message_k, cfg) / groups.max(1) as f64;
         let mut r = repair_blocks(k, prior, z_for_eps(eps), eps, cfg.extra_blocks, cfg.max_redundancy).max(cfg.span_floor.repair_blocks(k)).min(cap);
         for _ in 0..32 {
             let Some(q) = self.tail_losses(k + r, eps) else { break; };
@@ -524,39 +527,50 @@ impl FecAdaptiveState {
     pub fn on_sequence_finalized(&mut self, seq: u64, lost: bool, now_ns: u64) {
         if let Some(s) = &mut self.span { s.on_sequence_finalized(seq, lost, now_ns, self.tracker.cfg.window_ns); }
     }
+    /// Whole-message failure target, divided among independent Wirehair groups.
+    pub fn group_failure_target(&self, whole_message_k: u64, groups: usize) -> f64 {
+        let c = &self.tracker.cfg;
+        self.span.as_ref().map_or(c.eps, |s| s.target_failure(whole_message_k, c)) / groups.max(1) as f64
+    }
     /// Repair blocks for a new message of k source blocks.
-    pub fn repair_blocks(&self, k: u64) -> u64 {
+    pub fn repair_blocks(&self, k: u64) -> u64 { self.repair_blocks_for_group(k, k, 1) }
+    pub fn repair_blocks_for_group(&self, k: u64, whole_message_k: u64, groups: usize) -> u64 {
         let c = &self.tracker.cfg;
         if let Some(span) = &self.span {
-            if self.closed_loop_enabled() {
-                // Cold start has no feedback-window measurement: keep the full-message prior.
-                let horizon = if span.seen < 4096 { k } else { k.min(span.pending_peak.max(1)) };
-                let cap = ((k as f64 * c.max_redundancy).ceil() as u64).max(1).min(k);
-                span.margin_blocks(horizon, k, c).max(12.min(k)).min(cap)
-            } else { span.repair_blocks(k, c, self.z) }
+            let horizon = if self.closed_loop_enabled() && span.seen >= 4096 { k.min(span.pending_peak.max(1)) } else { k };
+            let cap = ((k as f64 * c.max_redundancy).ceil() as u64).max(1).min(k);
+            let r = span.margin_blocks_for_groups(horizon, whole_message_k, groups, c);
+            if self.closed_loop_enabled() { r.max(12.min(k)).min(cap) } else { r.min(cap) }
+        } else {
+            let eps = self.group_failure_target(whole_message_k, groups);
+            repair_blocks(k, self.p, z_for_eps(eps), eps, c.extra_blocks, c.max_redundancy)
         }
-        else { repair_blocks(k, self.p, self.z, c.eps, c.extra_blocks, c.max_redundancy) }
     }
     /// Total blocks for a message of k source blocks of which `lost` sent ones are known lost.
     pub fn topped_up_blocks(&self, k: u64, lost: u64, p_at_start: f64) -> u64 {
+        self.topped_up_blocks_for_group(k, k, 1, lost, p_at_start)
+    }
+    pub fn topped_up_blocks_for_group(&self, k: u64, whole_message_k: u64, groups: usize, lost: u64, p_at_start: f64) -> u64 {
         let c = &self.tracker.cfg;
-        if self.span.is_some() { return k + lost + self.repair_blocks(k); }
+        let cap = ((k as f64 * c.max_redundancy).ceil() as u64).min(k);
+        if self.span.is_some() { return k + lost.saturating_add(self.repair_blocks_for_group(k, whole_message_k, groups)).min(cap); }
+        let eps = self.group_failure_target(whole_message_k, groups);
         let p = self.p.max(p_at_start);
-        let r = repair_blocks(k + lost, p, self.z, c.eps, c.extra_blocks, c.max_redundancy * k as f64 / (k + lost) as f64);
-        k + lost + r
+        let r = repair_blocks(k + lost, p, z_for_eps(eps), eps, c.extra_blocks, c.max_redundancy * k as f64 / (k + lost) as f64);
+        k + lost.saturating_add(r).min(cap)
     }
     pub fn closed_loop_enabled(&self) -> bool {
         let c = &self.tracker.cfg;
         c.kind == LossEstimatorKind::SpanTail && c.topup && c.closed_loop
     }
-    /// Extra fresh repair symbols needed NOW, beyond repairs already sent, for one message.
-    /// All counts refer to the WHOLE message, not one Wirehair group. The caller retains its
-    /// monotone plan and distributes this budget among groups; aggregate losses alone cannot
-    /// guarantee each group (use ownership or a conservative concentration bound there).
-    /// Connection-wide unresolved data is a conservative proxy for this message's final
-    /// detection-delay window. Add unsent sources and repairs, solving the tail fixed point.
-    /// No per-packet message history, retransmission, feedback wait, or bandwidth-rate model.
+    /// Extra fresh repairs for a single-group message; no retransmission or feedback wait.
     pub fn extra_repair_blocks_needed_now(&self, k: u64, blocks_sent: u64, repair_blocks_sent: u64, own_declared_lost: u64) -> u64 {
+        self.extra_repair_blocks_needed_for_group(k, k, 1, blocks_sent, repair_blocks_sent, own_declared_lost)
+    }
+    /// Per-group own-loss budget, with whole-message target allocated by a union bound.
+    /// Connection-wide unresolved data conservatively bounds each group's tail; it is NOT
+    /// divided by group count (interleaving does not prove equal loss ownership).
+    pub fn extra_repair_blocks_needed_for_group(&self, k: u64, whole_message_k: u64, groups: usize, blocks_sent: u64, repair_blocks_sent: u64, own_declared_lost: u64) -> u64 {
         let Some(span) = &self.span else { return 0; };
         if !self.closed_loop_enabled() || k == 0 { return 0; }
         let c = &self.tracker.cfg;
@@ -566,7 +580,7 @@ impl FecAdaptiveState {
         let mut total_repairs = own_declared_lost.saturating_add(12.min(k)).min(cap);
         for _ in 0..32 {
             let horizon = pending.saturating_add(total_repairs.saturating_sub(repair_blocks_sent)).min(k.saturating_add(total_repairs)).max(1);
-            let margin = span.margin_blocks(horizon, k, c).max(12.min(k));
+            let margin = span.margin_blocks_for_groups(horizon, whole_message_k, groups, c).max(12.min(k));
             let next = total_repairs.max(own_declared_lost.saturating_add(margin)).min(cap);
             if next == total_repairs { break; }
             total_repairs = next;
