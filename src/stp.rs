@@ -57,7 +57,7 @@ pub fn ack_test() {
         let mut send_unreliable = Vec::new();
         if !sent && !wanted_connections.is_empty() {
             for msg in &messages {
-                send_unreliable.push((wanted_connections[0].0.to_connection_key(), msg.clone()));
+                send_unreliable.push((wanted_connections[0].0.to_connection_key(), 0, msg.clone()));
             }
             sent = true;
             println!("Sent {NUM_MESSAGES} messages, waiting 10s for receive...");
@@ -140,7 +140,7 @@ pub fn do_the_test_program3(port: u16, my_keypair: IdentityKeyPair, beam_to: Opt
             let mut send_unreliable = Vec::new();
             if wanted_connections.len() > 0 {
                 for _ in 0..50000 {
-                    send_unreliable.push((wanted_connections[0].0.to_connection_key(), Vec::from(b"Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...")));
+                    send_unreliable.push((wanted_connections[0].0.to_connection_key(), 0, Vec::from(b"Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...")));
                 }
                 // the sends will be truncated anyway
             }
@@ -425,6 +425,7 @@ pub struct UnreliableSendBuffer {
     pub message_queue: VecDeque<Vec<u8>>,
     pub partial_send_slot: Option<(Vec<u8>, u32)>,
     pub send_package_id: u16,
+    package_allocator: Option<std::sync::Arc<std::sync::atomic::AtomicU16>>,
     pub current_bytes_per_second: u64,
     /// Queue-capacity estimate in parts per million, updated from the adaptive policy.
     /// This is accounting, never a fixed-parity FEC selection.
@@ -597,6 +598,7 @@ impl UnreliableSendBuffer {
             message_queue: VecDeque::new(),
             partial_send_slot: None,
             send_package_id: 0,
+            package_allocator: None,
             current_bytes_per_second: 0,
             fec_capacity_overhead_ppm: 0,
             fec_send_slot: None,
@@ -643,7 +645,11 @@ impl UnreliableSendBuffer {
         let tag = std::mem::take(&mut tags[index as usize]);
         let mut extra = self.fec_extra_packet_tags.remove(&index).unwrap_or_default();
         extra.push(tag);
-        for tag in extra {
+        self.fec_finalize_tags(seq, lost, &extra);
+    }
+
+    fn fec_finalize_tags(&mut self, seq: u64, lost: bool, tags: &[u64]) {
+        for &tag in tags {
             let count = ((tag >> 32) & 0xffff) as u32;
             if count == 0 { continue; }
             let package = (tag >> 48) as u16;
@@ -821,6 +827,7 @@ impl UnreliableSendBuffer {
     /// Starts `msg` as the message being sent: grouped FEC if enabled and its length fits
     /// the wire format with at least two blocks at this packet size, plain otherwise.
     fn start_message(&mut self, msg: Vec<u8>, payload_len: usize) {
+        if let Some(ids) = &self.package_allocator { self.send_package_id = ids.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
         match self.fec_block_bytes(msg.len(), payload_len) {
             Some(block_bytes) => self.start_fec(std::sync::Arc::new(msg), block_bytes),
             None => {
@@ -961,6 +968,110 @@ impl UnreliableSendBuffer {
     }
 }
 
+/// Fixed sender magazines sharing a single packet-rate pacer. Queue indexes never go on wire.
+/// The receiver still delivers to ONE connection queue immediately on completion, unordered.
+#[derive(Debug)]
+pub struct SendQueues {
+    queues: Vec<UnreliableSendBuffer>,
+    next_queue: usize,
+    last_queue: usize,
+    fec_adaptive: Option<crate::fec_adapt::FecAdaptiveState>,
+    fec_packet_tags: Option<Box<[u64]>>,
+    fec_extra_packet_tags: HashMap<u64, Vec<u64>>,
+    next_packet_seq: u64,
+    fec_record: Option<Vec<crate::fec_adapt::FecMessageInfo>>,
+}
+
+impl SendQueues {
+    pub fn new(count: usize, bounds: (u32, u32, u32)) -> Self {
+        assert!((1..=64).contains(&count));
+        let ids = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0));
+        let queues = (0..count).map(|_| {
+            let mut q = UnreliableSendBuffer::new(bounds.0, bounds.1, bounds.2);
+            q.package_allocator = Some(ids.clone());
+            q
+        }).collect();
+        Self { queues, next_queue: 0, last_queue: 0, fec_adaptive: None,
+            fec_packet_tags: None, fec_extra_packet_tags: HashMap::new(), next_packet_seq: 0, fec_record: None }
+    }
+    pub fn submit_messages(&mut self, queue: usize, messages: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+        match self.queues.get_mut(queue) { Some(q) => q.submit_messages(messages), None => messages }
+    }
+    pub fn free_bytes(&mut self) -> Vec<u64> { self.queues.iter_mut().map(|q| q.free_bytes()).collect() }
+    pub fn has_unsent_data(&self) -> bool { self.queues.iter().any(|q| q.has_unsent_data()) }
+    fn set_time(&mut self, now: u64, rtt: u64) {
+        for q in &mut self.queues { q.fec_now_ns = now; q.fec_rtt_ns = rtt; q.fec_prune_retained(); }
+    }
+    fn set_rate(&mut self, bytes_per_second: u64) {
+        let active = self.queues.iter().filter(|q| q.has_unsent_data()).count().max(1) as u64;
+        for q in &mut self.queues { q.current_bytes_per_second = bytes_per_second / active; }
+    }
+    fn set_overhead(&mut self) {
+        let ppm = self.fec_adaptive.as_ref().unwrap().representative_ppm();
+        for q in &mut self.queues { q.fec_capacity_overhead_ppm = ppm; }
+    }
+    fn fec_prepare_packet(&mut self, seq: u64) {
+        self.next_packet_seq = seq;
+        if let Some(tags) = &mut self.fec_packet_tags { tags[(seq % PACKETS_WAITING_ACK_CAPACITY) as usize] = 0; }
+        self.fec_extra_packet_tags.remove(&(seq % PACKETS_WAITING_ACK_CAPACITY));
+    }
+    fn fec_on_packet_finalized(&mut self, seq: u64, lost: bool) {
+        if seq > self.next_packet_seq || self.next_packet_seq - seq >= PACKETS_WAITING_ACK_CAPACITY { return; }
+        let Some(tags) = &mut self.fec_packet_tags else { return; };
+        let index = seq % PACKETS_WAITING_ACK_CAPACITY;
+        let tag = std::mem::take(&mut tags[index as usize]);
+        let mut extra = self.fec_extra_packet_tags.remove(&index).unwrap_or_default();
+        extra.push(tag);
+        // Every active/suspended/retained slot receives its own package feedback. One tag ring,
+        // not one 2 MiB ring per magazine; the connection loss estimator is likewise shared.
+        for q in &mut self.queues {
+            q.fec_adaptive = self.fec_adaptive.take();
+            q.fec_finalize_tags(seq, lost, &extra);
+            self.fec_adaptive = q.fec_adaptive.take();
+        }
+    }
+    fn bound_retention(&mut self) {
+        loop {
+            let bytes: usize = self.queues.iter().flat_map(|q| &q.fec_retained).map(|r| r.slot.message.len()).sum();
+            let slots: usize = self.queues.iter().map(|q| q.fec_retained.len()).sum();
+            let over_bytes = bytes > FEC_RETAIN_SOURCE_BYTES;
+            if !over_bytes && slots <= FEC_RETAIN_SLOTS { break; }
+            // Reclaim the largest magazine's claim, preserving smaller magazines' history.
+            let i = (0..self.queues.len()).max_by_key(|&i| {
+                let q = &self.queues[i];
+                if over_bytes { q.fec_retained.iter().map(|r| r.slot.message.len()).sum() }
+                else { q.fec_retained.len() }
+            }).unwrap();
+            self.queues[i].fec_retained.pop_front();
+        }
+    }
+    fn fill_packet(&mut self, payload: &mut [u8]) -> usize {
+        for step in 0..self.queues.len() {
+            let i = (self.next_queue + step) % self.queues.len();
+            if !self.queues[i].has_unsent_data() { continue; }
+            let q = &mut self.queues[i];
+            q.next_packet_seq = self.next_packet_seq;
+            q.fec_adaptive = self.fec_adaptive.take();
+            q.fec_packet_tags = self.fec_packet_tags.take();
+            q.fec_extra_packet_tags = std::mem::take(&mut self.fec_extra_packet_tags);
+            q.fec_record = self.fec_record.take();
+            let used = fill_packet_payload_with_unreliable_fragments(payload, q);
+            self.fec_adaptive = q.fec_adaptive.take();
+            self.fec_packet_tags = q.fec_packet_tags.take();
+            self.fec_extra_packet_tags = std::mem::take(&mut q.fec_extra_packet_tags);
+            self.fec_record = q.fec_record.take();
+            self.bound_retention();
+            if used > 0 {
+                self.last_queue = i;
+                self.next_queue = (i + 1) % self.queues.len();
+                return used;
+            }
+            // Pending asynchronous encoder? It cannot hold up a ready magazine.
+        }
+        0
+    }
+}
+
 // The network thread keeps reading sockets whether or not the consumer keeps up, so without a
 // bound a flood of peer traffic (such as BFT round data re-sent during a stall) grows this queue
 // until the process is killed. Drop-oldest matches the send side, and both protocols tolerate it:
@@ -1057,7 +1168,7 @@ pub struct ConnectionTrackingData {
     pub handshake_hash: [u8; 64],
     // pub reliable_streams: ReliableStreams,
     
-    pub unreliable_send_buffer: UnreliableSendBuffer,
+    pub unreliable_send_buffer: SendQueues,
     pub unreliable_reassembly: Vec<ReassemblySlot>,
     pub unreliable_fec: Vec<FecRecvSlot>,
 }
@@ -1568,6 +1679,7 @@ pub fn connect_to_endpoint(
     my_connect_keypair: &IdentityKeyPair,
     endpoint: &STPAddress,
     send_buffer_params: (u32, u32, u32),
+    send_queue_count: usize,
 ) {
     assert!(my_connect_keypair.magic1 == endpoint.magic1);
 
@@ -1592,7 +1704,7 @@ pub fn connect_to_endpoint(
                 other_transport_identity: endpoint.key.clone(),
                 connection_state: ConnectionState::SendingClientHelloPlaintext { last_sent_time_ns: 0, hello_packet_payload },
                 handshake_hash: [0u8; 64],
-                unreliable_send_buffer: UnreliableSendBuffer::new(send_buffer_params.0, send_buffer_params.1, send_buffer_params.2),
+                unreliable_send_buffer: SendQueues::new(send_queue_count, send_buffer_params),
                 unreliable_reassembly: ReassemblySlot::new_ring(1024),
                 unreliable_fec: FecRecvSlot::new_ring(1024),
             },
@@ -1625,7 +1737,7 @@ pub fn connect_to_endpoint(
                 other_transport_identity: endpoint.key.clone(),
                 connection_state: ConnectionState::SendingClientHello { magic1: my_connect_keypair.magic1, last_sent_time_ns: 0, hello_packet_payload, handshake },
                 handshake_hash: [0u8; 64],
-                unreliable_send_buffer: UnreliableSendBuffer::new(send_buffer_params.0, send_buffer_params.1, send_buffer_params.2),
+                unreliable_send_buffer: SendQueues::new(send_queue_count, send_buffer_params),
                 unreliable_reassembly: ReassemblySlot::new_ring(1024),
                 unreliable_fec: FecRecvSlot::new_ring(1024),
             },
@@ -1919,7 +2031,7 @@ pub const ACK_BUFFER_TIME_NS: u64 = 50_000_000;
 pub struct NetworkThreadPush {
     pub initiate_connections: Vec<STPAddress>,
     pub wanted_connections: Vec<(STPAddress, [u8; 64])>,
-    pub send_unreliable: Vec<(ConnectionKey, Vec<u8>)>,
+    pub send_unreliable: Vec<(ConnectionKey, usize, Vec<u8>)>,
 }
 
 #[derive(Default)]
@@ -1930,11 +2042,11 @@ pub struct NetworkThreadPull {
     /// the connection's send queue was full (see `UnreliableSendBuffer::submit_messages`), or no
     /// connection with that key exists. Per connection they keep the order they were pushed in.
     /// Nothing is dropped; resubmit them later or discard them yourself.
-    pub send_unreliable_rejected: Vec<(ConnectionKey, Vec<u8>)>,
+    pub send_unreliable_rejected: Vec<(ConnectionKey, usize, Vec<u8>)>,
     /// For every connection the network thread holds (connected or still handshaking), the
     /// largest message its send queue would accept now, after this call's submissions; u64::MAX
     /// when its queue is empty. A connection missing here does not exist.
-    pub unreliable_send_free_bytes: Vec<(ConnectionKey, u64)>,
+    pub unreliable_send_free_bytes: Vec<(ConnectionKey, usize, u64)>,
     /// Cumulative counters for every connected connection.
     pub connection_stats: Vec<(ConnectionKey, ConnectionStats)>,
     /// Cumulative progress snapshots at first source, source completion and every repair
@@ -2006,8 +2118,11 @@ pub(crate) struct CongestionPolicy {
 }
 
 /// Socket binding and optional measurement. The transport policy is fixed internally.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct NetworkThreadOptions {
+    /// Fixed number of sender-only FIFO queues per connection (1..=64).
+    /// Each queue has explicit send_buffer_params bounds; rescue budget is shared.
+    pub send_queue_count: usize,
     /// See `new_network_thread_with_bind`.
     pub bind_ip: Option<std::net::IpAddr>,
     /// Report cumulative source/repair progress in `NetworkThreadPull::fec_messages`.
@@ -2018,8 +2133,14 @@ pub struct NetworkThreadOptions {
     pub loss_trace: Option<std::path::PathBuf>,
 }
 
+impl Default for NetworkThreadOptions {
+    fn default() -> Self { Self { send_queue_count: 1, bind_ip: None, record_fec_messages: false, record_loss_episodes: false, loss_trace: None } }
+}
+
 pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_pps: Option<u64>, send_buffer_params: (u32, u32, u32), options: NetworkThreadOptions) -> NetworkThreadHandle {
     let bind_ip = options.bind_ip;
+    let send_queue_count = options.send_queue_count;
+    assert!((1..=64).contains(&send_queue_count), "send_queue_count must be 1..=64");
     // One measured policy, not application configuration.
     let cc = crate::ship::CC;
     let cc_rate = move |t, r, k, startup_done| connection_rate(t, r, k, &cc, startup_done);
@@ -2125,7 +2246,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                     }
                     for keypair in &my_keypairs {
                         if w.magic1 == keypair.magic1 {
-                            connect_to_endpoint(&mut connections_map, keypair, w, send_buffer_params);
+                            connect_to_endpoint(&mut connections_map, keypair, w, send_buffer_params, send_queue_count);
                             break;
                         }
                     }
@@ -2136,26 +2257,27 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                 // does not accept, and everything for a connection not in the map, goes back to
                 // the caller untouched.
                 let mut resp = NetworkThreadPull::default();
-                req.send_unreliable.sort_by(|a, b| a.0.cmp(&b.0));
+                req.send_unreliable.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
                 let mut i = 0;
                 while i < req.send_unreliable.len() {
                     let key = req.send_unreliable[i].0;
+                    let queue = req.send_unreliable[i].1;
                     let mut j = i;
-                    while j < req.send_unreliable.len() && req.send_unreliable[j].0 == key { j += 1; }
+                    while j < req.send_unreliable.len() && req.send_unreliable[j].0 == key && req.send_unreliable[j].1 == queue { j += 1; }
                     let mut batch = Vec::with_capacity(j - i);
                     while i < j {
-                        batch.push(std::mem::take(&mut req.send_unreliable[i].1));
+                        batch.push(std::mem::take(&mut req.send_unreliable[i].2));
                         i += 1;
                     }
                     let rejected = if let Some(tracking_data) = connections_map.get_mut(&key) {
-                        tracking_data.unreliable_send_buffer.submit_messages(batch)
+                        tracking_data.unreliable_send_buffer.submit_messages(queue, batch)
                     } else {
                         batch
                     };
-                    resp.send_unreliable_rejected.extend(rejected.into_iter().map(|m| (key, m)));
+                    resp.send_unreliable_rejected.extend(rejected.into_iter().map(|m| (key, queue, m)));
                 }
                 resp.unreliable_send_free_bytes = connections_map.iter_mut()
-                    .map(|(key, value)| (*key, value.unreliable_send_buffer.free_bytes())).collect();
+                    .flat_map(|(key, value)| value.unreliable_send_buffer.free_bytes().into_iter().enumerate().map(|(q, bytes)| (*key, q, bytes))).collect();
                 if current_time_now_ns.saturating_sub(cpu_read_ns) >= 100_000_000 {
                     cpu_read_ns = current_time_now_ns;
                     #[cfg(target_os = "linux")]
@@ -2295,7 +2417,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                                     other_transport_identity: client_key,
                                                     connection_state: ConnectionState::SendingServerHelloPlaintext { magic2: chosen_magic2, last_sent_time_ns: 0, hello_packet_payload },
                                                     handshake_hash: [0u8; 64],
-                                                    unreliable_send_buffer: UnreliableSendBuffer::new(send_buffer_params.0, send_buffer_params.1, send_buffer_params.2),
+                                                    unreliable_send_buffer: SendQueues::new(send_queue_count, send_buffer_params),
                                                     unreliable_reassembly: ReassemblySlot::new_ring(1024),
                                                     unreliable_fec: FecRecvSlot::new_ring(1024),
                                                 },
@@ -2376,7 +2498,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                                         other_transport_identity: client_key,
                                                         connection_state: ConnectionState::SendingServerHello { cipher, magic1, magic2: chosen_magic2, last_sent_time_ns: 0, hello_packet_payload },
                                                         handshake_hash,
-                                                        unreliable_send_buffer: UnreliableSendBuffer::new(send_buffer_params.0, send_buffer_params.1, send_buffer_params.2),
+                                                        unreliable_send_buffer: SendQueues::new(send_queue_count, send_buffer_params),
                                                         unreliable_reassembly: ReassemblySlot::new_ring(1024),
                                                         unreliable_fec: FecRecvSlot::new_ring(1024),
                                                     },
@@ -3056,9 +3178,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                         
                         let time_to_considered_dropped = ((state.RTT_mean as f64 * 100_000.0 * cc.loss_timeout_rtts) as u64).max((2*(current_time_now_ns - state.last_ack_received_time)).min(1_000_000_000));
                         
-                        connection_tracking_data.unreliable_send_buffer.fec_now_ns = current_time_now_ns;
-                        connection_tracking_data.unreliable_send_buffer.fec_rtt_ns = state.RTT_mean as u64 * 100_000;
-                        connection_tracking_data.unreliable_send_buffer.fec_prune_retained();
+                        connection_tracking_data.unreliable_send_buffer.set_time(current_time_now_ns, state.RTT_mean as u64 * 100_000);
                         // every send site (data loop, tu probe, keepalive, both ack paths) gates on ring space, so head never laps tail
                         assert!(state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY);
                         while state.packets_waiting_ack_tail < state.send_sequence_number {
@@ -3210,18 +3330,18 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             state.packet_since_last_print += 1;
                         }
 
-                        connection_tracking_data.unreliable_send_buffer.current_bytes_per_second = payload_size as u64 * allowed_bandwidth_upps / 1000_000;
+                        connection_tracking_data.unreliable_send_buffer.set_rate(payload_size as u64 * allowed_bandwidth_upps / 1000_000);
                         {
                             let buf = &mut connection_tracking_data.unreliable_send_buffer;
                             let a = buf.fec_adaptive.get_or_insert_with(|| crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, current_time_now_ns, state.stats.packets_sent, state.stats.packets_lost));
                             a.on_tick(current_time_now_ns, state.stats.packets_sent, state.stats.packets_lost, state.stats.spurious_losses);
-                            buf.fec_capacity_overhead_ppm = a.representative_ppm();
+                            buf.set_overhead();
                             if record_fec_messages && buf.fec_record.is_none() { buf.fec_record = Some(Vec::new()); }
                         }
                         let mut unreliable_payload_size = 0;
                         while state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY - 1 && packet_send_allowance_now > 0 && state.packets_in_flight < allowed_packets_in_flight && {
                             connection_tracking_data.unreliable_send_buffer.fec_prepare_packet(state.send_sequence_number);
-                            unreliable_payload_size = fill_packet_payload_with_unreliable_fragments(&mut packet_memory_send[0..payload_size], &mut connection_tracking_data.unreliable_send_buffer);
+                            unreliable_payload_size = connection_tracking_data.unreliable_send_buffer.fill_packet(&mut packet_memory_send[0..payload_size]);
                             unreliable_payload_size > 0
                         } {
                         
@@ -3788,7 +3908,7 @@ mod precise_pacing_tests {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
             std::thread::sleep(std::time::Duration::from_millis(150));
-            service_connections(&client, NetworkThreadPush { wanted_connections: wanted.clone(), send_unreliable: vec![(key, vec![42; 1000]); 3], ..Default::default() }).unwrap();
+            service_connections(&client, NetworkThreadPush { wanted_connections: wanted.clone(), send_unreliable: vec![(key, 0, vec![42; 1000]); 3], ..Default::default() }).unwrap();
             let mut received = 0;
             while received < 3 {
                 let p = service_connections(&server, NetworkThreadPush::default()).unwrap();
@@ -4432,5 +4552,102 @@ mod fec_closed_loop_tests {
         b.fec_on_packet_lost(4);
         assert_eq!(b.fec_send_slot.as_ref().unwrap().lost, 21);
         assert!(b.fec_send_slot.as_ref().unwrap().n <= 128);
+    }
+}
+
+#[cfg(test)]
+mod send_queue_tests {
+    use super::*;
+    fn packet(s: &mut SendQueues, seq: u64) -> (usize, Vec<u8>) {
+        s.fec_prepare_packet(seq);
+        let mut p = vec![0; 1449];
+        assert!(s.fill_packet(&mut p) > 0);
+        (s.last_queue, p)
+    }
+    #[test]
+    fn backlogged_magazines_share_packets_exactly() {
+        for n in [2, 3] {
+            let mut s = SendQueues::new(n, (1000000, 16<<20, 16<<20));
+            for q in 0..n { assert!(s.submit_messages(q, vec![vec![q as u8; 8<<20]]).is_empty()); }
+            let mut counts = vec![0; n];
+            for seq in 0..3000 { counts[packet(&mut s, seq).0] += 1; }
+            assert!(counts.iter().all(|&c| c == 3000 / n));
+        }
+    }
+    #[test]
+    fn idle_magazine_gets_next_packet_and_full_bulk_does_not_block_enqueue() {
+        let mut s = SendQueues::new(8, (1000000, 2000, 2000));
+        s.submit_messages(0, vec![vec![1; 4000]]);
+        assert_eq!(s.submit_messages(0, vec![vec![2; 1000]]).len(), 1);
+        assert_eq!(packet(&mut s, 0).0, 0);
+        assert!(s.submit_messages(7, vec![vec![3; 1000]]).is_empty());
+        assert_eq!(packet(&mut s, 1).0, 7);
+        assert_eq!(packet(&mut s, 2).0, 0);
+        assert_eq!(s.submit_messages(8, vec![vec![4; 100]]).len(), 1);
+    }
+    #[test]
+    fn fifo_and_connection_app_limited_only_when_every_magazine_empty() {
+        let mut s = SendQueues::new(3, (1000000, 10000, 10000));
+        assert!(!s.has_unsent_data());
+        s.submit_messages(2, vec![vec![1; 3000], vec![2; 3000], vec![3; 1000], vec![4; 1000]]);
+        let mut seq = 0;
+        let mut seen = Vec::new();
+        while s.has_unsent_data() {
+            s.fec_prepare_packet(seq);
+            let mut p = vec![0; 1449];
+            if s.fill_packet(&mut p) == 0 { break; }
+            let mut cursor = 0;
+            while cursor + 8 <= p.len() {
+                let h = load_u64(&p[cursor..cursor+8]);
+                if h == u64::MAX { break; }
+                let len = ((h >> 18) & 0x3fff) as usize;
+                let byte = p[cursor + 8];
+                if seen.last() != Some(&byte) { seen.push(byte); }
+                cursor += 8 + len;
+            }
+            seq += 1;
+        }
+        assert_eq!(seen, [1, 2, 3, 4]);
+        assert!(!s.has_unsent_data());
+        s.submit_messages(1, vec![vec![5; 1000]]);
+        assert!(s.has_unsent_data());
+    }
+    #[test]
+    fn rescue_on_nonzero_magazine_counts_in_its_share_and_routes_all_feedback() {
+        let mut s = SendQueues::new(2, (1000000, 2<<20, 2<<20));
+        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0));
+        s.submit_messages(0, vec![vec![6; 1433*512]]);
+        s.submit_messages(1, vec![vec![7; 1000], vec![8; 1433*512]]);
+        assert_eq!(packet(&mut s, 0).0, 0);
+        assert_eq!(packet(&mut s, 1).0, 1);
+        packet(&mut s, 2);
+        packet(&mut s, 3);
+        let ordinal = s.queues[1].fec_send_slot.as_ref().unwrap().next_id;
+        s.fec_on_packet_finalized(1, true);
+        assert_eq!(packet(&mut s, 4).0, 0);
+        assert_eq!(packet(&mut s, 5).0, 1);
+        assert_eq!(s.queues[1].fec_send_slot.as_ref().unwrap().next_id, ordinal);
+        s.fec_on_packet_finalized(3, true);
+        assert_eq!(s.queues[1].fec_send_slot.as_ref().unwrap().lost, 1);
+        s.fec_on_packet_finalized(0, true);
+        assert_eq!(s.queues[0].fec_send_slot.as_ref().unwrap().lost, 1);
+        packet(&mut s, 6);
+        packet(&mut s, 7);
+        assert!(s.queues[1].fec_suspended.is_none());
+        assert_eq!(s.queues[1].fec_send_slot.as_ref().unwrap().next_id, ordinal + 1);
+    }
+    #[test]
+    fn largest_retention_claim_is_evicted_not_small_magazine_history() {
+        let mut s = SendQueues::new(2, (1000000, 1<<20, 1<<20));
+        let slot = |len| FecSendSlot { message: std::sync::Arc::new(vec![0; len]), block_bytes: len,
+            k: 1, n: 1, next_id: 1, encoder: FecEncoderState::Failed, block_buf: Vec::new(),
+            first_seq: 0, lost: 0, group_lost: vec![0], n_planned: 1, loss_estimate: 0.0,
+            finalized_symbols: 0, send_started_ns: 0, original_send_duration_ns: None };
+        s.queues[1].retain_fec(slot(1000), 0);
+        s.queues[0].retain_fec(slot(32<<20), 1);
+        s.queues[0].retain_fec(slot(32<<20), 2);
+        s.bound_retention();
+        assert_eq!(s.queues[1].fec_retained.len(), 1);
+        assert_eq!(s.queues[0].fec_retained.len(), 1);
     }
 }
