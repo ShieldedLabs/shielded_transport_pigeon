@@ -420,11 +420,76 @@ pub struct UnreliableSendBuffer {
     pub min_queue_size_bytes: u32,
     pub max_queue_size_bytes: u32,
     
+    /// Message bytes (not wire bytes) of the queued messages plus the one being sent.
     pub queue_bytes_filled: usize,
     pub message_queue: VecDeque<Vec<u8>>,
     pub partial_send_slot: Option<(Vec<u8>, u32)>,
     pub send_package_id: u16,
     pub current_bytes_per_second: u64,
+    /// Forward error correction for messages that start sending from now on, in parts per
+    /// million of extra coded blocks (0 = off, plain fragments exactly as without FEC). Set
+    /// every tick by the network thread from `NetworkThreadHandle::set_fec_redundancy_ppm`.
+    pub fec_redundancy_ppm: u32,
+    /// The FEC-coded message being sent (instead of `partial_send_slot`), if any.
+    pub fec_send_slot: Option<FecSendSlot>,
+    /// Adaptive FEC: per-connection loss estimate. When Some, each new message gets the repair
+    /// blocks this estimate calls for (and `fec_redundancy_ppm` is only a nonzero summary of it,
+    /// used for the queue capacity). Maintained by the network thread.
+    pub fec_adaptive: Option<crate::fec_adapt::FecAdaptiveState>,
+    /// Sequence number of the packet the next fragment goes into (set by the network thread), so
+    /// an FEC message knows which packets are its own when they are declared lost.
+    pub next_packet_seq: u64,
+    /// Finished FEC messages, when recording is enabled (Some); drained by the network thread.
+    pub fec_record: Option<Vec<crate::fec_adapt::FecMessageInfo>>,
+}
+
+/// Sender state of one FEC-coded message: blocks 0..k-1 are slices of the message itself and
+/// need no encoder; blocks k..n-1 are repair blocks from a Wirehair encoder, which is built on
+/// a helper thread while the source blocks go out (creating one costs ~4 us per block, 155 ms
+/// for a 48 MB message, too long to stall the network thread).
+pub struct FecSendSlot {
+    pub message: std::sync::Arc<Vec<u8>>,
+    pub block_bytes: usize,
+    pub k: u32,
+    pub n: u32,
+    pub next_id: u32,
+    encoder: FecEncoderState,
+    block_buf: Vec<u8>,
+    /// Sequence number of the message's first packet, own packets declared lost since, the block
+    /// count planned at the start, and the loss rate the plan was sized for (0 for fixed ppm).
+    pub first_seq: u64,
+    pub lost: u32,
+    pub n_planned: u32,
+    pub loss_estimate: f64,
+}
+
+enum FecEncoderState {
+    Pending(std::sync::mpsc::Receiver<Option<crate::fec::Encoder>>),
+    Ready(crate::fec::Encoder),
+    Failed,
+}
+
+impl std::fmt::Debug for FecSendSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FecSendSlot {{ len: {}, block_bytes: {}, k: {}, n: {}, next_id: {} }}", self.message.len(), self.block_bytes, self.k, self.n, self.next_id)
+    }
+}
+
+/// Header of an FEC fragment: two little-endian u64 words.
+///   word0: bit 0 = 1 (extended fragment; plain fragments have 0 here), bit 1 = 0,
+///          bits 2..18 package id, bits 18..32 block data length, bits 32..64 block id
+///   word1: bits 0..32 message length, bits 32..48 block bytes, bits 48..56 kind (1 = FEC), rest 0
+pub const STP_FEC_FRAGMENT_HEADER_SIZE: usize = 16;
+pub const STP_EXT_KIND_FEC: u64 = 1;
+/// Redundancy is capped at 100% (n = 2k).
+pub const MAX_FEC_REDUNDANCY_PPM: u32 = 1_000_000;
+/// Messages with at most this many blocks have their Wirehair encoder/decoder run inline on
+/// the network thread (well under 1 ms); bigger ones use a helper thread.
+pub const FEC_INLINE_MAX_BLOCKS: usize = 256;
+
+pub enum UnreliableFragment<'a> {
+    Plain { is_fin: bool, package_id: u16, data: &'a [u8], offset: u32 },
+    Fec { package_id: u16, message_len: u32, block_bytes: u16, block_id: u32, data: &'a [u8] },
 }
 
 impl UnreliableSendBuffer {
@@ -438,41 +503,87 @@ impl UnreliableSendBuffer {
             partial_send_slot: None,
             send_package_id: 0,
             current_bytes_per_second: 0,
+            fec_redundancy_ppm: 0,
+            fec_send_slot: None,
+            fec_adaptive: None,
+            next_packet_seq: 0,
+            fec_record: None,
         }
     }
 
+    /// The sender declared packet `seq` lost. If it belongs to the FEC message being sent, count
+    /// it, and with adaptive top-up grow that message's block count to cover it.
+    pub fn fec_on_packet_lost(&mut self, seq: u64) {
+        let Some(f) = &mut self.fec_send_slot else { return };
+        if seq < f.first_seq || f.next_id >= f.n { return; }
+        f.lost += 1;
+        if let Some(a) = &self.fec_adaptive {
+            if a.tracker.config().topup {
+                let n = a.topped_up_blocks(f.k as u64, f.lost as u64, f.loss_estimate).min(u32::MAX as u64) as u32;
+                f.n = f.n.max(n);
+            }
+        }
+    }
+
+    /// Capacity in message bytes. `current_bytes_per_second` is the wire payload rate; with FEC
+    /// on, a message costs about (1 + redundancy) times its size on the wire, so the time-based
+    /// target is scaled down by that factor to keep the queue at the same send time. The
+    /// min/max bounds are message bytes. (With FEC off this is exactly the old formula.)
     #[inline]
     pub fn current_byte_capacity(&self) -> u32 {
-        let dynamic_target = self.target_queue_size_us as u64 * self.current_bytes_per_second / 1000_000;
+        let mut dynamic_target = self.target_queue_size_us as u64 * self.current_bytes_per_second / 1000_000;
+        if self.fec_redundancy_ppm != 0 {
+            dynamic_target = dynamic_target * 1_000_000 / (1_000_000 + self.fec_redundancy_ppm as u64);
+        }
         dynamic_target.max(self.min_queue_size_bytes as u64).min(self.max_queue_size_bytes as u64) as u32
     }
     
-    pub fn submit_messages(&mut self, mut new_messages: Vec<Vec<u8>>) {
-        use rand::seq::SliceRandom;
-        new_messages.shuffle(&mut rand::thread_rng());
-        let mut new_bytes = 0;
-        for m in &new_messages { new_bytes += m.len(); }
-        self.message_queue.extend(new_messages);
-        self.queue_bytes_filled += new_bytes;
-        self.cut_to_size();
-    }
-    
-    pub fn cut_to_size(&mut self) {
-        while self.queue_bytes_filled > self.current_byte_capacity() as usize {
-            let Some(m) = self.message_queue.pop_front() else { break; };
-            self.queue_bytes_filled -= m.len();
+    /// Back pressure, never drop: a message once accepted is sent. Messages are accepted in the
+    /// caller's order while `queue_bytes_filled + len <= current_byte_capacity()`; a message is
+    /// always accepted when nothing is queued, so a message bigger than the capacity can still go
+    /// out on its own. Acceptance stops at the first message that does not fit, and that message
+    /// and every one after it are returned, in order and untouched, for the caller to resubmit.
+    /// (A future drop policy would hook in here, choosing what to evict instead of rejecting.)
+    pub fn submit_messages(&mut self, new_messages: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+        self.reclaim_finished_partial();
+        let capacity = self.current_byte_capacity() as usize;
+        let mut iter = new_messages.into_iter();
+        let mut rejected = Vec::new();
+        while let Some(m) = iter.next() {
+            if self.queue_bytes_filled == 0 || self.queue_bytes_filled + m.len() <= capacity {
+                self.queue_bytes_filled += m.len();
+                self.message_queue.push_back(m);
+            } else {
+                rejected.push(m);
+                rejected.extend(iter);
+                break;
+            }
         }
+        rejected
     }
-    
+
+    /// Largest message `submit_messages` would accept right now: u64::MAX when nothing is queued
+    /// (any size goes alone), otherwise the room left under the current capacity.
+    pub fn free_bytes(&mut self) -> u64 {
+        self.reclaim_finished_partial();
+        if self.queue_bytes_filled == 0 { return u64::MAX; }
+        (self.current_byte_capacity() as u64).saturating_sub(self.queue_bytes_filled as u64)
+    }
+
     pub fn has_unsent_data(&self) -> bool {
         if !self.message_queue.is_empty() { return true; }
         if let Some((msg, start_byte)) = &self.partial_send_slot {
             if (*start_byte as usize) < msg.len() { return true; }
         }
+        if let Some(f) = &self.fec_send_slot {
+            if f.next_id < f.n { return true; }
+        }
         false
     }
 
-    pub fn try_get_fragment(&mut self, frag_size: usize) -> Option<(bool, u16, &[u8], u32)> {
+    // A message whose last fragment has gone out still counts against the queue until it is
+    // released here.
+    fn reclaim_finished_partial(&mut self) {
         if let Some((msg, start_byte)) = &self.partial_send_slot {
             if *start_byte as usize >= msg.len() {
                 let msg_len = msg.len();
@@ -481,19 +592,128 @@ impl UnreliableSendBuffer {
                 self.send_package_id = self.send_package_id.wrapping_add(1);
             }
         }
-        if self.partial_send_slot.is_none() {
-            if let Some(front_msg) = self.message_queue.pop_front() {
-                self.partial_send_slot = Some((front_msg, 0));
+        if let Some(f) = &self.fec_send_slot {
+            if f.next_id >= f.n {
+                if let Some(rec) = &mut self.fec_record {
+                    let mut tag = [0u8; 8];
+                    let l = f.message.len().min(8);
+                    tag[..l].copy_from_slice(&f.message[..l]);
+                    rec.push(crate::fec_adapt::FecMessageInfo { tag: u64::from_le_bytes(tag), message_len: f.message.len(), k: f.k, n_planned: f.n_planned, n_sent: f.next_id, loss_estimate: f.loss_estimate, lost_during_send: f.lost });
+                }
+                self.queue_bytes_filled -= f.message.len();
+                self.fec_send_slot = None;
+                self.send_package_id = self.send_package_id.wrapping_add(1);
             }
-            else { return None; }
         }
+    }
+
+    /// Block size for an FEC message started in a packet with `payload_len` bytes of payload:
+    /// one block plus its header fills the packet. None if the message should go plain (FEC
+    /// off, or fewer than 2 / more than 64000 blocks).
+    fn fec_block_bytes(&self, message_len: usize, payload_len: usize) -> Option<usize> {
+        if self.fec_redundancy_ppm == 0 { return None; }
+        let block_bytes = payload_len.checked_sub(STP_FEC_FRAGMENT_HEADER_SIZE)?.min(0x3fff);
+        crate::fec::block_count(message_len, block_bytes)?;
+        Some(block_bytes)
+    }
+
+    fn start_fec(&mut self, message: std::sync::Arc<Vec<u8>>, block_bytes: usize) {
+        let k = crate::fec::block_count(message.len(), block_bytes).unwrap() as u32;
+        let (n, loss_estimate) = match &self.fec_adaptive {
+            Some(a) => (k + a.repair_blocks(k as u64).min(k as u64) as u32, a.p),
+            None => {
+                let ppm = self.fec_redundancy_ppm.min(MAX_FEC_REDUNDANCY_PPM) as u64;
+                (k + ((k as u64 * ppm + 999_999) / 1_000_000) as u32, 0.0)
+            }
+        };
+        let encoder = if k as usize <= FEC_INLINE_MAX_BLOCKS {
+            match crate::fec::encode(message.clone(), block_bytes) { Some(e) => FecEncoderState::Ready(e), None => FecEncoderState::Failed }
+        } else {
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            let m = message.clone();
+            match std::thread::Builder::new().name("stp-fec-encode".into()).spawn(move || { let _ = tx.send(crate::fec::encode(m, block_bytes)); }) {
+                Ok(_) => FecEncoderState::Pending(rx),
+                Err(_) => match crate::fec::encode(message.clone(), block_bytes) { Some(e) => FecEncoderState::Ready(e), None => FecEncoderState::Failed },
+            }
+        };
+        self.fec_send_slot = Some(FecSendSlot { message, block_bytes, k, n, next_id: 0, encoder, block_buf: vec![0u8; block_bytes], first_seq: self.next_packet_seq, lost: 0, n_planned: n, loss_estimate });
+    }
+
+    /// Starts `msg` as the message being sent: FEC-coded if enabled and it has 2..=64000 blocks
+    /// at this packet size, plain otherwise.
+    fn start_message(&mut self, msg: Vec<u8>, payload_len: usize) {
+        match self.fec_block_bytes(msg.len(), payload_len) {
+            Some(block_bytes) => self.start_fec(std::sync::Arc::new(msg), block_bytes),
+            None => self.partial_send_slot = Some((msg, 0)),
+        }
+    }
+
+    /// Next fragment for a packet with `payload_len` bytes of payload, of which `space` are still
+    /// free. None: nothing to send, or the next FEC block does not fit in what is left of this
+    /// packet (or its repair encoder is still being built); send the packet as it is.
+    pub fn next_fragment(&mut self, payload_len: usize, space: usize) -> Option<UnreliableFragment<'_>> {
+        self.reclaim_finished_partial();
+        if self.partial_send_slot.is_none() && self.fec_send_slot.is_none() {
+            let front_msg = self.message_queue.pop_front()?;
+            self.start_message(front_msg, payload_len);
+        }
+        if self.fec_send_slot.is_some() {
+            let need = { let f = self.fec_send_slot.as_ref().unwrap(); STP_FEC_FRAGMENT_HEADER_SIZE + crate::fec::block_len(f.message.len(), f.block_bytes, f.next_id) };
+            if need > space {
+                if space < payload_len { return None; } // the next packet has room
+                // The transmission unit shrank below the block size (black hole fallback; it
+                // never shrinks otherwise). Start the message over under a new package id with
+                // blocks that fit; the receiver drops the abandoned partial package in time.
+                let f = self.fec_send_slot.take().unwrap();
+                drop(f.encoder);
+                self.send_package_id = self.send_package_id.wrapping_add(1);
+                let msg = std::sync::Arc::try_unwrap(f.message).unwrap_or_else(|a| (*a).clone());
+                self.start_message(msg, payload_len);
+                return self.next_fragment(payload_len, space);
+            }
+            let package_id = self.send_package_id;
+            let mut repair_len = None;
+            {
+                let f = self.fec_send_slot.as_mut().unwrap();
+                if f.next_id >= f.k {
+                    if let FecEncoderState::Pending(rx) = &f.encoder {
+                        f.encoder = match rx.try_recv() {
+                            Ok(Some(e)) => FecEncoderState::Ready(e),
+                            Ok(None) | Err(std::sync::mpsc::TryRecvError::Disconnected) => FecEncoderState::Failed,
+                            Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+                        };
+                    }
+                    repair_len = match &mut f.encoder {
+                        FecEncoderState::Ready(e) => e.block_into(f.next_id, &mut f.block_buf),
+                        _ => None,
+                    };
+                    if repair_len.is_none() {
+                        // No encoder: the source blocks are all out, end the message there.
+                        f.next_id = f.n;
+                    }
+                }
+            }
+            let f = self.fec_send_slot.as_ref().unwrap();
+            if f.next_id >= f.n { return self.next_fragment(payload_len, space); }
+            let f = self.fec_send_slot.as_mut().unwrap();
+            let id = f.next_id;
+            if let Some(len) = repair_len {
+                f.next_id += 1;
+                return Some(UnreliableFragment::Fec { package_id, message_len: f.message.len() as u32, block_bytes: f.block_bytes as u16, block_id: id, data: &f.block_buf[..len] });
+            }
+            f.next_id += 1;
+            let start = id as usize * f.block_bytes;
+            let end = (start + f.block_bytes).min(f.message.len());
+            return Some(UnreliableFragment::Fec { package_id, message_len: f.message.len() as u32, block_bytes: f.block_bytes as u16, block_id: id, data: &f.message[start..end] });
+        }
+        let frag_size = space.checked_sub(STP_FRAGMENT_HEADER_SIZE)?;
         let (msg, start_byte) = self.partial_send_slot.as_mut().unwrap();
         let start = *start_byte as usize;
         let ret_size = (msg.len() - start).min(frag_size);
         // Both frag_size and msg.len() may be zero.
 
         *start_byte += ret_size as u32;
-        Some((*start_byte as usize == msg.len(), self.send_package_id, &msg[start..start + ret_size], start as u32))
+        Some(UnreliableFragment::Plain { is_fin: *start_byte as usize == msg.len(), package_id: self.send_package_id, data: &msg[start..start + ret_size], offset: start as u32 })
     }
 }
 
@@ -513,6 +733,8 @@ pub struct ReceiveQueue {
     pub peak_messages: usize,
     pub dropped_messages: u64,
     pub dropped_bytes: u64,
+    /// Like dropped_messages, but never reset.
+    pub dropped_messages_total: u64,
 }
 
 impl ReceiveQueue {
@@ -521,14 +743,19 @@ impl ReceiveQueue {
         buf.capacity() + std::mem::size_of::<(ConnectionKey, Vec<u8>)>()
     }
 
-    pub fn push(&mut self, key: ConnectionKey, buf: Vec<u8>, cap_bytes: usize) {
+    pub fn push(&mut self, key: ConnectionKey, mut buf: Vec<u8>, cap_bytes: usize) {
+        // Reassembly grows the buffer by doubling, so a big message can carry up to 2x its size
+        // in capacity; give that back before it is counted against the cap.
+        buf.shrink_to_fit();
         self.bytes += Self::entry_bytes(&buf);
         self.messages.push_back((key, buf));
-        while self.bytes > cap_bytes {
+        // Never evict the message just pushed: one message bigger than the cap is still delivered.
+        while self.bytes > cap_bytes && self.messages.len() > 1 {
             let Some((_, m)) = self.messages.pop_front() else { break; };
             let n = Self::entry_bytes(&m);
             self.bytes -= n;
             self.dropped_messages += 1;
+            self.dropped_messages_total += 1;
             self.dropped_bytes += n as u64;
         }
         self.peak_bytes = self.peak_bytes.max(self.bytes);
@@ -544,12 +771,25 @@ impl ReceiveQueue {
 fn fill_packet_payload_with_unreliable_fragments(payload: &mut [u8], unreliable_send_buffer: &mut UnreliableSendBuffer) -> bool {
     let mut send = false;
     let mut cursor = 0;
-    while cursor + STP_FRAGMENT_HEADER_SIZE <= payload.len() && let Some((is_fin, package_id, frag_data, frag_offset)) = unreliable_send_buffer.try_get_fragment(payload.len() - STP_FRAGMENT_HEADER_SIZE - cursor) {
+    let payload_len = payload.len();
+    while cursor + STP_FRAGMENT_HEADER_SIZE <= payload_len && let Some(frag) = unreliable_send_buffer.next_fragment(payload_len, payload_len - cursor) {
         send = true;
-        let header = 0 | ((is_fin as u64) << 1) | ((package_id as u64) << 2) | ((frag_data.len() as u64 & 0x3fff) << 18) | ((frag_offset as u64) << 32);
-        store_u64(&mut payload[cursor..cursor+STP_FRAGMENT_HEADER_SIZE], header);
-        frag_data.write_to(&mut payload[cursor+STP_FRAGMENT_HEADER_SIZE..]);
-        cursor += STP_FRAGMENT_HEADER_SIZE+frag_data.len();
+        match frag {
+            UnreliableFragment::Plain { is_fin, package_id, data: frag_data, offset: frag_offset } => {
+                let header = 0 | ((is_fin as u64) << 1) | ((package_id as u64) << 2) | ((frag_data.len() as u64 & 0x3fff) << 18) | ((frag_offset as u64) << 32);
+                store_u64(&mut payload[cursor..cursor+STP_FRAGMENT_HEADER_SIZE], header);
+                frag_data.write_to(&mut payload[cursor+STP_FRAGMENT_HEADER_SIZE..]);
+                cursor += STP_FRAGMENT_HEADER_SIZE+frag_data.len();
+            }
+            UnreliableFragment::Fec { package_id, message_len, block_bytes, block_id, data } => {
+                let word0 = 1 | ((package_id as u64) << 2) | ((data.len() as u64 & 0x3fff) << 18) | ((block_id as u64) << 32);
+                let word1 = message_len as u64 | ((block_bytes as u64) << 32) | (STP_EXT_KIND_FEC << 48);
+                store_u64(&mut payload[cursor..cursor+8], word0);
+                store_u64(&mut payload[cursor+8..cursor+16], word1);
+                data.write_to(&mut payload[cursor+STP_FEC_FRAGMENT_HEADER_SIZE..]);
+                cursor += STP_FEC_FRAGMENT_HEADER_SIZE+data.len();
+            }
+        }
     }
     if send == false { return false; }
     while cursor < payload.len() {
@@ -574,6 +814,7 @@ pub struct ConnectionTrackingData {
     
     pub unreliable_send_buffer: UnreliableSendBuffer,
     pub unreliable_reassembly: Vec<ReassemblySlot>,
+    pub unreliable_fec: Vec<FecRecvSlot>,
     
     pub nym_sock: Option<NymSockHandle>,
 }
@@ -692,12 +933,18 @@ pub struct ConnectionStateConnected {
     pub send_pacer_acc_ns: u64,
     pub congestion_event_time_ns: u64,
     pub congestion_event_rate_upps: u64,
+    pub stats: ConnectionStats,
     pub loss_window_start_ns: u64,
     pub loss_count_in_window: u64,
     pub is_app_limited: bool,
     pub app_limit_time_offset: u64,
     pub ecn_congestion_received: bool,
     pub ecn_oldest_send_time: u64,
+    /// Per sequence number in [tail - CAPACITY, tail): declared lost and not yet acked since
+    /// (spurious-loss detection). Same ring indexing as packets_waiting_ack_field.
+    pub declared_lost_field: Box<[u64; PACKETS_WAITING_ACK_WORDS]>,
+    /// Receiver ground truth over the peer's sequence numbers.
+    pub rx_tracker: RxSeqTracker,
 }
 pub fn new_connection_state_connected(cipher: Option<ConnectionCipherTriplet>, magic1: u64, magic2: u64, timestamp_ns: u64) -> ConnectionState {
     ConnectionState::Connected(ConnectionStateConnected {
@@ -736,18 +983,202 @@ pub fn new_connection_state_connected(cipher: Option<ConnectionCipherTriplet>, m
         packets_in_flight: 0,
         send_pacer_acc_ns: 0,
         congestion_event_time_ns: 0,
-        congestion_event_rate_upps: 0,
+        congestion_event_rate_upps: RATE_FLOOR_UPPS,
+        stats: ConnectionStats::default(),
         loss_window_start_ns: 0,
         loss_count_in_window: 0,
         is_app_limited: false,
         app_limit_time_offset: 0,
         ecn_congestion_received: false,
         ecn_oldest_send_time: 0,
+        declared_lost_field: Box::new([0; PACKETS_WAITING_ACK_WORDS]),
+        rx_tracker: RxSeqTracker::default(),
     })
 }
 
 impl ConnectionState {
     pub fn is_connected(&self) -> bool { if let ConnectionState::Connected(_) = self { true } else { false } }
+}
+
+/// Starting rate and lowest rate the congestion control allows, in millionths of a packet per
+/// second: 100 packets/s. At the previous 1 packet/s a fresh or quiet connection paced every
+/// packet up to a second apart, which added up to ~1 s to every message's delivery.
+pub const RATE_FLOOR_UPPS: u64 = 100 * 1_000_000;
+
+/// Cumulative per-connection counters, for measurement.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ConnectionStats {
+    /// Current smoothed RTT in microseconds (0 until sampled).
+    pub rtt_us: u64,
+    /// Sequenced packets sent (data and keepalive), and their UDP payload bytes. Acks,
+    /// handshake packets and transmission-unit probes are not counted.
+    pub packets_sent: u64,
+    pub bytes_sent: u64,
+    /// Sequenced packets declared lost (never acked in time).
+    pub packets_lost: u64,
+    /// Adaptive FEC only (else 0): the floored loss estimate new messages are sized for, and the
+    /// latest short-term loss sample it was built from.
+    pub fec_loss_estimate: f64,
+    pub fec_last_loss_sample: f64,
+
+    // ---- sender: what happened to the declarations ----
+    /// Declared-lost packets for which an ack arrived later anyway (the packet had arrived; the
+    /// declaration was spurious). Counted once per packet, while the ack still reports it (the
+    /// receiver's 4096-packet ack window) and within PACKETS_WAITING_ACK_CAPACITY of the tail.
+    pub spurious_losses: u64,
+    /// Transmission-unit probes that went unacked (not counted in packets_lost).
+    pub tu_probes_lost: u64,
+    /// Data packets STP_TEST_DROP_* skipped (they are counted in packets_sent).
+    pub test_dropped: u64,
+    /// Sequence numbers used so far: every sequenced packet including acks and TU probes.
+    pub seq_numbers_used: u64,
+
+    // ---- receiver ground truth (packets the peer sent us; every sequenced packet type) ----
+    /// Authenticated sequenced packets received from the peer (duplicates excluded).
+    pub rx_packets: u64,
+    /// Highest peer sequence number seen + 1 (the span the peer has used, as far as we know).
+    pub rx_seq_span: u64,
+    /// rx_seq_span - rx_packets: sequence numbers never received (so far). The last
+    /// RX_REORDER_WINDOW of them may still arrive.
+    pub rx_lost: u64,
+    /// Arrivals below the highest sequence number already seen (reordered or late).
+    pub rx_reordered: u64,
+    /// Of those, arrivals so late they had already been counted as part of a loss burst.
+    pub rx_late_beyond_window: u64,
+    pub rx_duplicates: u64,
+    /// Loss bursts (runs of consecutive missing sequence numbers) by length: 1, 2, 3-4, 5-8,
+    /// 9-16, 17-64, 65+. Final once RX_REORDER_WINDOW behind the highest seen; snapshots also
+    /// count the last window provisionally.
+    pub rx_burst_hist: [u64; 7],
+    pub rx_bursts: u64,
+
+    // ---- receiver message reassembly (a message can be lost after all its packets were acked) ----
+    /// Messages completed (plain reassembly or FEC decode) and handed to the receive queue.
+    pub rx_messages_completed: u64,
+    /// Partial messages discarded because a newer package took their slot, and the message bytes
+    /// they had received (plain: bytes held; FEC: blocks x block size).
+    pub rx_partial_evicted: u64,
+    pub rx_partial_evicted_bytes: u64,
+    /// Fragments that did not fit the partial message in their slot (it was discarded and restarted).
+    pub rx_insert_failures: u64,
+    /// Fragments of a package older than the one holding their slot (dropped).
+    pub rx_stale_fragments: u64,
+}
+
+/// Burst-length class boundaries of `ConnectionStats::rx_burst_hist` (inclusive upper bounds).
+pub const RX_BURST_CLASS_MAX: [u64; 6] = [1, 2, 4, 8, 16, 64];
+pub const RX_BURST_CLASS_NAMES: [&str; 7] = ["1", "2", "3-4", "5-8", "9-16", "17-64", "65+"];
+/// Reorder tolerance of the receiver's loss tracking, in sequence numbers.
+pub const RX_REORDER_WINDOW: u64 = 1024;
+
+/// Receiver-side sequence tracking: a sliding bitmap of the last RX_REORDER_WINDOW sequence
+/// numbers. A sequence number is finalized (received or missing) as it slides out, which closes
+/// or extends the current loss run. O(1) amortized per packet (one finalize per sequence number).
+#[derive(Debug, Clone)]
+pub struct RxSeqTracker {
+    base: u64,              // lowest sequence number not yet finalized
+    highest_plus1: u64,
+    bits: [u64; (RX_REORDER_WINDOW / 64) as usize],
+    run: u64,               // current run of missing finalized sequence numbers
+}
+
+impl Default for RxSeqTracker {
+    fn default() -> Self { RxSeqTracker { base: 0, highest_plus1: 0, bits: [0; (RX_REORDER_WINDOW / 64) as usize], run: 0 } }
+}
+
+impl RxSeqTracker {
+    fn close_run(&mut self, stats: &mut ConnectionStats) {
+        if self.run > 0 {
+            let class = RX_BURST_CLASS_MAX.iter().position(|&m| self.run <= m).unwrap_or(6);
+            stats.rx_burst_hist[class] += 1;
+            stats.rx_bursts += 1;
+            self.run = 0;
+        }
+    }
+    fn finalize_to(&mut self, new_base: u64, stats: &mut ConnectionStats) {
+        // Sequence numbers more than a window ahead of base were never in the bitmap: all missing.
+        let bitmap_end = new_base.min(self.base + RX_REORDER_WINDOW);
+        while self.base < bitmap_end {
+            let i = (self.base % RX_REORDER_WINDOW) as usize;
+            let got = self.bits[i / 64] & (1u64 << (i % 64)) != 0;
+            self.bits[i / 64] &= !(1u64 << (i % 64));
+            if got { self.close_run(stats); } else { self.run += 1; }
+            self.base += 1;
+        }
+        if new_base > self.base { self.run += new_base - self.base; self.base = new_base; }
+    }
+    /// For a stats snapshot: count the not-yet-final window as if nothing more will arrive, so
+    /// short runs see their bursts (the live tracker is untouched).
+    pub fn provisional_bursts(&self, stats: &mut ConnectionStats) {
+        let mut t = self.clone();
+        t.finalize_to(t.highest_plus1, stats);
+        t.close_run(stats);
+    }
+    /// One authenticated packet with (virtual) sequence number `seq` arrived.
+    pub fn on_packet(&mut self, seq: u64, stats: &mut ConnectionStats) {
+        if seq < self.base {
+            // Already finalized as missing: it was late, not lost. (Its burst stays counted.)
+            stats.rx_packets += 1;
+            stats.rx_reordered += 1;
+            stats.rx_late_beyond_window += 1;
+        } else {
+            if seq >= self.base + RX_REORDER_WINDOW { self.finalize_to(seq + 1 - RX_REORDER_WINDOW, stats); }
+            let i = (seq % RX_REORDER_WINDOW) as usize;
+            if self.bits[i / 64] & (1u64 << (i % 64)) != 0 { stats.rx_duplicates += 1; return; }
+            self.bits[i / 64] |= 1u64 << (i % 64);
+            stats.rx_packets += 1;
+            if seq < self.highest_plus1 { stats.rx_reordered += 1; }
+        }
+        self.highest_plus1 = self.highest_plus1.max(seq + 1);
+        stats.rx_seq_span = self.highest_plus1;
+        stats.rx_lost = self.highest_plus1.saturating_sub(stats.rx_packets);
+    }
+}
+
+/// Network-thread-wide counters, for measurement.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NetworkThreadStats {
+    /// Datagrams the kernel dropped on this socket (receive buffer full), cumulative; None where
+    /// the platform does not report it (Linux: SO_MEMINFO / /proc/net/udp{,6}).
+    pub kernel_rx_drops: Option<u64>,
+    /// Network-thread loop: iterations, longest gap between consecutive iteration starts
+    /// (includes the 150 us idle sleep), and gaps over 1 / 10 / 100 ms.
+    pub loop_iterations: u64,
+    pub max_loop_gap_ns: u64,
+    pub loop_gaps_over_1ms: u64,
+    pub loop_gaps_over_10ms: u64,
+    pub loop_gaps_over_100ms: u64,
+    /// Complete messages dropped because the receive queue was full (cumulative).
+    pub recv_queue_dropped_messages: u64,
+}
+
+/// Test-only time-varying loss schedule (see STP_TEST_DROP_SCHEDULE in the network thread).
+#[derive(Debug, Clone)]
+pub struct TestDropSchedule { steps: Vec<(u64, u64)>, period_ns: Option<u64> }
+
+impl TestDropSchedule {
+    pub fn parse(spec: &str) -> Option<TestDropSchedule> {
+        let mut steps = Vec::new();
+        let mut period_ns = None;
+        for part in spec.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            let secs = |t: &str| t.trim().trim_end_matches('s').parse::<f64>().ok().map(|x| (x * 1e9) as u64);
+            if let Some(p) = part.strip_prefix('@') { period_ns = Some(secs(p)?.max(1)); continue; }
+            let (t, pct) = part.split_once(':')?;
+            let pct: f64 = pct.trim().trim_end_matches('%').parse().ok()?;
+            steps.push((secs(t)?, (pct * 10_000.0).round().clamp(0.0, 1e6) as u64));
+        }
+        if steps.is_empty() { return None; }
+        steps.sort();
+        Some(TestDropSchedule { steps, period_ns })
+    }
+    fn from_env() -> Option<TestDropSchedule> {
+        let v = std::env::var("STP_TEST_DROP_SCHEDULE").ok()?;
+        Some(Self::parse(&v).unwrap_or_else(|| panic!("bad STP_TEST_DROP_SCHEDULE {v:?}")))
+    }
+    pub fn ppm_at(&self, t_ns: u64) -> u64 {
+        let t = match self.period_ns { Some(p) => t_ns % p, None => t_ns };
+        self.steps.iter().take_while(|s| s.0 <= t).last().map_or(0, |s| s.1)
+    }
 }
 
 pub fn get_send_time_for_sequence_number(sequence_number: u64, send_time_band: &[u64; 1024], send_time_band_head_index: u64) -> u64 {
@@ -872,6 +1303,7 @@ pub fn connect_to_endpoint(
                 handshake_hash: [0u8; 64],
                 unreliable_send_buffer: UnreliableSendBuffer::new(send_buffer_params.0, send_buffer_params.1, send_buffer_params.2),
                 unreliable_reassembly: ReassemblySlot::new_ring(1024),
+                unreliable_fec: FecRecvSlot::new_ring(1024),
                 nym_sock,
             },
         );
@@ -905,6 +1337,7 @@ pub fn connect_to_endpoint(
                 handshake_hash: [0u8; 64],
                 unreliable_send_buffer: UnreliableSendBuffer::new(send_buffer_params.0, send_buffer_params.1, send_buffer_params.2),
                 unreliable_reassembly: ReassemblySlot::new_ring(1024),
+                unreliable_fec: FecRecvSlot::new_ring(1024),
                 nym_sock,
             },
         );
@@ -934,6 +1367,9 @@ impl ReassemblySlot {
         }
     }
     
+    /// Message bytes received so far.
+    pub fn bytes_received(&self) -> u64 { self.received.iter().map(|&(s, e)| (e - s) as u64).sum() }
+
     pub fn new_ring(size: usize) -> Vec<ReassemblySlot> {
         let mut vec = Vec::with_capacity(size);
         for _ in 0..size { vec.push(Self::new()); }
@@ -1007,7 +1443,127 @@ impl ReassemblySlot {
     }
 }
 
-pub const MAX_JUMBOGRAM_LEN: usize = 1 << 23;
+/// Receiver state of one FEC-coded package, kept in a ring parallel to `unreliable_reassembly`
+/// and indexed the same way (package id % ring size).
+#[derive(Default)]
+pub struct FecRecvSlot {
+    pub package_id: u16,
+    state: FecRecvState,
+    /// Blocks handed to this slot's decoder (for loss accounting on eviction).
+    blocks_received: u32,
+}
+
+#[derive(Default)]
+enum FecRecvState {
+    #[default]
+    Empty,
+    /// Small message: decoded on the network thread.
+    Inline(crate::fec::Decoder),
+    /// Big message: blocks are handed to a decoder thread, which delivers the message through
+    /// the network thread's completion channel. Dropping the sender (eviction, disconnect)
+    /// ends that thread and frees the decoder.
+    Worker { tx: std::sync::mpsc::Sender<(u32, Vec<u8>)>, message_len: usize, block_bytes: usize },
+    /// Delivered (or given up): late surplus blocks of this package are ignored.
+    Done,
+}
+
+impl std::fmt::Debug for FecRecvSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let st = match &self.state { FecRecvState::Empty => "empty", FecRecvState::Inline(_) => "inline", FecRecvState::Worker { .. } => "worker", FecRecvState::Done => "done" };
+        write!(f, "FecRecvSlot {{ package_id: {}, state: {st} }}", self.package_id)
+    }
+}
+
+impl FecRecvSlot {
+    pub fn new_ring(size: usize) -> Vec<FecRecvSlot> {
+        (0..size).map(|_| FecRecvSlot::default()).collect()
+    }
+    pub fn in_use(&self) -> bool { !matches!(self.state, FecRecvState::Empty) }
+    /// Message bytes received so far (blocks x block size).
+    pub fn bytes_received(&self) -> u64 { self.blocks_received as u64 * self.params().map_or(0, |p| p.1) as u64 }
+    fn params(&self) -> Option<(usize, usize)> {
+        match &self.state {
+            FecRecvState::Inline(d) => Some((d.message_len(), d.block_bytes())),
+            FecRecvState::Worker { message_len, block_bytes, .. } => Some((*message_len, *block_bytes)),
+            _ => None,
+        }
+    }
+}
+
+/// Decoder threads per network thread; past this, big messages are decoded inline (slower for
+/// the network thread, but bounded in threads).
+pub const MAX_FEC_DECODE_WORKERS: usize = 8;
+
+struct FecWorkerGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+impl Drop for FecWorkerGuard {
+    fn drop(&mut self) { self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel); }
+}
+
+/// Handles one received FEC fragment for the package in `slot` (the caller has already made
+/// the slot belong to `package_id`). Returns a message to deliver if decoding finished inline.
+fn fec_receive_block(
+    slot: &mut FecRecvSlot, connection_key: ConnectionKey, package_id: u16,
+    message_len: usize, block_bytes: usize, block_id: u32, data: &[u8],
+    done_tx: &std::sync::mpsc::Sender<(ConnectionKey, u16, Vec<u8>)>, workers: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> Option<Vec<u8>> {
+    use crate::fec::*;
+    if matches!(slot.state, FecRecvState::Done) { return None; }
+    slot.blocks_received += 1;
+    // A block of the wrong length can never decode; drop it.
+    let k = block_count(message_len, block_bytes)?;
+    let expect = if (block_id as usize) < k { block_len(message_len, block_bytes, block_id) } else { block_bytes };
+    if data.len() != expect { return None; }
+    if slot.params().is_some_and(|p| p != (message_len, block_bytes)) {
+        // Same package id, different shape: restart like a plain slot whose insert fails.
+        slot.state = FecRecvState::Empty;
+    }
+    if !slot.in_use() {
+        let use_worker = k > FEC_INLINE_MAX_BLOCKS && workers.load(std::sync::atomic::Ordering::Acquire) < MAX_FEC_DECODE_WORKERS;
+        let mut spawned = None;
+        if use_worker {
+            let (tx, rx) = std::sync::mpsc::channel::<(u32, Vec<u8>)>();
+            let done_tx = done_tx.clone();
+            workers.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            let guard = FecWorkerGuard(workers.clone());
+            let r = std::thread::Builder::new().name("stp-fec-decode".into()).spawn(move || {
+                let _guard = guard;
+                let Some(mut dec) = Decoder::new(message_len, block_bytes) else { return; };
+                while let Ok((id, block)) = rx.recv() {
+                    match dec.add(id, &block) {
+                        Ok(DecodeStatus::NeedMore) | Err(DecodeError::BadBlock) => {}
+                        Ok(DecodeStatus::Done) => {
+                            if let Some(m) = dec.recover() { let _ = done_tx.send((connection_key, package_id, m)); }
+                            return;
+                        }
+                        Err(DecodeError::Failed(_)) => return,
+                    }
+                }
+            });
+            if r.is_ok() { spawned = Some(tx); }
+        }
+        slot.state = match spawned {
+            Some(tx) => FecRecvState::Worker { tx, message_len, block_bytes },
+            None => match Decoder::new(message_len, block_bytes) { Some(d) => FecRecvState::Inline(d), None => FecRecvState::Done },
+        };
+    }
+    match &mut slot.state {
+        FecRecvState::Inline(dec) => match dec.add(block_id, data) {
+            Ok(DecodeStatus::NeedMore) | Err(DecodeError::BadBlock) => None,
+            Ok(DecodeStatus::Done) => { let m = dec.recover(); slot.state = FecRecvState::Done; m }
+            Err(DecodeError::Failed(_)) => { slot.state = FecRecvState::Done; None }
+        },
+        FecRecvState::Worker { tx, .. } => {
+            // The worker is gone once it has decoded (or failed): nothing more to do.
+            if tx.send((block_id, data.to_vec())).is_err() { slot.state = FecRecvState::Done; }
+            None
+        }
+        _ => None,
+    }
+}
+
+// Largest unreliable message a receiver reassembles; a peer sending a bigger one is disconnected.
+// Was 8 MiB (1 << 23); raised so 50 MB messages can be sent. Both ends need the raised value.
+pub const MAX_JUMBOGRAM_LEN: usize = 1 << 26;
 
 pub const ACK_BUFFER_TIME_NS: u64 = 50_000_000;
 
@@ -1022,6 +1578,22 @@ pub struct NetworkThreadPush {
 pub struct NetworkThreadPull {
     pub current_connections: Vec<(STPAddress, [u8; 64])>,
     pub received_unreliable_messages: VecDeque<(ConnectionKey, Vec<u8>)>,
+    /// Messages from this call's `send_unreliable` that were not queued, handed back unchanged:
+    /// the connection's send queue was full (see `UnreliableSendBuffer::submit_messages`), or no
+    /// connection with that key exists. Per connection they keep the order they were pushed in.
+    /// Nothing is dropped; resubmit them later or discard them yourself.
+    pub send_unreliable_rejected: Vec<(ConnectionKey, Vec<u8>)>,
+    /// For every connection the network thread holds (connected or still handshaking), the
+    /// largest message its send queue would accept now, after this call's submissions; u64::MAX
+    /// when its queue is empty. A connection missing here does not exist.
+    pub unreliable_send_free_bytes: Vec<(ConnectionKey, u64)>,
+    /// Cumulative counters for every connected connection.
+    pub connection_stats: Vec<(ConnectionKey, ConnectionStats)>,
+    /// FEC messages whose last block went out since the previous call (only with
+    /// `NetworkThreadOptions::record_fec_messages`).
+    pub fec_messages: Vec<(ConnectionKey, crate::fec_adapt::FecMessageInfo)>,
+    /// Network-thread-wide counters (kernel drops, loop starvation).
+    pub thread_stats: NetworkThreadStats,
 }
 
 struct NetworkThreadInner {
@@ -1029,6 +1601,8 @@ struct NetworkThreadInner {
     stop: std::sync::atomic::AtomicBool,
     push: std::cell::UnsafeCell<NetworkThreadPush>,
     pull: std::cell::UnsafeCell<NetworkThreadPull>,
+    fec_redundancy_ppm: std::sync::atomic::AtomicU32,
+    fec_adaptive_enabled: std::sync::atomic::AtomicBool,
 }
 
 #[allow(unsafe_code)]
@@ -1049,12 +1623,111 @@ impl Drop for NetworkThreadHandle {
 }
 
 pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_pps: Option<u64>, send_buffer_params: (u32, u32, u32)) -> NetworkThreadHandle {
+    new_network_thread_with_bind(my_keypairs, my_port, max_pps, send_buffer_params, None)
+}
+
+/// Like `new_network_thread`, but `bind_ip: Some(ip)` binds the UDP socket to that one local
+/// address instead of the dual-stack wildcard, so replies leave from it (Fly.io UDP needs the
+/// `fly-global-services` IPv4 address). An IPv4 bind only reaches IPv4 peers, an IPv6 bind only
+/// IPv6 peers. Linux only; elsewhere a specific bind fails. `None` is `new_network_thread`.
+pub fn new_network_thread_with_bind(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_pps: Option<u64>, send_buffer_params: (u32, u32, u32), bind_ip: Option<std::net::IpAddr>) -> NetworkThreadHandle {
+    new_network_thread_with_options(my_keypairs, my_port, max_pps, send_buffer_params, NetworkThreadOptions { bind_ip, ..Default::default() })
+}
+
+/// Parameters of the existing R/P/G/S sending-rate curve; no alternative control law.
+#[derive(Debug, Clone, Copy)]
+pub struct CongestionControlOptions {
+    pub beta: f64,
+    pub recovery_rtts: u64,
+    pub rate_rp: f64,
+    pub rate_pg: f64,
+    pub rate_gs: f64,
+    pub time_pg: f64,
+    pub time_gs: f64,
+    pub loss_threshold: u64,
+    pub event_guard_rtts: f64,
+    /// Millionths of a packet per second (100_000_000 = 100 pps).
+    pub rate_floor_upps: u64,
+    pub initial_rate_upps: u64,
+    pub min_growth_uppsps: f64,
+    pub max_growth_uppsps: f64,
+}
+impl CongestionControlOptions {
+    pub const fn legacy() -> Self {
+        Self { beta: CUBIC_BETA, recovery_rtts: CUBIC_K_RTT_MULTIPLIER,
+            rate_rp: RATE_RP, rate_pg: RATE_PG, rate_gs: RATE_GS, time_pg: TIME_PG, time_gs: TIME_GS,
+            loss_threshold: 2, event_guard_rtts: 0.5, rate_floor_upps: RATE_FLOOR_UPPS, initial_rate_upps: RATE_FLOOR_UPPS,
+            min_growth_uppsps: CUBIC_MIN_GROWTH_UPPSPS, max_growth_uppsps: CUBIC_MAX_RATE_UPPS_PER_SEC }
+    }
+    /// Shorter probe plateau and stronger existing additive term; same R/P/G/S curve.
+    pub const fn balanced() -> Self {
+        Self { time_pg: 2.0, time_gs: 8.0, min_growth_uppsps: 25_000_000.0,
+            initial_rate_upps: 1_000_000_000, ..Self::legacy() }
+    }
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !(self.beta > 0.0 && self.beta < 1.0 && self.beta < self.rate_rp && self.rate_rp < self.rate_pg && self.rate_pg < self.rate_gs && self.rate_gs <= 100.0) { return Err("CC rate factors need 0 < beta < RP < PG < GS <= 100"); }
+        if !(1..=100).contains(&self.recovery_rtts) { return Err("CC recovery RTTs must be in 1..=100"); }
+        if !(1.1 <= self.time_pg && self.time_pg * 1.1 <= self.time_gs && self.time_gs <= 100.0) { return Err("CC phase times need PG >= 1.1 and GS >= 1.1*PG, GS <= 100"); }
+        let g_span = self.time_gs - self.time_pg;
+        let p_slope = (self.rate_pg - self.rate_rp) / (self.time_pg - 1.0);
+        if self.rate_gs - self.rate_pg - p_slope * g_span < 0.0 { return Err("CC G phase must have nonnegative curvature"); }
+        if !(0.0..=10.0).contains(&self.event_guard_rtts) { return Err("invalid CC guard"); }
+        if !(1..=10000).contains(&self.loss_threshold) { return Err("CC loss threshold must be in 1..=10000"); }
+        if !(self.rate_floor_upps > 0 && self.initial_rate_upps >= self.rate_floor_upps && self.initial_rate_upps <= 1_000_000_000_000 && self.min_growth_uppsps >= 0.0 && self.min_growth_uppsps.is_finite() && self.max_growth_uppsps > self.min_growth_uppsps && self.max_growth_uppsps <= 1e15) { return Err("invalid CC floor, initial rate or growth limits"); }
+        Ok(())
+    }
+}
+impl Default for CongestionControlOptions {
+    fn default() -> Self { Self::legacy() }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NetworkThreadOptions {
+    pub congestion_control: CongestionControlOptions,
+    /// See `new_network_thread_with_bind`.
+    pub bind_ip: Option<std::net::IpAddr>,
+    /// Sender-side forward error correction for unreliable messages of 2+ packets: extra
+    /// Wirehair-coded blocks in parts per million of the message's block count (20_000 = 2%),
+    /// so a message survives losing about that fraction of its packets. 0 = off: plain
+    /// fragments, wire bytes exactly as without FEC. Capped at 1_000_000 (100%). Receivers
+    /// decode FEC messages without configuration (but must run code that knows FEC fragments).
+    /// Can be changed later with `NetworkThreadHandle::set_fec_redundancy_ppm`.
+    pub fec_redundancy_ppm: u32,
+    /// FEC mode: None = fixed `fec_redundancy_ppm` (above). Some = adaptive: each connection
+    /// estimates its packet loss from its own sent/lost counts and sizes every message's repair
+    /// blocks so it fails with probability ~eps at that loss (see `fec_adapt`); then
+    /// `fec_redundancy_ppm` is ignored. Toggle with `NetworkThreadHandle::set_fec_adaptive_enabled`.
+    pub fec_adaptive: Option<crate::fec_adapt::AdaptiveFecConfig>,
+    /// Report every finished FEC message in `NetworkThreadPull::fec_messages` (for measurement).
+    pub record_fec_messages: bool,
+}
+
+impl NetworkThreadHandle {
+    /// Changes the FEC redundancy (see `NetworkThreadOptions::fec_redundancy_ppm`) for messages
+    /// that start sending from now on, on all connections.
+    pub fn set_fec_redundancy_ppm(&self, ppm: u32) {
+        self.inner.fec_redundancy_ppm.store(ppm.min(MAX_FEC_REDUNDANCY_PPM), std::sync::atomic::Ordering::Relaxed);
+    }
+    /// Switches between adaptive FEC (if `NetworkThreadOptions::fec_adaptive` was given) and the
+    /// fixed `fec_redundancy_ppm`. Per-connection estimator state is dropped while switched off
+    /// and starts over from `initial_loss` when switched back on.
+    pub fn set_fec_adaptive_enabled(&self, on: bool) {
+        self.inner.fec_adaptive_enabled.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_pps: Option<u64>, send_buffer_params: (u32, u32, u32), options: NetworkThreadOptions) -> NetworkThreadHandle {
+    let bind_ip = options.bind_ip;
+    let cc = options.congestion_control;
+    cc.validate().expect("invalid congestion controller configuration");
+    let cubic_rate = move |t, r, k| cubic_rate_with_options(t, r, k, &cc);
+
 
     // STP setup
     socket_setup();
     monotonic_clock_setup();
 
-    let socket = setup_and_bind_udp_socket(my_port).expect("Failed to bind socket, try again.");
+    let socket = setup_and_bind_udp_socket_on(my_port, bind_ip).expect("Failed to bind socket, try again.");
     
     // Nym setup
     let nym_handle = nym_setup();
@@ -1064,7 +1737,11 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
         stop: std::sync::atomic::AtomicBool::new(false),
         push: std::cell::UnsafeCell::new(NetworkThreadPush::default()),
         pull: std::cell::UnsafeCell::new(NetworkThreadPull::default()),
+        fec_redundancy_ppm: std::sync::atomic::AtomicU32::new(options.fec_redundancy_ppm.min(MAX_FEC_REDUNDANCY_PPM)),
+        fec_adaptive_enabled: std::sync::atomic::AtomicBool::new(options.fec_adaptive.is_some()),
     });
+    let fec_adaptive_cfg = options.fec_adaptive;
+    let record_fec_messages = options.record_fec_messages;
 
     let thread_inner = inner.clone();
 
@@ -1075,7 +1752,27 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
         let mut packet_memory_send      = new_packet_memory(); // Outgoing Decrypted
 
         let mut receive_queue = ReceiveQueue::default();
+        let (fec_done_tx, fec_done_rx) = std::sync::mpsc::channel::<(ConnectionKey, u16, Vec<u8>)>();
+        let fec_workers = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        // Test-only loss injection: STP_TEST_DROP_PPM=n skips sending n per million outgoing
+        // data packets while accounting them as sent, so congestion control sees real loss.
+        let test_drop_ppm: u64 = std::env::var("STP_TEST_DROP_PPM").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0).min(1_000_000);
+        let mut test_drop_rng: u64 = monotonic_clock_ns() | 1;
+        if test_drop_ppm != 0 { println!("STP port {my_port}: STP_TEST_DROP_PPM={test_drop_ppm}: dropping that fraction of outgoing data packets (test only)"); }
+        // STP_TEST_DROP_SCHEDULE="0:0.5,20:4,25:0.5,@60": piecewise-constant drop percentage from
+        // these seconds after thread start (overrides STP_TEST_DROP_PPM); a final "@T" repeats the
+        // schedule with period T s. STP_TEST_DROP_BURST=n: drops come in runs of n packets (the
+        // run start rate is divided by n, so the average stays the scheduled rate).
+        let test_drop_schedule = TestDropSchedule::from_env();
+        if let Some(sch) = &test_drop_schedule { println!("STP port {my_port}: STP_TEST_DROP_SCHEDULE: {sch:?} (test only)"); }
+        let test_drop_burst: u64 = std::env::var("STP_TEST_DROP_BURST").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1).max(1);
+        let mut test_drop_burst_left = 0u64;
+        let test_drop_t0 = monotonic_clock_ns();
         let mut receive_queue_report_time_ns = 0u64;
+        let mut thread_stats = NetworkThreadStats::default();
+        let mut last_loop_start_ns = 0u64;
+        let mut kernel_drops_read_ns = 0u64;
 
         let mut connections_map = HashMap::<ConnectionKey, ConnectionTrackingData>::new();
         let mut server_nym_sockets: Vec<NymSockHandle> = Vec::new();
@@ -1084,6 +1781,21 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
             if thread_inner.stop.load(std::sync::atomic::Ordering::Acquire) {
                 break;
             }
+            {
+                let t = monotonic_clock_ns();
+                if last_loop_start_ns != 0 {
+                    let gap = t.saturating_sub(last_loop_start_ns);
+                    thread_stats.max_loop_gap_ns = thread_stats.max_loop_gap_ns.max(gap);
+                    if gap > 1_000_000 { thread_stats.loop_gaps_over_1ms += 1; }
+                    if gap > 10_000_000 { thread_stats.loop_gaps_over_10ms += 1; }
+                    if gap > 100_000_000 { thread_stats.loop_gaps_over_100ms += 1; }
+                }
+                last_loop_start_ns = t;
+                thread_stats.loop_iterations += 1;
+            }
+            let fec_redundancy_ppm = thread_inner.fec_redundancy_ppm.load(std::sync::atomic::Ordering::Relaxed);
+            let fec_adaptive_now = if thread_inner.fec_adaptive_enabled.load(std::sync::atomic::Ordering::Relaxed) { fec_adaptive_cfg } else { None };
+            let test_drop_ppm = match &test_drop_schedule { Some(sch) => sch.ppm_at(monotonic_clock_ns().saturating_sub(test_drop_t0)), None => test_drop_ppm };
             if thread_inner.state.load(std::sync::atomic::Ordering::Acquire) == 1 {
                 let mut req = NetworkThreadPush::default();
 
@@ -1122,8 +1834,12 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                     }
                 }
                 
-                // attempt to push unreliable messages to queue, batched per connection
-                req.send_unreliable.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                // Push unreliable messages to their queues, batched per connection. The sort is
+                // stable so each connection's messages keep the caller's order. Whatever a queue
+                // does not accept, and everything for a connection not in the map, goes back to
+                // the caller untouched.
+                let mut resp = NetworkThreadPull::default();
+                req.send_unreliable.sort_by(|a, b| a.0.cmp(&b.0));
                 let mut i = 0;
                 while i < req.send_unreliable.len() {
                     let key = req.send_unreliable[i].0;
@@ -1134,12 +1850,42 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                         batch.push(std::mem::take(&mut req.send_unreliable[i].1));
                         i += 1;
                     }
-                    if let Some(tracking_data) = connections_map.get_mut(&key) {
-                        tracking_data.unreliable_send_buffer.submit_messages(batch);
+                    let rejected = if let Some(tracking_data) = connections_map.get_mut(&key) {
+                        tracking_data.unreliable_send_buffer.submit_messages(batch)
+                    } else {
+                        batch
+                    };
+                    resp.send_unreliable_rejected.extend(rejected.into_iter().map(|m| (key, m)));
+                }
+                resp.unreliable_send_free_bytes = connections_map.iter_mut()
+                    .map(|(key, value)| (*key, value.unreliable_send_buffer.free_bytes())).collect();
+                resp.connection_stats = connections_map.iter().filter_map(|(key, value)| match &value.connection_state {
+                    ConnectionState::Connected(c) => {
+                        let mut st = c.stats;
+                        st.seq_numbers_used = c.send_sequence_number;
+                        c.rx_tracker.provisional_bursts(&mut st);
+                        if let Some(a) = &value.unreliable_send_buffer.fec_adaptive {
+                            st.fec_loss_estimate = a.p;
+                            st.fec_last_loss_sample = a.tracker.last_sample();
+                        }
+                        Some((*key, st))
+                    }
+                    _ => None,
+                }).collect();
+                if current_time_now_ns.saturating_sub(kernel_drops_read_ns) >= 100_000_000 {
+                    kernel_drops_read_ns = current_time_now_ns;
+                    thread_stats.kernel_rx_drops = udp_socket_kernel_rx_drops(socket);
+                }
+                thread_stats.recv_queue_dropped_messages = receive_queue.dropped_messages_total;
+                resp.thread_stats = thread_stats;
+                if record_fec_messages {
+                    for (key, value) in connections_map.iter_mut() {
+                        if let Some(rec) = &mut value.unreliable_send_buffer.fec_record {
+                            resp.fec_messages.extend(rec.drain(..).map(|m| (*key, m)));
+                        }
                     }
                 }
 
-                let mut resp = NetworkThreadPull::default();
                 resp.current_connections = connections_map.iter().filter_map(|(key, value)| {
                     if value.is_connected() {
                         Some((value.address().clone(), value.handshake_hash))
@@ -1257,6 +2003,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                                                     handshake_hash: [0u8; 64],
                                                     unreliable_send_buffer: UnreliableSendBuffer::new(send_buffer_params.0, send_buffer_params.1, send_buffer_params.2),
                                                     unreliable_reassembly: ReassemblySlot::new_ring(1024),
+                                                    unreliable_fec: FecRecvSlot::new_ring(1024),
                                                     nym_sock: None,
                                                 },
                                             );
@@ -1338,6 +2085,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                                                         handshake_hash,
                                                         unreliable_send_buffer: UnreliableSendBuffer::new(send_buffer_params.0, send_buffer_params.1, send_buffer_params.2),
                                                         unreliable_reassembly: ReassemblySlot::new_ring(1024),
+                                                        unreliable_fec: FecRecvSlot::new_ring(1024),
                                                         nym_sock: None,
                                                     },
                                                 );
@@ -1463,6 +2211,8 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                             else {
                                 payload = &packet_memory_encrypted[6..buf_len];
                             }
+                            // Ground truth: every authenticated sequenced packet the peer sent.
+                            state.rx_tracker.on_packet(nonce as u64, &mut state.stats);
                             
                             if payload.len() < 516 {
                                 if OVERLY_VERBOSE { println!("Dropping from {connection_key:?}, payload < 516."); }
@@ -1505,6 +2255,15 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                                                 state.packets_in_flight -= 1;
                                             }
                                             
+                                        }
+                                    }
+                                    else if acked && index < state.packets_waiting_ack_tail && index + PACKETS_WAITING_ACK_CAPACITY >= state.packets_waiting_ack_tail {
+                                        // Acked after it was declared lost: the declaration was spurious.
+                                        let bit_index = index % PACKETS_WAITING_ACK_CAPACITY;
+                                        let w = &mut state.declared_lost_field[(bit_index / 64) as usize];
+                                        if *w & (1u64 << (bit_index % 64)) != 0 {
+                                            *w &= !(1u64 << (bit_index % 64));
+                                            state.stats.spurious_losses += 1;
                                         }
                                     }
                                 }
@@ -1640,6 +2399,54 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                             while remaining_payload.len() >= 8 {
                                 let header = load_u64(&remaining_payload[0..8]);
                                 if header == u64::MAX { break 'conn; }
+
+                                if header & 1 != 0 {
+                                    // Extended fragment (FEC); see STP_FEC_FRAGMENT_HEADER_SIZE.
+                                    let data_len = ((header >> 18) & 0x3fff) as usize;
+                                    if remaining_payload.len() < STP_FEC_FRAGMENT_HEADER_SIZE + data_len {
+                                        if OVERLY_VERBOSE { println!("Error, extended fragment extends beyond end of packet received from {connection_key:?}. Disconnecting..."); }
+                                        connections_map.remove(&connection_key);
+                                        break 'conn;
+                                    }
+                                    let word1 = load_u64(&remaining_payload[8..16]);
+                                    let data = &remaining_payload[STP_FEC_FRAGMENT_HEADER_SIZE..STP_FEC_FRAGMENT_HEADER_SIZE + data_len];
+                                    remaining_payload = &remaining_payload[STP_FEC_FRAGMENT_HEADER_SIZE + data_len..];
+                                    if (word1 >> 48) & 0xff != STP_EXT_KIND_FEC { continue; } // unknown kind: skip it
+                                    let package_id = ((header >> 2) & 0xffff) as u16;
+                                    let block_id = (header >> 32) as u32;
+                                    let message_len = (word1 & 0xffff_ffff) as usize;
+                                    let block_bytes = ((word1 >> 32) & 0xffff) as usize;
+                                    if message_len > MAX_JUMBOGRAM_LEN {
+                                        if VERBOSE { println!("Error, FEC message length ({message_len}) exceeds MAX_JUMBOGRAM_LEN from {connection_key:?}. Disconnecting..."); }
+                                        connections_map.remove(&connection_key);
+                                        break 'conn;
+                                    }
+                                    let slot_idx = package_id as usize % existing_connection.unreliable_fec.len();
+                                    {
+                                        // Same eviction rule as plain packages below, across both rings.
+                                        let slot = &mut existing_connection.unreliable_fec[slot_idx];
+                                        if slot.in_use() && slot.package_id != package_id {
+                                            if (package_id.wrapping_sub(slot.package_id) as i16) < 0 { state.stats.rx_stale_fragments += 1; continue; }
+                                            if !matches!(slot.state, FecRecvState::Done) {
+                                                state.stats.rx_partial_evicted += 1;
+                                                state.stats.rx_partial_evicted_bytes += slot.bytes_received();
+                                            }
+                                            *slot = FecRecvSlot::default();
+                                        }
+                                        slot.package_id = package_id;
+                                        let plain = &mut existing_connection.unreliable_reassembly[slot_idx];
+                                        if (plain.total_len.is_some() || !plain.received.is_empty()) && plain.package_id != package_id && (package_id.wrapping_sub(plain.package_id) as i16) > 0 {
+                                            state.stats.rx_partial_evicted += 1;
+                                            state.stats.rx_partial_evicted_bytes += plain.bytes_received();
+                                            *plain = ReassemblySlot::new();
+                                        }
+                                    }
+                                    if let Some(message) = fec_receive_block(&mut existing_connection.unreliable_fec[slot_idx], connection_key, package_id, message_len, block_bytes, block_id, data, &fec_done_tx, &fec_workers) {
+                                        state.stats.rx_messages_completed += 1;
+                                        receive_queue.push(connection_key, message, MAX_RECV_QUEUE_BYTES);
+                                    }
+                                    continue;
+                                }
                                 
                                 let is_reliable = header & 1 != 0;
                                 let is_fin = header & 2 != 0;
@@ -1685,20 +2492,33 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                                     let slot = &mut existing_connection.unreliable_reassembly[slot_idx];
                                     let slot_in_use = slot.total_len.is_some() || !slot.received.is_empty();
                                     if slot_in_use && slot.package_id != package_id {
-                                        if (package_id.wrapping_sub(slot.package_id) as i16) < 0 { continue; }
+                                        if (package_id.wrapping_sub(slot.package_id) as i16) < 0 { state.stats.rx_stale_fragments += 1; continue; }
+                                        state.stats.rx_partial_evicted += 1;
+                                        state.stats.rx_partial_evicted_bytes += slot.bytes_received();
                                         *slot = ReassemblySlot::new();
                                     }
                                     slot.package_id = package_id;
+                                    // A newer package also evicts an FEC package in the same slot index.
+                                    let fec = &mut existing_connection.unreliable_fec[slot_idx];
+                                    if fec.in_use() && fec.package_id != package_id && (package_id.wrapping_sub(fec.package_id) as i16) > 0 {
+                                        if !matches!(fec.state, FecRecvState::Done) {
+                                            state.stats.rx_partial_evicted += 1;
+                                            state.stats.rx_partial_evicted_bytes += fec.bytes_received();
+                                        }
+                                        *fec = FecRecvSlot::default();
+                                    }
                                 }
 
                                 let (mut success, mut complete) = existing_connection.unreliable_reassembly[slot_idx].insert(frag_offset as usize, frag_data, is_fin);
                                 if !success {
+                                    state.stats.rx_insert_failures += 1;
                                     existing_connection.unreliable_reassembly[slot_idx] = ReassemblySlot::new();
                                     existing_connection.unreliable_reassembly[slot_idx].package_id = package_id;
                                     (success, complete) = existing_connection.unreliable_reassembly[slot_idx].insert(frag_offset as usize, frag_data, is_fin);
                                     assert!(success);
                                 }
                                 if complete {
+                                    state.stats.rx_messages_completed += 1;
                                     let completed = std::mem::replace(&mut existing_connection.unreliable_reassembly[slot_idx], ReassemblySlot::new());
                                     receive_queue.push(connection_key, completed.buf, MAX_RECV_QUEUE_BYTES);
                                 }
@@ -1709,6 +2529,17 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                     } } // <- break 'conn lands here
                 }
 //////// END RECEIVE ////////////////////////////////////////////////////////////////////////
+
+                // Messages finished by FEC decoder threads.
+                while let Ok((key, package_id, message)) = fec_done_rx.try_recv() {
+                    if let Some(conn) = connections_map.get_mut(&key) {
+                        let idx = package_id as usize % conn.unreliable_fec.len();
+                        let slot = &mut conn.unreliable_fec[idx];
+                        if slot.package_id == package_id && slot.in_use() { slot.state = FecRecvState::Done; }
+                        if let ConnectionState::Connected(c) = &mut conn.connection_state { c.stats.rx_messages_completed += 1; }
+                        receive_queue.push(key, message, MAX_RECV_QUEUE_BYTES);
+                    }
+                }
 
 //////// BEGIN SEND ////////////////////////////////////////////////////////////////////////
                 let current_time_now_ns = monotonic_clock_ns();
@@ -1821,7 +2652,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                             state.RTT_mean = u16::MAX;
                             state.ack_pace_estimate = 0;
                             state.congestion_event_time_ns = 0;
-                            state.congestion_event_rate_upps = 0;
+                            state.congestion_event_rate_upps = cc.rate_floor_upps;
                             state.last_sent_data_packet = 0;
                             state.last_sent_could_have_sent_data_packet = 0;
                             if state.tu_probe_sequence_number != u64::MAX {
@@ -1837,6 +2668,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                         }
                         
                         if state.congestion_event_time_ns == 0 {
+                            state.congestion_event_rate_upps = cc.initial_rate_upps;
                             state.congestion_event_time_ns = current_time_now_ns;
                         }
 
@@ -1861,11 +2693,12 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                                     total_count += state.RTT_sample_counts[i] as u64;
                                 }
                                 state.RTT_mean = (total_sum / total_count) as u16;
+                                state.stats.rtt_us = state.RTT_mean as u64 * 100;
                             }
 
                             if state.RTT_mean != previous_rtt_mean {
-                                let old_k = CUBIC_K_RTT_MULTIPLIER * (previous_rtt_mean as u64 * 100_000);
-                                let new_k = CUBIC_K_RTT_MULTIPLIER * (state.RTT_mean as u64 * 100_000);
+                                let old_k = cc.recovery_rtts * (previous_rtt_mean as u64 * 100_000);
+                                let new_k = cc.recovery_rtts * (state.RTT_mean as u64 * 100_000);
                                 let current_t = current_time_now_ns.saturating_sub(state.congestion_event_time_ns);
 
                                 // First RTT received — backdate to R→P transition
@@ -1896,17 +2729,17 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                             }
                         }
 
-                        let time_to_bandwidth_recovery = CUBIC_K_RTT_MULTIPLIER * (state.RTT_mean as u64 * 100_000);
+                        let time_to_bandwidth_recovery = cc.recovery_rtts * (state.RTT_mean as u64 * 100_000);
 
                         // Local Limit congestion event
-                        if let Some(max_pps) = max_pps && max_pps*1_000_000 < cubic_rate(current_time_now_ns - state.congestion_event_time_ns, state.congestion_event_rate_upps, time_to_bandwidth_recovery).0 && current_time_now_ns > state.congestion_event_time_ns + (state.RTT_mean as u64 * 100_000) / 2 {
+                        if let Some(max_pps) = max_pps && max_pps*1_000_000 < cubic_rate(current_time_now_ns - state.congestion_event_time_ns, state.congestion_event_rate_upps, time_to_bandwidth_recovery).0 && current_time_now_ns > state.congestion_event_time_ns + (state.RTT_mean as f64 * 100_000.0 * cc.event_guard_rtts) as u64 {
                             let send_dt = current_time_now_ns - state.congestion_event_time_ns;
                             let send_t_factor = send_dt as f64 / time_to_bandwidth_recovery as f64;
                             let (_, send_mode) = cubic_rate(send_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery);
                             let discover_dt = if send_mode == 'P' { (time_to_bandwidth_recovery + send_dt) / 2 } else { send_dt };
                             let mut discovered = cubic_rate(discover_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery).0;
                             if send_mode == 'G' || send_mode == 'S' {
-                                let r_pg = (state.congestion_event_rate_upps as f64 * RATE_PG) as u64;
+                                let r_pg = (state.congestion_event_rate_upps as f64 * cc.rate_pg) as u64;
                                 discovered = r_pg + ((discovered.saturating_sub(r_pg)) as f64 * 0.5) as u64;
                             }
                             state.congestion_event_rate_upps = max_pps*1_000_000;
@@ -1916,7 +2749,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                         }
 
                         // ECN congestion event: the receiver saw CE-marked packets and relayed it via the ack's IP header
-                        if state.ecn_congestion_received && state.ecn_oldest_send_time > state.congestion_event_time_ns + (state.RTT_mean as u64 * 100_000) / 2 {
+                        if state.ecn_congestion_received && state.ecn_oldest_send_time > state.congestion_event_time_ns + (state.RTT_mean as f64 * 100_000.0 * cc.event_guard_rtts) as u64 {
                             state.ecn_congestion_received = false;
                             let send_dt = state.ecn_oldest_send_time - state.congestion_event_time_ns;
                             let send_t_factor = send_dt as f64 / time_to_bandwidth_recovery as f64;
@@ -1924,7 +2757,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                             let discover_dt = if send_mode == 'P' { (time_to_bandwidth_recovery + send_dt) / 2 } else { send_dt };
                             let mut discovered = cubic_rate(discover_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery).0;
                             if send_mode == 'G' || send_mode == 'S' {
-                                let r_pg = (state.congestion_event_rate_upps as f64 * RATE_PG) as u64;
+                                let r_pg = (state.congestion_event_rate_upps as f64 * cc.rate_pg) as u64;
                                 discovered = r_pg + ((discovered.saturating_sub(r_pg)) as f64 * 0.5) as u64;
                             }
                             state.congestion_event_rate_upps = discovered;
@@ -1942,6 +2775,8 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                         assert!(state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY);
                         while state.packets_waiting_ack_tail < state.send_sequence_number {
                             let bit_index = state.packets_waiting_ack_tail % PACKETS_WAITING_ACK_CAPACITY;
+                            // This slot now describes the tail packet (set below if declared lost).
+                            state.declared_lost_field[(bit_index / 64) as usize] &= !(1u64 << (bit_index % 64));
                             if state.packets_waiting_ack_field[(bit_index / 64) as usize] & (1u64 << (bit_index % 64)) != 0 {
                                 let mut send_time = get_send_time_for_sequence_number(state.packets_waiting_ack_tail, &state.send_time_band, state.send_time_band_head_index);
                                 if send_time != 0 && (state.RTT_mean == 0 || (current_time_now_ns - send_time) < time_to_considered_dropped) {
@@ -1953,6 +2788,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                                     state.tu_probe_sequence_number = u64::MAX;
                                     state.tu_probe_size_advance /= 5;
                                     state.tu_probe_failed_count += 1;
+                                    state.stats.tu_probes_lost += 1;
                                 }
                                 else {
                                     // Track losses in a rolling window of 1 RTT
@@ -1963,7 +2799,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                                     }
                                     state.loss_count_in_window += 1;
 
-                                    if state.loss_count_in_window >= 2 && send_time > state.congestion_event_time_ns + (state.RTT_mean as u64 * 100_000) / 2 {
+                                    if state.loss_count_in_window >= cc.loss_threshold && send_time > state.congestion_event_time_ns + (state.RTT_mean as f64 * 100_000.0 * cc.event_guard_rtts) as u64 {
                                         let send_dt = send_time - state.congestion_event_time_ns;
                                         let send_t_factor = send_dt as f64 / time_to_bandwidth_recovery as f64;
                                         let (_, send_mode) = cubic_rate(send_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery);
@@ -1974,7 +2810,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                                         // P/G/S: blend 50% toward R/P boundary rate.
                                         let mut discovered = cubic_rate(send_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery).0;
                                         if send_mode != 'R' {
-                                            let boundary = (state.congestion_event_rate_upps as f64 * RATE_RP) as u64;
+                                            let boundary = (state.congestion_event_rate_upps as f64 * cc.rate_rp) as u64;
                                             discovered = (discovered + boundary) / 2;
                                         }
                                         state.congestion_event_rate_upps = discovered;
@@ -1986,13 +2822,16 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                                     assert!(state.packets_in_flight > 0, "packets_in_flight underflow");
                                     state.packets_in_flight -= 1;
                                     state.packet_lost_since_last_print += 1;
+                                    state.stats.packets_lost += 1;
+                                    state.declared_lost_field[(bit_index / 64) as usize] |= 1u64 << (bit_index % 64);
+                                    connection_tracking_data.unreliable_send_buffer.fec_on_packet_lost(state.packets_waiting_ack_tail);
                                 }
                             }
                             state.packets_waiting_ack_field[(bit_index / 64) as usize] &= !(1u64 << (bit_index % 64));
                             state.packets_waiting_ack_tail += 1;
                         }
                         
-                        state.congestion_event_rate_upps = state.congestion_event_rate_upps.max(1_000_000);
+                        state.congestion_event_rate_upps = state.congestion_event_rate_upps.max(cc.rate_floor_upps);
                         
                         let (allowed_bandwidth_upps, cubic_mode) = if state.is_app_limited {
                             let rtt_ns = state.RTT_mean as u64 * 100_000;
@@ -2001,7 +2840,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                         } else {
                             cubic_rate(current_time_now_ns - state.congestion_event_time_ns, state.congestion_event_rate_upps, time_to_bandwidth_recovery)
                         };
-                        let allowed_bandwidth_upps = allowed_bandwidth_upps.max(1_000_000);
+                        let allowed_bandwidth_upps = allowed_bandwidth_upps.max(cc.rate_floor_upps);
                         // pps * 10^-6 * rtt * 10^-4 = p * 10^10
                         // BDP + sawtooth: pipe is full (BDP) plus ack batching excess (ack_pace_estimate is in 0.1ms units)
                         let bdp = allowed_bandwidth_upps * state.RTT_mean as u64 / 10_000;
@@ -2076,14 +2915,33 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                             increment_sequence_number_and_account(send_time_ns, &mut state.send_sequence_number, &mut state.send_time_band, &mut state.send_time_band_head_index, &mut state.packets_waiting_ack_field);
                             state.last_sent_data_packet = current_time_now_ns; // We use the older time here so the pacer skips less packets.
                             state.packets_in_flight += 1;
+                            state.stats.packets_sent += 1;
+                            state.stats.bytes_sent += 6 + packet_len as u64;
                             state.max_in_flight_since_last_print = state.max_in_flight_since_last_print.max(state.packets_in_flight);
                             packet_send_allowance_now = packet_send_allowance_now.saturating_sub(1);
                             state.packet_since_last_print += 1;
                         }
 
                         connection_tracking_data.unreliable_send_buffer.current_bytes_per_second = payload_size as u64 * allowed_bandwidth_upps / 1000_000;
-                        connection_tracking_data.unreliable_send_buffer.cut_to_size();
-                        while state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY - 1 && packet_send_allowance_now > 0 && state.packets_in_flight < allowed_packets_in_flight && fill_packet_payload_with_unreliable_fragments(&mut packet_memory_send[0..payload_size], &mut connection_tracking_data.unreliable_send_buffer) {
+                        {
+                            let buf = &mut connection_tracking_data.unreliable_send_buffer;
+                            match &fec_adaptive_now {
+                                Some(cfg) => {
+                                    let a = buf.fec_adaptive.get_or_insert_with(|| crate::fec_adapt::FecAdaptiveState::new(*cfg, current_time_now_ns, state.stats.packets_sent, state.stats.packets_lost));
+                                    a.on_tick(current_time_now_ns, state.stats.packets_sent, state.stats.packets_lost, state.stats.spurious_losses);
+                                    buf.fec_redundancy_ppm = a.representative_ppm();
+                                }
+                                None => {
+                                    buf.fec_adaptive = None;
+                                    buf.fec_redundancy_ppm = fec_redundancy_ppm;
+                                }
+                            }
+                            if record_fec_messages && buf.fec_record.is_none() { buf.fec_record = Some(Vec::new()); }
+                        }
+                        while state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY - 1 && packet_send_allowance_now > 0 && state.packets_in_flight < allowed_packets_in_flight && {
+                            connection_tracking_data.unreliable_send_buffer.next_packet_seq = state.send_sequence_number;
+                            fill_packet_payload_with_unreliable_fragments(&mut packet_memory_send[0..payload_size], &mut connection_tracking_data.unreliable_send_buffer)
+                        } {
                         
                             let virtual_nonce = state.send_sequence_number;
                             store_u16(&mut packet_memory_encrypted[0..2], connection_tracking_data.two_byte_send_prefix);
@@ -2099,11 +2957,21 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                             }
 
                             should_sleep = false;
-                            let send_time_ns = if let Some(ns) = &connection_tracking_data.nym_sock { nym_udp_send_with_congestion_and_dscp(ns, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::BestEffort, false) }
+                            let test_drop = if test_drop_burst_left > 0 { test_drop_burst_left -= 1; true } else {
+                                test_drop_ppm != 0 && {
+                                    test_drop_rng ^= test_drop_rng << 13; test_drop_rng ^= test_drop_rng >> 7; test_drop_rng ^= test_drop_rng << 17;
+                                    test_drop_rng % 1_000_000 < test_drop_ppm / test_drop_burst
+                                } && { test_drop_burst_left = test_drop_burst - 1; true }
+                            };
+                            if test_drop { state.stats.test_dropped += 1; }
+                            let send_time_ns = if test_drop { monotonic_clock_ns() }
+                            else if let Some(ns) = &connection_tracking_data.nym_sock { nym_udp_send_with_congestion_and_dscp(ns, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::BestEffort, false) }
                             else { udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::BestEffort, false) };
                             increment_sequence_number_and_account(send_time_ns, &mut state.send_sequence_number, &mut state.send_time_band, &mut state.send_time_band_head_index, &mut state.packets_waiting_ack_field);
                             state.last_sent_data_packet = current_time_now_ns; // We use the older time here so the pacer skips less packets.
                             state.packets_in_flight += 1;
+                            state.stats.packets_sent += 1;
+                            state.stats.bytes_sent += 6 + packet_len as u64;
                             state.max_in_flight_since_last_print = state.max_in_flight_since_last_print.max(state.packets_in_flight);
                             packet_send_allowance_now = packet_send_allowance_now.saturating_sub(1);
                             state.packet_since_last_print += 1;
@@ -2115,8 +2983,8 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                             state.is_app_limited = true;
                             state.app_limit_time_offset = current_time_now_ns - state.congestion_event_time_ns;
                             if cubic_mode == 'G' || cubic_mode == 'S' || cubic_mode == 'L' {
-                                state.congestion_event_rate_upps = (allowed_bandwidth_upps as f64 / RATE_PG) as u64;
-                                let t_pg = (TIME_PG * time_to_bandwidth_recovery as f64) as u64;
+                                state.congestion_event_rate_upps = (allowed_bandwidth_upps as f64 / cc.rate_pg) as u64;
+                                let t_pg = (cc.time_pg * time_to_bandwidth_recovery as f64) as u64;
                                 state.app_limit_time_offset = t_pg;
                                 state.congestion_event_time_ns = current_time_now_ns.saturating_sub(t_pg);
                             }
@@ -2207,35 +3075,40 @@ const RATE_GS: f64 = 4.0;   // rate factor at G-S transition
 const TIME_PG: f64 = 5.0;   // time factor (in k) for P-G transition
 const TIME_GS: f64 = 15.0;  // time factor (in k) for G-S transition
 
-/// Evaluate the CUBIC sending-rate function.
+/// Evaluate the legacy CUBIC sending-rate function (use `cubic_rate_with_options` for a configured curve).
 /// t_ns:  nanoseconds since the last congestion event.
 /// r_max: sending rate (upps) at the time the dropped packet was sent.
 /// k_ns:  time in nanoseconds to recover back to r_max.
 /// Returns (target sending rate in upps, mode char: R/P/G/S/L).
 pub fn cubic_rate(t_ns: u64, r_max: u64, k_ns: u64) -> (u64, char) {
+    cubic_rate_with_options(t_ns, r_max, k_ns, &CongestionControlOptions::legacy())
+}
+
+/// The original rate function, with its constants supplied at runtime.
+pub fn cubic_rate_with_options(t_ns: u64, r_max: u64, k_ns: u64, cc: &CongestionControlOptions) -> (u64, char) {
     if k_ns == 0 { return (r_max, 'R'); }
     let t = t_ns as f64;
     let r = r_max as f64;
     let k = k_ns as f64;
-    let drop = r * (1.0 - CUBIC_BETA);
-    let min_growth = CUBIC_MIN_GROWTH_UPPSPS / 1e9 * t;
-    let linear_cap_slope = CUBIC_MAX_RATE_UPPS_PER_SEC / 1e9;
+    let drop = r * (1.0 - cc.beta);
+    let min_growth = cc.min_growth_uppsps / 1e9 * t;
+    let linear_cap_slope = cc.max_growth_uppsps / 1e9;
 
-    // R: p^2 recovery from r*BETA up to r*RATE_RP
-    let r_rp = r * RATE_RP; // rate at R→P
-    let r_drop = r_rp - r * CUBIC_BETA; // total recovery range
+    // R: p^2 recovery from r*BETA up to r*cc.rate_rp
+    let r_rp = r * cc.rate_rp; // rate at R→P
+    let r_drop = r_rp - r * cc.beta; // total recovery range
     if t <= k {
         let p = 1.0 - t / k;
         let rate = r_rp - r_drop * p * p + min_growth;
-        return ((rate.max(r * CUBIC_BETA)) as u64, 'R');
+        return ((rate.max(r * cc.beta)) as u64, 'R');
     }
 
     let dt = t - k;
-    let t_pg = (TIME_PG - 1.0) * k; // duration of P phase
-    let t_gs = (TIME_GS - 1.0) * k; // duration of P+G phase (from end of R)
+    let t_pg = (cc.time_pg - 1.0) * k; // duration of P phase
+    let t_gs = (cc.time_gs - 1.0) * k; // duration of P+G phase (from end of R)
 
-    let r_pg = r * RATE_PG; // rate at P→G
-    let r_gs = r * RATE_GS; // rate at G→S
+    let r_pg = r * cc.rate_pg; // rate at P→G
+    let r_gs = r * cc.rate_gs; // rate at G→S
 
     // P: linear from r_rp to r_pg
     let p_slope = (r_pg - r_rp) / t_pg; // derivative at P exit = G entry
@@ -2344,3 +3217,253 @@ pub fn get_handshake_hash(handshake: &snow::HandshakeState) -> [u8; 64] {
 use crate::helpers::*;
 use crate::native_sockets::*;
 use crate::nym_sockets::*;
+
+#[cfg(test)]
+mod congestion_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_transition_rates() {
+        let (r, k) = (1_000_000_000, 900_000_000);
+        assert_eq!(cubic_rate(0, r, k), (670_000_000, 'R'));
+        assert_eq!(cubic_rate(k, r, k), (980_900_000, 'R'));
+        assert_eq!(cubic_rate(5 * k, r, k), (1_054_500_000, 'P'));
+        assert_eq!(cubic_rate(15 * k, r, k), (4_013_499_999, 'G'));
+    }
+
+    #[test]
+    fn parameters_change_only_the_original_curve() {
+        let mut cc = CongestionControlOptions::legacy();
+        cc.beta = 0.8;
+        cc.recovery_rtts = 4;
+        cc.time_pg = 2.0;
+        cc.time_gs = 6.0;
+        cc.validate().unwrap();
+        assert_eq!(cubic_rate_with_options(0, 1_000_000_000, 800_000_000, &cc), (800_000_000, 'R'));
+        assert_eq!(cubic_rate_with_options(1_600_000_000, 1_000_000_000, 800_000_000, &cc), (1_051_600_000, 'P'));
+        let mut previous = 0;
+        for t in (0..100_000_000_000u64).step_by(10_000_000) {
+            let rate = cubic_rate_with_options(t, 1_000_000_000, 800_000_000, &cc).0;
+            assert!(rate >= previous);
+            previous = rate;
+        }
+    }
+
+    #[test]
+    fn balanced_changes_only_four_parameters() {
+        let cc = CongestionControlOptions::balanced();
+        let old = CongestionControlOptions::legacy();
+        cc.validate().unwrap();
+        assert_eq!(cc.beta, old.beta);
+        assert_eq!(cc.recovery_rtts, old.recovery_rtts);
+        assert_eq!((cc.rate_rp, cc.rate_pg, cc.rate_gs), (old.rate_rp, old.rate_pg, old.rate_gs));
+        assert_eq!((cc.loss_threshold, cc.event_guard_rtts), (old.loss_threshold, old.event_guard_rtts));
+        assert_eq!(cc.rate_floor_upps, old.rate_floor_upps);
+        assert_eq!(cc.max_growth_uppsps, old.max_growth_uppsps);
+        assert_eq!((cc.time_pg, cc.time_gs, cc.min_growth_uppsps, cc.initial_rate_upps), (2.0, 8.0, 25_000_000.0, 1_000_000_000));
+        assert_eq!(cubic_rate_with_options(0, 1_000_000_000, 1_800_000_000, &cc), (670_000_000, 'R'));
+        assert_eq!(cubic_rate_with_options(3_600_000_000, 1_000_000_000, 1_800_000_000, &cc), (1_140_000_000, 'P'));
+    }
+
+    #[test]
+    fn invalid_parameters_are_rejected() {
+        let base = CongestionControlOptions::legacy();
+        for bad in [CongestionControlOptions { beta: f64::NAN, ..base },
+            CongestionControlOptions { beta: 1.0, ..base },
+            CongestionControlOptions { recovery_rtts: 0, ..base },
+            CongestionControlOptions { time_pg: 1.0, ..base },
+            CongestionControlOptions { time_gs: 1.5, ..base },
+            CongestionControlOptions { loss_threshold: 0, ..base },
+            CongestionControlOptions { initial_rate_upps: 1, ..base },
+            CongestionControlOptions { event_guard_rtts: f64::NAN, ..base },
+            CongestionControlOptions { time_pg: 1.1, time_gs: 100.0, ..base }] {
+            assert!(bad.validate().is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod fec_send_tests {
+    use super::*;
+    use rand::{Rng, RngCore};
+
+    /// Parsed fragment: (package_id, Some((message_len, block_bytes, block_id)) for FEC or None for plain, is_fin, offset, data)
+    type Frag = (u16, Option<(usize, usize, u32)>, bool, u32, Vec<u8>);
+
+    fn parse_packet(mut p: &[u8]) -> Vec<Frag> {
+        let mut out = Vec::new();
+        while p.len() >= 8 {
+            let h = load_u64(&p[0..8]);
+            if h == u64::MAX { break; }
+            let len = ((h >> 18) & 0x3fff) as usize;
+            let pkg = ((h >> 2) & 0xffff) as u16;
+            if h & 1 != 0 {
+                let w1 = load_u64(&p[8..16]);
+                assert_eq!(w1 >> 48, STP_EXT_KIND_FEC);
+                out.push((pkg, Some(((w1 & 0xffff_ffff) as usize, ((w1 >> 32) & 0xffff) as usize, (h >> 32) as u32)), false, 0, p[16..16 + len].to_vec()));
+                p = &p[16 + len..];
+            } else {
+                out.push((pkg, None, h & 2 != 0, (h >> 32) as u32, p[8..8 + len].to_vec()));
+                p = &p[8 + len..];
+            }
+        }
+        out
+    }
+
+    /// Fills packets of `payload_len` until the buffer is drained (waiting for encoder threads).
+    fn drain(buf: &mut UnreliableSendBuffer, payload_len: usize, max_packets: usize) -> Vec<Vec<Frag>> {
+        let mut packets = Vec::new();
+        let mut mem = vec![0u8; payload_len];
+        while packets.len() < max_packets {
+            if fill_packet_payload_with_unreliable_fragments(&mut mem, buf) {
+                packets.push(parse_packet(&mem));
+            } else if buf.has_unsent_data() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            } else {
+                break;
+            }
+        }
+        packets
+    }
+
+    fn msg(len: usize) -> Vec<u8> {
+        let mut v = vec![0u8; len];
+        rand::rng().fill_bytes(&mut v);
+        v
+    }
+
+    fn new_buf(ppm: u32) -> UnreliableSendBuffer {
+        let mut b = UnreliableSendBuffer::new(1_000_000, 1 << 26, 1 << 26);
+        b.fec_redundancy_ppm = ppm;
+        b
+    }
+
+    #[test]
+    fn ppm_zero_sends_plain_fragments() {
+        let mut b = new_buf(0);
+        let (m1, m2) = (msg(20_000), msg(100));
+        assert!(b.submit_messages(vec![m1.clone(), m2.clone()]).is_empty());
+        let packets = drain(&mut b, 9194, 100);
+        assert_eq!(packets.len(), 3);
+        let frags: Vec<Frag> = packets.into_iter().flatten().collect();
+        assert!(frags.iter().all(|f| f.1.is_none()));
+        // 9186 + 9186 + 1628 bytes of package 0, then package 1 packed into the third packet.
+        assert_eq!(frags.iter().map(|f| (f.0, f.3, f.4.len(), f.2)).collect::<Vec<_>>(), vec![(0, 0, 9186, false), (0, 9186, 9186, false), (0, 18372, 1628, true), (1, 0, 100, true)]);
+        let joined: Vec<u8> = frags[..3].iter().flat_map(|f| f.4.clone()).collect();
+        assert_eq!(joined, m1);
+        assert_eq!(frags[3].4, m2);
+        assert_eq!(b.queue_bytes_filled, 0);
+    }
+
+    fn check_fec(frags: &[Frag], package_id: u16, m: &[u8], ppm: u64, drop_every: usize) {
+        let mine: Vec<&Frag> = frags.iter().filter(|f| f.0 == package_id).collect();
+        let (len, bb, _) = mine[0].1.unwrap();
+        assert_eq!(len, m.len());
+        let k = crate::fec::block_count(len, bb).unwrap();
+        let n = k + ((k as u64 * ppm).div_ceil(1_000_000)) as usize;
+        let ids: Vec<u32> = mine.iter().map(|f| f.1.unwrap().2).collect();
+        assert_eq!(ids, (0..n as u32).collect::<Vec<_>>());
+        for f in &mine[..k] {
+            let s = f.1.unwrap().2 as usize * bb;
+            assert_eq!(&f.4[..], &m[s..(s + bb).min(len)]);
+        }
+        let mut dec = crate::fec::Decoder::new(len, bb).unwrap();
+        for (i, f) in mine.iter().enumerate() {
+            if drop_every != 0 && i % drop_every == 0 { continue; }
+            if dec.add(f.1.unwrap().2, &f.4).unwrap() == crate::fec::DecodeStatus::Done {
+                assert_eq!(dec.recover().unwrap(), m);
+                return;
+            }
+        }
+        panic!("package {package_id} did not decode");
+    }
+
+    #[test]
+    fn fec_small_inline_encoder() {
+        let ppm = 50_000;
+        let mut b = new_buf(ppm as u32);
+        let (m1, m2, m3) = (msg(100_000), msg(500), msg(1146 * 2));
+        assert!(b.submit_messages(vec![m1.clone(), m2.clone(), m3.clone()]).is_empty());
+        let frags: Vec<Frag> = drain(&mut b, 1162, 1000).into_iter().flatten().collect();
+        // K = 88 blocks of 1146 B, N = 88 + ceil(4.4) = 93; losing 4 of them is fine.
+        check_fec(&frags, 0, &m1, ppm, 25);
+        // One block: plain.
+        assert!(frags.iter().any(|f| f.0 == 1 && f.1.is_none() && f.4 == m2));
+        // Exactly two blocks: FEC with 3 blocks.
+        check_fec(&frags, 2, &m3, ppm, 0);
+        assert_eq!(b.queue_bytes_filled, 0);
+    }
+
+    #[test]
+    fn fec_big_threaded_encoder() {
+        let ppm = 20_000;
+        let mut b = new_buf(ppm as u32);
+        let m = msg(3_000_000);
+        b.submit_messages(vec![m.clone()]);
+        let frags: Vec<Frag> = drain(&mut b, 9194, 100_000).into_iter().flatten().collect();
+        check_fec(&frags, 0, &m, ppm, 60);
+    }
+
+    #[test]
+    fn fec_restarts_when_tu_shrinks() {
+        let mut b = new_buf(100_000);
+        let m = msg(200_000);
+        b.submit_messages(vec![m.clone()]);
+        let mut first = drain(&mut b, 9194, 5);
+        assert!(first.iter().flatten().all(|f| f.0 == 0 && f.1.unwrap().1 == 9178));
+        let rest: Vec<Frag> = drain(&mut b, 1162, 10_000).into_iter().flatten().collect();
+        assert!(rest.iter().all(|f| f.0 == 1 && f.1.unwrap().1 == 1146));
+        check_fec(&rest, 1, &m, 100_000, 0);
+        first.clear();
+        assert_eq!(b.queue_bytes_filled, 0);
+    }
+
+    #[test]
+    fn fec_capacity_scales_with_redundancy() {
+        let mut b = new_buf(0);
+        b.min_queue_size_bytes = 0;
+        b.current_bytes_per_second = 1_100_000;
+        assert_eq!(b.current_byte_capacity(), 1_100_000);
+        b.fec_redundancy_ppm = 100_000;
+        assert_eq!(b.current_byte_capacity(), 1_000_000);
+    }
+}
+
+#[cfg(test)]
+mod rx_tracker_tests {
+    use super::*;
+
+    fn run(seqs: impl IntoIterator<Item = u64>) -> ConnectionStats {
+        let mut st = ConnectionStats::default();
+        let mut t = RxSeqTracker::default();
+        for s in seqs { t.on_packet(s, &mut st); }
+        let mut snap = st;
+        t.provisional_bursts(&mut snap);
+        snap
+    }
+
+    #[test]
+    fn bursts_reordering_and_late_arrivals() {
+        // Missing: 5 (1), 10-11 (2), 20-27 (8), 3000-3099 (100); 40 arrives late but in window.
+        let lost = |s: u64| s == 5 || (10..12).contains(&s) || (20..28).contains(&s) || (3000..3100).contains(&s);
+        let order: Vec<u64> = (0..5000).filter(|&s| !lost(s) && s != 40).flat_map(|s| if s == 45 { vec![45, 40] } else { vec![s] }).collect();
+        let st = run(order);
+        assert_eq!(st.rx_seq_span, 5000);
+        assert_eq!(st.rx_packets, 5000 - 111);
+        assert_eq!(st.rx_lost, 111);
+        assert_eq!(st.rx_reordered, 1);
+        assert_eq!(st.rx_late_beyond_window, 0);
+        assert_eq!(st.rx_bursts, 4);
+        assert_eq!(st.rx_burst_hist, [1, 1, 0, 1, 0, 0, 1]);
+        // 40 arriving after the window passed it: counted as received (late), burst stays counted.
+        let late: Vec<u64> = (0..5000).filter(|&s| s != 40).chain([40]).collect();
+        let st = run(late);
+        assert_eq!((st.rx_lost, st.rx_late_beyond_window, st.rx_bursts), (0, 1, 1));
+        // A jump far beyond the window is one burst.
+        let st = run([0, 1, 100_000]);
+        assert_eq!((st.rx_lost, st.rx_bursts, st.rx_burst_hist[6]), (99_998, 1, 1));
+        // Duplicates are not received twice.
+        let st = run([0, 1, 1, 2]);
+        assert_eq!((st.rx_packets, st.rx_duplicates, st.rx_lost), (3, 1, 0));
+    }
+}

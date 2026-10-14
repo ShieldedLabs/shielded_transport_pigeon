@@ -57,6 +57,30 @@ mod linux {
     #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
     pub struct SockHandle(libc::c_int, Option<Ipv6Addr>); // Linux
 
+    /// Datagrams the kernel dropped on this socket (sk_drops: receive buffer full, etc.),
+    /// cumulative. SO_MEMINFO (SK_MEMINFO_DROPS, Linux 4.6+), else the `drops` column of
+    /// /proc/net/udp6 and /proc/net/udp for the socket's inode. None if neither works.
+    pub fn udp_socket_kernel_rx_drops(sock: SockHandle) -> Option<u64> { // Linux
+        const SO_MEMINFO: libc::c_int = 55;
+        const SK_MEMINFO_VARS: usize = 9;
+        let mut mi = [0u32; SK_MEMINFO_VARS];
+        let mut len = std::mem::size_of_val(&mi) as libc::socklen_t;
+        let r = unsafe { libc::getsockopt(sock.0, libc::SOL_SOCKET, SO_MEMINFO, mi.as_mut_ptr() as *mut libc::c_void, &mut len) };
+        if r == 0 && len as usize >= SK_MEMINFO_VARS * 4 { return Some(mi[8] as u64); }
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(sock.0, &mut st) } != 0 { return None; }
+        let inode = st.st_ino.to_string();
+        for f in ["/proc/net/udp6", "/proc/net/udp"] {
+            let Ok(text) = std::fs::read_to_string(f) else { continue };
+            for line in text.lines().skip(1) {
+                let cols: Vec<&str> = line.split_whitespace().collect();
+                // sl local rem st tx:rx tr:tm retrnsmt uid timeout inode ref pointer drops
+                if cols.len() >= 13 && cols[9] == inode { return cols[12].parse().ok(); }
+            }
+        }
+        None
+    }
+
     /*
         This procedure is needed because on some vps' the ipv6 setup is wrong so that
         we end up using only the prefix address. Here is an example bad setup.
@@ -144,6 +168,18 @@ mod linux {
 
     #[inline]
     pub fn setup_and_bind_udp_socket(port: u16) -> Option<SockHandle> { // Linux
+        setup_and_bind_udp_socket_on(port, None)
+    }
+
+    /// `bind_ip: None` binds the dual-stack wildcard `[::]`. `Some(v4)` binds the v4-mapped
+    /// `::ffff:a.b.c.d` on the same dual-stack socket (IPV6_V6ONLY stays 0), so the send and
+    /// receive paths keep their v4-mapped Ipv6Addr form; `Some(v6)` binds that IPv6 address.
+    pub fn setup_and_bind_udp_socket_on(port: u16, bind_ip: Option<std::net::IpAddr>) -> Option<SockHandle> { // Linux
+        let bind_addr: Ipv6Addr = match bind_ip {
+            None => Ipv6Addr::UNSPECIFIED,
+            Some(std::net::IpAddr::V4(v4)) => v4.to_ipv6_mapped(),
+            Some(std::net::IpAddr::V6(v6)) => v6,
+        };
         let fd = unsafe {
             libc::socket(
                 libc::AF_INET6,
@@ -184,6 +220,26 @@ mod linux {
                 let _ = libc::close(fd);
                 return None;
             }
+
+            // The kernel default (~208 KiB, about 20 jumbo packets) overflows at high rates and
+            // the excess is dropped before STP sees it. Ask for 16 MiB: the *FORCE variants
+            // ignore net.core.{r,w}mem_max but need CAP_NET_ADMIN; otherwise the plain options
+            // are capped at those sysctls. Failure is not fatal.
+            let want: libc::c_int = 16 << 20;
+            for (force, plain, name) in [(libc::SO_RCVBUFFORCE, libc::SO_RCVBUF, "SO_RCVBUF"), (libc::SO_SNDBUFFORCE, libc::SO_SNDBUF, "SO_SNDBUF")] {
+                let len = std::mem::size_of_val(&want) as libc::socklen_t;
+                if libc::setsockopt(fd, libc::SOL_SOCKET, force, &want as *const _ as *const libc::c_void, len) != 0
+                    && libc::setsockopt(fd, libc::SOL_SOCKET, plain, &want as *const _ as *const libc::c_void, len) != 0
+                {
+                    eprintln!("Failed to set {name}: {}", std::io::Error::last_os_error());
+                }
+                let mut got: libc::c_int = 0;
+                let mut got_len = std::mem::size_of_val(&got) as libc::socklen_t;
+                libc::getsockopt(fd, libc::SOL_SOCKET, plain, &mut got as *mut _ as *mut libc::c_void, &mut got_len);
+                if (got as i64) < want as i64 {
+                    eprintln!("{name} is {got} bytes (wanted {want}); raise net.core.{}mem_max for more", if plain == libc::SO_RCVBUF { "r" } else { "w" });
+                }
+            }
         }
 
         // Make socket non-blocking
@@ -218,12 +274,14 @@ mod linux {
             }
         }
 
-        let known_good_ipv6_address = first_usable_ipv6();
+        // A socket bound to one address sends from it; overriding the source would fail.
+        let known_good_ipv6_address = if bind_ip.is_none() { first_usable_ipv6() } else { None };
 
         unsafe {
             let mut addr: libc::sockaddr_in6 = std::mem::zeroed();
             addr.sin6_family = libc::AF_INET6 as _;
             addr.sin6_port = port.to_be();
+            addr.sin6_addr = libc::in6_addr { s6_addr: bind_addr.octets() };
 
             if libc::bind(
                 fd,
@@ -231,7 +289,7 @@ mod linux {
                 std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
             ) != 0
             {
-                eprintln!("bind([::]:{}) failed: {}", port, std::io::Error::last_os_error());
+                eprintln!("bind([{}]:{}) failed: {}", bind_addr, port, std::io::Error::last_os_error());
                 let _ = libc::close(fd);
                 return None;
             }
@@ -418,7 +476,9 @@ mod linux {
                 if err.raw_os_error() == Some(libc::EMSGSIZE) || err.raw_os_error() == Some(libc::EAGAIN)
                     || err.raw_os_error() == Some(libc::ENETUNREACH) || err.raw_os_error() == Some(libc::EHOSTUNREACH)
                     || err.raw_os_error() == Some(libc::ENETDOWN) || err.raw_os_error() == Some(libc::ECONNREFUSED)
-                    || err.raw_os_error() == Some(libc::EHOSTDOWN) /* @todo(judah): ensure we actually want to tolerate this error  */{
+                    || err.raw_os_error() == Some(libc::EHOSTDOWN) /* @todo(judah): ensure we actually want to tolerate this error  */
+                    // A socket bound to an IPv4 address cannot send to an IPv6 peer: unreachable.
+                    || err.raw_os_error() == Some(libc::EAFNOSUPPORT) {
                     return timestamp_ns;
                 }
                 panic!("UDP Socket error: {}", err);
@@ -674,6 +734,20 @@ mod linux {
         }
     }
 }
+
+/// Binding one specific address is implemented on Linux only; elsewhere `Some` fails.
+#[cfg(not(target_os = "linux"))]
+pub fn setup_and_bind_udp_socket_on(port: u16, bind_ip: Option<std::net::IpAddr>) -> Option<SockHandle> {
+    if let Some(ip) = bind_ip {
+        eprintln!("binding a specific address ({ip}) is only supported on Linux");
+        return None;
+    }
+    setup_and_bind_udp_socket(port)
+}
+
+/// Kernel receive drops are only reported on Linux.
+#[cfg(not(target_os = "linux"))]
+pub fn udp_socket_kernel_rx_drops(_sock: SockHandle) -> Option<u64> { None }
 
 #[cfg(target_os = "windows")]
 pub use windows::*;

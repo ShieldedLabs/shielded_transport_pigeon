@@ -8,6 +8,8 @@
 #![allow(dead_code, unused_variables, unused_mut, unused_imports, unused_assignments, unused_unsafe)]
 #![allow(deprecated)]
 
+pub mod fec;
+pub mod fec_adapt;
 pub mod helpers;
 pub mod native_sockets;
 pub mod nym_sockets;
