@@ -3844,16 +3844,10 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     state.stats.tu_probes_lost += 1;
                                 }
                                 else {
-                                    // Track losses in a rolling window of 1 RTT
-                                    let rtt_ns = state.RTT_mean as u64 * 100_000;
-                                    if current_time_now_ns - state.loss_window_start_ns > rtt_ns {
-                                        state.loss_window_start_ns = current_time_now_ns;
-                                        state.loss_count_in_window = 0;
-                                    }
-                                    // Covered losses still enter loss/FEC statistics below, but
-                                    // cannot prime the threshold for a subsequent congestion cut.
-                                    let eligible = state.packets_waiting_ack_tail >= state.outage.ignore_loss_before_seq && send_time > state.congestion_event_time_ns + (rtt_ns as f64 * cc.event_guard_rtts) as u64;
-                                        let trigger = count_congestion_loss(&mut state.loss_count_in_window, eligible, cc.loss_threshold);
+                                    // Covered or early-counted losses still enter loss/FEC
+                                    // statistics below, but cannot prime a duplicate cut.
+                                    let trigger = count_congestion_signal(state, state.packets_waiting_ack_tail,
+                                        send_time, current_time_now_ns, &cc);
 
                                     if trigger {
                                         let before = state.congestion_event_time_ns;
@@ -4490,6 +4484,7 @@ const ACK_HOLE_NEWER_PACKETS: usize = 3;
 struct AckHole {
     newest: [Option<u64>; ACK_HOLE_NEWER_PACKETS],
     cursor: u64,
+    confirmed_before: u64, // qualifying holes already fed to the congestion cohort
     candidate: Option<(u64, u64)>, // sequence, first qualifying ACK arrival
 }
 impl AckHole {
@@ -4528,8 +4523,12 @@ fn observe_ack_hole(state: &mut ConnectionStateConnected, now: u64, cc: &Congest
                 if now.saturating_sub(since) >= grace {
                     // Only the CC anchor changes. Pending bits, final-loss timer,
                     // flight count, retry/rescue and FEC erasure feedback stay intact.
-                    apply_loss_congestion(state, sent, now, cc, max_pps);
-                    println!("congestion early ACK HOLE {seq} at {now} ns");
+                    let trigger = count_congestion_signal(state, seq, sent, now, cc);
+                    state.ack_hole.confirmed_before = seq + 1;
+                    if trigger {
+                        apply_loss_congestion(state, sent, now, cc, max_pps);
+                        println!("congestion early ACK HOLE {seq} at {now} ns");
+                    }
                     state.ack_hole.cursor = seq + 1;
                     state.ack_hole.candidate = None;
                 }
@@ -4604,6 +4603,21 @@ fn apply_loss_congestion(state: &mut ConnectionStateConnected, send_time: u64, c
     state.loss_count_in_window = 0;
     state.cc_startup_done = true;
     println!("congestion event PACKET DROPPED {} ...  rate discovered: {} pps  now:{now_mode}@{now_t_factor:.2} sent:{send_mode}@{send_t_factor:.2}", state.packets_waiting_ack_tail, state.congestion_event_rate_upps as f64 / 1000000.0);
+}
+
+// Early holes and timeout losses share one RTT cohort and send-time eligibility.
+// The monotone early scan has already counted any unresolved hole below its
+// watermark; a later timeout still finalizes loss, but cannot count it twice.
+fn count_congestion_signal(state: &mut ConnectionStateConnected, seq: u64, sent: u64, now: u64, cc: &CongestionPolicy) -> bool {
+    if seq < state.ack_hole.confirmed_before { return false; }
+    let rtt_ns = state.RTT_mean as u64 * 100_000;
+    if now.saturating_sub(state.loss_window_start_ns) > rtt_ns {
+        state.loss_window_start_ns = now;
+        state.loss_count_in_window = 0;
+    }
+    let eligible = seq >= state.outage.ignore_loss_before_seq
+        && sent > state.congestion_event_time_ns.saturating_add((rtt_ns as f64 * cc.event_guard_rtts) as u64);
+    count_congestion_loss(&mut state.loss_count_in_window, eligible, cc.loss_threshold)
 }
 
 fn count_congestion_loss(count: &mut u64, eligible: bool, threshold: u64) -> bool {
@@ -4682,11 +4696,11 @@ mod congestion_tests {
         assert!(!s.cc_startup_done); // still inside RTT/16 reordering grace
         data_receipt(&mut s, 5);
         observe_ack_hole(&mut s, 1_120_000_000, &cc, None);
-        assert!(s.cc_startup_done);
-        assert_eq!(s.congestion_event_time_ns, 1_120_000_000);
-        let before = connection_rate(1_120_000_000, 2_000_000_000,
-            cc.recovery_rtts * 100_000_000, &cc, false).0;
-        assert!(s.congestion_event_rate_upps < before);
+        assert!(!s.cc_startup_done); // confirmed isolated loss is only one cohort member
+        assert_eq!(s.loss_count_in_window, 1);
+        assert_eq!(s.ack_hole.confirmed_before, 1);
+        assert_eq!(s.congestion_event_time_ns, 0);
+        assert_eq!(s.congestion_event_rate_upps, 2_000_000_000);
     }
 
     #[test]
@@ -4708,8 +4722,16 @@ mod congestion_tests {
         observe_ack_hole(&mut s, 1_100_000_000, &crate::ship::CC, None);
         data_receipt(&mut s, 5);
         observe_ack_hole(&mut s, 1_110_000_000, &crate::ship::CC, None);
-        let cut = (s.congestion_event_time_ns, s.congestion_event_rate_upps);
+        assert!(!s.cc_startup_done); // first hole only primes the shared cohort
         data_receipt(&mut s, 6);
+        observe_ack_hole(&mut s, 1_120_000_000, &crate::ship::CC, None);
+        data_receipt(&mut s, 7);
+        observe_ack_hole(&mut s, 1_130_000_000, &crate::ship::CC, None);
+        assert!(s.cc_startup_done);
+        assert_eq!(s.congestion_event_time_ns, 1_130_000_000);
+        assert_eq!(s.loss_count_in_window, 0);
+        let cut = (s.congestion_event_time_ns, s.congestion_event_rate_upps);
+        data_receipt(&mut s, 8);
         observe_ack_hole(&mut s, 1_140_000_000, &crate::ship::CC, None);
         let sent = s.send_time(0);
         apply_loss_congestion(&mut s, sent, 1_300_000_000, &crate::ship::CC, None);
@@ -4719,13 +4741,17 @@ mod congestion_tests {
     #[test]
     fn ack_hole_leaves_final_loss_and_fec_accounting_untouched() {
         let mut s = hole_state();
-        for seq in [1, 2, 3] { data_receipt(&mut s, seq); }
+        for seq in [2, 3, 4] { data_receipt(&mut s, seq); }
         observe_ack_hole(&mut s, 1_100_000_000, &crate::ship::CC, None);
-        data_receipt(&mut s, 4);
+        data_receipt(&mut s, 5);
+        observe_ack_hole(&mut s, 1_110_000_000, &crate::ship::CC, None);
+        data_receipt(&mut s, 6);
+        observe_ack_hole(&mut s, 1_120_000_000, &crate::ship::CC, None);
+        data_receipt(&mut s, 7);
         let bits = s.packets_waiting_ack_field;
         let flight = s.packets_in_flight;
         let timeout = s.loss_timer.timeout_ns(100_000_000, 0, &crate::ship::CC);
-        observe_ack_hole(&mut s, 1_110_000_000, &crate::ship::CC, None);
+        observe_ack_hole(&mut s, 1_130_000_000, &crate::ship::CC, None);
         assert!(s.cc_startup_done);
         assert_eq!(s.packets_waiting_ack_field, bits);
         assert_eq!(s.packets_waiting_ack_tail, 0);
@@ -4736,8 +4762,43 @@ mod congestion_tests {
         assert!(s.declared_lost_field.iter().all(|&w| w == 0));
         assert_eq!(s.loss_timer.timeout_ns(100_000_000, 0, &crate::ship::CC), timeout);
         let sent = s.send_time(0);
-        assert!(1_110_000_000 - sent < timeout); // not eligible for final loss yet
+        assert!(1_130_000_000 - sent < timeout); // not eligible for final loss yet
         assert!(sent + timeout >= 1_200_000_000); // unchanged conservative deadline
+    }
+
+    #[test]
+    fn ack_hole_is_not_counted_again_when_finalized_without_a_cut() {
+        let mut s = hole_state();
+        let cc = crate::ship::CC;
+        for seq in [1, 2, 3] { data_receipt(&mut s, seq); }
+        observe_ack_hole(&mut s, 1_100_000_000, &cc, None);
+        data_receipt(&mut s, 4);
+        observe_ack_hole(&mut s, 1_110_000_000, &cc, None);
+        assert_eq!(s.loss_count_in_window, 1);
+        let sent = s.send_time(0);
+        assert!(!count_congestion_signal(&mut s, 0, sent, 1_140_000_000, &cc));
+        assert_eq!(s.loss_count_in_window, 1);
+        assert!(!s.cc_startup_done);
+        // A distinct timeout loss participates in the same cohort.
+        let sent = s.send_time(8);
+        assert!(count_congestion_signal(&mut s, 8, sent, 1_140_000_000, &cc));
+        apply_loss_congestion(&mut s, sent, 1_140_000_000, &cc, None);
+        assert!(s.cc_startup_done);
+        assert_eq!(s.loss_count_in_window, 0);
+    }
+
+    #[test]
+    fn ack_hole_cohort_expires_after_one_rtt() {
+        let mut s = hole_state();
+        let cc = crate::ship::CC;
+        for seq in [1, 2, 3] { data_receipt(&mut s, seq); }
+        observe_ack_hole(&mut s, 1_100_000_000, &cc, None);
+        data_receipt(&mut s, 4);
+        observe_ack_hole(&mut s, 1_110_000_000, &cc, None);
+        let sent = s.send_time(8);
+        assert!(!count_congestion_signal(&mut s, 8, sent, 1_220_000_000, &cc));
+        assert_eq!(s.loss_count_in_window, 1);
+        assert!(!s.cc_startup_done);
     }
 
     #[test]
