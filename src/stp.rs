@@ -4327,10 +4327,13 @@ mod fec_closed_loop_tests {
         b.start_fec(std::sync::Arc::new(vec![0u8; 1433 * 64]), 1433);
         let initial_n = b.fec_send_slot.as_ref().unwrap().n;
         for seq in 0..64 {
+            b.fec_prepare_packet(seq as u64);
             assert!(matches!(b.next_fragment(1449, 1449), Some(UnreliableFragment::Fec { block_id, .. }) if block_id == seq));
             b.fec_adaptive.as_mut().unwrap().on_data_sent(seq as u64);
         }
         b.fec_send_slot.as_mut().unwrap().lost = 20;
+        b.fec_send_slot.as_mut().unwrap().group_lost[0] = 20;
+        b.fec_prepare_packet(64);
         assert!(matches!(b.next_fragment(1449, 1449), Some(UnreliableFragment::Fec { block_id: 64, .. })));
         let f = b.fec_send_slot.as_ref().unwrap();
         assert!(f.n > initial_n && f.n >= 96 && f.n <= 128, "initial={initial_n} n={}", f.n);
