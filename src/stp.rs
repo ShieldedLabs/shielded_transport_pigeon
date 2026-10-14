@@ -1136,6 +1136,12 @@ pub struct SendQueues {
     packet_owner: Option<Box<[u8]>>,
     queues: Vec<UnreliableSendBuffer>,
     next_queue: usize,
+    // Equal-weight byte service, excluding packet padding. A dormant queue receives
+    // no accumulated credit; joining queues begin at the current service clock.
+    scheduled_bytes: Vec<u64>,
+    queue_active: Vec<bool>,
+    service_clock: u64,
+    fec_owner_tags: HashMap<u64, Vec<(u8, u64)>>,
     last_queue: usize,
     last_dscp: Dscp,
     fec_adaptive: Option<crate::fec_adapt::FecAdaptiveState>,
@@ -1155,7 +1161,7 @@ impl SendQueues {
             q.retention_quota = std::sync::Arc::new(RetentionQuota::new(count));
             q
         }).collect();
-        Self { packet_owner: None, queues, next_queue: 0, last_queue: 0, last_dscp: Dscp::BestEffort, fec_adaptive: None,
+        Self { scheduled_bytes: vec![0; count], queue_active: vec![false; count], service_clock: 0, fec_owner_tags: HashMap::new(), packet_owner: None, queues, next_queue: 0, last_queue: 0, last_dscp: Dscp::BestEffort, fec_adaptive: None,
             fec_packet_tags: None, fec_extra_packet_tags: HashMap::new(), next_packet_seq: 0, fec_record: None }
     }
     pub fn submit_messages(&mut self, queue: usize, messages: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
@@ -1182,6 +1188,7 @@ impl SendQueues {
         if let Some(owners) = &mut self.packet_owner { owners[(seq % PACKETS_WAITING_ACK_CAPACITY) as usize] = u8::MAX; }
         if let Some(tags) = &mut self.fec_packet_tags { tags[(seq % PACKETS_WAITING_ACK_CAPACITY) as usize] = 0; }
         self.fec_extra_packet_tags.remove(&(seq % PACKETS_WAITING_ACK_CAPACITY));
+        self.fec_owner_tags.remove(&(seq % PACKETS_WAITING_ACK_CAPACITY));
     }
     fn fec_on_packet_finalized(&mut self, seq: u64, lost: bool) {
         if seq > self.next_packet_seq || self.next_packet_seq - seq >= PACKETS_WAITING_ACK_CAPACITY { return; }
@@ -1192,10 +1199,31 @@ impl SendQueues {
         extra.push(tag);
         let Some(owners) = &mut self.packet_owner else { return; };
         let owner = std::mem::replace(&mut owners[index as usize], u8::MAX);
-        let Some(q) = self.queues.get_mut(owner as usize) else { return; };
-        q.fec_adaptive = self.fec_adaptive.take();
-        q.fec_finalize_tags(seq, lost, &extra);
-        self.fec_adaptive = q.fec_adaptive.take();
+        let mut by_owner = self.fec_owner_tags.remove(&index).unwrap_or_default();
+        by_owner.extend(extra.into_iter().map(|tag| (owner, tag)));
+        for (owner, tag) in by_owner {
+            let Some(q) = self.queues.get_mut(owner as usize) else { continue; };
+            q.fec_adaptive = self.fec_adaptive.take();
+            q.fec_finalize_tags(seq, lost, &[tag]);
+            self.fec_adaptive = q.fec_adaptive.take();
+        }
+    }
+    // The primary/extra tag ring belongs to one queue at a time. On a packing
+    // switch, preserve its tags WITH their owner rather than routing the whole
+    // physical packet to the final queue. Storage is bounded by the packet ring.
+    fn select_packet_owner(&mut self, owner: usize) {
+        let index = (self.next_packet_seq % PACKETS_WAITING_ACK_CAPACITY) as usize;
+        let owners = self.packet_owner.get_or_insert_with(|| vec![u8::MAX; PACKETS_WAITING_ACK_CAPACITY as usize].into_boxed_slice());
+        let old = owners[index];
+        if old == owner as u8 { return; }
+        owners[index] = owner as u8;
+        if let Some(tags) = &mut self.fec_packet_tags {
+            let tag = std::mem::take(&mut tags[index]);
+            if tag != 0 { self.fec_owner_tags.entry(index as u64).or_default().push((old, tag)); }
+        }
+        if let Some(tags) = self.fec_extra_packet_tags.remove(&(index as u64)) {
+            self.fec_owner_tags.entry(index as u64).or_default().extend(tags.into_iter().map(|tag| (old, tag)));
+        }
     }
     #[cfg(test)]
     fn bound_retention(&mut self) {
@@ -1205,32 +1233,61 @@ impl SendQueues {
         }
     }
     fn fill_packet(&mut self, payload: &mut [u8]) -> usize {
-        for step in 0..self.queues.len() {
-            let i = (self.next_queue + step) % self.queues.len();
-            if !self.queues[i].has_unsent_data() { continue; }
+        let count = self.queues.len();
+        // Normalize before counters can overflow (only comparisons matter).
+        if self.service_clock > 1u64 << 60 {
+            for bytes in &mut self.scheduled_bytes { *bytes = bytes.saturating_sub(self.service_clock); }
+            self.service_clock = 0;
+        }
+        for i in 0..count {
+            let active = self.queues[i].has_unsent_data();
+            if !self.queue_active[i] || !active { self.scheduled_bytes[i] = self.service_clock; }
+            self.queue_active[i] = active;
+        }
+        let mut blocked = 0u64;
+        let mut cursor = 0;
+        let mut class = None;
+        while cursor + STP_WHOLE_HEADER_SIZE <= payload.len() {
+            // Least served eligible queue wins; round-robin breaks equal byte ties.
+            // A full FEC symbol or a whole small message never splits to fill a tail.
+            let candidate = (0..count).map(|step| (self.next_queue + step) % count)
+                .filter(|&i| self.queue_active[i] && blocked & (1u64 << i) == 0)
+                .min_by_key(|&i| self.scheduled_bytes[i]);
+            let Some(i) = candidate else { break; };
+            self.select_packet_owner(i);
             let q = &mut self.queues[i];
             q.next_packet_seq = self.next_packet_seq;
+            q.packet_dscp = class;
             q.fec_adaptive = self.fec_adaptive.take();
             q.fec_packet_tags = self.fec_packet_tags.take();
             q.fec_extra_packet_tags = std::mem::take(&mut self.fec_extra_packet_tags);
             q.fec_record = self.fec_record.take();
-            let used = fill_packet_payload_with_unreliable_fragments(payload, q);
+            let used = q.next_fragment(payload.len(), payload.len() - cursor)
+                .map(|frag| write_fragment(&mut payload[cursor..], frag)).unwrap_or(0);
             self.fec_adaptive = q.fec_adaptive.take();
             self.fec_packet_tags = q.fec_packet_tags.take();
             self.fec_extra_packet_tags = std::mem::take(&mut q.fec_extra_packet_tags);
             self.fec_record = q.fec_record.take();
-            let dscp = q.packet_dscp.unwrap_or(Dscp::BestEffort);
-            if used > 0 {
-                self.last_dscp = dscp;
-                let owners = self.packet_owner.get_or_insert_with(|| vec![u8::MAX; PACKETS_WAITING_ACK_CAPACITY as usize].into_boxed_slice());
-                owners[(self.next_packet_seq % PACKETS_WAITING_ACK_CAPACITY) as usize] = i as u8;
-                self.last_queue = i;
-                self.next_queue = (i + 1) % self.queues.len();
-                return used;
+            if used == 0 {
+                // Different class, no fitting whole symbol, asynchronous encoder or
+                // package-ring pressure: try another FIFO without waiting to coalesce.
+                blocked |= 1u64 << i;
+                self.queue_active[i] = q.has_unsent_data();
+                continue;
             }
-            // Pending asynchronous encoder? It cannot hold up a ready magazine.
+            class = q.packet_dscp;
+            self.last_dscp = class.unwrap();
+            self.last_queue = i;
+            self.next_queue = (i + 1) % count;
+            self.scheduled_bytes[i] += used as u64;
+            cursor += used;
+            if let Some(clock) = (0..count).filter(|&i| self.queue_active[i]).map(|i| self.scheduled_bytes[i]).min() {
+                self.service_clock = self.service_clock.max(clock);
+            }
         }
-        0
+        if cursor == 0 { return 0; }
+        payload[cursor..].fill(0xff);
+        payload.len()
     }
 }
 
@@ -3016,24 +3073,6 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             // Authentication/replay admission precedes allocation, but positive receipt
                             // follows it. A memory-erased packet must look lost to the sender.
                             let mut memory_erased = false;
-
-                            // A legitimate data packet could never this state because to be all zeroes the
-                            // first fragment would have to be package_id=0 and frag_len=0. If so that is
-                            // either the only fragment and followed by u64::MAX terminator OR there would
-                            // be a second fragment with a package_id != 0.
-                            {
-                                let mut all_null = true;
-                                let mut i = 0;
-                                while all_null && i < payload.len() {
-                                    all_null &= payload[i] == 0;
-                                    i += 1;
-                                }
-                                if all_null {
-                                    state.ack_receiver.receive_with_rtt(nonce, timestamp_ns, ecn_marked, &mut state.ack_timer, state.stats.rtt_us, buf_len);
-                                    if OVERLY_VERBOSE { println!("Received keep alive from {connection_key:?}."); }
-                                    break 'conn;
-                                }
-                            }
 
                             // if OVERLY_VERBOSE { println!("Got data from {:?}  data: {:?}", existing_connection.other_transport_identity, payload); }
                             
@@ -5129,7 +5168,10 @@ mod send_queue_tests {
         assert_eq!(s.submit_messages(0, vec![vec![2; 1000]]).len(), 1);
         assert_eq!(packet(&mut s, 0).0, 0);
         assert!(s.submit_messages(7, vec![vec![3; 1000]]).is_empty());
-        assert_eq!(packet(&mut s, 1).0, 7);
+        let (_, mixed) = packet(&mut s, 1);
+        // The new FIFO goes first; the old queue can use its remaining tail.
+        assert_eq!(read_fragment_header(&mixed).unwrap().1, 4);
+        assert_eq!(&mixed[4..1004], &[3;1000]);
         assert_eq!(packet(&mut s, 2).0, 0);
         assert_eq!(s.submit_messages(8, vec![vec![4; 100]]).len(), 1);
     }
@@ -5170,10 +5212,10 @@ mod send_queue_tests {
         packet(&mut s, 3);
         let ordinal = s.queues[1].fec_send_slot.as_ref().unwrap().next_id;
         s.fec_on_packet_finalized(1, true);
-        assert_eq!(packet(&mut s, 4).0, 0);
-        assert_eq!(packet(&mut s, 5).0, 1);
+        assert_eq!(packet(&mut s, 4).0, 1);
+        assert_eq!(packet(&mut s, 5).0, 0);
         assert_eq!(s.queues[1].fec_send_slot.as_ref().unwrap().next_id, ordinal);
-        s.fec_on_packet_finalized(3, true);
+        s.fec_on_packet_finalized(2, true);
         assert_eq!(s.queues[1].fec_send_slot.as_ref().unwrap().lost, 1);
         s.fec_on_packet_finalized(0, true);
         assert_eq!(s.queues[0].fec_send_slot.as_ref().unwrap().lost, 1);
@@ -5604,5 +5646,79 @@ mod compact_frame_tests {
         let mut q = [0; 84];
         write_fragment(&mut q, UnreliableFragment::Plain { is_fin: true, package_id: u16::MAX, data: &[7;80], offset: 0 });
         assert_eq!((read_fragment_header(&q).unwrap().0 >> 2) & 0xffff, u16::MAX as u64);
+    }
+}
+
+#[cfg(test)]
+mod byte_fair_packing_tests {
+    use super::*;
+    fn frames(p: &[u8]) -> Vec<(u16, usize, Vec<u8>)> {
+        let mut out = Vec::new(); let mut cursor = 0;
+        while let Some((h, size)) = read_fragment_header(&p[cursor..]) {
+            let size = if h & 1 != 0 { 16 } else { size };
+            let len = ((h >> 18) & 0x3fff) as usize;
+            out.push((((h >> 2) & 0xffff) as u16, size, p[cursor+size..cursor+size+len].to_vec()));
+            cursor += size+len;
+        }
+        out
+    }
+    #[test]
+    fn unequal_whole_message_sizes_get_equal_byte_service_and_fifo() {
+        for n in [2, 3] {
+            let mut s = SendQueues::new(n, (1_000_000, 16<<20, 16<<20));
+            for q in 0..n {
+                let len = [80, 1000, 400][q];
+                s.submit_messages(q, (0..10000u32).map(|i| {
+                    let mut m = vec![q as u8; len]; m[..4].copy_from_slice(&i.to_le_bytes()); m
+                }).collect());
+            }
+            let mut bytes = vec![0usize; n]; let mut seen = vec![0u32; n];
+            for seq in 0..1000 {
+                s.fec_prepare_packet(seq); let mut p = [0;1162];
+                assert_eq!(s.fill_packet(&mut p), p.len());
+                for (_, header, data) in frames(&p) {
+                    let q = data[4] as usize;
+                    assert_eq!(u32::from_le_bytes(data[..4].try_into().unwrap()), seen[q]);
+                    seen[q] += 1; bytes[q] += header+data.len();
+                }
+            }
+            assert!(*bytes.iter().max().unwrap()-*bytes.iter().min().unwrap() <= 2*1162, "{bytes:?}");
+            assert_eq!(bytes.iter().map(|&b| b as u64).collect::<Vec<_>>(), s.scheduled_bytes);
+        }
+    }
+    #[test]
+    fn cross_queue_packing_keeps_every_sources_owner_and_rescue_feedback() {
+        let mut s = SendQueues::new(2, (1_000_000, 10000, 10000));
+        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0));
+        for q in 0..2 { s.submit_messages(q, vec![vec![q as u8;80];7]); }
+        let mut p = [0;1162]; s.fec_prepare_packet(0); s.fill_packet(&mut p);
+        let f = frames(&p); assert_eq!(f.len(),13);
+        assert!(f.iter().any(|f| f.2[0] == 0) && f.iter().any(|f| f.2[0] == 1));
+        for q in &mut s.queues { q.reclaim_finished_partial(); }
+        s.fec_on_packet_finalized(0,true);
+        for (package, _, data) in f {
+            let owner = data[0] as usize;
+            let slot = &s.queues[owner].fec_retained[&package].slot;
+            assert_eq!(slot.finalized_symbols,1); assert_eq!(slot.lost,1);
+            assert!(slot.next_id < slot.n);
+        }
+        s.bound_retention();
+        // Retry both queues in one packet and route successful feedback once per source.
+        s.fec_prepare_packet(1); s.fill_packet(&mut p); s.fec_on_packet_finalized(1,false);
+        assert!(s.queues.iter().all(|q| q.rescue_ready_count == 0));
+    }
+    #[test]
+    fn mtu_growth_tail_can_carry_another_queues_whole_messages_without_reencoding() {
+        let mut s = SendQueues::new(2, (1_000_000, 1<<20, 1<<20));
+        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC,0,0,0));
+        s.submit_messages(0,vec![vec![9;65536]]);
+        s.fec_prepare_packet(0); s.fill_packet(&mut [0;1162]);
+        assert_eq!(s.queues[0].fec_send_slot.as_ref().unwrap().block_bytes,1146);
+        s.submit_messages(1,vec![vec![7;80];3]);
+        let mut p = [0;1449]; s.fec_prepare_packet(1); s.fill_packet(&mut p);
+        let f = frames(&p);
+        assert!(f.iter().any(|f| f.1 == 16 && f.2.len()==1146));
+        assert_eq!(f.iter().filter(|f| f.1 == 4 && f.2.len()==80).count(),3);
+        assert_eq!(s.queues[0].fec_send_slot.as_ref().unwrap().block_bytes,1146);
     }
 }
