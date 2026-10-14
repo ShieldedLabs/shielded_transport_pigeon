@@ -604,6 +604,9 @@ fn send(a: &Args) {
     let unix_epoch_s = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
     let load_start = load_average();
     let epoch = Instant::now();
+    // CSV timestamps share the packet trace's native monotonic clock, not the
+    // benchmark-local Instant origin. Receiver timestamps use ping calibration.
+    let trace_epoch_ns = shielded_transport_pigeon::native_sockets::monotonic_clock_ns();
     let ns = || epoch.elapsed().as_nanos() as u64;
 
     println!("stp_bench send: {count} messages, {:.1} MB total, sizes {min}..{max} B log-uniform, seed {seed}", total_bytes as f64 / 1e6);
@@ -933,8 +936,8 @@ fn send(a: &Args) {
         let mut file = std::io::BufWriter::new(file);
         writeln!(file, "app_id,size,submit_ns,delivered,recv_ns,first_seq,last_seq").unwrap();
         for id in 0..count {
-            let submit = first_submit_ns[id as usize].map(|t| t.to_string()).unwrap_or_default();
-            let received = recs.get(&id).map(|&(_, t)| t.to_string()).unwrap_or_default();
+            let submit = first_submit_ns[id as usize].map(|t| trace_epoch_ns.saturating_add(t).to_string()).unwrap_or_default();
+            let received = recs.get(&id).map(|&(_, t)| ((trace_epoch_ns as f64 + to_sender(t)).max(0.0) as u64).to_string()).unwrap_or_default();
             let ok = recs.get(&id).is_some_and(|&(ok, _)| ok);
             let (first, last) = bounds[id as usize].map(|(a,b)| (a.to_string(),b.to_string())).unwrap_or_default();
             writeln!(file, "{id},{},{submit},{},{received},{first},{last}", sizes[id as usize], u8::from(ok)).unwrap();
