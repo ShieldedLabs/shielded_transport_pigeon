@@ -941,7 +941,9 @@ pub struct ConnectionStateConnected {
     loss_episodes: LossEpisodes,
     pub is_app_limited: bool,
     pub app_limit_time_offset: u64,
+    /// Sender feedback and receiver echo are independent directions.
     pub ecn_congestion_received: bool,
+    pub ecn_echo_pending: bool,
     pub ecn_oldest_send_time: u64,
     /// Per sequence number in [tail - CAPACITY, tail): declared lost and not yet acked since
     /// (spurious-loss detection). Same ring indexing as packets_waiting_ack_field.
@@ -995,6 +997,7 @@ pub fn new_connection_state_connected(cipher: Option<ConnectionCipherTriplet>, m
         is_app_limited: false,
         app_limit_time_offset: 0,
         ecn_congestion_received: false,
+        ecn_echo_pending: false,
         ecn_oldest_send_time: 0,
         declared_lost_field: Box::new([0; PACKETS_WAITING_ACK_WORDS]),
         rx_tracker: RxSeqTracker::default(),
@@ -2387,8 +2390,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
 
                                     if let Some(cipher) = &mut state.cipher { o += cipher.current.write_message(virtual_nonce, state.ack_field.as_bytes(), &mut packet_memory_send[o..]).unwrap(); }
                                     else { o += state.ack_field.as_bytes().write_to(&mut packet_memory_send[o..]); }
-                                    let ack_ecn = state.ecn_congestion_received;
-                                    state.ecn_congestion_received = false;
+                                    let ack_ecn = take_ecn_echo(state);
                                     if let Some(ns) = &existing_connection.nym_sock { nym_udp_send_with_congestion_and_dscp(ns, existing_connection.other_ip, existing_connection.other_port, &packet_memory_send[..o], Dscp::Af21, ack_ecn); }
                                     else { udp_send_with_congestion_and_dscp(socket, existing_connection.other_ip, existing_connection.other_port, &packet_memory_send[..o], Dscp::Af21, ack_ecn); }
                                     state.ack_timer = u64::MAX;
@@ -2410,7 +2412,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
 
                             let bit_index = nonce-state.ack_field.field_base;
                             state.ack_field.field[bit_index as usize / 64] |= 1u64 << (bit_index % 64);
-                            if ecn_marked { state.ecn_congestion_received = true; }
+                            if ecn_marked { state.ecn_echo_pending = true; }
                             if state.ack_timer == u64::MAX { state.ack_timer = timestamp_ns + ACK_BUFFER_TIME_NS; }
 
                             // A legitimate data packet could never this state because to be all zeroes the
@@ -2674,8 +2676,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 
                                 if let Some(cipher) = &mut state.cipher { o += cipher.current.write_message(virtual_nonce, state.ack_field.as_bytes(), &mut packet_memory_send[o..]).unwrap(); }
                                 else { o += state.ack_field.as_bytes().write_to(&mut packet_memory_send[o..]); }
-                                let ack_ecn = state.ecn_congestion_received;
-                                state.ecn_congestion_received = false;
+                                let ack_ecn = take_ecn_echo(state);
                                 if let Some(ns) = &connection_tracking_data.nym_sock { nym_udp_send_with_congestion_and_dscp(ns, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_send[..o], Dscp::Af21, ack_ecn); }
                                 else { udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_send[..o], Dscp::Af21, ack_ecn); }
                                 state.ack_timer = u64::MAX;
@@ -2773,8 +2774,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
 
 
                         // ECN congestion event: the receiver saw CE-marked packets and relayed it via the ack's IP header
-                        if state.ecn_congestion_received && state.ecn_oldest_send_time > state.congestion_event_time_ns + (state.RTT_mean as f64 * 100_000.0 * cc.event_guard_rtts) as u64 {
-                            state.ecn_congestion_received = false;
+                        if take_ecn_signal(state, cc.event_guard_rtts) {
                             let send_dt = state.ecn_oldest_send_time - state.congestion_event_time_ns;
                             let send_t_factor = send_dt as f64 / time_to_bandwidth_recovery as f64;
                             let (_, send_mode) = cc_rate(send_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery, state.cc_startup_done);
@@ -3283,6 +3283,16 @@ use crate::helpers::*;
 use crate::native_sockets::*;
 use crate::nym_sockets::*;
 
+fn take_ecn_echo(state: &mut ConnectionStateConnected) -> bool {
+    std::mem::take(&mut state.ecn_echo_pending)
+}
+
+fn take_ecn_signal(state: &mut ConnectionStateConnected, guard_rtts: f64) -> bool {
+    // Consume covered feedback too: it must not survive to a later ACK/epoch.
+    let pending = std::mem::take(&mut state.ecn_congestion_received);
+    pending && state.ecn_oldest_send_time > state.congestion_event_time_ns.saturating_add((state.RTT_mean as f64 * 100_000.0 * guard_rtts) as u64)
+}
+
 fn connection_rate(t_ns: u64, anchor_upps: u64, k_ns: u64, cc: &CongestionControlOptions, startup_done: bool) -> (u64, char) {
     if cc.startup_multiplier > 0.0 && !startup_done {
         let rtt_ns = k_ns / cc.recovery_rtts;
@@ -3348,6 +3358,28 @@ impl LossEpisodes {
 #[cfg(test)]
 mod congestion_tests {
     use super::*;
+
+    #[test]
+    fn ecn_echo_cannot_steal_sender_feedback_or_repeat_guarded_signals() {
+        let ConnectionState::Connected(mut state) = new_connection_state_connected(None, 0, 1, 1) else { unreachable!() };
+        state.RTT_mean = 2000;
+        state.congestion_event_time_ns = 1_000_000_000;
+        state.ecn_oldest_send_time = 1_200_000_000;
+        state.ecn_congestion_received = true;
+        state.ecn_echo_pending = true;
+        assert!(take_ecn_echo(&mut state));
+        assert!(!take_ecn_echo(&mut state));
+        assert!(take_ecn_signal(&mut state, 0.5));
+        assert!(!take_ecn_signal(&mut state, 0.5));
+        state.ecn_congestion_received = true;
+        state.ecn_oldest_send_time = 1_050_000_000;
+        assert!(!take_ecn_signal(&mut state, 0.5));
+        assert!(!state.ecn_congestion_received);
+        assert!(!take_ecn_echo(&mut state));
+        state.ecn_echo_pending = true;
+        assert!(!take_ecn_signal(&mut state, 0.5));
+        assert!(take_ecn_echo(&mut state));
+    }
 
     #[test]
     fn optional_startup_is_rate_based_and_exits_to_curve() {
