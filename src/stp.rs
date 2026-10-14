@@ -599,7 +599,7 @@ impl FecSendSlot {
         let layout = crate::fec::MessageLayout::new(self.message.len(), self.block_bytes).unwrap();
         let total = self.segment.map_or(self.message.len(), |s| s.total as usize);
         let groups = self.segment.map_or(layout.groups, |s| (s.total as usize).div_ceil(FEC_SEGMENT_BYTES));
-        (segment_source_horizon(total, self.block_bytes, self.plan_ks.as_ref()), groups, total > self.retain_limit)
+        (segment_source_horizon(total, self.block_bytes, self.plan_ks.as_ref()), groups, self.message.len() > self.retain_limit)
     }
 
     fn refresh_plan(&mut self, a: &crate::fec_adapt::FecAdaptiveState) {
@@ -1020,7 +1020,7 @@ impl UnreliableSendBuffer {
         let whole_k = segment_source_horizon(total, block_bytes, plan_ks.as_ref());
         let target_groups = segment.map_or(layout.groups, |s| (s.total as usize).div_ceil(FEC_SEGMENT_BYTES));
         let repairs = (0..layout.groups).map(|g| a.repair_blocks_for_group_at_tail(layout.group(g).1 as u64,
-            whole_k, target_groups, total > self.retention_quota.byte_limit)).max().unwrap_or(0);
+            whole_k, target_groups, message.len() > self.retention_quota.byte_limit)).max().unwrap_or(0);
         let (n, loss_estimate) = (k + repairs as u32 * layout.groups as u32, a.p);
         let n = layout.round_plan(n);
         let encoder = if k as usize <= FEC_INLINE_MAX_BLOCKS {
@@ -6274,6 +6274,35 @@ fn idle_join_and_clock_normalization_are_bounded() {
 mod lazy_fec_segment_tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn segment_tail_policy_matches_actual_retained_unit_not_root_length() {
+        let mut s = SendQueues::new(2, (1_000_000, 64<<20, 64<<20));
+        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0));
+        s.submit_messages(0, vec![vec![7; 50<<20]]);
+        let mut packet = vec![0; 1450];
+        s.fec_prepare_packet(0);
+        assert!(s.fill_packet(&mut packet) > 0);
+        let f = s.queues[0].fec_send_slot.as_ref().unwrap();
+        assert!(f.segment.unwrap().total as usize > f.retain_limit);
+        assert!(f.message.len() <= f.retain_limit);
+        let (whole_k, groups, burst_tail) = f.plan_context();
+        assert_eq!(groups, 25);
+        assert!(!burst_tail); // retain_fec retains this 2 MiB unit, not 50 MiB
+        let a = s.fec_adaptive.as_ref().unwrap();
+        let repairs = a.repair_blocks_for_group_at_tail(f.k as u64, whole_k, groups, false);
+        let unretainable_repairs = a.repair_blocks_for_group_at_tail(f.k as u64, whole_k, groups, true);
+        assert_ne!(repairs, unretainable_repairs);
+        assert_eq!(f.n_planned, f.k + repairs as u32);
+        let package = s.queues[0].send_package_id;
+        let q = &mut s.queues[0];
+        q.fec_send_slot.as_mut().unwrap().next_id = q.fec_send_slot.as_ref().unwrap().n;
+        q.reclaim_finished_partial();
+        let retained = &q.fec_retained[&package].slot;
+        assert_eq!(retained.message.len(), 2<<20);
+        assert!(retained.retention_lease.is_some());
+        assert!(!retained.plan_context().2);
+    }
 
     #[test]
     fn lazy_group_plans_use_their_own_k_after_tu_growth() {
