@@ -176,7 +176,8 @@ WirehairResult CreateDecoder(
     uint64_t messageBytes,
     uint32_t blockBytes,
     wirehair::WireProfile profile,
-    WirehairCodec* codecOut)
+    WirehairCodec* codecOut,
+    uint64_t memoryLimit = UINT64_MAX)
 {
     if (!codecOut) {
         return Wirehair_InvalidInput;
@@ -210,6 +211,7 @@ WirehairResult CreateDecoder(
         }
     }
 
+    codec->SetMemoryLimit(memoryLimit);
     codec->SetWireProfile(profile);
     const WirehairResult result =
         codec->InitializeDecoder(messageBytes, blockBytes);
@@ -432,6 +434,16 @@ WIREHAIR_EXPORT WirehairCodec wirehair_decoder_create(
     (void)CreateDecoder(
         reuseOpt, messageBytes, blockBytes,
         wirehair::WireProfile::LegacyCurrent, &codec);
+    return codec;
+}
+
+// STP-local bounded constructor. Every arena regrow remains under this limit.
+WIREHAIR_EXPORT WirehairCodec wirehair_decoder_create_limited(
+    uint64_t messageBytes, uint32_t blockBytes, uint64_t memoryLimit)
+{
+    WirehairCodec codec = nullptr;
+    (void)CreateDecoder(nullptr, messageBytes, blockBytes,
+        wirehair::WireProfile::LegacyCurrent, &codec, memoryLimit);
     return codec;
 }
 

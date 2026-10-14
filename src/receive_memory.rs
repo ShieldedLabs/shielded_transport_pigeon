@@ -21,7 +21,7 @@ impl ReceiveMemoryBudget {
     }
 }
 impl Default for ReceiveMemoryBudget {
-    fn default() -> Self { Self { limit: 3 << 30, used: AtomicUsize::new(0), peak: AtomicUsize::new(0) } }
+    fn default() -> Self { Self { limit: 4 << 30, used: AtomicUsize::new(0), peak: AtomicUsize::new(0) } }
 }
 #[derive(Debug)]
 pub(crate) struct Reservation { budget: Arc<ReceiveMemoryBudget>, bytes: usize }
