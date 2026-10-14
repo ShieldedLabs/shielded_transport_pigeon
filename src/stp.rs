@@ -939,6 +939,7 @@ pub struct ConnectionStateConnected {
     pub loss_window_start_ns: u64,
     pub loss_count_in_window: u64,
     loss_episodes: LossEpisodes,
+    loss_response: LossResponseWindow,
     pub is_app_limited: bool,
     pub app_limit_time_offset: u64,
     /// Sender feedback and receiver echo are independent directions.
@@ -994,6 +995,7 @@ pub fn new_connection_state_connected(cipher: Option<ConnectionCipherTriplet>, m
         loss_window_start_ns: 0,
         loss_count_in_window: 0,
         loss_episodes: LossEpisodes::default(),
+        loss_response: LossResponseWindow::default(),
         is_app_limited: false,
         app_limit_time_offset: 0,
         ecn_congestion_received: false,
@@ -1660,6 +1662,10 @@ pub struct CongestionControlOptions {
     /// Also require this fraction of a commanded-rate RTT's packets to be lost.
     /// Zero preserves the two-loss legacy detector; nonzero can tolerate radio noise.
     pub loss_fraction_ppm: u32,
+    /// Opt-in completed send-time RTT cohort loss fraction. Below this fraction
+    /// do not cut; at/above it use the normal beta cut. Uses actual packet counts,
+    /// not delivery-rate estimation. Zero retains the legacy episode detector.
+    pub loss_response_fraction_ppm: u32,
     /// Age-based declaration, not sequence gaps: additional reorder/jitter tolerance.
     pub loss_timeout_rtts: f64,
     pub event_guard_rtts: f64,
@@ -1693,7 +1699,7 @@ impl CongestionControlOptions {
     pub const fn legacy() -> Self {
         Self { beta: CUBIC_BETA, recovery_rtts: CUBIC_K_RTT_MULTIPLIER,
             rate_rp: RATE_RP, rate_pg: RATE_PG, rate_gs: RATE_GS, time_pg: TIME_PG, time_gs: TIME_GS,
-            loss_threshold: 2, loss_fraction_ppm: 0, loss_timeout_rtts: 2.0, event_guard_rtts: 0.5, ecn_event_guard_rtts: 0.0, rate_floor_upps: RATE_FLOOR_UPPS, initial_rate_upps: RATE_FLOOR_UPPS,
+            loss_threshold: 2, loss_fraction_ppm: 0, loss_response_fraction_ppm: 0, loss_timeout_rtts: 2.0, event_guard_rtts: 0.5, ecn_event_guard_rtts: 0.0, rate_floor_upps: RATE_FLOOR_UPPS, initial_rate_upps: RATE_FLOOR_UPPS,
             min_growth_uppsps: CUBIC_MIN_GROWTH_UPPSPS, max_growth_uppsps: CUBIC_MAX_RATE_UPPS_PER_SEC,
             friendly_growth_alpha: 0.0, relative_growth_per_rtt: 0.0, bound_recovery_growth: false, compound_growth: false, proportional_growth: false, record_loss_episodes: false, startup_multiplier: 0.0 }
     }
@@ -1713,7 +1719,7 @@ impl CongestionControlOptions {
         if !(1..=10000).contains(&self.loss_threshold) { return Err("CC loss threshold must be in 1..=10000"); }
         if !(self.rate_floor_upps > 0 && self.initial_rate_upps >= self.rate_floor_upps && self.initial_rate_upps <= 1_000_000_000_000 && self.min_growth_uppsps >= 0.0 && self.min_growth_uppsps.is_finite() && self.max_growth_uppsps > self.min_growth_uppsps && self.max_growth_uppsps <= 1e15) { return Err("invalid CC floor, initial rate or growth limits"); }
         if !(0.0..=100.0).contains(&self.friendly_growth_alpha) || !(0.0..=10.0).contains(&self.relative_growth_per_rtt) { return Err("invalid CC RTT-scaled growth envelope"); }
-        if self.loss_fraction_ppm > 500_000 || !(2.0..=10.0).contains(&self.loss_timeout_rtts) { return Err("invalid CC loss episode/reorder tolerance"); }
+        if self.loss_fraction_ppm > 500_000 || self.loss_response_fraction_ppm > 500_000 || !(2.0..=10.0).contains(&self.loss_timeout_rtts) { return Err("invalid CC loss episode/reorder tolerance"); }
         if self.proportional_growth && !(self.bound_recovery_growth && self.compound_growth && self.relative_growth_per_rtt > 0.0) { return Err("CC proportional growth requires bounded compound relative growth"); }
         if self.startup_multiplier != 0.0 && !(1.01..=2.0).contains(&self.startup_multiplier) { return Err("CC startup multiplier must be zero or 1.01..=2"); }
         Ok(())
@@ -2836,30 +2842,10 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                         let rate = local_rate_limit(cc_rate(send_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery, state.cc_startup_done).0.max(cc.rate_floor_upps), max_pps);
                                         congestion_loss_threshold(rate, rtt_ns, &cc)
                                     };
-                                    let trigger = count_congestion_loss(&mut state.loss_count_in_window, eligible, threshold);
+                                    let trigger = cc.loss_response_fraction_ppm == 0 && count_congestion_loss(&mut state.loss_count_in_window, eligible, threshold);
 
                                     if trigger {
-                                        let send_dt = send_time - state.congestion_event_time_ns;
-                                        let send_t_factor = send_dt as f64 / time_to_bandwidth_recovery as f64;
-                                        let (_, send_mode) = cc_rate(send_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery, state.cc_startup_done);
-                                        let now_dt = current_time_now_ns - state.congestion_event_time_ns;
-                                        let now_t_factor = now_dt as f64 / time_to_bandwidth_recovery as f64;
-                                        let (_, now_mode) = cc_rate(now_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery, state.cc_startup_done);
-                                        // R: use rate at send time.
-                                        // P/G/S: blend 50% toward R/P boundary rate.
-                                        let mut discovered = cc_rate(send_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery, state.cc_startup_done).0;
-                                        if send_mode == 'I' {
-                                            discovered = cc_rate(send_dt.saturating_sub(rtt_ns), state.congestion_event_rate_upps, time_to_bandwidth_recovery, false).0;
-                                        } else if send_mode != 'R' {
-                                            let boundary = (state.congestion_event_rate_upps as f64 * cc.rate_rp) as u64;
-                                            discovered = (discovered + boundary) / 2;
-                                        }
-                                        state.congestion_event_rate_upps = local_rate_limit(discovered, max_pps);
-                                        state.congestion_event_time_ns = current_time_now_ns;
-                                        state.app_limit_time_offset = 0;
-                                        state.loss_count_in_window = 0;
-                                        state.cc_startup_done = true;
-                                        println!("congestion event PACKET DROPPED {} ...  rate discovered: {} pps  now:{now_mode}@{now_t_factor:.2} sent:{send_mode}@{send_t_factor:.2}", state.packets_waiting_ack_tail, state.congestion_event_rate_upps as f64 / 1000000.0);
+                                        apply_loss_congestion(state, send_time, current_time_now_ns, &cc, max_pps);
                                     }
                                     assert!(state.packets_in_flight > 0, "packets_in_flight underflow");
                                     state.packets_in_flight -= 1;
@@ -2867,6 +2853,17 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     state.stats.packets_lost += 1;
                                     state.declared_lost_field[(bit_index / 64) as usize] |= 1u64 << (bit_index % 64);
                                     connection_tracking_data.unreliable_send_buffer.fec_on_packet_lost(state.packets_waiting_ack_tail);
+                                }
+                            }
+                            if cc.loss_response_fraction_ppm > 0 {
+                                let sent_ns = get_send_time_for_sequence_number(state.packets_waiting_ack_tail, &state.send_time_band, state.send_time_band_head_index);
+                                let rtt_ns = state.RTT_mean as u64 * 100_000;
+                                let eligible = sent_ns != u64::MAX && sent_ns > state.congestion_event_time_ns.saturating_add((rtt_ns as f64 * cc.event_guard_rtts) as u64);
+                                if eligible {
+                                    let lost = state.declared_lost_field[(bit_index / 64) as usize] & (1u64 << (bit_index % 64)) != 0;
+                                    if let Some(loss_ns) = state.loss_response.on_packet(sent_ns, lost, rtt_ns, cc.loss_response_fraction_ppm, cc.loss_threshold) {
+                                        apply_loss_congestion(state, loss_ns, current_time_now_ns, &cc, max_pps);
+                                    }
                                 }
                             }
                             if cc.record_loss_episodes {
@@ -3293,7 +3290,7 @@ fn take_ecn_signal(state: &mut ConnectionStateConnected, guard_rtts: f64) -> boo
     // Consume covered feedback too: it must not survive to a later ACK/epoch.
     let pending = std::mem::take(&mut state.ecn_congestion_received);
     let eligible = pending && state.ecn_oldest_send_time > state.congestion_event_time_ns.saturating_add((state.RTT_mean as f64 * 100_000.0 * guard_rtts) as u64);
-    if eligible { state.loss_count_in_window = 0; }
+    if eligible { state.loss_count_in_window = 0; state.loss_response = LossResponseWindow::default(); }
     eligible
 }
 
@@ -3320,10 +3317,58 @@ fn congestion_loss_threshold(rate_upps: u64, rtt_ns: u64, cc: &CongestionControl
     cc.loss_threshold.max(fraction.min(u64::MAX as u128) as u64)
 }
 
+fn apply_loss_congestion(state: &mut ConnectionStateConnected, send_time: u64, current_time_now_ns: u64, cc: &CongestionControlOptions, max_pps: Option<u64>) {
+    let rtt_ns = state.RTT_mean as u64 * 100_000;
+    let time_to_bandwidth_recovery = cc.recovery_rtts * rtt_ns;
+    let send_dt = send_time - state.congestion_event_time_ns;
+    let send_t_factor = send_dt as f64 / time_to_bandwidth_recovery as f64;
+    let (_, send_mode) = connection_rate(send_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery, cc, state.cc_startup_done);
+    let now_dt = current_time_now_ns - state.congestion_event_time_ns;
+    let now_t_factor = now_dt as f64 / time_to_bandwidth_recovery as f64;
+    let (_, now_mode) = connection_rate(now_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery, cc, state.cc_startup_done);
+    // R: use rate at send time.
+    // P/G/S: blend 50% toward R/P boundary rate.
+    let mut discovered = connection_rate(send_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery, cc, state.cc_startup_done).0;
+    if send_mode == 'I' {
+        discovered = connection_rate(send_dt.saturating_sub(rtt_ns), state.congestion_event_rate_upps, time_to_bandwidth_recovery, cc, false).0;
+    } else if send_mode != 'R' {
+        let boundary = (state.congestion_event_rate_upps as f64 * cc.rate_rp) as u64;
+        discovered = (discovered + boundary) / 2;
+    }
+    state.congestion_event_rate_upps = local_rate_limit(discovered, max_pps);
+    state.congestion_event_time_ns = current_time_now_ns;
+    state.app_limit_time_offset = 0;
+    state.loss_count_in_window = 0;
+    state.cc_startup_done = true;
+    println!("congestion event PACKET DROPPED {} ...  rate discovered: {} pps  now:{now_mode}@{now_t_factor:.2} sent:{send_mode}@{send_t_factor:.2}", state.packets_waiting_ack_tail, state.congestion_event_rate_upps as f64 / 1000000.0);
+    state.loss_response = LossResponseWindow::default();
+}
+
 fn count_congestion_loss(count: &mut u64, eligible: bool, threshold: u64) -> bool {
     if !eligible { return false; }
     *count = count.saturating_add(1);
     *count >= threshold
+}
+
+/// Constant-memory send-time cohort, evaluated only when a full RTT has retired.
+/// Counting ACKed and lost packets is a loss fraction, never an ACK-rate estimate.
+#[derive(Debug, Default)]
+struct LossResponseWindow { start_ns: u64, width_ns: u64, packets: u64, lost: u64, last_loss_ns: u64 }
+impl LossResponseWindow {
+    fn on_packet(&mut self, sent_ns: u64, lost: bool, rtt_ns: u64, fraction_ppm: u32, min_losses: u64) -> Option<u64> {
+        let mut signal = None;
+        if self.packets > 0 && sent_ns.saturating_sub(self.start_ns) >= self.width_ns {
+            if self.lost >= min_losses && self.lost as u128 * 1_000_000 >= self.packets as u128 * fraction_ppm as u128 {
+                signal = Some(self.last_loss_ns);
+            }
+            *self = Self::default();
+        }
+        if self.packets == 0 { self.start_ns = sent_ns; self.width_ns = rtt_ns.max(100_000); }
+        self.packets += 1;
+        self.lost += u64::from(lost);
+        if lost { self.last_loss_ns = sent_ns; }
+        signal
+    }
 }
 
 #[derive(Debug, Default)]
@@ -3362,6 +3407,22 @@ impl LossEpisodes {
 #[cfg(test)]
 mod congestion_tests {
     use super::*;
+
+    #[test]
+    fn actual_loss_fraction_uses_completed_send_cohort() {
+        assert_eq!(std::mem::size_of::<LossResponseWindow>(), 40);
+        let mut window = LossResponseWindow::default();
+        // Two scattered losses out of 100: no cut at 3%, including before closure.
+        for i in 0..100 { assert_eq!(window.on_packet(1 + i * 1_000_000, i == 10 || i == 80, 100_000_000, 30_000, 2), None); }
+        assert_eq!(window.on_packet(100_000_001, false, 100_000_000, 30_000, 2), None);
+        // A six-packet cluster out of 100 crosses the threshold at cohort closure.
+        for i in 1..100 { assert_eq!(window.on_packet(100_000_001 + i * 1_000_000, (20..26).contains(&i), 100_000_000, 30_000, 2), None); }
+        assert_eq!(window.on_packet(200_000_001, false, 100_000_000, 30_000, 2), Some(125_000_001));
+        // One loss in a tiny cohort still respects min_losses.
+        let mut tiny = LossResponseWindow::default();
+        assert_eq!(tiny.on_packet(1, true, 100_000_000, 30_000, 2), None);
+        assert_eq!(tiny.on_packet(100_000_001, false, 100_000_000, 30_000, 2), None);
+    }
 
     #[test]
     fn ecn_echo_cannot_steal_sender_feedback_or_repeat_guarded_signals() {

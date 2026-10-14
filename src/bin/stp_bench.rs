@@ -160,6 +160,9 @@ fn cc_options(a: &Args) -> CongestionControlOptions {
     let loss_fraction_pct = a.num::<f64>("cc-loss-fraction-pct", cc.loss_fraction_ppm as f64 / 10_000.0);
     if !(0.0..=50.0).contains(&loss_fraction_pct) { die("invalid --cc-loss-fraction-pct"); }
     cc.loss_fraction_ppm = (loss_fraction_pct * 10_000.0).round() as u32;
+    let response_pct = a.num::<f64>("cc-loss-response-pct", cc.loss_response_fraction_ppm as f64 / 10_000.0);
+    if !(0.0..=50.0).contains(&response_pct) { die("invalid --cc-loss-response-pct"); }
+    cc.loss_response_fraction_ppm = (response_pct * 10_000.0).round() as u32;
     cc.loss_timeout_rtts = a.num("cc-loss-timeout-rtts", cc.loss_timeout_rtts);
     cc.event_guard_rtts = a.num("cc-guard-rtts", cc.event_guard_rtts);
     cc.ecn_event_guard_rtts = a.num("cc-ecn-guard-rtts", cc.ecn_event_guard_rtts);
