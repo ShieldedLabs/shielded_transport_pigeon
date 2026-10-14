@@ -614,8 +614,14 @@ impl CurvePacer {
             return false;
         }
         let count = (sequence - self.base_sequence) as f64 - self.count_offset;
+        // Waiting for the next whole packet is not execution debt. At low
+        // rates that wait can exceed many cadence periods (e.g. 10ms at 100pps).
+        // Only discard credit when the first unexecuted packet is overdue.
+        let Some(next_ns) = self.schedule.inverse((count + 1.0).max(0.0)) else {
+            return false;
+        };
         let completed_ns = self.origin_ns + self.schedule.inverse(count.max(0.0)).unwrap_or(0);
-        if now.saturating_sub(completed_ns) <= tolerance_ns {
+        if now.saturating_sub(self.origin_ns + next_ns) <= tolerance_ns {
             return false;
         }
         self.stop = Some(StopPoint {
@@ -855,6 +861,38 @@ mod tests {
         assert_eq!(s.inverse(3.0), Some(2_500_000_000));
         assert_eq!(s.rate(1_500_000_000), 0.0);
     }
+    #[test]
+    fn low_rates_earn_slots_across_ticks_and_idle_resume() {
+        for cadence in [1_000_000, 2_000_000, 5_000_000, 10_000_000] {
+            for pps in [1.0, 10.0, 100.0] {
+                let mut p = CurvePacer::new(0, 0);
+                let schedule = |_| PacketSchedule::constant(pps, CONTROLLER_HORIZON_NS).unwrap();
+                let key = (1, 1, 1, false);
+                let mut sequence = 0;
+                p.begin(0, sequence, true, key, schedule);
+                p.finish(0, sequence, None);
+                for now in (cadence..=2_000_000_000).step_by(cadence as usize) {
+                    assert!(!p.stop_if_late(now, sequence, cadence * 2), "{pps}pps/{cadence}ns");
+                    sequence += p.begin(now, sequence, true, key, schedule);
+                    p.finish(now, sequence, None);
+                }
+                assert!(sequence.abs_diff((pps * 2.0) as u64) <= 1, "{pps}pps sent {sequence}");
+                p.finish(2_000_000_000, sequence, Some(StopReason::QueueEmpty));
+                assert_eq!(p.begin(5_000_000_000, sequence, false, key, schedule), 0);
+                p.finish(5_000_000_000, sequence, Some(StopReason::QueueEmpty));
+                assert_eq!(p.begin(5_000_000_000, sequence, true, key, schedule), 0);
+                p.finish(5_000_000_000, sequence, None);
+                let start_sequence = sequence;
+                for now in (5_000_000_000 + cadence..=7_000_000_000).step_by(cadence as usize) {
+                    assert!(!p.stop_if_late(now, sequence, cadence * 2));
+                    sequence += p.begin(now, sequence, true, key, schedule);
+                    p.finish(now, sequence, None);
+                }
+                assert!((sequence - start_sequence).abs_diff((pps * 2.0) as u64) <= 1);
+            }
+        }
+    }
+
     #[test]
     fn cpu_debt_stops_at_completed_count_and_resumes_at_now() {
         let mut p = CurvePacer::new(0, 0);

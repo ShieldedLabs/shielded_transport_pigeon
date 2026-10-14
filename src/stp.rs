@@ -4151,6 +4151,44 @@ mod polynomial_pacing_tests {
     use super::*;
 
     #[test]
+    fn low_rate_polynomial_handshake_and_idle_then_burst() {
+        for (cadence_ms, pps) in [(2, 100), (5, 100), (2, 10)] {
+            let port = std::net::UdpSocket::bind("[::1]:0").unwrap().local_addr().unwrap().port();
+            let server_key = new_keypair_from_connect_magic1(CONNECT_MAGIC1_PLAIN_TEXT).unwrap();
+            let address = STPAddress { ip: Ipv6Addr::LOCALHOST, port, magic1: CONNECT_MAGIC1_PLAIN_TEXT, key: server_key.public.clone() };
+            let key = address.to_connection_key();
+            let opts = || NetworkThreadOptions {
+                pacing: PacingOptions::Polynomial { cadence_ms },
+                congestion_control: CongestionControlOptions { initial_rate_upps: pps * 1_000_000, rate_floor_upps: pps * 1_000_000, ..CongestionControlOptions::legacy() },
+                ..Default::default()
+            };
+            let server = new_network_thread_with_options(vec![server_key], port, None, (1_000_000,1<<20,1<<20), opts());
+            let client = new_network_thread_with_options(vec![new_keypair_from_connect_magic1(CONNECT_MAGIC1_PLAIN_TEXT).unwrap()], 0, None, (1_000_000,1<<20,1<<20), opts());
+            service_connections(&client, NetworkThreadPush { initiate_connections: vec![address], ..Default::default() }).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut wanted = Vec::new();
+            loop {
+                service_connections(&server, NetworkThreadPush::default()).unwrap();
+                let p = service_connections(&client, NetworkThreadPush::default()).unwrap();
+                if !p.current_connections.is_empty() { wanted = p.current_connections; }
+                if p.connection_stats.iter().any(|(_, s)| s.packets_sent > 0 && s.rtt_us > 0) { break; }
+                assert!(std::time::Instant::now() < deadline, "{pps}pps/poly{cadence_ms} idle handshake stalled");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            service_connections(&client, NetworkThreadPush { wanted_connections: wanted.clone(), send_unreliable: vec![(key, vec![42; 1000]); 3], ..Default::default() }).unwrap();
+            let mut received = 0;
+            while received < 3 {
+                let p = service_connections(&server, NetworkThreadPush::default()).unwrap();
+                for (_, message) in p.received_unreliable_messages { assert_eq!(message, vec![42; 1000]); received += 1; }
+                service_connections(&client, NetworkThreadPush { wanted_connections: wanted.clone(), ..Default::default() }).unwrap();
+                assert!(std::time::Instant::now() < deadline, "{pps}pps/poly{cadence_ms} burst stalled");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
+
+    #[test]
     fn idle_polynomial_peer_sends_control_without_application_data() {
         let port = std::net::UdpSocket::bind("[::1]:0").unwrap().local_addr().unwrap().port();
         let server_key = new_keypair_from_connect_magic1(CONNECT_MAGIC1_PLAIN_TEXT).unwrap();
