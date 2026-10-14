@@ -425,11 +425,16 @@ impl PackageAllocator {
     fn store(&self, id: u16, order: std::sync::atomic::Ordering) { self.next.store(id, order); }
     fn allocate(self: &std::sync::Arc<Self>) -> Option<std::sync::Arc<PackageLease>> {
         let mut live = self.live.lock().unwrap();
-        for _ in 0..1024 {
-            let id = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let next = self.next.load(std::sync::atomic::Ordering::Relaxed);
+        for offset in 0..1024u16 {
+            let id = next.wrapping_add(offset);
             let index = id as usize % 1024;
             if live[index] == 0 {
                 live[index] = 1;
+                // Failed probes must not burn an entire ID generation. Ring pressure
+                // can retry thousands of times within one RTT; advancing on failure
+                // makes new IDs look older under the receiver's 16-bit half-range rule.
+                self.next.store(id.wrapping_add(1), std::sync::atomic::Ordering::Relaxed);
                 return Some(std::sync::Arc::new(PackageLease { allocator: self.clone(), id }));
             }
         }
@@ -933,13 +938,10 @@ impl UnreliableSendBuffer {
     fn start_message(&mut self, msg: Vec<u8>, payload_len: usize) -> bool {
         self.package_lease = None;
         if let Some(ids) = self.package_allocator.clone() {
-            let lease = loop {
-                if let Some(lease) = ids.allocate() { break Some(lease); }
-                // Ring pressure is a bounded-rescue eviction, never eviction of another
-                // magazine's live original. Releasing our oldest retained lease makes room.
-                if self.pop_oldest_retained().is_none() { break None; }
-            };
-            let Some(lease) = lease else {
+            // Receiver ring pressure is backpressure, not permission to discard a
+            // retained package before its loss feedback arrives. Ready rescue can
+            // still run; ACK finalization or bounded expiry releases a ring position.
+            let Some(lease) = ids.allocate() else {
                 self.message_queue.push_front((self.current_dscp, msg));
                 return false;
             };
@@ -5047,5 +5049,48 @@ mod sender_lifetime_tests {
         assert_eq!(s.queues[1].fec_retained[&q1_id].slot.finalized_symbols, 0);
         s.fec_on_packet_finalized(0, true);
         assert!(s.queues[1].has_unsent_data());
+    }
+}
+
+#[cfg(test)]
+mod package_pressure_tests {
+    use super::*;
+    #[test]
+    fn failed_ring_probes_do_not_burn_package_generations() {
+        let allocator = std::sync::Arc::new(PackageAllocator::new());
+        let mut leases: Vec<_> = (0..1024).map(|_| allocator.allocate().unwrap()).collect();
+        let next = allocator.load(std::sync::atomic::Ordering::Relaxed);
+        for _ in 0..128 { assert!(allocator.allocate().is_none()); }
+        assert_eq!(allocator.load(std::sync::atomic::Ordering::Relaxed), next);
+        let old = leases.remove(0).id;
+        let fresh = allocator.allocate().unwrap();
+        assert_eq!(fresh.id % 1024, old % 1024);
+        assert!((fresh.id.wrapping_sub(old) as i16) > 0);
+        assert_eq!(fresh.id, 1024);
+    }
+}
+
+#[cfg(test)]
+mod ring_pressure_rescue_tests {
+    use super::*;
+    #[test]
+    fn ring_pressure_preserves_retained_sources_until_feedback() {
+        let mut s = SendQueues::new(1, (1_000_000, 2<<20, 2<<20));
+        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0));
+        s.submit_messages(0, (0..1025).map(|_| vec![1; 1000]).collect());
+        for seq in 0..1024 {
+            s.fec_prepare_packet(seq);
+            assert!(s.fill_packet(&mut [0; 1449]) > 0);
+        }
+        assert_eq!(s.queues[0].fec_retained.len(), 1024);
+        s.fec_prepare_packet(1024);
+        assert_eq!(s.fill_packet(&mut [0; 1449]), 0);
+        assert_eq!(s.queues[0].fec_retained.len(), 1024);
+        s.fec_on_packet_finalized(0, true);
+        s.fec_prepare_packet(1024);
+        assert!(s.fill_packet(&mut [0; 1449]) > 0); // resend without allocating an ID
+        s.fec_on_packet_finalized(1024, false);
+        s.fec_prepare_packet(1025);
+        assert!(s.fill_packet(&mut [0; 1449]) > 0); // the deferred original now has a lease
     }
 }

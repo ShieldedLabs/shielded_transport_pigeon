@@ -964,6 +964,7 @@ fn send_magazines(a: &Args) {
     println!("{delivered}/{} delivered, total goodput {gp:.3} Mbit/s", sizes.len());
     let mut json = json;
     json.insert_str(json.len()-2, &format!(",\"packets_sent\":{},\"packets_lost\":{},\"spurious_losses\":{},\"receiver_rx_lost\":{},\"receiver_rx_reordered\":{},\"receiver_rx_late_beyond_window\":{},\"cc_rate_pps\":{:.3}", stats.packets_sent, stats.packets_lost, stats.spurious_losses, receiver.st.rx_lost, receiver.st.rx_reordered, receiver.st.rx_late_beyond_window, stats.cc_rate_upps as f64/1e6));
+    json.insert_str(json.len()-2, &format!(",\"receiver_stale_fragments\":{},\"receiver_partials_evicted\":{},\"receiver_insert_failures\":{}", receiver.st.rx_stale_fragments, receiver.st.rx_partial_evicted, receiver.st.rx_insert_failures));
     std::fs::write(a.str("out").unwrap_or("stp_bench_report.json"), json).unwrap();
     drop(handle);
     if delivered != sizes.len() { std::process::exit(1); }
