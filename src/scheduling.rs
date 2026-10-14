@@ -231,9 +231,14 @@ pub(crate) fn shift(c: &[f64], offset: f64) -> Vec<f64> {
     out
 }
 
-/// Convert the existing pps controller to cumulative pieces, splitting at phase,
-/// linear-cap and floor crossings. Coefficients are local (seconds, packets), not
-/// absolute counters, so nonce precision does not depend on the age of a connection.
+/// Convert the configured controller to cumulative pieces. Polynomial branches
+/// remain exact; all their cap/envelope/floor crossings are isolated with roots().
+/// The compound envelope uses degree-six Taylor rate pieces (degree-seven counts).
+/// Its Lagrange remainder is <= min(0.001 * rate_floor, 0.1 / horizon_seconds)
+/// pps everywhere. Taking min/max preserves that uniform error bound, so its
+/// integral error is <= 0.1 packet over the entire horizon, not per segment.
+/// Integer upps truncation adds <= 1e-6 pps; crossing times round to nanoseconds.
+/// Refuse a schedule exceeding 128 pieces rather than silently relaxing accuracy.
 pub fn controller_schedule(
     t_ns: u64,
     r_upps: u64,
@@ -241,13 +246,28 @@ pub fn controller_schedule(
     cc: &crate::stp::CongestionControlOptions,
     horizon_ns: u64,
 ) -> Result<PacketSchedule, CurveError> {
+    if horizon_ns == 0 || t_ns.checked_add(horizon_ns).is_none() {
+        return Err(CurveError::InvalidDuration);
+    }
     if k_ns == 0 {
         return PacketSchedule::constant(r_upps.max(cc.rate_floor_upps) as f64 / 1e6, horizon_ns);
     }
     let k = k_ns as f64 / 1e9;
     let r = r_upps as f64 / 1e6;
-    let growth = cc.min_growth_uppsps / 1e6;
-    let cap_slope = cc.max_growth_uppsps / 1e6;
+    let rtt = k / cc.recovery_rtts as f64;
+    let growth = if cc.friendly_growth_alpha > 0.0 {
+        (cc.min_growth_uppsps / 1e6)
+            .max(cc.friendly_growth_alpha / rtt.powi(2))
+            .min(cc.max_growth_uppsps / 1e6)
+    } else {
+        cc.min_growth_uppsps / 1e6
+    };
+    let cap_slope = if cc.relative_growth_per_rtt > 0.0 && !cc.compound_growth {
+        (cc.max_growth_uppsps / 1e6).min(r * cc.relative_growth_per_rtt / rtt)
+    } else {
+        cc.max_growth_uppsps / 1e6
+    };
+    let floor = cc.rate_floor_upps as f64 / 1e6;
     let p_start = k;
     let g_start = cc.time_pg * k;
     let s_start = cc.time_gs * k;
@@ -256,92 +276,169 @@ pub fn controller_schedule(
     let a = (r * (cc.rate_gs - cc.rate_pg) - p_slope * g_span) / g_span.powi(2);
     let start = t_ns as f64 / 1e9;
     let end = start + horizon_ns as f64 / 1e9;
+    let lambda = cc.relative_growth_per_rtt / rtt;
+    let anchor = r * cc.beta;
+    // exp(lambda*t) meets the absolute linear envelope at zero and at most
+    // one positive time (convexity). After that crossing exp can be discarded,
+    // which also avoids overflow at long connection ages / very small RTTs.
+    let exp_end = if cc.bound_recovery_growth
+        && cc.compound_growth
+        && lambda > 0.0
+        && anchor > 0.0
+        && anchor * lambda < cap_slope
+    {
+        let ratio = cap_slope / (anchor * lambda);
+        let mut hi: f64 = 1.0;
+        while hi.exp_m1() / hi < ratio {
+            hi *= 2.0;
+        }
+        let mut lo = 0.0;
+        for _ in 0..64 {
+            let mid = (lo + hi) * 0.5;
+            if mid.exp_m1() / mid < ratio {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        (lo + hi) * 0.5 / lambda
+    } else {
+        0.0
+    };
     let mut phases = vec![start];
     phases.extend(
-        [p_start, g_start, s_start]
+        [p_start, g_start, s_start, exp_end]
             .into_iter()
             .filter(|t| *t > start && *t < end),
     );
     phases.push(end);
+    phases.sort_by(|a, b| a.total_cmp(b));
+    phases.dedup();
+    let tolerance = (floor * 0.001).min(0.1 / (horizon_ns as f64 / 1e9));
     let mut pieces = Vec::new();
     let mut emitted_ns = 0;
     for w in phases.windows(2) {
-        let t = w[0];
-        let (origin, mut rate, cap) = if t < p_start {
-            let drop = r * (cc.rate_rp - cc.beta);
-            (
-                0.0,
-                vec![r * cc.beta, 2.0 * drop / k + growth, -drop / k.powi(2)],
-                None,
-            )
-        } else if t < g_start {
-            (
-                p_start,
-                vec![r * cc.rate_rp + growth * p_start, p_slope + growth],
-                Some(vec![
-                    r * cc.rate_rp + growth * t + cap_slope * (t - p_start),
-                    cap_slope + growth,
-                ]),
-            )
-        } else if t < s_start {
-            (
-                g_start,
-                vec![r * cc.rate_pg + growth * g_start, p_slope + growth, a],
-                Some(vec![
-                    r + growth * t + cap_slope * (t - p_start),
-                    cap_slope + growth,
-                ]),
-            )
-        } else {
-            let mut v = vec![0.0; 11];
-            v[0] = r * cc.rate_gs + growth * s_start;
-            v[1] = p_slope + 2.0 * a * g_span + growth;
-            v[10] = r * (1.0 - cc.beta) * 10.0 / (3.0 * k).powi(10);
-            (
-                s_start,
-                v,
-                Some(vec![
-                    r + growth * t + cap_slope * (t - p_start),
-                    cap_slope + growth,
-                ]),
-            )
-        };
-        rate = shift(&rate, t - origin);
-        let duration = w[1] - t;
-        let floor = cc.rate_floor_upps as f64 / 1e6;
-        let mut boundaries = vec![0.0, duration];
-        let mut floor_diff = rate.clone();
-        floor_diff[0] -= floor;
-        boundaries.extend(roots(&floor_diff, 0.0, duration));
-        if let Some(cap) = &cap {
-            let mut diff = rate.clone();
-            for (i, c) in cap.iter().enumerate() {
-                diff[i] -= c;
-            }
-            boundaries.extend(roots(&diff, 0.0, duration));
-            let mut diff = cap.clone();
-            diff[0] -= floor;
-            boundaries.extend(roots(&diff, 0.0, duration));
-        }
-        boundaries.sort_by(|a, b| a.total_cmp(b));
-        boundaries.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
-        for b in boundaries.windows(2) {
-            let midpoint = (b[0] + b[1]) * 0.5;
-            let capped = cap
-                .as_ref()
-                .is_some_and(|c| eval(c, midpoint) < eval(&rate, midpoint));
-            let selected = if capped { cap.as_ref().unwrap() } else { &rate };
-            let local = if eval(selected, midpoint) < floor {
-                vec![floor]
+        let mut t = w[0];
+        while t < w[1] {
+            let exponential = t < exp_end;
+            let amplitude = if exponential {
+                anchor * (lambda * t).exp()
             } else {
-                shift(selected, b[0])
+                0.0
             };
-            // Round absolute boundaries once: rounded durations still sum to horizon exactly.
-            let stop_ns = (((t - start + b[1]) * 1e9).round() as u64).min(horizon_ns);
-            if stop_ns > emitted_ns {
-                pieces.push(PacketPolynomial::from_rate(&local, stop_ns - emitted_ns)?);
-                emitted_ns = stop_ns;
+            let mut duration = w[1] - t;
+            if exponential {
+                duration = duration.min(0.5 / lambda);
+                // Positive Taylor coefficients: the seventh-order Lagrange
+                // remainder bounds every point of this whole interval.
+                while amplitude * (lambda * duration).exp() * (lambda * duration).powi(7) / 5040.0
+                    > tolerance
+                {
+                    duration *= 0.5;
+                }
             }
+            let stop = (t + duration).min(w[1]);
+            if stop <= t {
+                return Err(CurveError::InvalidDuration);
+            }
+            let (origin, rate, cap) = if t < p_start {
+                let drop = r * (cc.rate_rp - cc.beta);
+                (
+                    0.0,
+                    vec![anchor, 2.0 * drop / k + growth, -drop / k.powi(2)],
+                    None,
+                )
+            } else if t < g_start {
+                (
+                    p_start,
+                    vec![r * cc.rate_rp + growth * p_start, p_slope + growth],
+                    Some(vec![
+                        r * cc.rate_rp + growth * t + cap_slope * (t - p_start),
+                        cap_slope + growth,
+                    ]),
+                )
+            } else if t < s_start {
+                (
+                    g_start,
+                    vec![r * cc.rate_pg + growth * g_start, p_slope + growth, a],
+                    Some(vec![
+                        r + growth * t + cap_slope * (t - p_start),
+                        cap_slope + growth,
+                    ]),
+                )
+            } else {
+                let mut v = vec![0.0; 11];
+                v[0] = r * cc.rate_gs + growth * s_start;
+                v[1] = p_slope + 2.0 * a * g_span + growth;
+                v[10] = r * (1.0 - cc.beta) * 10.0 / (3.0 * k).powi(10);
+                (
+                    s_start,
+                    v,
+                    Some(vec![
+                        r + growth * t + cap_slope * (t - p_start),
+                        cap_slope + growth,
+                    ]),
+                )
+            };
+            let mut candidates = vec![shift(&rate, t - origin)];
+            if let Some(cap) = cap {
+                candidates.push(cap);
+            }
+            if cc.bound_recovery_growth {
+                candidates.push(vec![anchor + (growth + cap_slope) * t, growth + cap_slope]);
+                if exponential {
+                    let mut exp = vec![amplitude];
+                    for i in 1..=6 {
+                        exp.push(exp[i - 1] * lambda / i as f64);
+                    }
+                    exp[0] += growth * t;
+                    exp[1] += growth;
+                    candidates.push(exp);
+                }
+            }
+            let mut boundaries = vec![0.0, stop - t];
+            // Include every pairwise crossing, including floor crossings. This
+            // handles multiple switches within a phase, not just endpoint signs.
+            for (i, left) in candidates.iter().enumerate() {
+                for right in candidates
+                    .iter()
+                    .skip(i + 1)
+                    .chain(std::iter::once(&vec![floor]))
+                {
+                    let mut diff = vec![0.0; left.len().max(right.len())];
+                    for (j, c) in left.iter().enumerate() {
+                        diff[j] += c;
+                    }
+                    for (j, c) in right.iter().enumerate() {
+                        diff[j] -= c;
+                    }
+                    boundaries.extend(roots(&diff, 0.0, stop - t));
+                }
+            }
+            boundaries.sort_by(|a, b| a.total_cmp(b));
+            boundaries.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
+            for b in boundaries.windows(2) {
+                let midpoint = (b[0] + b[1]) * 0.5;
+                let selected = candidates
+                    .iter()
+                    .min_by(|a, b| eval(a, midpoint).total_cmp(&eval(b, midpoint)))
+                    .unwrap();
+                let stop_ns = (((t - start + b[1]) * 1e9).round() as u64).min(horizon_ns);
+                if stop_ns > emitted_ns {
+                    // Shift to the rounded origin, not the ideal crossing.
+                    let local = if eval(selected, midpoint) < floor {
+                        vec![floor]
+                    } else {
+                        shift(selected, emitted_ns as f64 / 1e9 - (t - start))
+                    };
+                    pieces.push(PacketPolynomial::from_rate(&local, stop_ns - emitted_ns)?);
+                    if pieces.len() > 128 {
+                        return Err(CurveError::InvalidDegree);
+                    }
+                    emitted_ns = stop_ns;
+                }
+            }
+            t = stop;
         }
     }
     PacketSchedule::new(pieces)
@@ -679,12 +776,11 @@ mod tests {
         p.finish(110_000_000, 20, None);
         assert_eq!(p.history.lookup(13), None);
         assert_eq!(p.history.lookup(14), Some(101_666_667));
-        assert!(
-            p.history
-                .records()
-                .iter()
-                .any(|r| r.stop.is_some() && r.start_ns == 6_666_667 && r.end_ns == 100_000_000)
-        );
+        assert!(p
+            .history
+            .records()
+            .iter()
+            .any(|r| r.stop.is_some() && r.start_ns == 6_666_667 && r.end_ns == 100_000_000));
     }
     #[test]
     fn history_bounds_time_and_high_absolute_counters() {
@@ -788,14 +884,13 @@ mod tests {
         p.finish(22_500_000, 4, None);
         assert_eq!(p.history.lookup(2), Some(21_000_000));
         assert_eq!(p.error_max_ns, 1_000_000);
-        assert!(
-            p.history
-                .records()
-                .iter()
-                .any(|r| r.stop == Some(StopReason::CpuLate)
-                    && r.start_ns == 2_000_000
-                    && r.end_ns == 20_000_000)
-        );
+        assert!(p
+            .history
+            .records()
+            .iter()
+            .any(|r| r.stop == Some(StopReason::CpuLate)
+                && r.start_ns == 2_000_000
+                && r.end_ns == 20_000_000));
         // A partial CPU-budgeted execution truncates the curve too.
         assert_eq!(p.begin(24_000_000, 4, true, key, schedule), 2);
         p.finish(26_000_000, 5, Some(StopReason::CpuLate));
@@ -803,36 +898,220 @@ mod tests {
         assert_eq!(p.history.lookup(4), Some(23_000_000));
         assert_eq!(p.begin(26_000_000, 5, true, key, schedule), 0);
     }
+    fn controller_profiles() -> Vec<(&'static str, crate::stp::CongestionControlOptions)> {
+        use crate::stp::CongestionControlOptions as CC;
+        let cap500 = CC {
+            max_growth_uppsps: 500_000_000.0,
+            min_growth_uppsps: 25_000_000.0,
+            initial_rate_upps: 1_000_000_000,
+            ..CC::legacy()
+        };
+        let compound = CC {
+            relative_growth_per_rtt: 0.02,
+            bound_recovery_growth: true,
+            compound_growth: true,
+            ..cap500
+        };
+        vec![
+            ("legacy", CC::legacy()),
+            ("balanced", CC::balanced()),
+            (
+                "floor800",
+                CC {
+                    rate_floor_upps: 800_000_000,
+                    ..cap500
+                },
+            ),
+            ("cap500", cap500),
+            ("compound02", compound),
+            (
+                "relative02",
+                CC {
+                    compound_growth: false,
+                    ..compound
+                },
+            ),
+            (
+                "friendly",
+                CC {
+                    friendly_growth_alpha: 0.5,
+                    ..cap500
+                },
+            ),
+            (
+                "friendly-compound",
+                CC {
+                    friendly_growth_alpha: 0.5,
+                    ..compound
+                },
+            ),
+            // Wide cap keeps exp selected while lambda*h is large enough to
+            // exercise Taylor refinement, rather than an almost-linear exp.
+            (
+                "compound-wide",
+                CC {
+                    max_growth_uppsps: 50_000_000_000.0,
+                    ..compound
+                },
+            ),
+            // Exposes the uncapped tenth-order S polynomial as well as L.
+            (
+                "uncapped-S",
+                CC {
+                    max_growth_uppsps: 1e15,
+                    ..CC::legacy()
+                },
+            ),
+        ]
+    }
+
+    /// Simpson integration on a grid independent of the fitted polynomial.
+    /// Split at phase and schedule boundaries to avoid integrating across the
+    /// controller's possible P->G cap discontinuity. Check every partial count,
+    /// not just the final integral (errors cannot cancel unseen).
+    fn check_controller(
+        cc: &crate::stp::CongestionControlOptions,
+        r: u64,
+        k: u64,
+        t: u64,
+    ) -> (f64, f64, usize) {
+        let horizon = CONTROLLER_HORIZON_NS;
+        let s = controller_schedule(t, r, k, cc, horizon).unwrap();
+        assert_eq!(s.duration_ns(), horizon);
+        let oracle = |dt| {
+            crate::stp::cubic_rate_with_options(t + dt, r, k, cc)
+                .0
+                .max(cc.rate_floor_upps) as f64
+                / 1e6
+        };
+        let mut boundaries = vec![0, horizon];
+        let mut elapsed = 0;
+        for p in s.pieces() {
+            elapsed += p.duration_ns();
+            boundaries.push(elapsed);
+        }
+        for phase in [k as f64, k as f64 * cc.time_pg, k as f64 * cc.time_gs] {
+            let phase = phase.round() as u64;
+            if phase > t && phase - t < horizon {
+                boundaries.push(phase - t);
+            }
+        }
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        let mut integrated = 0.0;
+        let mut previous = 0.0;
+        let mut max_rate_error: f64 = 0.0;
+        let mut max_count_error: f64 = 0.0;
+        for w in boundaries.windows(2) {
+            for i in 0..512u64 {
+                let a = w[0] + (w[1] - w[0]) * i / 512;
+                let b = w[0] + (w[1] - w[0]) * (i + 1) / 512;
+                if b == a {
+                    continue;
+                }
+                let m = a + (b - a) / 2;
+                // Extrapolate one-sided endpoints to avoid a phase's value at
+                // equality contaminating its successor. Odd ns widths need a
+                // half-ns midpoint; otherwise the oracle quadrature itself can
+                // err by packets on the very steep, uncapped S polynomial.
+                let mid_rate = if (b - a) % 2 == 0 {
+                    oracle(m)
+                } else {
+                    (oracle(m) + oracle(m + 1)) * 0.5
+                };
+                let left = 2.0 * oracle(a + 1) - oracle(a + 2);
+                let right = 2.0 * oracle(b - 1) - oracle(b.saturating_sub(2));
+                integrated += (left + 4.0 * mid_rate + right) * (b - a) as f64 / 6e9;
+                for dt in [a + 1, m, b - 1] {
+                    let expected = oracle(dt);
+                    let error = (s.rate(dt) - expected).abs() / expected;
+                    max_rate_error = max_rate_error.max(error);
+                    assert!(
+                        error <= 0.005 + 1e-6 / expected,
+                        "rate: t={t} dt={dt} k={k} r={r} got={} expected={expected} cc={cc:?}",
+                        s.rate(dt)
+                    );
+                }
+                let count = s.count(b);
+                assert!(count >= previous, "nonmonotone cumulative count");
+                previous = count;
+                let error = (count - integrated).abs();
+                max_count_error = max_count_error.max(error);
+                assert!(error < 1.0,
+                    "integral: t={t} dt={b} k={k} r={r} got={count} expected={integrated} cc={cc:?}");
+            }
+        }
+        (max_rate_error, max_count_error, s.pieces().len())
+    }
+
     #[test]
     fn controller_derivative_matches_pps_across_phases_caps_floor() {
-        for cc in [
-            crate::stp::CongestionControlOptions::legacy(),
-            crate::stp::CongestionControlOptions::balanced(),
-            crate::stp::CongestionControlOptions {
-                rate_floor_upps: 800_000_000,
-                initial_rate_upps: 1_000_000_000,
-                ..crate::stp::CongestionControlOptions::legacy()
-            },
-        ] {
+        for (name, cc) in controller_profiles() {
+            let mut rate: f64 = 0.0;
+            let mut count: f64 = 0.0;
+            let mut pieces = 0;
             for k in [1_000_000, 30_000_000, 1_800_000_000] {
                 for t in [0, k / 2, k, k * 2, k * 5, k * 15, k * 20, k * 30] {
-                    let s = controller_schedule(t, 1_000_000_000, k, &cc, CONTROLLER_HORIZON_NS)
-                        .unwrap();
-                    assert_eq!(s.duration_ns(), CONTROLLER_HORIZON_NS);
-                    for dt in (1..CONTROLLER_HORIZON_NS).step_by(997_001) {
-                        let expected =
-                            crate::stp::cubic_rate_with_options(t + dt, 1_000_000_000, k, &cc)
-                                .0
-                                .max(cc.rate_floor_upps) as f64
-                                / 1e6;
-                        assert!(
-                            (s.rate(dt) - expected).abs() < expected * 1e-6 + 0.01,
-                            "t={t} dt={dt} k={k} got={} expected={expected}",
-                            s.rate(dt)
-                        );
+                    let errors = check_controller(&cc, 1_000_000_000, k, t);
+                    rate = rate.max(errors.0);
+                    count = count.max(errors.1);
+                    pieces = pieces.max(errors.2);
+                }
+            }
+            eprintln!("{name}: max_rate_relative={rate:.9} max_integral_packets={count:.9} max_pieces={pieces}");
+        }
+    }
+
+    #[test]
+    fn controller_option_combinations_and_zero_k() {
+        use crate::stp::CongestionControlOptions as CC;
+        for mask in 0..16 {
+            let cc = CC {
+                friendly_growth_alpha: if mask & 1 != 0 { 0.25 } else { 0.0 },
+                relative_growth_per_rtt: if mask & 2 != 0 { 0.02 } else { 0.0 },
+                bound_recovery_growth: mask & 4 != 0,
+                compound_growth: mask & 8 != 0,
+                recovery_rtts: 7,
+                max_growth_uppsps: 500_000_000.0,
+                min_growth_uppsps: 25_000_000.0,
+                ..CC::balanced()
+            };
+            assert!(cc.validate().is_ok());
+            for r in [10_000_000, 50_000_000_000] {
+                for k in [1_000_000, 1_800_000_000] {
+                    for t in [0, k, k * 6, k * 10, 10_000_000_000_000] {
+                        check_controller(&cc, r, k, t);
                     }
                 }
             }
+            check_controller(&cc, 1_000_000_000, 0, 0);
+        }
+        assert!(matches!(
+            controller_schedule(0, 1, 1, &CC::legacy(), 0),
+            Err(CurveError::InvalidDuration)
+        ));
+        assert!(matches!(
+            controller_schedule(u64::MAX, 1, 1, &CC::legacy(), 1),
+            Err(CurveError::InvalidDuration)
+        ));
+    }
+
+    #[test]
+    fn controller_schedule_cost() {
+        for (name, cc) in controller_profiles() {
+            let iterations = 2000;
+            let start = std::time::Instant::now();
+            for i in 0..iterations {
+                let t = (i % 8) * 30_000_000;
+                std::hint::black_box(
+                    controller_schedule(t, 1_000_000_000, 30_000_000, &cc, CONTROLLER_HORIZON_NS)
+                        .unwrap(),
+                );
+            }
+            eprintln!(
+                "{name}: {} ns/controller_schedule (2000 calls, k=30ms)",
+                start.elapsed().as_nanos() / iterations as u128
+            );
         }
     }
 }
