@@ -691,6 +691,9 @@ pub const FEC_INLINE_MAX_BLOCKS: usize = 256;
 // a peer ACKing every packet; drain until empty, but do not let a flood starve sends.
 const MAX_RECV_PACKETS_PER_TICK: usize = 64;
 const MAX_SEND_PACKETS_PER_TICK: u64 = 64;
+// One million pps, matching the existing startup ceiling. Bound long-lived cubic
+// probing too; this is an arithmetic safety limit, not a congestion signal.
+const MAX_CC_RATE_UPPS: u64 = 1_000_000_000_000;
 // Retain at most 2 ms of quantum-limited catch-up credit. Old scheduling delays
 // must not become an ever-growing burst that stops ACK service and inflates RTT.
 const MAX_SEND_CATCHUP_NS: u64 = 2_000_000;
@@ -698,7 +701,17 @@ const MAX_SEND_CATCHUP_NS: u64 = 2_000_000;
 #[derive(Debug)]
 struct SendPacingGrant { packets: u64, carry_ns: u64 }
 
+/// Preserve multiply-then-divide precision without overflowing the intermediate.
+fn rate_mul_div(rate: u64, multiplier: u64, divisor: u64) -> u64 {
+    (rate as u128 * multiplier as u128 / divisor as u128).min(u64::MAX as u128) as u64
+}
+
+fn send_interval_ns(rate_upps: u64) -> u64 {
+    (1_000_000_000_000_000 / rate_upps.max(1)).max(1)
+}
+
 fn send_pacing_grant(elapsed_ns: u64, interval_ns: u64, credit_ns: u64) -> SendPacingGrant {
+    let interval_ns = interval_ns.max(1);
     let budget = elapsed_ns.saturating_add(credit_ns);
     let due = budget / interval_ns;
     let packets = due.min(MAX_SEND_PACKETS_PER_TICK);
@@ -2173,7 +2186,7 @@ pub struct ReassemblySlot {
     pub package_id: u16,
     completed: bool,
     segment_parts: Option<Vec<(u32, Vec<u8>)>>,
-    last_segment_ns: u64,
+    last_segment_ns: u64, // Last accepted plain fragment or segment symbol.
 }
 
 impl ReassemblySlot {
@@ -2202,13 +2215,13 @@ impl ReassemblySlot {
         vec
     }
 
-    /// Reserve before any allocation, including a sparse fragment's high-water offset.
-    /// Geometric growth is explicit so Vec cannot silently exceed the admitted capacity.
+    /// Plain messages never need the lazy-FEC segment path. Bound their high-water
+    /// allocation and reserve only the arrived extent (not a claimed larger total).
     fn admit(&mut self, offset: usize, len: usize, budget: &std::sync::Arc<crate::receive_memory::ReceiveMemoryBudget>) -> bool {
         if self.completed { return true; }
         if self.segment_parts.is_some() { return false; }
-        let Some(end) = offset.checked_add(len).filter(|&n| n <= MAX_JUMBOGRAM_LEN) else { return false; };
-        let buf_cap = if end > self.buf.capacity() { end.max(self.buf.capacity().saturating_mul(2)).max(8) } else { self.buf.capacity() };
+        let Some(end) = offset.checked_add(len).filter(|&n| n <= FEC_SEGMENT_BYTES) else { return false; };
+        let buf_cap = end.max(self.buf.capacity());
         let range_cap = if self.received.len() == self.received.capacity() { (self.received.capacity() * 2).max(4) } else { self.received.capacity() };
         let Some(bytes) = range_cap.checked_mul(8).and_then(|r| buf_cap.checked_add(r)?.checked_add(256)) else { return false; };
         match &mut self.reservation {
@@ -2290,8 +2303,9 @@ impl ReassemblySlot {
     pub fn insert(&mut self, offset: usize, data: &[u8], is_fin: bool) -> (bool, bool) {
         if self.completed { return (true, false); } // fresh-nonce K=1 rescue must not redeliver
 
+        let Some(end) = offset.checked_add(data.len()).filter(|&n| n <= FEC_SEGMENT_BYTES) else { return (false, false); };
         let start = offset as u32;
-        let end = (offset + data.len()) as u32;
+        let end = end as u32;
 
         // If this is the final fragment, derive total_len from offset + data.len()
         if is_fin {
@@ -2311,7 +2325,7 @@ impl ReassemblySlot {
             if let Some(tl) = self.total_len {
                 if start > tl { return (false, false); }
             }
-            let complete = self.total_len.is_some_and(|tl| self.received.len() == 1 && self.received[0] == (0, tl));
+            let complete = self.total_len.is_some_and(|tl| tl == 0 || (self.received.len() == 1 && self.received[0] == (0, tl)));
             return (true, complete);
         }
 
@@ -2420,10 +2434,10 @@ fn fec_inactive_grace_ns(rtt: u16, pressure: bool) -> u64 {
     }
 }
 
-/// Incomplete roots follow symbol inactivity, not connection keepalive ACKs.
+/// Incomplete plain messages and roots follow fragment inactivity, not keepalive ACKs.
 fn retire_inactive_segment_roots(slots: &mut [ReassemblySlot], now_ns: u64, grace_ns: u64) {
     for slot in slots {
-        if slot.segment_parts.is_some() && now_ns.saturating_sub(slot.last_segment_ns) > grace_ns {
+        if !slot.completed && slot.reservation.is_some() && now_ns.saturating_sub(slot.last_segment_ns) > grace_ns {
             *slot = ReassemblySlot::new();
         }
     }
@@ -3529,6 +3543,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     (success, complete) = existing_connection.unreliable_reassembly[slot_idx].insert(frag_offset as usize, frag_data, is_fin);
                                     assert!(success);
                                 }
+                                existing_connection.unreliable_reassembly[slot_idx].last_segment_ns = timestamp_ns;
                                 if complete {
                                     state.stats.rx_messages_completed += 1;
                                     let reservation = existing_connection.unreliable_reassembly[slot_idx].reservation.take();
@@ -3905,13 +3920,13 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                         }
                         // pps * 10^-6 * rtt * 10^-4 = p * 10^10
                         // BDP + sawtooth: pipe is full (BDP) plus ack batching excess (ack_pace_estimate is in 0.1ms units)
-                        let bdp = allowed_bandwidth_upps * state.RTT_mean as u64 / 10_000;
-                        let sawtooth = allowed_bandwidth_upps * state.ack_pace_estimate as u64 / 10_000;
-                        let allowed_packets_in_flight = ((bdp + sawtooth) / 1_000_000).max(1);
+                        let bdp = rate_mul_div(allowed_bandwidth_upps, state.RTT_mean as u64, 10_000);
+                        let sawtooth = rate_mul_div(allowed_bandwidth_upps, state.ack_pace_estimate as u64, 10_000);
+                        let allowed_packets_in_flight = (bdp.saturating_add(sawtooth) / 1_000_000).max(1);
 
                         // 1 / (upps * 10^-6) = 10^6 / upps <- seconds
                         // ns = (10^6 / upps) * 10^9 = 10^15 / upps
-                        let time_between_sends_ns = 1_000_000_000_000_000 / allowed_bandwidth_upps.max(1);
+                        let time_between_sends_ns = send_interval_ns(allowed_bandwidth_upps);
                         // This is some Unity Game developer level crap approximation but it will have to do.
                         let elapsed_ns = current_time_now_ns + 1 - state.last_sent_could_have_sent_data_packet.max(state.last_ack_received_time.saturating_sub(ACK_BUFFER_TIME_NS));
                         let grant = send_pacing_grant(elapsed_ns, time_between_sends_ns, state.send_pacer_acc_ns);
@@ -3985,7 +4000,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             state.packet_since_last_print += 1;
                         }
 
-                        connection_tracking_data.unreliable_send_buffer.set_rate(payload_size as u64 * allowed_bandwidth_upps / 1000_000);
+                        connection_tracking_data.unreliable_send_buffer.set_rate(rate_mul_div(allowed_bandwidth_upps, payload_size as u64, 1_000_000));
                         {
                             let buf = &mut connection_tracking_data.unreliable_send_buffer;
                             let (lost, spurious) = fec_learning_counters(state);
@@ -4109,7 +4124,7 @@ fn cubic_rate(t_ns: u64, r_max: u64, k_ns: u64) -> (u64, char) {
 
 /// Internal evaluation with the fixed policy (no application tuning API).
 pub(crate) fn cubic_rate_with_options(t_ns: u64, r_max: u64, k_ns: u64, cc: &CongestionPolicy) -> (u64, char) {
-    if k_ns == 0 { return (r_max, 'R'); }
+    if k_ns == 0 { return (r_max.min(MAX_CC_RATE_UPPS), 'R'); }
     let t = t_ns as f64;
     let r = r_max as f64;
     let k = k_ns as f64;
@@ -4122,7 +4137,7 @@ pub(crate) fn cubic_rate_with_options(t_ns: u64, r_max: u64, k_ns: u64, cc: &Con
     let finish = |rate: u64, mode| {
         let absolute = r * cc.beta + (floor + ceiling) / 1e9 * t;
         let relative = r * cc.beta * (cc.relative_growth_per_rtt * t / (rtt_seconds * 1e9)).exp() + min_growth;
-        (rate.min(relative.min(absolute) as u64), mode)
+        (rate.min(relative.min(absolute) as u64).min(MAX_CC_RATE_UPPS), mode)
     };
 
     // R: p^2 recovery from r*BETA up to r*cc.rate_rp
@@ -4448,7 +4463,7 @@ fn connection_rate(t_ns: u64, anchor_upps: u64, k_ns: u64, cc: &CongestionPolicy
         let rtt_ns = k_ns / cc.recovery_rtts;
         // The sentinel RTT means no sample yet: never ramp on an unknown path.
         let exponent = if rtt_ns == u16::MAX as u64 * 100_000 { 0.0 } else { cc.startup_multiplier.ln() * t_ns as f64 / rtt_ns.max(100_000) as f64 };
-        ((anchor_upps as f64 * exponent.min(30.0).exp()).min(1e12) as u64, 'I')
+        ((anchor_upps as f64 * exponent.min(30.0).exp()).min(MAX_CC_RATE_UPPS as f64) as u64, 'I')
     } else { cubic_rate_with_options(t_ns, anchor_upps, k_ns, cc) }
 }
 
@@ -4584,7 +4599,7 @@ impl LossTimer {
 }
 
 fn local_rate_limit(rate: u64, max_pps: Option<u64>) -> u64 {
-    max_pps.map_or(rate, |limit| rate.min(limit.saturating_mul(1_000_000).max(1)))
+    max_pps.map_or(rate, |limit| rate.min(limit.saturating_mul(1_000_000).max(1))).min(MAX_CC_RATE_UPPS)
 }
 
 fn apply_loss_congestion(state: &mut ConnectionStateConnected, send_time: u64, current_time_now_ns: u64, cc: &CongestionPolicy, max_pps: Option<u64>) {
@@ -6460,11 +6475,12 @@ mod uniform_udp_capture_tests {
         messages.push((key,0,Dscp::BestEffort,vec![7;4<<20]));
         messages.extend(vec![(key,1,Dscp::BestEffort,vec![1;80]);20]);
         messages.extend(vec![(key,1,Dscp::BestEffort,vec![2;1000]);10]);
+        messages.push((key,1,Dscp::BestEffort,vec![]));
         service_connections(&client, NetworkThreadPush { wanted_connections: cw.clone(), send_unreliable: messages, ..Default::default() }).unwrap();
         let growth_time = Instant::now() + Duration::from_millis(200);
         while Instant::now() < growth_time { poll(&mut cw,&mut sw,&mut received); std::thread::sleep(Duration::from_millis(1)); }
         mtu.store(1472,Ordering::Release);
-        while received.len() < 33 {
+        while received.len() < 34 {
             poll(&mut cw,&mut sw,&mut received);
             assert!(Instant::now() < deadline, "mixed messages failed delivery: {}",received.len());
             std::thread::sleep(Duration::from_millis(1));
@@ -6473,6 +6489,7 @@ mod uniform_udp_capture_tests {
         assert_eq!(received.iter().filter(|m| m.len()==1000 && m.iter().all(|&b| b==2)).count(),10);
         assert_eq!(received.iter().filter(|m| m.len()==65536 && m.iter().all(|&b| b==3)).count(),2);
         assert_eq!(received.iter().filter(|m| m.len()==4<<20 && m.iter().all(|&b| b==7)).count(),1);
+        assert_eq!(received.iter().filter(|m| m.is_empty()).count(),1);
         // Timing/CPU load can drain the mixed train before a held MTU probe retries.
         // Explicitly wait for authenticated TU growth, then send a whole message so
         // the size-transition assertion does not depend on thread scheduling.
@@ -6518,7 +6535,7 @@ mod uniform_udp_capture_tests {
         assert!(histogram.iter().filter(|((k,_),_)| *k=="ack").all(|((_,size),_)| *size==174));
         println!("UDP_SIZE_HISTOGRAM kind,udp_payload_bytes,count");
         for ((kind,size),count) in histogram { println!("UDP_SIZE_HISTOGRAM {kind},{size},{count}"); }
-        println!("UDP_SIZE_PROOF encrypted mixed=20x80B+10x1000B+2x65536B+1x4MiB MTU=1184->1472 outage=3s idle=8s; every actual datagram matched send-site TU/ACK/probe expectation");
+        println!("UDP_SIZE_PROOF encrypted mixed=1x0B+20x80B+10x1000B+2x65536B+1x4MiB MTU=1184->1472 outage=3s idle=8s; every actual datagram matched send-site TU/ACK/probe expectation");
     }
 }
 
@@ -6920,5 +6937,239 @@ mod lazy_fec_segment_tests {
             let (header,size)=read_fragment_header(&p).unwrap();
             assert_eq!(size,4); assert_eq!(header&1,0); assert_eq!((header>>18)&0x3fff,len as u64);
         }
+    }
+}
+
+#[cfg(test)]
+mod review2_tests {
+    use super::*;
+
+    #[test]
+    fn review2_sparse_fragment_rejected_without_high_water_allocation() {
+        let process = crate::receive_memory::ReceiveMemoryBudget::new(4 << 30);
+        let peer = crate::receive_memory::ReceiveMemoryBudget::connection_share(&process);
+        let mut slot = ReassemblySlot::new();
+        for offset in [32usize << 20, MAX_JUMBOGRAM_LEN - 1, FEC_SEGMENT_BYTES, usize::MAX] {
+            assert!(!slot.admit(offset, 1, &peer));
+            assert_eq!(slot.insert(offset, &[0xAA], false), (false, false));
+            assert_eq!(slot.insert(offset, &[0xAA], true), (false, false));
+            assert_eq!(slot.buf.capacity(), 0);
+            assert_eq!(peer.used(), 0);
+            assert_eq!(process.used(), 0);
+        }
+        // The boundary itself remains legal and charged at its exact capacity.
+        assert!(slot.admit(FEC_SEGMENT_BYTES - 1, 1, &peer));
+        assert_eq!(slot.insert(FEC_SEGMENT_BYTES - 1, &[0xAA], true), (true, false));
+        assert_eq!(slot.buf.len(), FEC_SEGMENT_BYTES);
+        assert_eq!(peer.used(), slot.buf.capacity() + slot.received.capacity() * 8 + 256);
+        assert_eq!(process.used(), peer.used());
+        drop(slot);
+        assert_eq!(peer.used(), 0);
+        assert_eq!(process.used(), 0);
+    }
+
+    #[test]
+    fn review2_plain_partial_expires_with_segment_roots() {
+        let process = crate::receive_memory::ReceiveMemoryBudget::new(16 << 20);
+        let budget = crate::receive_memory::ReceiveMemoryBudget::connection_share(&process);
+        let mut slots = [ReassemblySlot::new(), ReassemblySlot::new(), ReassemblySlot::new()];
+        slots[0].package_id = 1;
+        assert!(slots[0].admit(100, 16, &budget));
+        assert_eq!(slots[0].insert(100, &[1u8; 16], false), (true, false));
+        slots[0].last_segment_ns = 1;
+        let plain_charge = budget.used();
+        assert!(plain_charge > 0);
+
+        let total = 3u32 << 20;
+        let group_len = (total as usize).div_ceil((total as usize).div_ceil(FEC_SEGMENT_BYTES));
+        let layout = crate::fec::MessageLayout::new(group_len, 1500).unwrap();
+        let seg = FecSegment { root: 5, total, offset: 0 };
+        assert!(slots[1].admit_segment(seg, layout, 0, crate::fec::block_len(group_len, 1500, 0), 1, &budget));
+        assert!(budget.used() > plain_charge);
+        // Completion tombstones must survive the inactivity sweep.
+        assert!(slots[2].admit(0, 1, &budget));
+        assert_eq!(slots[2].insert(0, &[2], true), (true, true));
+        assert_eq!(slots[2].take_complete(), vec![2]);
+
+        let grace = fec_inactive_grace_ns(100, false);
+        let charge = budget.used();
+        retire_inactive_segment_roots(&mut slots, 1 + grace, grace);
+        assert_eq!(budget.used(), charge); // strict boundary, as for FEC
+        slots[0].last_segment_ns = 2; // another successfully received fragment
+        retire_inactive_segment_roots(&mut slots, 2 + grace, grace);
+        assert_eq!(budget.used(), plain_charge);
+        assert!(slots[1].segment_parts.is_none() && slots[1].total_len.is_none());
+        retire_inactive_segment_roots(&mut slots, 1 + 3_600_000_000_000, grace);
+        assert_eq!(budget.used(), 0);
+        assert_eq!(process.used(), 0);
+        assert_eq!(slots[0].buf.capacity(), 0);
+        assert!(slots[2].completed);
+    }
+
+    #[test]
+    fn review2_segment_header_conflicts_refused() {
+        let budget = crate::receive_memory::ReceiveMemoryBudget::new(16 << 20);
+        let mut slot = ReassemblySlot::new();
+        let total = 3u32 << 20;
+        let group_len = (total as usize).div_ceil((total as usize).div_ceil(FEC_SEGMENT_BYTES));
+        let layout = crate::fec::MessageLayout::new(group_len, 1500).unwrap();
+        assert!(slot.admit_segment(FecSegment { root: 9, total, offset: 0 }, layout, 0, 1500, 1, &budget));
+        let total2 = 4u32 << 20;
+        let group_len2 = (total2 as usize).div_ceil((total2 as usize).div_ceil(FEC_SEGMENT_BYTES));
+        let layout2 = crate::fec::MessageLayout::new(group_len2, 1500).unwrap();
+        assert!(!slot.admit_segment(FecSegment { root: 9, total: total2, offset: 0 }, layout2, 0, 1500, 1, &budget));
+        assert!(!slot.admit_segment(FecSegment { root: 8, total, offset: 0 }, layout, 0, 1500, 1, &budget));
+        assert!(slot.admit_segment(FecSegment { root: 9 + 1024, total, offset: 0 }, layout, 0, 1500, 1, &budget));
+    }
+
+    #[test]
+    fn review2_zero_length_message_delivered_once() {
+        let mut b = UnreliableSendBuffer::new(100000, 1000000, 1000000);
+        assert!(b.submit_messages(vec![vec![]]).is_empty());
+        b.fec_prepare_packet(0);
+        let frag = b.next_fragment(1449, 1449).expect("empty message must produce a fragment");
+        assert!(matches!(frag, UnreliableFragment::Plain { is_fin: true, data: [], offset: 0, .. }));
+        let mut frame = [0u8; 8];
+        let used = write_fragment(&mut frame, UnreliableFragment::Plain { is_fin: true, package_id: 7, data: &[], offset: 0 });
+        assert_eq!(used, STP_WHOLE_HEADER_SIZE);
+        let (header, hdr_size) = read_fragment_header(&frame).unwrap();
+        assert_eq!(hdr_size, STP_WHOLE_HEADER_SIZE);
+        assert_eq!(header & 2, 2);
+        assert_eq!((header >> 18) & 0x3fff, 0);
+
+        let budget = crate::receive_memory::ReceiveMemoryBudget::new(1 << 20);
+        let mut slot = ReassemblySlot::new();
+        slot.package_id = 7;
+        assert!(slot.admit(0, 0, &budget));
+        assert_eq!(slot.insert(0, &[], false), (true, false)); // non-final isn't a message
+        assert_eq!(slot.insert(0, &[], true), (true, true));
+        let reservation = slot.reservation.take();
+        let mut queue = ReceiveQueue::default();
+        let key = ConnectionKey::default();
+        queue.push_reserved(key, slot.take_complete(), MAX_RECV_QUEUE_BYTES, reservation);
+        assert_eq!(queue.messages.len(), 1);
+        assert!(queue.messages[0].1.is_empty());
+        assert_eq!(budget.used(), ReceiveQueue::entry_bytes(&queue.messages[0].1) + 128);
+        for _ in 0..3 {
+            assert!(slot.admit(0, 0, &budget));
+            assert_eq!(slot.insert(0, &[], true), (true, false)); // rescue must not redeliver
+        }
+        assert_eq!(queue.take().into_iter().collect::<Vec<_>>(), vec![(key, vec![])]);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn review2_cubic_rate_bounded_after_weeks_without_congestion() {
+        let cc = &crate::ship::CC;
+        let k = cc.recovery_rtts * 1_000_000;
+        for t in [2_000_000_000_000_000, u64::MAX] {
+            let (rate, _) = connection_rate(t, 200_000_000, k, cc, true);
+            let allowed = local_rate_limit(rate, None);
+            assert_eq!(allowed, MAX_CC_RATE_UPPS);
+            assert_eq!(send_interval_ns(allowed), 1000);
+        }
+        for startup_done in [false, true] {
+            for k in [0, 1, 9_000_000] {
+                assert!(connection_rate(u64::MAX, u64::MAX, k, cc, startup_done).0 <= MAX_CC_RATE_UPPS);
+            }
+        }
+        assert_eq!(local_rate_limit(u64::MAX, Some(u64::MAX)), MAX_CC_RATE_UPPS);
+    }
+
+    #[test]
+    fn review2_pacing_interval_zero_cannot_panic() {
+        for rate in [0, 1, MAX_CC_RATE_UPPS, u64::MAX] {
+            assert!(send_interval_ns(rate) >= 1);
+        }
+        let grant = send_pacing_grant(1_000_000_000, 0, 0);
+        assert_eq!(grant.packets, MAX_SEND_PACKETS_PER_TICK);
+        assert_eq!(grant.carry_ns, MAX_SEND_CATCHUP_NS);
+        let grant = send_pacing_grant(0, 0, 0);
+        assert_eq!(grant.packets, 0);
+        assert_eq!(grant.carry_ns, 0);
+    }
+
+    #[test]
+    fn review2_bdp_multiply_cannot_overflow_after_days() {
+        let cc = &crate::ship::CC;
+        let k = cc.recovery_rtts * 6_553_500_000;
+        let (rate, _) = connection_rate(600_000_000_000_000, 200_000_000, k, cc, true);
+        let allowed = local_rate_limit(rate, None);
+        assert_eq!(allowed, MAX_CC_RATE_UPPS);
+        let expected = allowed.checked_mul(65535).unwrap() / 10_000;
+        assert_eq!(rate_mul_div(allowed, 65535, 10_000), expected);
+    }
+
+    #[test]
+    fn review2_rate_products_use_wide_intermediates() {
+        // Even without the safety cap, divide the full product before saturating.
+        let rate = 600_000_000_000_000u64;
+        assert!(rate.checked_mul(65535).is_none());
+        assert_eq!(rate_mul_div(rate, 65535, 10_000), 3_932_100_000_000_000);
+        assert_eq!(rate_mul_div(rate, 65507, 1_000_000), 39_304_200_000_000);
+        assert_eq!(rate_mul_div(u64::MAX, u64::MAX, 1), u64::MAX);
+        assert_eq!(rate_mul_div(u64::MAX, 1, 1), u64::MAX);
+        for rate in [0, 1, 200_000_000, MAX_CC_RATE_UPPS] {
+            for (multiplier, divisor) in [(0, 10_000), (100, 10_000), (65535, 10_000), (1472, 1_000_000)] {
+                assert_eq!(rate_mul_div(rate, multiplier, divisor), rate * multiplier / divisor);
+            }
+        }
+    }
+
+    fn connected() -> ConnectionStateConnected {
+        let ConnectionState::Connected(s) = new_connection_state_connected(None, 0, 1, 1_000_000_000) else { unreachable!() };
+        s
+    }
+
+    #[test]
+    fn review2_ackhole_repeated_cuts_no_panic() {
+        let cc = &crate::ship::CC;
+        let mut s = connected();
+        s.RTT_mean = 100;
+        s.cc_startup_done = true;
+        s.congestion_event_rate_upps = 2_000_000_000;
+        let mut now = 10_000_000_000u64;
+        s.congestion_event_time_ns = now - 10_000_000;
+        let mut cuts = 0u32;
+        for _round in 0..50u64 {
+            let hole = s.send_sequence_number;
+            // 0ad3b9d shares the two-loss RTT cohort: exercise two holes, not one.
+            // Six sends also close the send-time bucket holding the first holes.
+            for _ in 0..6 { s.account_send(now); now += 1_000_000; }
+            s.packets_in_flight += 6;
+            for i in 2..6u64 {
+                let bit = (hole + i) % PACKETS_WAITING_ACK_CAPACITY;
+                s.packets_waiting_ack_field[(bit / 64) as usize] &= !(1u64 << (bit % 64));
+                s.packets_in_flight -= 1;
+                s.ack_hole.acknowledged(hole + i);
+            }
+            let before = s.congestion_event_rate_upps;
+            for _ in 0..2 {
+                observe_ack_hole(&mut s, now, cc, None);
+                now += 2_000_000;
+                observe_ack_hole(&mut s, now, cc, None);
+            }
+            if s.congestion_event_rate_upps != before { cuts += 1; }
+            assert!(s.congestion_event_rate_upps <= before);
+            now += 100_000_000;
+        }
+        assert!(cuts >= 40, "expected persistent hole pattern to cut repeatedly, got {cuts} cuts");
+        assert_eq!(std::mem::size_of_val(&s.ack_hole), std::mem::size_of::<AckHole>());
+    }
+
+    #[test]
+    fn review2_bitmap_ack_decode_bounds() {
+        use crate::ack::BitmapAck;
+        let mut a = BitmapAck { highest: 100, sample_seq: 101, delay_us: 0, ce_count: 0, bitmap: [0; 16] };
+        a.bitmap[((100 - a.base()) / 64) as usize] |= 1u64 << ((100 - a.base()) % 64);
+        assert!(BitmapAck::decode(&a.encode()).is_none());
+        let mut b = BitmapAck { highest: 100, sample_seq: 100, delay_us: 0, ce_count: 0, bitmap: [0; 16] };
+        assert!(BitmapAck::decode(&b.encode()).is_none());
+        b.bitmap[((100 - b.base()) / 64) as usize] |= 1u64 << ((100 - b.base()) % 64);
+        let d = BitmapAck::decode(&b.encode()).unwrap();
+        assert!(d.acknowledged().all(|s| s <= d.highest));
+        let waiting = vec![0u64; PACKETS_WAITING_ACK_WORDS];
+        let lost = vec![0u64; PACKETS_WAITING_ACK_WORDS];
+        assert!(d.relevant(&waiting, &lost).acknowledged().all(|s| s <= d.highest));
     }
 }
