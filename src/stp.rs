@@ -467,7 +467,7 @@ pub struct FecSendSlot {
 }
 
 impl FecSendSlot {
-    fn refresh_plan(&mut self, a: &crate::fec_adapt::FecAdaptiveState) {
+    fn refresh_plan(&mut self, a: &crate::fec_adapt::FecAdaptiveState, burst_tail: bool) {
         let layout = crate::fec::MessageLayout::new(self.message.len(), self.block_bytes).unwrap();
         let groups = layout.groups as u64;
         let sources = self.next_id.min(self.k) as u64;
@@ -477,7 +477,7 @@ impl FecSendSlot {
             let k = layout.group(group).1 as u64;
             let source_sent = (sources / groups + u64::from((group as u64) < sources % groups)).min(k);
             let repair_sent = repairs / groups + u64::from((group as u64) < repairs % groups);
-            let total_repairs = repair_sent + a.extra_repair_blocks_needed_for_group(k, self.k as u64, layout.groups, source_sent + repair_sent, repair_sent, self.group_lost[group] as u64);
+            let total_repairs = repair_sent + a.extra_repair_blocks_needed_for_group_at_tail(k, self.k as u64, layout.groups, source_sent + repair_sent, repair_sent, self.group_lost[group] as u64, burst_tail);
             per_group_repairs = per_group_repairs.max(total_repairs);
         }
         // Equal complete rounds conservatively protect the most affected group, not mean loss.
@@ -584,7 +584,7 @@ impl UnreliableSendBuffer {
         }
         f.lost = f.lost.saturating_add(count);
         if let Some(a) = &self.fec_adaptive {
-            f.refresh_plan(a);
+            f.refresh_plan(a, self.message_queue.is_empty());
         }
     }
 
@@ -647,6 +647,13 @@ impl UnreliableSendBuffer {
     // A message whose last fragment has gone out still counts against the queue until it is
     // released here.
     fn reclaim_finished_partial(&mut self) {
+        // Queue occupancy may change after the last planned symbol was emitted. Before
+        // discarding the encoder, give the true final queued message its burst-tail floor.
+        if self.message_queue.is_empty() {
+            if let (Some(a), Some(f)) = (&self.fec_adaptive, &mut self.fec_send_slot) {
+                if f.next_id >= f.n { f.refresh_plan(a, true); }
+            }
+        }
         if let Some((msg, start_byte)) = &self.partial_send_slot {
             if *start_byte as usize >= msg.len() {
                 let msg_len = msg.len();
@@ -690,7 +697,7 @@ impl UnreliableSendBuffer {
         let layout = crate::fec::MessageLayout::new(message.len(), block_bytes).unwrap();
         let k = layout.k as u32;
         let a = self.fec_adaptive.as_ref().expect("adaptive FEC initialized before coding");
-        let repairs = (0..layout.groups).map(|g| a.repair_blocks_for_group(layout.group(g).1 as u64, k as u64, layout.groups)).max().unwrap_or(0);
+        let repairs = (0..layout.groups).map(|g| a.repair_blocks_for_group_at_tail(layout.group(g).1 as u64, k as u64, layout.groups, false)).max().unwrap_or(0);
         let (n, loss_estimate) = (k + repairs as u32 * layout.groups as u32, a.p);
         let n = layout.round_plan(n);
         let encoder = if k as usize <= FEC_INLINE_MAX_BLOCKS {
@@ -727,9 +734,10 @@ impl UnreliableSendBuffer {
         }
         if self.fec_send_slot.is_some() {
             if let (Some(a), Some(f)) = (&self.fec_adaptive, &mut self.fec_send_slot) {
-                // Refresh at source completion and the final planned repair, without tail waiting.
+                // Decide burst-tail protection only once sources have left: the application
+                // can refill the queue during transmission. Recheck at the final repair.
                 if f.next_id >= f.k && (f.next_id == f.k || f.next_id + 1 >= f.n) {
-                    f.refresh_plan(a);
+                    f.refresh_plan(a, self.message_queue.is_empty());
                 }
             }
             let need = { let f = self.fec_send_slot.as_ref().unwrap(); STP_FEC_FRAGMENT_HEADER_SIZE + crate::fec::block_len(f.message.len(), f.block_bytes, crate::fec::MessageLayout::new(f.message.len(), f.block_bytes).unwrap().wire_id(f.next_id)) };
@@ -3960,7 +3968,7 @@ mod fec_send_tests {
         f.next_id = f.k; // all sources sent, no repairs yet
         f.group_lost[1] = 900;
         f.lost = 900;
-        f.refresh_plan(&a);
+        f.refresh_plan(&a, true);
         let expected_repairs = (0..layout.groups).map(|g| a.extra_repair_blocks_needed_for_group(layout.group(g).1 as u64, layout.k as u64, layout.groups, layout.group(g).1 as u64, 0, f.group_lost[g] as u64)).max().unwrap();
         assert_eq!(f.n, layout.round_plan(f.k + expected_repairs as u32 * layout.groups as u32));
         let eps = a.group_failure_target(layout.k as u64, 1);
@@ -3968,7 +3976,7 @@ mod fec_send_tests {
         assert!(expected_repairs >= 900 + 12);
         let n = f.n;
         f.group_lost[1] = 0;
-        f.refresh_plan(&a);
+        f.refresh_plan(&a, true);
         assert_eq!(f.n, n); // plans never shrink
     }
 
@@ -4050,6 +4058,34 @@ mod rx_tracker_tests {
 mod fec_closed_loop_tests {
     use super::*;
     use crate::fec_adapt::{AdaptiveFecConfig, FecAdaptiveState};
+
+    #[test]
+    fn burst_floor_is_deferred_until_source_completion_and_rechecked_before_reclaim() {
+        let make = || {
+            let mut b = UnreliableSendBuffer::new(100000, 1000000, 1000000);
+            b.fec_adaptive = Some(FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0));
+            b.submit_messages(vec![vec![0; 1433 * 12]]);
+            b
+        };
+        let mut b = make();
+        assert!(b.next_fragment(1449, 1449).is_some());
+        assert!(b.fec_send_slot.as_ref().unwrap().n < 24);
+        // A successor arriving while sources go out avoids the fixed floor.
+        b.submit_messages(vec![vec![0; 1433 * 12]]);
+        for _ in 1..13 { assert!(b.next_fragment(1449, 1449).is_some()); }
+        assert!(b.fec_send_slot.as_ref().unwrap().n < 24);
+        // End of planned repairs, but the queue just became empty: do not discard the
+        // encoder before upgrading to the full burst-tail floor.
+        let f = b.fec_send_slot.as_mut().unwrap();
+        f.next_id = f.n;
+        b.message_queue.clear();
+        b.reclaim_finished_partial();
+        assert_eq!(b.fec_send_slot.as_ref().unwrap().n, 24);
+
+        let mut b = make();
+        for _ in 0..13 { assert!(b.next_fragment(1449, 1449).is_some()); }
+        assert_eq!(b.fec_send_slot.as_ref().unwrap().n, 24); // true tail at sources done
+    }
 
     #[test]
     fn refreshes_own_loss_budget_at_source_completion_without_a_new_loss_event() {

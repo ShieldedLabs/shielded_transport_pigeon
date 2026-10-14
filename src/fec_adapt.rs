@@ -287,12 +287,16 @@ impl SpanLossProfile {
         self.margin_blocks_for_groups(k, whole_message_k, 1, cfg)
     }
     fn margin_blocks_for_groups(&self, k: u64, whole_message_k: u64, groups: usize, cfg: &AdaptiveFecConfig) -> u64 {
+        self.margin_blocks_for_groups_with_floor(k, whole_message_k, groups, cfg, true)
+    }
+    fn margin_blocks_for_groups_with_floor(&self, k: u64, whole_message_k: u64, groups: usize, cfg: &AdaptiveFecConfig, burst_tail: bool) -> u64 {
         let cap = ((k as f64 * cfg.max_redundancy).ceil() as u64).max(1);
-        // Explicit prior/floor protects against unobserved loss. It cannot predict a new queue
-        // overflow event; fixing CC is preferable to paying for a pathological startup prior.
+        // The absolute real-trace burst floor protects the final queued message. Interior
+        // messages still get the IID prior and empirical loss tail, not a fixed 12 symbols.
         let prior = if self.seen < 4096 { cfg.initial_loss } else { cfg.min_loss };
         let eps = self.target_failure(whole_message_k, cfg) / groups.max(1) as f64;
-        let mut r = repair_blocks(k, prior, z_for_eps(eps), eps, cfg.extra_blocks, cfg.max_redundancy).max(12.min(k)).min(cap);
+        let floor = if burst_tail { 12.min(k) } else { 0 };
+        let mut r = repair_blocks(k, prior, z_for_eps(eps), eps, cfg.extra_blocks, cfg.max_redundancy).max(floor).min(cap);
         for _ in 0..32 {
             let Some(q) = self.tail_losses(k + r, eps) else { break; };
             let next = r.max(q.saturating_add(cfg.extra_blocks as u64).max(1)).min(cap);
@@ -356,12 +360,15 @@ impl FecAdaptiveState {
     /// Repair blocks for a new message of k source blocks.
     pub fn repair_blocks(&self, k: u64) -> u64 { self.repair_blocks_for_group(k, k, 1) }
     pub fn repair_blocks_for_group(&self, k: u64, whole_message_k: u64, groups: usize) -> u64 {
+        self.repair_blocks_for_group_at_tail(k, whole_message_k, groups, true)
+    }
+    pub fn repair_blocks_for_group_at_tail(&self, k: u64, whole_message_k: u64, groups: usize, burst_tail: bool) -> u64 {
         let c = &self.tracker.cfg;
         let span = &self.span;
         let horizon = if span.seen >= 4096 { k.min(span.pending_peak.max(1)) } else { k };
         let cap = ((k as f64 * c.max_redundancy).ceil() as u64).max(1).min(k);
-        let r = span.margin_blocks_for_groups(horizon, whole_message_k, groups, c);
-        r.max(12.min(k)).min(cap)
+        let r = span.margin_blocks_for_groups_with_floor(horizon, whole_message_k, groups, c, burst_tail);
+        r.max(if burst_tail { 12.min(k) } else { 0 }).min(cap)
     }
     /// Extra fresh repairs for a single-group message; no retransmission or feedback wait.
     pub fn extra_repair_blocks_needed_now(&self, k: u64, blocks_sent: u64, repair_blocks_sent: u64, own_declared_lost: u64) -> u64 {
@@ -371,16 +378,20 @@ impl FecAdaptiveState {
     /// Connection-wide unresolved data conservatively bounds each group's tail; it is NOT
     /// divided by group count (interleaving does not prove equal loss ownership).
     pub fn extra_repair_blocks_needed_for_group(&self, k: u64, whole_message_k: u64, groups: usize, blocks_sent: u64, repair_blocks_sent: u64, own_declared_lost: u64) -> u64 {
+        self.extra_repair_blocks_needed_for_group_at_tail(k, whole_message_k, groups, blocks_sent, repair_blocks_sent, own_declared_lost, true)
+    }
+    pub fn extra_repair_blocks_needed_for_group_at_tail(&self, k: u64, whole_message_k: u64, groups: usize, blocks_sent: u64, repair_blocks_sent: u64, own_declared_lost: u64, burst_tail: bool) -> u64 {
         let span = &self.span;
         if k == 0 { return 0; }
         let c = &self.tracker.cfg;
         let cap = ((k as f64 * c.max_redundancy).ceil() as u64).min(k);
+        let floor = if burst_tail { 12.min(k) } else { 0 };
         let unsent_sources = k.saturating_sub(blocks_sent.saturating_sub(repair_blocks_sent));
         let pending = span.unresolved_data_packets().saturating_add(unsent_sources);
-        let mut total_repairs = own_declared_lost.saturating_add(12.min(k)).min(cap);
+        let mut total_repairs = own_declared_lost.saturating_add(floor).min(cap);
         for _ in 0..32 {
             let horizon = pending.saturating_add(total_repairs.saturating_sub(repair_blocks_sent)).min(k.saturating_add(total_repairs)).max(1);
-            let margin = span.margin_blocks_for_groups(horizon, whole_message_k, groups, c).max(12.min(k));
+            let margin = span.margin_blocks_for_groups_with_floor(horizon, whole_message_k, groups, c, burst_tail).max(floor);
             let next = total_repairs.max(own_declared_lost.saturating_add(margin)).min(cap);
             if next == total_repairs { break; }
             total_repairs = next;
@@ -533,6 +544,28 @@ mod tests {
         assert!(s.repair_blocks(32, &cfg, z_for_eps(cfg.eps)) >= 11);
         assert!(s.target_failure(32768, &cfg) < s.target_failure(32, &cfg));
         assert!(std::mem::size_of::<SpanLossProfile>() < 50000);
+    }
+
+    #[test]
+    fn interior_margin_keeps_loss_risk_without_absolute_burst_floor() {
+        let mut a = FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0);
+        for seq in 0..10000 {
+            a.on_data_sent(seq);
+            a.on_sequence_finalized(seq, false, seq * 1000);
+        }
+        let r = a.repair_blocks_for_group_at_tail(12, 12, 1, false);
+        assert!((1..=5).contains(&r), "clean interior {r}");
+        assert_eq!(a.repair_blocks_for_group_at_tail(12, 12, 1, true), 12);
+        assert!(a.extra_repair_blocks_needed_for_group_at_tail(12, 12, 1, 12, 0, 0, false) <= 5);
+        // A learned 10-packet cluster must still raise interior protection.
+        for base in (10000..20000).step_by(100) {
+            for seq in base..base+100 { a.on_data_sent(seq); }
+            for seq in base..base+100 {
+                a.on_sequence_finalized(seq, seq % 1000 < 10, seq * 1000);
+            }
+        }
+        let clustered = a.repair_blocks_for_group_at_tail(12, 12, 1, false);
+        assert!(clustered >= 11, "clustered {clustered}");
     }
 
     #[test]
