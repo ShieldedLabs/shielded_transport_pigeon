@@ -738,6 +738,11 @@ impl UnreliableSendBuffer {
         let frag_size = space.checked_sub(STP_FRAGMENT_HEADER_SIZE)?;
         let (msg, start_byte) = self.partial_send_slot.as_mut().unwrap();
         let start = *start_byte as usize;
+        // A plain message that fits a fresh packet has exactly one physical erasure event.
+        // Do not fill the preceding packet's tail with a partial prefix of that message.
+        if start == 0 && msg.len() <= payload_len.saturating_sub(STP_FRAGMENT_HEADER_SIZE) && msg.len() > frag_size {
+            return None;
+        }
         let ret_size = (msg.len() - start).min(frag_size);
         // Both frag_size and msg.len() may be zero.
 
@@ -3929,6 +3934,45 @@ mod fec_send_tests {
         let mut b = UnreliableSendBuffer::new(1_000_000, 1 << 26, 1 << 26);
         b.fec_redundancy_ppm = ppm;
         b
+    }
+
+    #[test]
+    fn thousand_byte_messages_occupy_one_physical_packet_each() {
+        for payload_len in [1162, 1450, 9194] {
+            let mut b = new_buf(0);
+            // Leave a tail too short for the next message, followed by many fresh-packet messages.
+            let mut messages = vec![msg(payload_len - 600)];
+            messages.extend((0..200).map(|_| msg(1000)));
+            assert!(b.submit_messages(messages.clone()).is_empty());
+            let packets = drain(&mut b, payload_len, 300);
+            for id in 1..=200 {
+                let physical: Vec<_> = packets.iter().filter(|p| p.iter().any(|f| f.0 == id)).collect();
+                assert_eq!(physical.len(), 1, "payload={payload_len}, package={id}");
+                let fragments: Vec<_> = physical[0].iter().filter(|f| f.0 == id).collect();
+                assert_eq!(fragments.len(), 1);
+                let f = fragments[0];
+                assert!(f.1.is_none() && f.2);
+                assert_eq!(f.3, 0);
+                assert_eq!(f.4, messages[id as usize]);
+            }
+            assert!(!b.has_unsent_data());
+            assert_eq!(b.queue_bytes_filled, 0);
+        }
+    }
+
+    #[test]
+    fn small_plain_message_defers_tail_and_rechecks_tu() {
+        let mut b = new_buf(0);
+        assert!(b.submit_messages(vec![msg(1000)]).is_empty());
+        assert!(b.next_fragment(1450, 500).is_none());
+        assert_eq!(b.partial_send_slot.as_ref().unwrap().1, 0);
+        match b.next_fragment(1162, 1162).unwrap() {
+            UnreliableFragment::Plain { is_fin, offset, data, .. } => {
+                assert!(is_fin);
+                assert_eq!((offset, data.len()), (0, 1000));
+            }
+            _ => panic!("one-packet message must remain plain"),
+        }
     }
 
     #[test]
