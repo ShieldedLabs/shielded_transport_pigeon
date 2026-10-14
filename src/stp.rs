@@ -1461,6 +1461,7 @@ pub struct ConnectionStateConnected {
     pub congestion_event_rate_upps: u64,
     /// Startup exits only on a genuine loss/ECN event, never on RTT/delivery signals.
     pub cc_startup_done: bool,
+    outage: OutageState,
     pub stats: ConnectionStats,
     pub loss_window_start_ns: u64,
     pub loss_count_in_window: u64,
@@ -1521,6 +1522,7 @@ pub fn new_connection_state_connected(cipher: Option<ConnectionCipherTriplet>, m
         congestion_event_time_ns: 0,
         congestion_event_rate_upps: RATE_FLOOR_UPPS,
         cc_startup_done: false,
+        outage: OutageState::default(),
         stats: ConnectionStats::default(),
         loss_window_start_ns: 0,
         loss_count_in_window: 0,
@@ -2856,6 +2858,18 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     state.peer_ack_delay_us = a.delay_us;
                                     Some(a)
                                 } else { None };
+                                if state.outage.since_ns.is_some() && bitmap_ack.as_ref().is_some_and(|a| {
+                                    a.acknowledged().any(|seq| {
+                                        let bit = seq % PACKETS_WAITING_ACK_CAPACITY;
+                                        seq >= state.packets_waiting_ack_tail && seq < state.send_sequence_number &&
+                                            state.packets_waiting_ack_field[(bit / 64) as usize] & (1 << (bit % 64)) != 0
+                                    })
+                                }) {
+                                    // Only a newly acknowledged outage probe proves round-trip recovery.
+                                    // Replayed/stale ACK contents cannot extend the deadline or resume data.
+                                    resume_outage(state, &mut existing_connection.unreliable_send_buffer,
+                                        &mut existing_connection.unreliable_fec, timestamp_ns, max_pps);
+                                }
                                 state.stats.ack_packets_received += 1;
 
                                 let mut RTT_acc = 0u64;
@@ -3190,7 +3204,9 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                 if current_time_now_ns.saturating_sub(fec_sweep_ns) >= 100_000_000 {
                     for conn in connections_map.values_mut() {
                         if let ConnectionState::Connected(c) = &mut conn.connection_state {
-                            let grace = fec_inactive_grace_ns(c.RTT_mean, false);
+                            let grace = if c.outage.since_ns.is_some() || current_time_now_ns.saturating_sub(c.last_ack_received_time) >= OUTAGE_ACK_SILENCE_NS {
+                                OUTAGE_TIMEOUT_NS
+                            } else { fec_inactive_grace_ns(c.RTT_mean, false) };
                             c.stats.fec_decode_timeouts += retire_inactive_fec_workers(&mut conn.unreliable_fec, current_time_now_ns, grace, false);
                         }
                     }
@@ -3267,7 +3283,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                     }
                     ConnectionState::Connected(state) => {
                         debug_assert!(state.magic2 != 0, "Connection entered Connected state without negotiating magic2");
-                        if state.last_ack_received_time + 15_000_000_000 < current_time_now_ns {
+                        if OutageState::expired(current_time_now_ns, state.last_ack_received_time) {
                             if VERBOSE { println!("Disconnected from: {:?}.", connection_tracking_data.other_transport_identity); }
                             return false; // connection timeout
                         }
@@ -3294,26 +3310,36 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             }
                         }
                         
-                        if state.RTT_sample_cursor != 0 && state.last_ack_received_time + 15_000_000_000/2 < current_time_now_ns {
-                            // blackhole detected, go to safe TU
-                            state.current_tu = ASSUMED_UDP_PAYLOAD_SIZE_WITH_GUARANTEED_DELIVERY as u64;
-                            state.RTT_sample_cursor = 0;
-                            state.RTT_mean = u16::MAX;
-                            state.ack_pace_estimate = 0;
-                            state.congestion_event_time_ns = 0;
-                            state.congestion_event_rate_upps = cc.rate_floor_upps;
-                            state.last_sent_data_packet = 0;
-                            state.last_sent_could_have_sent_data_packet = 0;
-                            if state.tu_probe_sequence_number != u64::MAX {
-                                // Orphaning an in-flight TU probe. It was never counted in packets_in_flight,
-                                // but a late ack or the tail-advance loop will try to decrement it.
-                                // Count it now so the decrement balances.
+                        if state.outage.since_ns.is_none() && state.send_sequence_number > state.packets_waiting_ack_tail
+                            && current_time_now_ns.saturating_sub(state.last_ack_received_time) >= OUTAGE_ACK_SILENCE_NS {
+                            enter_outage(state, &mut connection_tracking_data.unreliable_send_buffer,
+                                current_time_now_ns, connection_tracking_data.two_byte_send_prefix, loss_trace.as_mut());
+                        }
+                        if state.outage.since_ns.is_some() {
+                            if state.outage.probe_due(current_time_now_ns) {
+                                let seq = state.send_sequence_number;
+                                store_u16(&mut packet_memory_encrypted[0..2], connection_tracking_data.two_byte_send_prefix);
+                                store_u32(&mut packet_memory_encrypted[2..6], crate::sequence::to_wire(seq));
+                                // Authenticated null fragment: elicits a bitmap ACK but creates no message.
+                                let data = [0u8; OUTAGE_PROBE_PAYLOAD_BYTES];
+                                let packet_len = if let Some(cipher) = &mut state.cipher {
+                                    cipher.current.write_message(seq, &data, &mut packet_memory_encrypted[6..]).unwrap()
+                                } else {
+                                    packet_memory_encrypted[6..6+data.len()].copy_from_slice(&data);
+                                    data.len()
+                                };
+                                let send_time = udp_send_with_congestion_and_dscp(socket,
+                                    connection_tracking_data.other_ip, connection_tracking_data.other_port,
+                                    &packet_memory_encrypted[..6+packet_len], Dscp::Af21, false);
+                                state.account_send(send_time);
                                 state.packets_in_flight += 1;
-                                state.max_in_flight_since_last_print = state.max_in_flight_since_last_print.max(state.packets_in_flight);
+                                state.stats.packets_sent += 1;
+                                state.stats.bytes_sent += (6 + packet_len) as u64;
+                                state.last_sent_data_packet = send_time;
+                                state.packet_since_last_print += 1;
+                                if let Some(t) = &mut loss_trace { t.sent(connection_tracking_data.two_byte_send_prefix, seq, send_time, &data); }
                             }
-                            state.tu_probe_sequence_number = u64::MAX;
-                            state.tu_probe_failed_count = 0;
-                            if OVERLY_VERBOSE { println!("Blackhole detected!"); }
+                            return true;
                         }
                         
                         if state.congestion_event_time_ns == 0 {
@@ -3442,7 +3468,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     }
                                     // Covered losses still enter loss/FEC statistics below, but
                                     // cannot prime the threshold for a subsequent congestion cut.
-                                    let eligible = send_time > state.congestion_event_time_ns + (rtt_ns as f64 * cc.event_guard_rtts) as u64;
+                                    let eligible = state.packets_waiting_ack_tail >= state.outage.ignore_loss_before_seq && send_time > state.congestion_event_time_ns + (rtt_ns as f64 * cc.event_guard_rtts) as u64;
                                         let trigger = count_congestion_loss(&mut state.loss_count_in_window, eligible, cc.loss_threshold);
 
                                     if trigger {
@@ -3823,6 +3849,147 @@ pub fn get_handshake_hash(handshake: &snow::HandshakeState) -> [u8; 64] {
 use crate::helpers::*;
 pub use crate::native_sockets::Dscp;
 use crate::native_sockets::*;
+
+// An outage is lack of round-trip progress, not a stream of independent congestion events.
+const OUTAGE_ACK_SILENCE_NS: u64 = 2_000_000_000;
+const OUTAGE_TIMEOUT_NS: u64 = 120_000_000_000;
+const OUTAGE_FIRST_PROBE_NS: u64 = 250_000_000;
+const OUTAGE_MAX_PROBE_NS: u64 = 4_000_000_000;
+// Existing peers classify non-ACK packets by authenticated size: 517 is the minimum.
+const OUTAGE_PROBE_PAYLOAD_BYTES: usize = 517;
+
+#[derive(Debug, Default)]
+struct OutageState {
+    since_ns: Option<u64>,
+    next_probe_ns: u64,
+    probe_interval_ns: u64,
+    resume_rate_upps: u64,
+    ignore_loss_before_seq: u64,
+}
+impl OutageState {
+    fn enter(&mut self, now: u64, rate: u64) {
+        self.since_ns = Some(now);
+        self.next_probe_ns = now;
+        self.probe_interval_ns = OUTAGE_FIRST_PROBE_NS;
+        self.resume_rate_upps = rate.min(crate::ship::CC.initial_rate_upps);
+    }
+    fn probe_due(&mut self, now: u64) -> bool {
+        if self.since_ns.is_none() || now < self.next_probe_ns { return false; }
+        self.next_probe_ns = now.saturating_add(self.probe_interval_ns);
+        self.probe_interval_ns = self.probe_interval_ns.saturating_mul(2).min(OUTAGE_MAX_PROBE_NS);
+        true
+    }
+    fn expired(now: u64, last_ack: u64) -> bool {
+        now.saturating_sub(last_ack) >= OUTAGE_TIMEOUT_NS
+    }
+}
+
+fn enter_outage(state: &mut ConnectionStateConnected, buf: &mut SendQueues,
+    now: u64, prefix: u16, mut trace: Option<&mut crate::loss_trace::LossTrace>) {
+    state.outage.enter(now, state.stats.cc_rate_upps.max(1));
+    for q in &mut buf.queues { q.fec_now_ns = now; }
+    // Finalize the stranded train once. FEC retains/rescues its source within the existing
+    // source-byte budget; no missing packet here invokes loss-based congestion control.
+    while state.packets_waiting_ack_tail < state.send_sequence_number {
+        let seq = state.packets_waiting_ack_tail;
+        let bit = seq % PACKETS_WAITING_ACK_CAPACITY;
+        let pending = state.packets_waiting_ack_field[(bit / 64) as usize] & (1 << (bit % 64)) != 0;
+        let lost = pending && seq != state.tu_probe_sequence_number;
+        if pending {
+            if lost {
+                state.packets_in_flight = state.packets_in_flight.checked_sub(1).expect("outage flight underflow");
+                state.stats.packets_lost += 1;
+                state.packet_lost_since_last_print += 1;
+                state.declared_lost_field[(bit / 64) as usize] |= 1 << (bit % 64);
+                if let Some(t) = trace.as_deref_mut() { t.outcome('L', prefix, seq, now); }
+            } else { state.stats.tu_probes_lost += 1; }
+        }
+        state.packets_waiting_ack_field[(bit / 64) as usize] &= !(1 << (bit % 64));
+        if let Some(a) = &mut buf.fec_adaptive { a.on_sequence_finalized(seq, lost, now); }
+        buf.fec_on_packet_finalized(seq, lost);
+        state.packets_waiting_ack_tail += 1;
+    }
+    state.tu_probe_sequence_number = u64::MAX;
+    state.ecn_congestion_received = false;
+    state.loss_count_in_window = 0;
+    state.stats.cc_rate_upps = 0;
+    println!("research outage entered at {} ns after {} ms ACK silence", now, now.saturating_sub(state.last_ack_received_time) / 1_000_000);
+}
+
+fn resume_outage(state: &mut ConnectionStateConnected, buf: &mut SendQueues,
+    slots: &mut [FecRecvSlot], now: u64, max_pps: Option<u64>) {
+    let Some(since) = state.outage.since_ns.take() else { return; };
+    let paused = now.saturating_sub(since);
+    // Freeze active retention time, not its byte budget or package identity. Objects already
+    // expired before entry are not resurrected; workers with new ingress need no clock shift.
+    for q in &mut buf.queues {
+        for retained in q.fec_retained.values_mut() { retained.expires_ns = retained.expires_ns.saturating_add(paused); }
+        for slot in [&mut q.fec_send_slot, &mut q.fec_suspended].into_iter().flatten() {
+            slot.send_started_ns = slot.send_started_ns.saturating_add(paused);
+        }
+    }
+    for slot in slots { if slot.last_block_ns <= since { slot.last_block_ns = slot.last_block_ns.saturating_add(paused); } }
+    state.outage.ignore_loss_before_seq = state.send_sequence_number;
+    state.congestion_event_rate_upps = local_rate_limit(state.outage.resume_rate_upps, max_pps).max(1);
+    state.congestion_event_time_ns = now;
+    state.cc_startup_done = false;
+    state.RTT_sample_sums.fill(0);
+    state.RTT_sample_counts.fill(0);
+    state.RTT_sample_cursor = 0;
+    state.RTT_mean_cursor = 0;
+    state.RTT_mean = u16::MAX;
+    state.ack_arrival_times.fill(0);
+    state.ack_pace_estimate = 0;
+    state.send_pacer_acc_ns = 0;
+    state.last_sent_could_have_sent_data_packet = now;
+    state.last_sent_data_packet = now;
+    state.loss_count_in_window = 0;
+    state.loss_window_start_ns = now;
+    state.app_limit_time_offset = 0;
+    state.current_tu = ASSUMED_UDP_PAYLOAD_SIZE_WITH_GUARANTEED_DELIVERY as u64;
+    state.tu_probe_failed_count = 0;
+    println!("research outage resumed after {} ms at {} pps", paused / 1_000_000, state.congestion_event_rate_upps / 1_000_000);
+}
+
+#[test]
+fn research_outage_backoff_is_bounded_and_dead_peer_expires_at_120s() {
+    let mut o = OutageState::default();
+    o.enter(1_000_000_000, 5_000_000_000);
+    assert_eq!(o.resume_rate_upps, crate::ship::CC.initial_rate_upps);
+    for due in [1_000_000_000, 1_250_000_000, 1_750_000_000, 2_750_000_000, 4_750_000_000, 8_750_000_000] {
+        assert!(!o.probe_due(due - 1));
+        assert!(o.probe_due(due));
+    }
+    assert_eq!(o.probe_interval_ns, OUTAGE_MAX_PROBE_NS);
+    assert!(!OutageState::expired(119_999_999_999, 0));
+    assert!(OutageState::expired(120_000_000_000, 0));
+}
+
+#[test]
+fn research_outage_finalizes_once_and_resumes_conservatively() {
+    let ConnectionState::Connected(mut s) = new_connection_state_connected(None, 0, 1, 1_000_000_000) else { unreachable!() };
+    let mut b = SendQueues::new(1, (100000, 1000000, 1000000));
+    s.stats.cc_rate_upps = 5_000_000_000;
+    s.account_send(1_000_000_000);
+    s.account_send(1_001_000_000);
+    s.packets_in_flight = 2;
+    let cuts = s.congestion_event_rate_upps;
+    enter_outage(&mut s, &mut b, 3_000_000_000, 0, None);
+    assert_eq!(s.packets_in_flight, 0);
+    assert_eq!(s.packets_waiting_ack_tail, 2);
+    assert_eq!(s.stats.packets_lost, 2);
+    assert_eq!(s.congestion_event_rate_upps, cuts);
+    assert_eq!(s.stats.cc_rate_upps, 0);
+    s.account_send(27_000_000_000);
+    s.packets_in_flight = 1;
+    resume_outage(&mut s, &mut b, &mut [], 27_010_000_000, None);
+    assert!(s.outage.since_ns.is_none());
+    assert_eq!(s.outage.ignore_loss_before_seq, 3);
+    assert_eq!(s.congestion_event_rate_upps, crate::ship::CC.initial_rate_upps);
+    assert_eq!(s.send_pacer_acc_ns, 0);
+    assert_eq!(s.loss_count_in_window, 0);
+    assert_eq!(s.stats.packets_lost, 2);
+}
 
 fn take_ecn_signal(state: &mut ConnectionStateConnected, guard_rtts: f64) -> bool {
     // Consume covered feedback too: it must not survive to a later ACK/epoch.
