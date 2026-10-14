@@ -840,7 +840,7 @@ fn send_magazines(a: &Args) {
     let to = STPAddress::parse(a.str("to").unwrap_or_else(|| die("send needs --to"))).unwrap_or_else(|| die("bad --to"));
     let key = to.to_connection_key();
     let kp = new_keypair_from_connect_magic1(to.magic1).unwrap();
-    let handle = new_network_thread_with_options(vec![kp], 0, max_pps(a), send_buffer_params(a), NetworkThreadOptions { send_queue_count: n, record_fec_messages: true, ..Default::default() });
+    let handle = new_network_thread_with_options(vec![kp], 0, max_pps(a), send_buffer_params(a), NetworkThreadOptions { send_queue_count: n, record_fec_messages: true, record_loss_episodes: a.num::<u8>("loss-episodes", 0) != 0, loss_trace: a.str("loss-trace").map(std::path::PathBuf::from), ..Default::default() });
     let mut wanted = service_connections(&handle, NetworkThreadPush { initiate_connections: vec![to], ..Default::default() }).unwrap().current_connections;
     let mut outbox = Vec::new();
     let epoch = Instant::now(); let ns = || epoch.elapsed().as_nanos() as u64;
@@ -875,7 +875,7 @@ fn send_magazines(a: &Args) {
     let control_queue = if n > 1 && mode != "dueling" { 1 } else { 0 };
     let mut pending: Vec<VecDeque<(u32, Vec<u8>)>> = (0..n).map(|_| VecDeque::new()).collect();
     let mut sizes = Vec::new(); let mut ids = Vec::new(); let mut submitted = Vec::new(); let mut small_ids = Vec::new();
-    let mut recs = HashMap::new(); let mut stats = ConnectionStats::default();
+    let mut recs = HashMap::new(); let mut stats = ConnectionStats::default(); let mut receiver = RxReport::default();
     let mut free = vec![u64::MAX; n]; let mut last_status = Instant::now()-Duration::from_secs(1);
     let mut drained = false; let mut last_growth = Instant::now(); let mut last_delivery = start as f64;
     let drain_limit = a.num::<u64>("timeout", 180);
@@ -927,7 +927,13 @@ fn send_magazines(a: &Args) {
         for (_, d) in p.received_unreliable_messages {
             if let Parsed::Ok(STATUS, pl) = parse(&d) && pl.len() >= 4 {
                 let count = u32_at(pl, 0) as usize;
-                if pl.len() < 4+13*count { continue; }
+                if pl.len() < 4+13*count+4 { continue; }
+                let at = 4+13*count;
+                let words = u32_at(pl, at) as usize;
+                if pl.len() == at+4+8*words {
+                    let v: Vec<u64> = (0..words).map(|i| u64_at(pl, at+4+8*i)).collect();
+                    if let Some(r) = RxReport::from_words(&v) { receiver = r; }
+                }
                 for i in 0..count {
                     let at = 4+13*i; let id = u32_at(pl, at); let ok = pl[at+4] != 0; let t = u64_at(pl, at+5);
                     if recs.insert(id, (ok, t)).is_none() { last_growth = Instant::now(); }
@@ -953,5 +959,7 @@ fn send_magazines(a: &Args) {
     let gp = bytes as f64*8.0/1e6/wall;
     let json = format!("{{\"workload\":\"{mode}\",\"num_queues\":{n},\"duration_seconds\":{duration},\"wall_seconds\":{wall:.6},\"total_messages\":{},\"delivered\":{delivered},\"goodput_Mbitps\":{gp:.6},\"wire_bytes_per_delivered_byte\":{:.6},\"queues\":[{}],\"window_queues\":[{}],\"small\":{},\"rtt_ms_min\":{:.3},\"latency_method\":\"last-byte delivery minus first bulk submission or scheduled Poisson small arrival; ping offset error <= RTT/2\"}}\n", sizes.len(), stats.bytes_sent as f64/bytes.max(1) as f64, queues.join(","), window.join(","), small[0], pings[0].0 as f64/1e6);
     println!("{delivered}/{} delivered, total goodput {gp:.3} Mbit/s", sizes.len());
+    let mut json = json;
+    json.insert_str(json.len()-2, &format!(",\"packets_sent\":{},\"packets_lost\":{},\"spurious_losses\":{},\"receiver_rx_lost\":{},\"receiver_rx_reordered\":{},\"receiver_rx_late_beyond_window\":{},\"cc_rate_pps\":{:.3}", stats.packets_sent, stats.packets_lost, stats.spurious_losses, receiver.st.rx_lost, receiver.st.rx_reordered, receiver.st.rx_late_beyond_window, stats.cc_rate_upps as f64/1e6));
     std::fs::write(a.str("out").unwrap_or("stp_bench_report.json"), json).unwrap();
 }
