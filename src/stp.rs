@@ -2772,7 +2772,9 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 let r_pg = (state.congestion_event_rate_upps as f64 * cc.rate_pg) as u64;
                                 discovered = r_pg + ((discovered.saturating_sub(r_pg)) as f64 * 0.5) as u64;
                             }
-                            state.congestion_event_rate_upps = discovered;
+                            // Discovery must reflect a locally capped sender as well: otherwise
+                            // a loss above a stale curve anchor would not lower actual pacing.
+                            state.congestion_event_rate_upps = local_rate_limit(discovered, max_pps);
                             state.congestion_event_time_ns = current_time_now_ns;
                             state.app_limit_time_offset = 0;
                             println!("congestion event ECN CE ...  rate discovered: {} pps  sent:{send_mode}@{send_t_factor:.2}", state.congestion_event_rate_upps as f64 / 1000000.0);
@@ -2833,7 +2835,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                             let boundary = (state.congestion_event_rate_upps as f64 * cc.rate_rp) as u64;
                                             discovered = (discovered + boundary) / 2;
                                         }
-                                        state.congestion_event_rate_upps = discovered;
+                                        state.congestion_event_rate_upps = local_rate_limit(discovered, max_pps);
                                         state.congestion_event_time_ns = current_time_now_ns;
                                         state.app_limit_time_offset = 0;
                                         state.loss_count_in_window = 0;
@@ -3346,6 +3348,18 @@ mod congestion_tests {
         assert!(count_congestion_loss(&mut count, true, 10));
         cc.loss_timeout_rtts = 1.0;
         assert!(cc.validate().is_err());
+    }
+
+    #[test]
+    fn congestion_after_local_ceiling_still_cuts_actual_pacing() {
+        let (r, k) = (1_000_000_000, 900_000_000);
+        let stale_discovery = cubic_rate(20 * k, r, k).0;
+        assert!(stale_discovery > r);
+        // An uncapped discovery could leave actual pacing stuck at the local cap
+        // even after genuine loss. Cap the new anchor, not only the final output.
+        let anchor = local_rate_limit(stale_discovery, Some(1000));
+        assert_eq!(anchor, r);
+        assert_eq!(local_rate_limit(cubic_rate(0, anchor, k).0, Some(1000)), 670_000_000);
     }
 
     #[test]
