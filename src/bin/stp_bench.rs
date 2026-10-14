@@ -3,6 +3,7 @@
 //!   stp_bench serve --port P [--bind IP] [--advertise IP] [--seed-key HEX64]
 //!   stp_bench send  --to STPADDR [--seed N] [--count N] [--min 100] [--max 50000000]
 //!                   [--timeout 600] [--idle 10] [--out report.json] [--fec-pct 0]
+//!                   [--loss-trace events.csv] (S/F/L/A sender event CSV; see loss_trace.rs)
 //!
 //! Both: [--queue-us 1000000] [--queue-min 4194304] [--queue-max 67108864] [--max-pps N]
 //! (the send_buffer_params and max_pps given to the STP network thread).
@@ -409,7 +410,7 @@ fn send(a: &Args) {
     }
 
     let kp = new_keypair_from_connect_magic1(to.magic1).unwrap_or_else(|| die("unsupported crypto in --to"));
-    let handle = new_network_thread_with_options(vec![kp], 0, max_pps(a), send_buffer_params(a), NetworkThreadOptions { bind_ip: None, congestion_control: cc_options(a), fec_redundancy_ppm: fec_ppm, fec_adaptive, record_fec_messages: true });
+    let handle = new_network_thread_with_options(vec![kp], 0, max_pps(a), send_buffer_params(a), NetworkThreadOptions { bind_ip: None, congestion_control: cc_options(a), fec_redundancy_ppm: fec_ppm, fec_adaptive, record_fec_messages: true, loss_trace: a.str("loss-trace").map(std::path::PathBuf::from) });
     // Per data id: (k, blocks sent, blocks planned, loss estimate) of its FEC coding, if coded.
     let mut fec_info: HashMap<u32, (u32, u32, u32, f64)> = HashMap::new();
     // One sample per second: (t, loss estimate, sample, packets sent/lost, UDP bytes, RTT us).
@@ -693,5 +694,6 @@ fn send(a: &Args) {
         series.iter().map(|x| format!("[{:.1},{:.5},{:.5},{},{},{},{}]", x.0, x.1, x.2, x.3, x.4, x.5, x.6)).collect::<Vec<_>>().join(","), cc_options(a));
     std::fs::write(&out, json).unwrap_or_else(|e| die(&format!("writing {out}: {e}")));
     println!("report written to {out}");
+    drop(handle); // A traced run joins the network thread and flushes its event CSV.
     std::process::exit(if delivered == count as u64 { 0 } else { 1 });
 }

@@ -1611,7 +1611,8 @@ unsafe impl std::marker::Sync for NetworkThreadInner {}
 // Note(Sam): Using this handle from two threads at once is UB. Only one thread may call service_connections at any given time.
 pub struct NetworkThreadHandle {
     inner: std::sync::Arc<NetworkThreadInner>,
-    thread: std::thread::JoinHandle<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    join_on_drop: bool,
 }
 
 // The network thread owns the socket, so it has to end for the port to close and for peers to
@@ -1619,6 +1620,8 @@ pub struct NetworkThreadHandle {
 impl Drop for NetworkThreadHandle {
     fn drop(&mut self) {
         self.inner.stop.store(true, std::sync::atomic::Ordering::Release);
+        // A traced run must flush the final buffered events before the process exits.
+        if self.join_on_drop { if let Some(t) = self.thread.take() { let _ = t.join(); } }
     }
 }
 
@@ -1700,6 +1703,8 @@ pub struct NetworkThreadOptions {
     pub fec_adaptive: Option<crate::fec_adapt::AdaptiveFecConfig>,
     /// Report every finished FEC message in `NetworkThreadPull::fec_messages` (for measurement).
     pub record_fec_messages: bool,
+    /// Optional sender packet/fragment/outcome event CSV; disabled by default.
+    pub loss_trace: Option<std::path::PathBuf>,
 }
 
 impl NetworkThreadHandle {
@@ -1742,6 +1747,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
     });
     let fec_adaptive_cfg = options.fec_adaptive;
     let record_fec_messages = options.record_fec_messages;
+    let mut loss_trace = options.loss_trace.as_deref().map(|p| crate::loss_trace::LossTrace::open(p).expect("open loss trace"));
 
     let thread_inner = inner.clone();
 
@@ -2235,6 +2241,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                         if state.packets_waiting_ack_field[(bit_index / 64) as usize] & (1u64 << (bit_index % 64)) != 0 {
                                             state.packets_waiting_ack_field[(bit_index / 64) as usize] &= !(1u64 << (bit_index % 64));
                                             state.last_ack_received_time = timestamp_ns;
+                                            if let Some(t) = &mut loss_trace { t.outcome('A', existing_connection.two_byte_send_prefix, index, timestamp_ns); }
 
                                             let send_time_of_latest_ns = get_send_time_for_sequence_number(index, &state.send_time_band, state.send_time_band_head_index);
                                             if send_time_of_latest_ns != 0 && send_time_of_latest_ns != u64::MAX {
@@ -2264,6 +2271,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                         if *w & (1u64 << (bit_index % 64)) != 0 {
                                             *w &= !(1u64 << (bit_index % 64));
                                             state.stats.spurious_losses += 1;
+                                            if let Some(t) = &mut loss_trace { t.outcome('A', existing_connection.two_byte_send_prefix, index, timestamp_ns); }
                                         }
                                     }
                                 }
@@ -2823,6 +2831,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     state.packets_in_flight -= 1;
                                     state.packet_lost_since_last_print += 1;
                                     state.stats.packets_lost += 1;
+                                    if let Some(t) = &mut loss_trace { t.outcome('L', connection_tracking_data.two_byte_send_prefix, state.packets_waiting_ack_tail, current_time_now_ns); }
                                     state.declared_lost_field[(bit_index / 64) as usize] |= 1u64 << (bit_index % 64);
                                     connection_tracking_data.unreliable_send_buffer.fec_on_packet_lost(state.packets_waiting_ack_tail);
                                 }
@@ -2968,6 +2977,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             else if let Some(ns) = &connection_tracking_data.nym_sock { nym_udp_send_with_congestion_and_dscp(ns, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::BestEffort, false) }
                             else { udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::BestEffort, false) };
                             increment_sequence_number_and_account(send_time_ns, &mut state.send_sequence_number, &mut state.send_time_band, &mut state.send_time_band_head_index, &mut state.packets_waiting_ack_field);
+                            if let Some(t) = &mut loss_trace { t.sent(connection_tracking_data.two_byte_send_prefix, virtual_nonce, send_time_ns, &packet_memory_send[..payload_size]); }
                             state.last_sent_data_packet = current_time_now_ns; // We use the older time here so the pacer skips less packets.
                             state.packets_in_flight += 1;
                             state.stats.packets_sent += 1;
@@ -3032,7 +3042,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
 
     NetworkThreadHandle {
         inner,
-        thread,
+        thread: Some(thread),
+        join_on_drop: options.loss_trace.is_some(),
     }
 }
 
