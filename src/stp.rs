@@ -2783,9 +2783,12 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                         state.loss_window_start_ns = current_time_now_ns;
                                         state.loss_count_in_window = 0;
                                     }
-                                    state.loss_count_in_window += 1;
+                                    // Covered losses still enter loss/FEC statistics below, but
+                                    // cannot prime the threshold for a subsequent congestion cut.
+                                    let eligible = send_time > state.congestion_event_time_ns + (rtt_ns as f64 * cc.event_guard_rtts) as u64;
+                                    let trigger = count_congestion_loss(&mut state.loss_count_in_window, eligible, cc.loss_threshold);
 
-                                    if state.loss_count_in_window >= cc.loss_threshold && send_time > state.congestion_event_time_ns + (state.RTT_mean as f64 * 100_000.0 * cc.event_guard_rtts) as u64 {
+                                    if trigger {
                                         let send_dt = send_time - state.congestion_event_time_ns;
                                         let send_t_factor = send_dt as f64 / time_to_bandwidth_recovery as f64;
                                         let (_, send_mode) = cubic_rate(send_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery);
@@ -3213,9 +3216,24 @@ fn local_rate_limit(rate: u64, max_pps: Option<u64>) -> u64 {
     max_pps.map_or(rate, |limit| rate.min(limit.saturating_mul(1_000_000).max(1)))
 }
 
+fn count_congestion_loss(count: &mut u64, eligible: bool, threshold: u64) -> bool {
+    if !eligible { return false; }
+    *count = count.saturating_add(1);
+    *count >= threshold
+}
+
 #[cfg(test)]
 mod congestion_tests {
     use super::*;
+
+    #[test]
+    fn guarded_losses_do_not_prime_the_next_event() {
+        let mut count = 0;
+        for _ in 0..100 { assert!(!count_congestion_loss(&mut count, false, 2)); }
+        assert_eq!(count, 0);
+        assert!(!count_congestion_loss(&mut count, true, 2));
+        assert!(count_congestion_loss(&mut count, true, 2));
+    }
 
     #[test]
     fn local_ceiling_does_not_create_recovery_sawtooth() {
