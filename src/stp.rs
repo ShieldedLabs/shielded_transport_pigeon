@@ -1153,6 +1153,7 @@ pub struct ConnectionStateConnected {
     pub highest_peer_acked: Option<u64>,
     pub peer_ack_delay_us: u32,
     pub peer_ce_count: u32,
+    loss_timer: LossTimer,
 
     // Note(Sam): HARD ASSUMPTION that no link ever has a greater RTT than 4.295 seconds.
     pub send_time_band: [u64; 1024], // 1024 buckets of 4.194 ms giving 4.295 seconds of tracking.
@@ -1219,6 +1220,7 @@ pub fn new_connection_state_connected(cipher: Option<ConnectionCipherTriplet>, m
         highest_peer_acked: None,
         peer_ack_delay_us: 0,
         peer_ce_count: 0,
+        loss_timer: LossTimer::default(),
         send_time_band: [0; 1024],
         send_time_band_head_index: 0,
         RTT_sample_sums: [0; 16],
@@ -2527,11 +2529,13 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
 
                                 let mut RTT_acc = 0u64;
                                 let mut RTT_count = 0u64;
+                                let mut ack_latency_ns = 0u64;
                                 
                                 let mut oldest_newly_acked_send_time: u64 = u64::MAX;
                                 let relevant_ack = bitmap_ack.as_ref().map(|a| a.relevant(&state.packets_waiting_ack_field, &state.declared_lost_field[..]));
                                 let indices = relevant_ack.iter().flat_map(crate::ack::BitmapAck::acknowledged);
                                 for index in indices {
+                                    let mut newly_acked = false;
                                     if index < state.send_sequence_number {
                                         state.highest_peer_acked = Some(state.highest_peer_acked.unwrap_or(index).max(index));
                                     }
@@ -2542,19 +2546,10 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                             state.last_ack_received_time = timestamp_ns;
                                             if let Some(t) = &mut loss_trace { t.outcome('A', existing_connection.two_byte_send_prefix, index, timestamp_ns); }
 
+                                            newly_acked = true;
                                             let send_time_of_latest_ns = state.send_time(index);
                                             if send_time_of_latest_ns != 0 && send_time_of_latest_ns != u64::MAX {
                                                 oldest_newly_acked_send_time = oldest_newly_acked_send_time.min(send_time_of_latest_ns);
-                                                // One truthful sample per new-format ACK. Its delay belongs only
-                                                // to sample_seq, not every packet repeated in the bitmap.
-                                                if bitmap_ack.as_ref().is_none_or(|a| index == a.sample_seq) {
-                                                    let delay = bitmap_ack.as_ref().map_or(0, |a| a.delay_us as u64 * 1000);
-                                                    let raw = timestamp_ns.saturating_sub(send_time_of_latest_ns);
-                                                    if delay < raw {
-                                                        RTT_acc += (raw - delay).max(100_000) / 100_000;
-                                                        RTT_count += 1;
-                                                    }
-                                                }
                                             }
                                             
                                             if index == state.tu_probe_sequence_number {
@@ -2578,10 +2573,28 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                         if *w & (1u64 << (bit_index % 64)) != 0 {
                                             *w &= !(1u64 << (bit_index % 64));
                                             state.stats.spurious_losses += 1;
+                                            newly_acked = true;
+                                            state.last_ack_received_time = timestamp_ns;
                                             if let Some(t) = &mut loss_trace { t.outcome('A', existing_connection.two_byte_send_prefix, index, timestamp_ns); }
                                         }
                                     }
+                                    if newly_acked {
+                                        let sent_ns = state.send_time(index);
+                                        if sent_ns != 0 && sent_ns != u64::MAX {
+                                            let raw = timestamp_ns.saturating_sub(sent_ns);
+                                            ack_latency_ns = ack_latency_ns.max(raw);
+                                            // A late sample is still a truthful RTT measurement.
+                                            if bitmap_ack.as_ref().is_none_or(|a| index == a.sample_seq) {
+                                                let delay = bitmap_ack.as_ref().map_or(0, |a| a.delay_us as u64 * 1000);
+                                                if delay < raw {
+                                                    RTT_acc += (raw - delay).max(100_000) / 100_000;
+                                                    RTT_count += 1;
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
+                                if ack_latency_ns != 0 { state.loss_timer.observe(ack_latency_ns); }
 
                                 let ce_feedback = bitmap_ack.as_ref().is_some_and(|a| crate::ack::update_ce_count(&mut state.peer_ce_count, a.ce_count));
                                 if ecn_marked || ce_feedback {
@@ -3051,10 +3064,9 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             println!("congestion event ECN CE ...  rate discovered: {} pps  sent:{send_mode}@{send_t_factor:.2}", state.congestion_event_rate_upps as f64 / 1000000.0);
                         }
 
-                        // NOTE(Sam): We may experience black holes if RTT suddenly increases since
-                        // there is a cyclic dependency beteen RTT and measuring RTT because of drop.
-                        
-                        let time_to_considered_dropped = ((state.RTT_mean as f64 * 100_000.0 * cc.loss_timeout_rtts) as u64).max((2*(current_time_now_ns - state.last_ack_received_time)).min(1_000_000_000));
+                        let time_to_considered_dropped = state.loss_timer.timeout_ns(
+                            state.RTT_mean as u64 * 100_000,
+                            current_time_now_ns.saturating_sub(state.last_ack_received_time), &cc);
                         
                         connection_tracking_data.unreliable_send_buffer.fec_now_ns = current_time_now_ns;
                         connection_tracking_data.unreliable_send_buffer.fec_rtt_ns = state.RTT_mean as u64 * 100_000;
@@ -3505,6 +3517,37 @@ fn quantized_rtt_mean(sum: u64, count: u64) -> u16 {
     (sum / count.max(1)).clamp(1, u16::MAX as u64) as u16
 }
 
+/// Loss timing observes full ACK latency (including receiver batching), independently
+/// of the delay-corrected RTT used by CC. One sample per ACK, not per bitmap bit.
+/// Late ACKs must participate: censoring them leaves a low-rate sender blind to jitter.
+#[derive(Debug, Default)]
+struct LossTimer {
+    srtt_ns: u64,
+    rttvar_ns: u64,
+}
+
+impl LossTimer {
+    fn observe(&mut self, latency_ns: u64) {
+        let sample = latency_ns.max(100_000);
+        if self.srtt_ns == 0 {
+            self.srtt_ns = sample;
+            self.rttvar_ns = sample / 2;
+        } else {
+            self.rttvar_ns = (3 * self.rttvar_ns + self.srtt_ns.abs_diff(sample)) / 4;
+            self.srtt_ns = (7 * self.srtt_ns + sample) / 8;
+        }
+    }
+
+    fn timeout_ns(&self, rtt_ns: u64, since_ack_ns: u64, cc: &CongestionPolicy) -> u64 {
+        // Keep the shipped two-RTT minimum and blackhole grace. ACK delay is
+        // included in raw samples; reserve the policy cap even before a sample.
+        let minimum = (rtt_ns as f64 * cc.loss_timeout_rtts) as u64
+            + crate::ship::ACK.max_delay_us as u64 * 1000;
+        minimum.max(self.srtt_ns.saturating_add((4 * self.rttvar_ns).max(1_000_000)))
+            .max(since_ack_ns.saturating_mul(2).min(1_000_000_000))
+    }
+}
+
 fn local_rate_limit(rate: u64, max_pps: Option<u64>) -> u64 {
     max_pps.map_or(rate, |limit| rate.min(limit.saturating_mul(1_000_000).max(1)))
 }
@@ -3580,6 +3623,37 @@ impl LossEpisodes {
 #[cfg(test)]
 mod congestion_tests {
     use super::*;
+
+    #[test]
+    fn loss_timer_keeps_ack_delay_at_the_rate_floor() {
+        let cc = crate::ship::CC;
+        let mut timer = LossTimer::default();
+        // At 100 pps the count trigger takes 80 ms, but the delay cap flushes
+        // after 10 ms. Stable 50 ms path + 10 ms ACK delay is not a loss.
+        for _ in 0..100 { timer.observe(60_000_000); }
+        let timeout = timer.timeout_ns(50_000_000, 0, &cc);
+        assert!(timeout >= 110_000_000);
+        assert!(timeout < 200_000_000); // genuine losses still retire promptly
+    }
+
+    #[test]
+    fn loss_timer_learns_late_ack_without_censoring_and_recovers() {
+        let cc = crate::ship::CC;
+        let mut timer = LossTimer::default();
+        for _ in 0..100 { timer.observe(50_000_000); }
+        assert!(timer.timeout_ns(50_000_000, 0, &cc) < 150_000_000);
+        // The old two-mean-RTT detector already declared this packet lost.
+        // Its late ACK must increase the timer, not just the spurious counter.
+        timer.observe(160_000_000);
+        assert!(timer.timeout_ns(50_000_000, 0, &cc) > 160_000_000);
+        for i in 0..500 {
+            timer.observe(if i % 4 == 0 { 160_000_000 } else { 50_000_000 });
+            assert!(timer.timeout_ns(50_000_000, 0, &cc) > 160_000_000);
+        }
+        for _ in 0..100 { timer.observe(50_000_000); }
+        assert!(timer.timeout_ns(50_000_000, 0, &cc) < 120_000_000);
+        assert_eq!(timer.timeout_ns(50_000_000, 600_000_000, &cc), 1_000_000_000);
+    }
 
     #[test]
     fn loss_free_app_empty_resume_preserves_every_active_curve() {
