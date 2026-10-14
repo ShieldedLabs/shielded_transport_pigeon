@@ -1694,6 +1694,9 @@ pub struct CongestionControlOptions {
     /// Optional initial pps multiplication per RTT until first loss/ECN (0 disables).
     /// Uses only elapsed active time and RTT; no delivery/bandwidth/delay signal.
     pub startup_multiplier: f64,
+    /// Anchor startup exit this many RTTs before the lost/marked packet's send.
+    /// One preserves the initial experiment; larger values cut overshoot harder.
+    pub startup_backoff_rtts: f64,
 }
 impl CongestionControlOptions {
     pub const fn legacy() -> Self {
@@ -1701,7 +1704,7 @@ impl CongestionControlOptions {
             rate_rp: RATE_RP, rate_pg: RATE_PG, rate_gs: RATE_GS, time_pg: TIME_PG, time_gs: TIME_GS,
             loss_threshold: 2, loss_fraction_ppm: 0, loss_response_fraction_ppm: 0, loss_timeout_rtts: 2.0, event_guard_rtts: 0.5, ecn_event_guard_rtts: 0.0, rate_floor_upps: RATE_FLOOR_UPPS, initial_rate_upps: RATE_FLOOR_UPPS,
             min_growth_uppsps: CUBIC_MIN_GROWTH_UPPSPS, max_growth_uppsps: CUBIC_MAX_RATE_UPPS_PER_SEC,
-            friendly_growth_alpha: 0.0, relative_growth_per_rtt: 0.0, bound_recovery_growth: false, compound_growth: false, proportional_growth: false, record_loss_episodes: false, startup_multiplier: 0.0 }
+            friendly_growth_alpha: 0.0, relative_growth_per_rtt: 0.0, bound_recovery_growth: false, compound_growth: false, proportional_growth: false, record_loss_episodes: false, startup_multiplier: 0.0, startup_backoff_rtts: 1.0 }
     }
     /// Shorter probe plateau and stronger existing additive term; same R/P/G/S curve.
     pub const fn balanced() -> Self {
@@ -1722,6 +1725,7 @@ impl CongestionControlOptions {
         if self.loss_fraction_ppm > 500_000 || self.loss_response_fraction_ppm > 500_000 || !(2.0..=10.0).contains(&self.loss_timeout_rtts) { return Err("invalid CC loss episode/reorder tolerance"); }
         if self.proportional_growth && !(self.bound_recovery_growth && self.compound_growth && self.relative_growth_per_rtt > 0.0) { return Err("CC proportional growth requires bounded compound relative growth"); }
         if self.startup_multiplier != 0.0 && !(1.01..=2.0).contains(&self.startup_multiplier) { return Err("CC startup multiplier must be zero or 1.01..=2"); }
+        if !(0.0..=4.0).contains(&self.startup_backoff_rtts) { return Err("CC startup backoff must be in 0..=4 RTTs"); }
         Ok(())
     }
 }
@@ -2789,7 +2793,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             let discover_dt = if send_mode == 'P' { (time_to_bandwidth_recovery + send_dt) / 2 } else { send_dt };
                             let mut discovered = cc_rate(discover_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery, state.cc_startup_done).0;
                             if send_mode == 'I' {
-                                discovered = cc_rate(send_dt.saturating_sub(state.RTT_mean as u64 * 100_000), state.congestion_event_rate_upps, time_to_bandwidth_recovery, false).0;
+                                discovered = cc_rate(send_dt.saturating_sub((state.RTT_mean as f64 * 100_000.0 * cc.startup_backoff_rtts) as u64), state.congestion_event_rate_upps, time_to_bandwidth_recovery, false).0;
                             } else if send_mode == 'G' || send_mode == 'S' {
                                 let r_pg = (state.congestion_event_rate_upps as f64 * cc.rate_pg) as u64;
                                 discovered = r_pg + ((discovered.saturating_sub(r_pg)) as f64 * 0.5) as u64;
@@ -3330,7 +3334,7 @@ fn apply_loss_congestion(state: &mut ConnectionStateConnected, send_time: u64, c
     // P/G/S: blend 50% toward R/P boundary rate.
     let mut discovered = connection_rate(send_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery, cc, state.cc_startup_done).0;
     if send_mode == 'I' {
-        discovered = connection_rate(send_dt.saturating_sub(rtt_ns), state.congestion_event_rate_upps, time_to_bandwidth_recovery, cc, false).0;
+        discovered = connection_rate(send_dt.saturating_sub((rtt_ns as f64 * cc.startup_backoff_rtts) as u64), state.congestion_event_rate_upps, time_to_bandwidth_recovery, cc, false).0;
     } else if send_mode != 'R' {
         let boundary = (state.congestion_event_rate_upps as f64 * cc.rate_rp) as u64;
         discovered = (discovered + boundary) / 2;
@@ -3468,6 +3472,14 @@ mod congestion_tests {
         assert_eq!(connection_rate(0, r, k, &CongestionControlOptions::legacy(), false), cubic_rate(0, r, k));
         assert!(CongestionControlOptions { startup_multiplier: f64::NAN, ..cc }.validate().is_err());
         assert!(CongestionControlOptions { startup_multiplier: 1.0, ..cc }.validate().is_err());
+        assert!(CongestionControlOptions { startup_backoff_rtts: f64::NAN, ..cc }.validate().is_err());
+        let cc = CongestionControlOptions { startup_backoff_rtts: 2.0, ..cc };
+        let ConnectionState::Connected(mut state) = new_connection_state_connected(None, 0, 1, 1) else { unreachable!() };
+        state.RTT_mean = 2000;
+        state.congestion_event_rate_upps = r;
+        apply_loss_congestion(&mut state, 10*rtt, 12*rtt, &cc, None);
+        assert_eq!(state.congestion_event_rate_upps, connection_rate(8*rtt, r, k, &cc, false).0);
+        assert!(state.cc_startup_done);
     }
 
     #[test]
