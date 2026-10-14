@@ -1285,8 +1285,8 @@ impl ReceiveQueue {
     }
 }
 
-/// Returns the used payload length (0 when there is nothing to send). Real data
-/// payloads are at least 517 bytes: exactly 516 is reserved for size-identified ACKs.
+/// Fill a full transmission unit, or return 0 if nothing was queued.
+/// Padding is an authenticated terminator, never a variable-size tail.
 fn fill_packet_payload_with_unreliable_fragments(payload: &mut [u8], unreliable_send_buffer: &mut UnreliableSendBuffer) -> usize {
     unreliable_send_buffer.packet_dscp = None;
     let mut send = false;
@@ -1313,9 +1313,8 @@ fn fill_packet_payload_with_unreliable_fragments(payload: &mut [u8], unreliable_
         }
     }
     if send == false { return 0; }
-    let used = cursor.max(517).min(payload.len());
     payload[cursor..].fill(0xff);
-    used
+    payload.len()
 }
 
 const RECEIVE_CONNECTION_BYTES: usize = 512 << 10;
@@ -2840,7 +2839,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 payload = &packet_memory_encrypted[6..buf_len];
                             }
                             // Packet TYPE is still determined by authenticated payload SIZE.
-                            let is_ack = payload.len() == 516 || payload.len() == crate::ack::ACK_PAYLOAD_LEN;
+                            let is_ack = payload.len() == crate::ack::ACK_PAYLOAD_LEN;
                             if is_ack != crate::sequence::is_ack_space(non_virtual_nonce) { break 'conn; }
                             if !state.receive_sequences.commit(nonce) { break 'conn; }
                             // ACK nonces are not holes in the dense data stream.
@@ -3321,7 +3320,9 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 store_u16(&mut packet_memory_encrypted[0..2], connection_tracking_data.two_byte_send_prefix);
                                 store_u32(&mut packet_memory_encrypted[2..6], crate::sequence::to_wire(seq));
                                 // Authenticated null fragment: elicits a bitmap ACK but creates no message.
-                                let data = [0u8; OUTAGE_PROBE_PAYLOAD_BYTES];
+                                let probe_payload_len = state.current_tu as usize - total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(state.magic1).unwrap();
+                                packet_memory_send[..probe_payload_len].fill(0xff);
+                                let data = &packet_memory_send[..probe_payload_len];
                                 let packet_len = if let Some(cipher) = &mut state.cipher {
                                     cipher.current.write_message(seq, &data, &mut packet_memory_encrypted[6..]).unwrap()
                                 } else {
@@ -3538,7 +3539,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             state.tu_probe_size_advance = state.tu_probe_size_advance.max(1).min(ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE as u64);
                             state.tu_probe_size = (state.current_tu + state.tu_probe_size_advance).min(ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE as u64);
                             let payload_size = state.tu_probe_size as usize - total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(state.magic1).unwrap();
-                            let null_bytes = [0u8; ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE];
+                            let null_bytes = [0xffu8; ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE];
                             
                             state.tu_probe_sequence_number = state.send_sequence_number;
                         
@@ -3565,7 +3566,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                         let payload_size = state.current_tu as usize - total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(state.magic1).unwrap();
                         
                         if state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY - 1 && state.last_sent_data_packet + 15_000_000_000/3 < current_time_now_ns {
-                            let null_bytes = [0u8; ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE];
+                            let null_bytes = [0xffu8; ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE];
                         
                             let virtual_nonce = state.send_sequence_number;
                             store_u16(&mut packet_memory_encrypted[0..2], connection_tracking_data.two_byte_send_prefix);
@@ -3860,8 +3861,6 @@ const OUTAGE_ACK_SILENCE_NS: u64 = 2_000_000_000;
 const OUTAGE_TIMEOUT_NS: u64 = 120_000_000_000;
 const OUTAGE_FIRST_PROBE_NS: u64 = 250_000_000;
 const OUTAGE_MAX_PROBE_NS: u64 = 4_000_000_000;
-// Existing peers classify non-ACK packets by authenticated size: 517 is the minimum.
-const OUTAGE_PROBE_PAYLOAD_BYTES: usize = 517;
 
 #[derive(Debug, Default)]
 struct OutageState {
@@ -4601,13 +4600,13 @@ mod fec_send_tests {
     }
 
     #[test]
-    fn trimmed_data_never_uses_ack_size() {
+    fn padded_data_always_fills_current_tu() {
         let mut payload = vec![0; 9194];
         for len in [0, 1, 500, 508, 509, 600] {
             let mut b = new_buf();
             b.submit_messages(vec![vec![7; len]]);
             let used = fill_packet_payload_with_unreliable_fragments(&mut payload, &mut b);
-            assert_eq!(used, (len + STP_FRAGMENT_HEADER_SIZE).max(517));
+            assert_eq!(used, payload.len());
             assert!(used > 516);
             let f = parse_packet(&payload[..used]);
             assert_eq!(f[0].4, vec![7; len]);
@@ -4616,9 +4615,9 @@ mod fec_send_tests {
         b.submit_messages(vec![vec![9; 200_000]]);
         let mut small = vec![0; 1162];
         assert_eq!(fill_packet_payload_with_unreliable_fragments(&mut small, &mut b), 1162);
-        // TU grew after coding started: do not pay 288B of padding per block.
+        // An existing encoder keeps its layout, but its wire packet uses the grown TU.
         let mut grown = vec![0; 1450];
-        assert_eq!(fill_packet_payload_with_unreliable_fragments(&mut grown, &mut b), 1162);
+        assert_eq!(fill_packet_payload_with_unreliable_fragments(&mut grown, &mut b), 1450);
     }
 
     #[test]
@@ -5198,11 +5197,11 @@ mod traffic_class_tests {
         s.submit_classified_messages(0, vec![(Dscp::Ef, vec![1; 100]), (Dscp::BestEffort, vec![2; 100]), (Dscp::BestEffort, vec![3; 100])]);
         let mut p = vec![0; 1449];
         s.fec_prepare_packet(0);
-        assert_eq!(s.fill_packet(&mut p), 517);
+        assert_eq!(s.fill_packet(&mut p), p.len());
         assert_eq!(s.last_dscp, Dscp::Ef);
         assert_eq!(&p[108..116], &[255; 8]);
         s.fec_prepare_packet(1);
-        assert_eq!(s.fill_packet(&mut p), 517);
+        assert_eq!(s.fill_packet(&mut p), p.len());
         assert_eq!(s.last_dscp, Dscp::BestEffort);
         assert_eq!(p[8], 2);
         assert_eq!(p[116], 3);
