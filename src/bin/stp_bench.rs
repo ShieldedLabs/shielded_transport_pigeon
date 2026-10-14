@@ -10,6 +10,8 @@
 //! Giant demo: send --to STPADDR --giant 1G --fec-pct 3 --timeout 600 --idle 30.
 //! Both endpoints must support extended FEC kind 2 for messages above 64000 source blocks.
 //!                   [--loss-trace events.csv] (S/F/L/A sender event CSV; see loss_trace.rs)
+//!                   [--message-trace messages.csv] requires loss-trace; app ID, size,
+//!                   first submission, delivery status, receiver clock, actual sequence bounds.
 //!
 //! Both: [--queue-us 1000000] [--queue-min 4194304] [--queue-max 67108864] [--max-pps N]
 //! (the send_buffer_params and max_pps given to the STP network thread).
@@ -460,7 +462,38 @@ fn integrated_rx_report_roundtrip() {
     assert_eq!(&words[32..37], &[21, 22, 23, 24, 25]);
 }
 
+// Offline benchmark-only join after the sender trace has been flushed. Fragment
+// zero carries the application tag; wire package IDs may wrap and be reused.
+fn message_sequences(reader: impl std::io::BufRead, sizes: &[usize]) -> std::io::Result<Vec<Option<(u64, u64)>>> {
+    let mut result = vec![None; sizes.len()];
+    let mut wire: HashMap<(u16, u16), (Option<usize>, u64, u64)> = HashMap::new();
+    for line in reader.lines() {
+        let line = line?;
+        let f: Vec<_> = line.split(',').collect();
+        if f.first() != Some(&"F") { continue; }
+        if f.len() != 11 { return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "message trace needs tagged loss-trace CSV")); }
+        let bad = || std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid loss-trace field");
+        let key = (f[1].parse::<u16>().map_err(|_| bad())?, f[6].parse::<u16>().map_err(|_| bad())?);
+        let seq = f[2].parse::<u64>().map_err(|_| bad())?;
+        if f[7] == "0" {
+            if let Some((Some(id), first, last)) = wire.remove(&key) { result[id] = Some((first, last)); }
+            let id = f[9].parse::<usize>().ok().filter(|&id| id < sizes.len() && f[10].parse::<usize>().ok() == Some(sizes[id]));
+            wire.insert(key, (id, seq, seq));
+        } else if let Some((_, _, last)) = wire.get_mut(&key) { *last = seq; }
+    }
+    for (_, (id, first, last)) in wire { if let Some(id) = id { result[id] = Some((first, last)); } }
+    Ok(result)
+}
+
+#[test]
+fn message_sequences_map_tags_and_handle_wire_id_reuse() {
+    let csv = "F,1,10,1,1000,0,7,0,0,0,1000\nF,1,11,2,8,0,7,1,1,-1,-1\nF,1,12,3,8,0,7,0,1,1,65536\nF,1,13,4,8,0,7,1,1,-1,-1\nF,1,14,5,8,0,8,0,0,4294967040,48\n";
+    assert_eq!(message_sequences(std::io::Cursor::new(csv), &[1000,65536]).unwrap(), vec![Some((10,11)),Some((12,13))]);
+    assert!(message_sequences(std::io::Cursor::new("F,1,1\n"), &[1000]).is_err());
+}
+
 fn send(a: &Args) {
+    if a.str("message-trace").is_some() && a.str("loss-trace").is_none() { die("--message-trace requires --loss-trace"); }
     let to = STPAddress::parse(a.str("to").unwrap_or_else(|| die("send needs --to STPADDR"))).unwrap_or_else(|| die("bad --to address"));
     let seed: u64 = a.num("seed", 1);
     let giant = a.str("giant").map(|s| giant_size(s).unwrap_or_else(|| die("--giant needs a byte count, 256M or 1G (binary units, whole framed message)")));
@@ -891,5 +924,23 @@ fn send(a: &Args) {
     std::fs::write(&out, json).unwrap_or_else(|e| die(&format!("writing {out}: {e}")));
     println!("report written to {out}");
     drop(handle); // A traced run joins the network thread and flushes its event CSV.
+    if let Some(path) = a.str("message-trace") {
+        use std::io::Write;
+        let packet_path = a.str("loss-trace").unwrap();
+        let packets = std::fs::File::open(packet_path).unwrap_or_else(|e| die(&format!("reading {packet_path}: {e}")));
+        let bounds = message_sequences(std::io::BufReader::new(packets), &sizes).unwrap_or_else(|e| die(&format!("joining {packet_path}: {e}")));
+        let file = std::fs::File::create(path).unwrap_or_else(|e| die(&format!("writing {path}: {e}")));
+        let mut file = std::io::BufWriter::new(file);
+        writeln!(file, "app_id,size,submit_ns,delivered,recv_ns,first_seq,last_seq").unwrap();
+        for id in 0..count {
+            let submit = first_submit_ns[id as usize].map(|t| t.to_string()).unwrap_or_default();
+            let received = recs.get(&id).map(|&(_, t)| t.to_string()).unwrap_or_default();
+            let ok = recs.get(&id).is_some_and(|&(ok, _)| ok);
+            let (first, last) = bounds[id as usize].map(|(a,b)| (a.to_string(),b.to_string())).unwrap_or_default();
+            writeln!(file, "{id},{},{submit},{},{received},{first},{last}", sizes[id as usize], u8::from(ok)).unwrap();
+        }
+        file.flush().unwrap();
+        println!("message trace written to {path}");
+    }
     std::process::exit(if delivered == count as u64 { 0 } else { 1 });
 }
