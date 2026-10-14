@@ -7,6 +7,7 @@
 #![allow(dead_code, unused_variables, unused_mut, unused_imports, unused_assignments, unused_unsafe)]
 #![allow(deprecated)]
 
+mod ship;
 pub mod ack;
 pub mod fec;
 pub mod fec_adapt;

@@ -2021,12 +2021,12 @@ impl NetworkThreadHandle {
 
 pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_pps: Option<u64>, send_buffer_params: (u32, u32, u32), options: NetworkThreadOptions) -> NetworkThreadHandle {
     let bind_ip = options.bind_ip;
-    let curve_cadence_ns = options.pacing.cadence_ns(&options.congestion_control);
-    let curve_burst_budget_ns = curve_cadence_ns.and_then(|cadence|
-        Some(options.polynomial_burst_budget_ns.unwrap_or(cadence)).filter(|ns| *ns != 0));
-    let pacing_diagnostics = options.pacing_diagnostics;
-    let cc = options.congestion_control;
-    let ack_options = options.acknowledgements;
+    // Only the measured ship policy runs; research configuration is removed next.
+    let curve_cadence_ns: Option<u64> = None;
+    let curve_burst_budget_ns: Option<u64> = None;
+    let pacing_diagnostics = false;
+    let cc = crate::ship::CC;
+    let ack_options = crate::ship::ACK;
     cc.validate().expect("invalid congestion controller configuration");
     let cc_rate = move |t, r, k, startup_done| connection_rate(t, r, k, &cc, startup_done);
 
@@ -2042,10 +2042,10 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
         stop: std::sync::atomic::AtomicBool::new(false),
         push: std::cell::UnsafeCell::new(NetworkThreadPush::default()),
         pull: std::cell::UnsafeCell::new(NetworkThreadPull::default()),
-        fec_redundancy_ppm: std::sync::atomic::AtomicU32::new(options.fec_redundancy_ppm.min(MAX_FEC_REDUNDANCY_PPM)),
-        fec_adaptive_enabled: std::sync::atomic::AtomicBool::new(options.fec_adaptive.is_some()),
+        fec_redundancy_ppm: std::sync::atomic::AtomicU32::new(0),
+        fec_adaptive_enabled: std::sync::atomic::AtomicBool::new(true),
     });
-    let fec_adaptive_cfg = options.fec_adaptive;
+    let fec_adaptive_cfg = Some(crate::ship::FEC);
     let record_fec_messages = options.record_fec_messages;
     let mut loss_trace = options.loss_trace.as_deref().map(|p| crate::loss_trace::LossTrace::open(p).expect("open loss trace"));
 
@@ -2101,8 +2101,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                 last_loop_start_ns = t;
                 thread_stats.loop_iterations += 1;
             }
-            let fec_redundancy_ppm = thread_inner.fec_redundancy_ppm.load(std::sync::atomic::Ordering::Relaxed);
-            let fec_adaptive_now = if thread_inner.fec_adaptive_enabled.load(std::sync::atomic::Ordering::Relaxed) { fec_adaptive_cfg } else { None };
+            let fec_redundancy_ppm = 0;
+            let fec_adaptive_now = fec_adaptive_cfg;
             let test_drop_ppm = match &test_drop_schedule { Some(sch) => sch.ppm_at(monotonic_clock_ns().saturating_sub(test_drop_t0)), None => test_drop_ppm };
             if thread_inner.state.load(std::sync::atomic::Ordering::Acquire) == 1 {
                 let mut req = NetworkThreadPush::default();
