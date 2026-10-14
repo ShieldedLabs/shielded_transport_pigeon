@@ -164,6 +164,7 @@ fn cc_options(a: &Args) -> CongestionControlOptions {
     cc.max_growth_uppsps = a.num("cc-max-growth-ppsps", cc.max_growth_uppsps / 1e6) * 1e6;
     cc.friendly_growth_alpha = a.num("cc-friendly-alpha", cc.friendly_growth_alpha);
     cc.relative_growth_per_rtt = a.num("cc-relative-growth", cc.relative_growth_per_rtt);
+    cc.bound_recovery_growth = a.num::<u8>("cc-bound-recovery-growth", u8::from(cc.bound_recovery_growth)) != 0;
     cc.record_loss_episodes = a.num::<u8>("cc-record-loss-episodes", u8::from(cc.record_loss_episodes)) != 0;
     if let Err(e) = cc.validate() { die(e); }
     cc

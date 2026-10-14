@@ -1662,6 +1662,8 @@ pub struct CongestionControlOptions {
     /// Optional growth ceiling as a fraction of the anchor rate per RTT (0 disables).
     /// The additive floor remains available even at low anchor rates.
     pub relative_growth_per_rtt: f64,
+    /// Apply the growth envelope to R as well as P/G/S, bounding regrowth after cuts.
+    pub bound_recovery_growth: bool,
     /// Opt-in fixed-memory congestion-episode instrumentation, never alters the rate.
     pub record_loss_episodes: bool,
 }
@@ -1671,7 +1673,7 @@ impl CongestionControlOptions {
             rate_rp: RATE_RP, rate_pg: RATE_PG, rate_gs: RATE_GS, time_pg: TIME_PG, time_gs: TIME_GS,
             loss_threshold: 2, event_guard_rtts: 0.5, rate_floor_upps: RATE_FLOOR_UPPS, initial_rate_upps: RATE_FLOOR_UPPS,
             min_growth_uppsps: CUBIC_MIN_GROWTH_UPPSPS, max_growth_uppsps: CUBIC_MAX_RATE_UPPS_PER_SEC,
-            friendly_growth_alpha: 0.0, relative_growth_per_rtt: 0.0, record_loss_episodes: false }
+            friendly_growth_alpha: 0.0, relative_growth_per_rtt: 0.0, bound_recovery_growth: false, record_loss_episodes: false }
     }
     /// Shorter probe plateau and stronger existing additive term; same R/P/G/S curve.
     pub const fn balanced() -> Self {
@@ -3112,6 +3114,12 @@ pub fn cubic_rate_with_options(t_ns: u64, r_max: u64, k_ns: u64, cc: &Congestion
     } else { cc.max_growth_uppsps };
     let min_growth = floor / 1e9 * t;
     let linear_cap_slope = ceiling / 1e9;
+    let finish = |rate: u64, mode| {
+        if cc.bound_recovery_growth {
+            let envelope = (r * cc.beta + (floor + ceiling) / 1e9 * t) as u64;
+            (rate.min(envelope), mode)
+        } else { (rate, mode) }
+    };
 
     // R: p^2 recovery from r*BETA up to r*cc.rate_rp
     let r_rp = r * cc.rate_rp; // rate at R→P
@@ -3119,7 +3127,7 @@ pub fn cubic_rate_with_options(t_ns: u64, r_max: u64, k_ns: u64, cc: &Congestion
     if t <= k {
         let p = 1.0 - t / k;
         let rate = r_rp - r_drop * p * p + min_growth;
-        return ((rate.max(r * cc.beta)) as u64, 'R');
+        return finish((rate.max(r * cc.beta)) as u64, 'R');
     }
 
     let dt = t - k;
@@ -3137,7 +3145,7 @@ pub fn cubic_rate_with_options(t_ns: u64, r_max: u64, k_ns: u64, cc: &Congestion
         let capped = r_rp + linear_cap_slope * dt + min_growth;
         let rate = rate.min(capped);
         let rate = if rate.is_finite() { rate } else { r };
-        return (rate as u64, 'P');
+        return finish(rate as u64, 'P');
     }
 
     // G: quadratic from (t_pg, r_pg), entry derivative = p_slope
@@ -3152,7 +3160,7 @@ pub fn cubic_rate_with_options(t_ns: u64, r_max: u64, k_ns: u64, cc: &Congestion
         let capped = r + linear_cap_slope * dt + min_growth;
         let rate = rate.min(capped);
         let rate = if rate.is_finite() { rate } else { r };
-        return (rate as u64, 'G');
+        return finish(rate as u64, 'G');
     }
 
     // S: p^10 explosive ramp from G→S point
@@ -3173,7 +3181,7 @@ pub fn cubic_rate_with_options(t_ns: u64, r_max: u64, k_ns: u64, cc: &Congestion
     let rate = rate.min(capped);
     let rate = if rate.is_finite() { rate } else { r };
     let mode = if uncapped > capped { 'L' } else { 'S' };
-    (rate as u64, mode)
+    finish(rate as u64, mode)
 }
 
 
@@ -3299,6 +3307,24 @@ mod congestion_tests {
         assert_eq!(stats.max_rtt_loss_window_packets, 100);
         assert_eq!(std::mem::size_of::<LossEpisodes>(), 104);
         assert_eq!(stats.packets_lost, 0); // Meter never alters actual loss/CC accounting.
+    }
+
+    #[test]
+    fn bounded_recovery_cannot_bypass_relative_growth_limit() {
+        let mut cc = CongestionControlOptions::balanced();
+        cc.max_growth_uppsps = 500e6;
+        cc.relative_growth_per_rtt = 0.02;
+        let (r, k) = (1_000_000_000, 1_800_000_000);
+        assert_eq!(cubic_rate_with_options(k, r, k, &cc).0, 1_025_000_000);
+        cc.bound_recovery_growth = true;
+        assert_eq!(cubic_rate_with_options(k, r, k, &cc).0, 895_000_000);
+        let mut prev = 0;
+        for t in (0..100*k).step_by((k/1000) as usize) {
+            let rate = cubic_rate_with_options(t, r, k, &cc).0;
+            assert!(rate >= prev);
+            assert!(rate <= (r as f64 * cc.beta + 125e6 * t as f64 / 1e9) as u64);
+            prev = rate;
+        }
     }
 
     #[test]
