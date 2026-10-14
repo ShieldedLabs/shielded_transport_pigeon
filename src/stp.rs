@@ -518,6 +518,7 @@ pub struct UnreliableSendBuffer {
     rescue_ready: VecDeque<u16>,
     rescue_ready_count: usize,
     retained_next_prune_ns: u64,
+    retained_last_prune_ns: u64,
     fec_extra_packet_tags: HashMap<u64, Vec<u64>>,
     fec_rescue_package: Option<u16>,
     fec_suspended: Option<FecSendSlot>,
@@ -782,6 +783,7 @@ impl UnreliableSendBuffer {
             rescue_ready: VecDeque::new(),
             rescue_ready_count: 0,
             retained_next_prune_ns: 0,
+            retained_last_prune_ns: 0,
             fec_extra_packet_tags: HashMap::new(),
             fec_rescue_package: None,
             fec_suspended: None,
@@ -914,9 +916,12 @@ impl UnreliableSendBuffer {
         if self.fec_now_ns < self.retained_next_prune_ns { return; }
         let expired: Vec<u16> = self.fec_retained.iter().filter(|(_, r)| r.expires_ns <= self.fec_now_ns).map(|(&p, _)| p).collect();
         for package in expired { self.remove_retained(package); }
-        // Keep periodic scans cheap, but never sleep across an absolute deadline.
+        // Full-map scans stay at least 1 ms apart. Nonready expired sources may
+        // linger by that quantum; active/ready repairs have exact O(1) expiry guards.
+        self.retained_last_prune_ns = self.fec_now_ns;
         self.retained_next_prune_ns = self.fec_now_ns.saturating_add(10_000_000)
-            .min(self.fec_retained.values().map(|r| r.expires_ns).min().unwrap_or(u64::MAX));
+            .min(self.fec_retained.values().map(|r| r.expires_ns).min().unwrap_or(u64::MAX))
+            .max(self.fec_now_ns.saturating_add(1_000_000));
     }
 
     fn retain_fec(&mut self, mut slot: FecSendSlot, package: u16) {
@@ -941,7 +946,8 @@ impl UnreliableSendBuffer {
         if self.fec_now_ns >= expires_ns { return; }
         self.retained_bytes += slot.message.len();
         if slot.next_id > 0 && slot.next_id < slot.n { self.rescue_ready.push_back(package); self.rescue_ready_count += 1; }
-        self.retained_next_prune_ns = self.retained_next_prune_ns.min(expires_ns);
+        self.retained_next_prune_ns = self.retained_next_prune_ns.min(expires_ns)
+            .max(self.retained_last_prune_ns.saturating_add(1_000_000));
         self.fec_retained.insert(package, RetainedFecSlot { slot, package, expires_ns });
     }
 
@@ -4396,20 +4402,23 @@ fn resume_outage(state: &mut ConnectionStateConnected, buf: &mut SendQueues,
     // Sources already outside retention at entry are not resurrected.
     for q in &mut buf.queues {
         for retained in q.fec_retained.values_mut() {
-            if retained.slot.repair_policy == crate::fec_adapt::RepairPolicy::Reliability {
-                retained.expires_ns = retained.expires_ns.saturating_add(paused);
-            }
+            retained.expires_ns = retained.expires_ns.saturating_add(paused);
+            if let Some(deadline) = &mut retained.slot.retained_until_ns { *deadline = deadline.saturating_add(paused); }
         }
         for slot in [&mut q.fec_send_slot, &mut q.fec_suspended].into_iter().flatten() {
             slot.send_started_ns = slot.send_started_ns.saturating_add(paused);
+            if let Some(deadline) = &mut slot.retained_until_ns { *deadline = deadline.saturating_add(paused); }
         }
     }
     // A path outage is not a stationary 100%-loss channel. Start a fresh FEC
     // observation window; source rescue plans above remain intact.
     if buf.fec_adaptive.is_some() {
         let (lost, spurious) = fec_learning_counters(state);
-        buf.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC,
-            now, state.stats.packets_sent, lost.saturating_sub(spurious)));
+        let policy = buf.fec_adaptive.as_ref().unwrap().policy;
+        let mut fresh = crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC,
+            now, state.stats.packets_sent, lost.saturating_sub(spurious));
+        fresh.policy = policy;
+        buf.fec_adaptive = Some(fresh);
     }
     // Receiver-only peers notice the outage later, at their own keepalive. A
     // partial worker's entire silence must be paused, not only time since that
@@ -4506,7 +4515,9 @@ fn retry_handshake(created: u64, last_sent: &mut u64, now: u64, lifetime: u64,
 // No NEW repair may be formed after expiry; the single pre-assembled ciphertext
 // remains immutable and may still be accepted after expiry.
 fn prepare_connected_send_tick(state: &mut ConnectionStateConnected, buf: &mut SendQueues, now: u64) {
-    buf.set_time(now, state.RTT_mean as u64 * 100_000);
+    // Real path outages pause the retention budget for every policy. A local
+    // socket refusal is not an outage, and must still free expired sources.
+    if state.outage.since_ns.is_none() { buf.set_time(now, state.RTT_mean as u64 * 100_000); }
     if state.locally_blocked { freeze_local_send(state, now); }
 }
 
@@ -7662,6 +7673,8 @@ mod race_expiry_block_tests {
             assert!(!finish_connected_send(&mut state, &mut q, PendingSendKind::Data, None,
                 deadline - 1, &[7;32], &[8;16], Dscp::BestEffort, 0, None));
             prepare_connected_send_tick(&mut state, &mut q, deadline);
+            assert!(q.queues[0].fec_rescue_package.is_none()); // no new repair at the exact deadline
+            prepare_connected_send_tick(&mut state, &mut q, deadline + 1_000_000); // bounded prune quantum
             assert!(q.queues[0].fec_retained.is_empty());
             assert!(q.queues[0].fec_rescue_package.is_none());
             assert_eq!(*q.queues[0].retention_quota.used.lock().unwrap(), (0,0));
@@ -7679,5 +7692,87 @@ mod race_expiry_block_tests {
         f.rescue_plan(); assert_eq!(f.n,32); // P0's original active-round deficit update
         f.repair_policy = RepairPolicy::MeanTopup; f.n = 30;
         f.rescue_plan(); assert_eq!(f.n,30); // P2 freezes a round once accepted
+    }
+}
+
+#[cfg(test)]
+mod race_delta_review_tests {
+use super::*;
+
+#[test]
+fn review_p0_retention_must_survive_outage_send_ticks() {
+    let mut b = SendQueues::new(1, (100000, 1000000, 1000000));
+    b.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 1_000_000_000, 0, 0));
+    let ConnectionState::Connected(mut s) = new_connection_state_connected(None, 0, 1, 1_000_000_000) else { unreachable!() };
+    s.stats.cc_rate_upps = 100_000_000;
+    b.set_time(1_000_000_000, 100_000_000);
+    b.submit_messages(0, vec![vec![7; 1433 * 12]]);
+    let mut seq = 0;
+    while b.has_unsent_data() {
+        b.fec_prepare_packet(seq);
+        assert!(b.fill_packet(&mut [0;1449]) > 0);
+        s.account_send(1_000_000_000 + seq * 1_000_000);
+        s.packets_in_flight += 1;
+        seq += 1;
+    }
+    let deadline = b.queues[0].fec_retained[&0].expires_ns;
+    assert_eq!(b.queues[0].fec_retained[&0].slot.repair_policy, crate::fec_adapt::RepairPolicy::Reliability);
+    enter_outage(&mut s, &mut b, deadline - 1_000_000, 0, None);
+    assert_eq!(b.queues[0].fec_retained.len(), 1);
+    assert!(b.queues[0].fec_retained[&0].slot.next_id < b.queues[0].fec_retained[&0].slot.n);
+    // Every Connected send tick calls this BEFORE returning from the outage branch.
+    prepare_connected_send_tick(&mut s, &mut b, deadline + 1_000_000);
+    assert_eq!(b.queues[0].fec_retained.len(), 1,
+        "P0 active-time retention was pruned during outage, before resume_outage can extend it");
+    resume_outage(&mut s, &mut b, &mut [], deadline + 24_000_000_000, None);
+    assert!(b.queues[0].fec_retained[&0].expires_ns > deadline + 24_000_000_000);
+}
+}
+
+#[cfg(test)]
+mod race_outage_pause_tests {
+    use super::*;
+    use crate::fec_adapt::{FecAdaptiveState, RepairPolicy};
+    #[test]
+    fn mean_policy_retained_and_active_topups_pause_during_outage_without_renewal() {
+        for policy in [RepairPolicy::MeanTopup, RepairPolicy::Streaming] {
+            for active in [false, true] {
+                let mut b = SendQueues::new(1, (1000000,1000000,1000000));
+                let mut a = FecAdaptiveState::new(crate::ship::FEC, 1_000_000_000, 0, 0);
+                a.policy = policy; a.p = 0.02; b.fec_adaptive = Some(a);
+                b.set_time(1_000_000_000, 100_000_000);
+                b.submit_messages(0,vec![vec![7;1433*20]]);
+                let mut seq = 0;
+                while b.has_unsent_data() { b.fec_prepare_packet(seq); assert!(b.fill_packet(&mut [0;1449]) > 0); seq += 1; }
+                let deadline = b.queues[0].fec_retained[&0].expires_ns;
+                let ConnectionState::Connected(mut state) = new_connection_state_connected(None,0,1,1_000_000_000) else { unreachable!() };
+                if active {
+                    for old in 0..seq { b.fec_on_packet_finalized(old,true); }
+                    b.set_time(deadline-1_000_000,100_000_000);
+                    b.fec_prepare_packet(seq); assert!(b.fill_packet(&mut [0;1449]) > 0);
+                    assert!(b.queues[0].fec_rescue_package.is_some());
+                }
+                let entry = deadline-1_000_000;
+                enter_outage(&mut state,&mut b,entry,0,None);
+                let resume = deadline+24_000_000_000;
+                for now in [deadline+1_000_000, resume-1] { prepare_connected_send_tick(&mut state,&mut b,now); }
+                assert_eq!(*b.queues[0].retention_quota.used.lock().unwrap(), (1433*20,1));
+                resume_outage(&mut state,&mut b,&mut [],resume,None);
+                assert_eq!(b.fec_adaptive.as_ref().unwrap().policy,policy);
+                prepare_connected_send_tick(&mut state,&mut b,resume);
+                let extended = deadline+(resume-entry);
+                if active { assert_eq!(b.queues[0].fec_send_slot.as_ref().unwrap().retained_until_ns,Some(extended)); }
+                else {
+                    assert_eq!(b.queues[0].fec_retained[&0].expires_ns,extended);
+                    assert_eq!(b.queues[0].fec_retained[&0].slot.retained_until_ns,Some(extended));
+                }
+                // Retain again without a new round's hold budget: only outage time was added.
+                if active {
+                    let f = b.queues[0].fec_send_slot.take().unwrap(); b.queues[0].fec_rescue_package = None;
+                    b.queues[0].retain_fec(f,0);
+                    assert_eq!(b.queues[0].fec_retained[&0].expires_ns,extended);
+                }
+            }
+        }
     }
 }
