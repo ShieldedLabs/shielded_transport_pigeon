@@ -911,7 +911,9 @@ pub enum UnreliableFragment<'a> {
 }
 
 impl UnreliableSendBuffer {
-    pub fn new(target_queue_size_us: u32, min_queue_size_bytes: u32, max_queue_size_bytes: u32) -> Self {
+    // Standalone allocator-less buffers are internal fixtures; public callers
+    // construct SendQueues, which installs the guarded shared identity allocator.
+    pub(crate) fn new(target_queue_size_us: u32, min_queue_size_bytes: u32, max_queue_size_bytes: u32) -> Self {
         Self {
             target_queue_size_us,
             min_queue_size_bytes,
