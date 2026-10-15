@@ -148,7 +148,7 @@ impl RxReport {
             s.rx_messages_completed, s.rx_partial_evicted, s.rx_partial_evicted_bytes, s.rx_insert_failures, s.rx_stale_fragments]);
         v.extend_from_slice(&[s.fec_decode_last_tail_ns, s.fec_decode_max_tail_ns, s.fec_ingress_dropped_blocks, s.udp_payload_tu]);
         v.extend_from_slice(&[s.ack_packets_sent, s.ack_bytes_sent, s.ack_packets_received, s.ack_delay_us_max as u64, s.rtt_samples]);
-        v.extend_from_slice(&[s.fec_decode_admission_refusals, s.fec_decode_timeouts, s.fec_decode_preemptions, s.fec_worker_limit_events, s.fec_decode_peak_workers, s.rx_plain_admission_refusals]);
+        v.extend_from_slice(&[s.fec_decode_admission_refusals, s.fec_decode_timeouts, s.fec_decode_preemptions, s.fec_worker_limit_events, s.fec_decode_peak_workers, s.rx_plain_admission_refusals, s.rx_stale_identity_frames]);
         v
     }
     // Preserve the aggregate wire counter; partition its two disjoint causes
@@ -156,9 +156,9 @@ impl RxReport {
     fn worker_limit_json(&self) -> String {
         let retired = self.st.fec_decode_preemptions;
         let refused = self.st.fec_worker_limit_events.saturating_sub(retired);
-        format!(",\"receiver_fec_worker_refusals\":{refused},\"receiver_fec_worker_pressure_retirements\":{retired}")
+        format!(",\"receiver_fec_worker_refusals\":{refused},\"receiver_fec_worker_pressure_retirements\":{retired},\"receiver_stale_identity_frames\":{}", self.st.rx_stale_identity_frames)
     }
-    const WORDS: usize = 43;
+    const WORDS: usize = 44;
     fn from_words(w: &[u64]) -> Option<RxReport> {
         if w.len() < 37 { return None; }
         let mut st = ConnectionStats { rx_packets: w[0], rx_seq_span: w[1], rx_lost: w[2], rx_reordered: w[3], rx_late_beyond_window: w[4], rx_duplicates: w[5], rx_bursts: w[6], ..Default::default() };
@@ -177,6 +177,7 @@ impl RxReport {
         st.fec_worker_limit_events = w.get(40).copied().unwrap_or(0);
         st.fec_decode_peak_workers = w.get(41).copied().unwrap_or(0);
         st.rx_plain_admission_refusals = w.get(42).copied().unwrap_or(0);
+        st.rx_stale_identity_frames = w.get(43).copied().unwrap_or(0);
         Some(RxReport { st, th, cpu_user_us: w[21], cpu_sys_us: w[22] })
     }
 }
@@ -405,7 +406,7 @@ fn send_duty_boundaries() {
 
 #[test]
 fn integrated_rx_report_roundtrip() {
-    let r = RxReport { st: ConnectionStats { fec_decode_last_tail_ns: 11, fec_decode_max_tail_ns: 12, fec_ingress_dropped_blocks: 13, udp_payload_tu: 1472, ack_packets_sent: 21, ack_bytes_sent: 22, ack_packets_received: 23, ack_delay_us_max: 24, rtt_samples: 25, fec_decode_admission_refusals: 31, fec_decode_timeouts: 32, fec_decode_preemptions: 33, fec_worker_limit_events: 34, fec_decode_peak_workers: 35, rx_plain_admission_refusals: 36, ..Default::default() }, ..Default::default() };
+    let r = RxReport { st: ConnectionStats { fec_decode_last_tail_ns: 11, fec_decode_max_tail_ns: 12, fec_ingress_dropped_blocks: 13, udp_payload_tu: 1472, ack_packets_sent: 21, ack_bytes_sent: 22, ack_packets_received: 23, ack_delay_us_max: 24, rtt_samples: 25, fec_decode_admission_refusals: 31, fec_decode_timeouts: 32, fec_decode_preemptions: 33, fec_worker_limit_events: 34, fec_decode_peak_workers: 35, rx_plain_admission_refusals: 36, rx_stale_identity_frames: 37, ..Default::default() }, ..Default::default() };
     let words = r.to_words();
     assert_eq!(words.len(), RxReport::WORDS);
     let decoded = RxReport::from_words(&words).unwrap();
@@ -413,11 +414,12 @@ fn integrated_rx_report_roundtrip() {
     assert_eq!(&words[28..32], &[11, 12, 13, 1472]);
     assert_eq!(&words[32..37], &[21, 22, 23, 24, 25]);
     assert_eq!(&words[37..40], &[31, 32, 33]);
-    assert_eq!(decoded.worker_limit_json(), ",\"receiver_fec_worker_refusals\":1,\"receiver_fec_worker_pressure_retirements\":33");
-    assert_eq!(RxReport::default().worker_limit_json(), ",\"receiver_fec_worker_refusals\":0,\"receiver_fec_worker_pressure_retirements\":0");
+    assert_eq!(decoded.worker_limit_json(), ",\"receiver_fec_worker_refusals\":1,\"receiver_fec_worker_pressure_retirements\":33,\"receiver_stale_identity_frames\":37");
+    assert_eq!(RxReport::default().worker_limit_json(), ",\"receiver_fec_worker_refusals\":0,\"receiver_fec_worker_pressure_retirements\":0,\"receiver_stale_identity_frames\":0");
     // Old receivers still report the original prefix without the new counters.
     let old = RxReport::from_words(&words[..37]).unwrap();
     assert_eq!(old.st.fec_decode_admission_refusals, 0);
+    assert_eq!(old.st.rx_stale_identity_frames, 0);
 }
 
 // Research-only sidecar: disk stream, not an unbounded in-memory result list.

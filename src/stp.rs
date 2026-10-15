@@ -531,7 +531,8 @@ impl Drop for PackageLease {
 }
 
 /// Full-ID lookup into bounded storage, never `id % capacity`. On pressure the
-/// oldest identity is retired permanently; late packets are erased, not aliased.
+/// completed/inactive identities retire first; a full live table refuses new IDs.
+/// Retired identities never reopen; retained live identities may be older.
 #[derive(Debug, Default)]
 struct ReceiveIndex { slots: std::collections::BTreeMap<u64, usize>, floor: u64, roles: Vec<Option<ReceiveRole>> }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -542,6 +543,14 @@ enum ReceiveRole {
 }
 impl ReceiveIndex {
     fn get(&self, id: u64) -> Option<usize> { self.slots.get(&id).copied() }
+    fn frame_is_stale(&self, frame: &WireFrame<'_>) -> bool {
+        let stale = |id| id < self.floor && self.get(id).is_none();
+        match frame {
+            WireFrame::Plain { id, .. } => stale(*id),
+            WireFrame::Fec { id, segment, .. } => stale(*id) || segment.is_some_and(|s| stale(s.root)),
+            _ => false,
+        }
+    }
     // Identity metadata survives decoder/assembly retirement, until the ID itself
     // is permanently retired. Both tables share this one immutable role binding.
     fn claim(&mut self, id: u64, role: ReceiveRole) -> bool {
@@ -551,14 +560,31 @@ impl ReceiveIndex {
             None => { self.roles[index] = Some(role); true }
         }
     }
+    #[cfg(test)]
     fn admit(&mut self, id: u64, plain: &mut [ReassemblySlot], fec: &mut [FecRecvSlot]) -> Option<usize> {
-        if id < self.floor || id == u64::MAX { return None; }
+        self.admit_at(id, plain, fec, 0, u64::MAX)
+    }
+    fn admit_at(&mut self, id: u64, plain: &mut [ReassemblySlot], fec: &mut [FecRecvSlot], now_ns: u64, grace_ns: u64) -> Option<usize> {
+        if id == u64::MAX { return None; }
+        // Active identities may outlive thousands of newer completed messages.
+        // The watermark forbids reopening retired IDs, not using retained ones.
         if let Some(index) = self.get(id) { return Some(index); }
+        if id < self.floor { return None; }
         let index = if self.slots.len() < plain.len() { self.slots.len() }
             else {
-                if id <= *self.slots.first_key_value()?.0 { return None; }
-                let (retired, index) = self.slots.pop_first()?;
-                self.floor = retired.checked_add(1)?;
+                // Completed or already-erased state is cheap to retire. Never
+                // erase recently ACKed live state just to admit a newer ID.
+                let candidates = || self.slots.range(..id);
+                let unused = |i: usize| plain[i].reservation.is_none() && plain[i].buf.is_empty()
+                    && plain[i].received.is_empty() && plain[i].segment_parts.is_none()
+                    && !fec[i].in_use();
+                let last_active = |i: usize| plain[i].last_segment_ns.max(fec[i].last_block_ns);
+                let (&retired, &index) = candidates().find(|&(_, &i)|
+                    plain[i].completed || matches!(fec[i].state, FecRecvState::Done) || unused(i))
+                    .or_else(|| candidates().filter(|&(_, &i)| now_ns.saturating_sub(last_active(i)) > grace_ns)
+                        .min_by_key(|&(_, &i)| last_active(i)))?;
+                self.slots.remove(&retired);
+                self.floor = self.floor.max(retired.checked_add(1)?);
                 if id < self.floor { return None; }
                 plain[index] = ReassemblySlot::new();
                 fec[index] = FecRecvSlot::default();
@@ -2179,6 +2205,8 @@ pub struct ConnectionStats {
     pub rx_insert_failures: u64,
     /// Fragments of a package older than the one holding their slot (dropped).
     pub rx_stale_fragments: u64,
+    /// Frames for permanently retired identities, ignored but physically ACKed.
+    pub rx_stale_identity_frames: u64,
     /// Worker delivery minus its last successfully enqueued FEC fragment, on receiver's
     /// monotonic clock. Completion can precede surplus repair packets arriving.
     pub fec_decode_last_tail_ns: u64,
@@ -2842,7 +2870,11 @@ fn valid_fec_symbol(layout: crate::fec::MessageLayout, block_id: u32, data_len: 
 /// guard. Never decrement its counters here: it may still be inside Wirehair.
 /// Explicit retirement makes queued completion ineligible, even before ID eviction.
 fn retire_inactive_fec_workers(slots: &mut [FecRecvSlot], now_ns: u64, grace_ns: u64, oldest_only: bool) -> u64 {
-    let eligible = |s: &FecRecvSlot| matches!(s.state, FecRecvState::Worker { .. }) && now_ns.saturating_sub(s.last_block_ns) > grace_ns;
+    // Worker-admission pressure only needs to free a worker. The periodic sweep
+    // also expires inline decoders, so abandoned small FEC units cannot pin IDs.
+    let eligible = |s: &FecRecvSlot| (matches!(s.state, FecRecvState::Worker { .. })
+        || (!oldest_only && matches!(s.state, FecRecvState::Inline(_))))
+        && now_ns.saturating_sub(s.last_block_ns) > grace_ns;
     if oldest_only {
         if let Some(index) = slots.iter().enumerate().filter(|(_, s)| eligible(s)).min_by_key(|(_, s)| s.last_block_ns).map(|(i, _)| i) {
             slots[index].state = FecRecvState::Done;
@@ -2854,6 +2886,7 @@ fn retire_inactive_fec_workers(slots: &mut [FecRecvSlot], now_ns: u64, grace_ns:
     for slot in slots {
         if eligible(slot) {
             slot.state = FecRecvState::Done;
+            slot.reservation = None;
             retired += 1;
         }
     }
@@ -2945,14 +2978,14 @@ fn fec_receive_block(
         }
     }
     match &mut slot.state {
-        FecRecvState::Inline(dec) => match dec.add(block_id, data) {
+        FecRecvState::Inline(dec) => { slot.last_block_ns = monotonic_clock_ns(); match dec.add(block_id, data) {
             Ok(DecodeStatus::NeedMore) | Err(DecodeError::BadBlock) => None,
             Ok(DecodeStatus::Done) => {
                 let m = dec.recover(); slot.state = FecRecvState::Done;
                 let r = slot.reservation.take()?; m.map(|m| (m, r))
             }
             Err(DecodeError::Failed(_)) => { slot.state = FecRecvState::Done; slot.reservation = None; None }
-        },
+        } },
         FecRecvState::Worker { tx, .. } => {
             match tx.try_send((block_id, data.to_vec())) {
                 Ok(()) => slot.last_block_ns = monotonic_clock_ns(),
@@ -3846,6 +3879,12 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             while let Some((frame, consumed)) = read_frame(remaining_payload) {
                                 remaining_payload = &remaining_payload[consumed..];
                                 if matches!(frame, WireFrame::Unknown) { continue; }
+                                // Retired identities cannot reopen. Surplus repairs/late
+                                // fragments are still network receipts, not pressure loss.
+                                if existing_connection.receive_index.frame_is_stale(&frame) {
+                                    state.stats.rx_stale_identity_frames += 1;
+                                    continue;
+                                }
                                 if let WireFrame::Whole(data) = frame {
                                     if data.len() > max_message_size { break 'conn; }
                                     let Some(reservation) = existing_connection.receive_budget.reserve(data.len() + 256) else { memory_erased = true; continue; };
@@ -3864,12 +3903,12 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     if !valid_fec_symbol(layout, block_id, data.len()) { continue; }
                                     if (kind == STP_EXT_KIND_GROUPED_FEC) != (layout.groups > 1) { continue; }
                                     if segment.is_some_and(|s| !s.valid(message_len) || s.root == package_id) { continue; }
-                                    let Some(slot_idx) = existing_connection.receive_index.admit(package_id,
-                                        &mut existing_connection.unreliable_reassembly, &mut existing_connection.unreliable_fec) else { memory_erased = true; continue; };
+                                    let Some(slot_idx) = existing_connection.receive_index.admit_at(package_id,
+                                        &mut existing_connection.unreliable_reassembly, &mut existing_connection.unreliable_fec, timestamp_ns, fec_inactive_grace_ns(state.RTT_mean, true)) else { memory_erased = true; continue; };
                                     if !existing_connection.receive_index.claim(package_id, ReceiveRole::Fec { message_len, block_bytes, segment }) { continue; }
                                     if let Some(segment) = segment {
-                                        let Some(root_idx) = existing_connection.receive_index.admit(segment.root,
-                                            &mut existing_connection.unreliable_reassembly, &mut existing_connection.unreliable_fec) else { memory_erased = true; continue; };
+                                        let Some(root_idx) = existing_connection.receive_index.admit_at(segment.root,
+                                            &mut existing_connection.unreliable_reassembly, &mut existing_connection.unreliable_fec, timestamp_ns, fec_inactive_grace_ns(state.RTT_mean, true)) else { memory_erased = true; continue; };
                                         if !existing_connection.receive_index.claim(segment.root, ReceiveRole::Root { total: segment.total }) { continue; }
                                         // Root admission may have retired the unit in a very small table.
                                         if existing_connection.receive_index.get(package_id) != Some(slot_idx) { memory_erased = true; continue; }
@@ -3916,8 +3955,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     let dropped_before = existing_connection.unreliable_fec[slot_idx].ingress_dropped;
                                     if let Some((message, mut _reservation)) = fec_receive_block(&mut existing_connection.unreliable_fec[slot_idx], connection_key, package_id, message_len, block_bytes, block_id, data, &fec_done_tx, &fec_workers, &existing_connection.receive_budget) {
                                         let completed = if let Some(segment) = segment {
-                                            let Some(root_idx) = existing_connection.receive_index.admit(segment.root,
-                                            &mut existing_connection.unreliable_reassembly, &mut existing_connection.unreliable_fec) else { memory_erased = true; continue; };
+                                            let Some(root_idx) = existing_connection.receive_index.admit_at(segment.root,
+                                            &mut existing_connection.unreliable_reassembly, &mut existing_connection.unreliable_fec, timestamp_ns, fec_inactive_grace_ns(state.RTT_mean, true)) else { memory_erased = true; continue; };
                                             _reservation.shrink(message.capacity());
                                             existing_connection.unreliable_reassembly[root_idx].finish_segment(segment, &message)
                                         } else { Some((message, _reservation)) };
@@ -3953,8 +3992,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
 
                                 //if OVERLY_VERBOSE { println!("Fragment from {:?}: R:{} F:{} ID:{} L:{} O:{}", connection_key, is_reliable, is_fin, package_id, frag_len, frag_offset); }
                                 
-                                let Some(slot_idx) = existing_connection.receive_index.admit(package_id,
-                                    &mut existing_connection.unreliable_reassembly, &mut existing_connection.unreliable_fec) else { memory_erased = true; continue; };
+                                let Some(slot_idx) = existing_connection.receive_index.admit_at(package_id,
+                                    &mut existing_connection.unreliable_reassembly, &mut existing_connection.unreliable_fec, timestamp_ns, fec_inactive_grace_ns(state.RTT_mean, true)) else { memory_erased = true; continue; };
 
                                 if !existing_connection.receive_index.claim(package_id, ReceiveRole::Plain) { continue; }
                                 {
@@ -8594,6 +8633,198 @@ mod wire_v2_tests {
         let n = write_fragment(&mut p, UnreliableFragment::Plain { is_fin: true, package_id: 65535, data: &data, offset: 0 });
         assert_eq!(n, 16386); assert_eq!(read_frame(&p), Some((WireFrame::Whole(&data), n)));
         assert_ne!(&p[..4], &[255; 4]);
+    }
+    #[test]
+    fn receive_index_retired_fec_topup_is_acknowledged_without_reopening() {
+        let mut index = ReceiveIndex::default();
+        let mut plain = ReassemblySlot::new_ring(4);
+        let mut fec = FecRecvSlot::new_ring(4);
+        let unit = index.admit(1, &mut plain, &mut fec).unwrap();
+        assert!(index.claim(1, ReceiveRole::Fec { message_len: 2272, block_bytes: 1136, segment: None }));
+        fec[unit].state = FecRecvState::Done;
+        for id in 2..10 {
+            let slot = index.admit(id, &mut plain, &mut fec).unwrap();
+            assert!(index.claim(id, ReceiveRole::Plain));
+            assert_eq!(plain[slot].insert(0, &[7; 1000], true), (true, true));
+            plain[slot].take_complete();
+        }
+        assert!(index.get(1).is_none());
+        let mut payload = [255; 1442];
+        write_fragment(&mut payload, UnreliableFragment::Fec { segment: None, package_id: 1,
+            message_len: 2272, block_bytes: 1136, block_id: 20, data: &[3; 1136] });
+        let mut memory_erased = false;
+        let mut cursor = &payload[..];
+        // Same pre-admission stale gate as the transport: no retired ID can
+        // reopen, and no new allocation/pressure refusal is attempted for it.
+        let mut stale_frames = 0;
+        while let Some((frame, used)) = read_frame(cursor) {
+            cursor = &cursor[used..];
+            if index.frame_is_stale(&frame) { stale_frames += 1; continue; }
+            if let WireFrame::Fec { id, .. } = frame {
+                memory_erased |= index.admit(id, &mut plain, &mut fec).is_none();
+            }
+        }
+        assert_eq!(stale_frames, 1);
+        assert!(!memory_erased);
+        let mut receiver = crate::ack::AckReceiver::default();
+        let mut timer = u64::MAX;
+        if !memory_erased { receiver.receive(5000, 1, false, &mut timer); }
+        assert!(receiver.ack(2).acknowledged().any(|seq| seq == 5000));
+        assert!(index.get(1).is_none());
+        // A never-seen child of an already-retired root is stale too, before
+        // trying to admit that child into a potentially full live table.
+        let segment = Some(FecSegment { root: 1, total: 4 << 20, offset: 0 });
+        assert!(index.frame_is_stale(&WireFrame::Fec { kind: STP_EXT_KIND_SEGMENT_FEC,
+            id: 100, block_id: 0, message_len: 2 << 20, block_bytes: 1136, segment, data: &[3; 1136] }));
+    }
+    #[test]
+    fn receive_index_active_root_survives_completed_fragment_churn() {
+        let mut index = ReceiveIndex::default();
+        let mut plain = ReassemblySlot::new_ring(1024);
+        let mut fec = FecRecvSlot::new_ring(1024);
+        let root = index.admit(13, &mut plain, &mut fec).unwrap();
+        assert!(index.claim(13, ReceiveRole::Root { total: 4 << 20 }));
+        let unit = index.admit(14, &mut plain, &mut fec).unwrap();
+        let segment = FecSegment { root: 13, total: 4 << 20, offset: 0 };
+        assert!(index.claim(14, ReceiveRole::Fec { message_len: 2 << 20, block_bytes: 1168, segment: Some(segment) }));
+        let budget = crate::receive_memory::ReceiveMemoryBudget::new(64 << 20);
+        let layout = wire_fec_layout(2 << 20, 1168).unwrap();
+        assert!(plain[root].admit_segment(segment, layout, 0, 1168, 1, &budget));
+        let (done_tx, _done_rx) = std::sync::mpsc::channel();
+        let workers = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        fec[unit].package_id = 14;
+        assert!(fec_receive_block(&mut fec[unit], ConnectionKey::default(), 14,
+            2 << 20, 1168, 0, &[3; 1168], &done_tx, &workers, &budget).is_none());
+        // q2 fills spare packet tails with pieces of 1000-byte messages. Each
+        // finished small message leaves a tombstone while the old root is live.
+        for id in 15..4015 {
+            let slot = index.admit(id, &mut plain, &mut fec).unwrap();
+            assert!(index.claim(id, ReceiveRole::Plain));
+            plain[slot].package_id = id;
+            assert!(plain[slot].admit(0, 1000, &budget));
+            assert_eq!(plain[slot].insert(0, &[7; 400], false), (true, false));
+            assert_eq!(plain[slot].insert(400, &[7; 600], true), (true, true));
+            assert_eq!(plain[slot].take_complete(), vec![7; 1000]);
+            assert!(index.slots.len() <= 1024);
+        }
+        // These are the exact admissions gating positive packet receipt in the
+        // FEC receive path. Both must work even below the retirement watermark.
+        assert_eq!(index.admit(14, &mut plain, &mut fec), Some(unit));
+        assert_eq!(index.admit(13, &mut plain, &mut fec), Some(root));
+        assert!(plain[root].admit_segment(segment, layout, 1, 1168, 2, &budget));
+        let first = vec![3; 2 << 20];
+        assert!(plain[root].finish_segment(segment, &first).is_none());
+        let second = FecSegment { offset: 2 << 20, ..segment };
+        let (message, _) = plain[root].finish_segment(second, &first).unwrap();
+        assert_eq!(message, vec![3; 4 << 20]);
+        assert!(index.admit(15, &mut plain, &mut fec).is_none());
+    }
+    #[test]
+    fn receive_index_active_plain_survives_completed_fec_churn() {
+        let mut index = ReceiveIndex::default();
+        let mut plain = ReassemblySlot::new_ring(4);
+        let mut fec = FecRecvSlot::new_ring(4);
+        let active = index.admit(1, &mut plain, &mut fec).unwrap();
+        assert!(index.claim(1, ReceiveRole::Plain));
+        plain[active].package_id = 1;
+        assert_eq!(plain[active].insert(0, &[1; 500], false), (true, false));
+        for id in 2..100 {
+            let slot = index.admit(id, &mut plain, &mut fec).unwrap();
+            assert!(index.claim(id, ReceiveRole::Fec { message_len: 2000, block_bytes: 1136, segment: None }));
+            fec[slot].package_id = id;
+            fec[slot].state = FecRecvState::Done;
+        }
+        assert_eq!(index.admit(1, &mut plain, &mut fec), Some(active));
+        assert_eq!(plain[active].insert(500, &[1; 500], true), (true, true));
+        assert_eq!(plain[active].take_complete(), vec![1; 1000]);
+    }
+    #[test]
+    fn receive_index_live_flood_refuses_new_and_preserves_active_root() {
+        let mut index = ReceiveIndex::default();
+        let mut plain = ReassemblySlot::new_ring(1024);
+        let mut fec = FecRecvSlot::new_ring(1024);
+        let budget = crate::receive_memory::ReceiveMemoryBudget::new(16 << 20);
+        let grace = fec_inactive_grace_ns(2000, true);
+        let root = index.admit_at(0, &mut plain, &mut fec, 10, grace).unwrap();
+        let segment = FecSegment { root: 0, total: 4 << 20, offset: 0 };
+        let layout = wire_fec_layout(2 << 20, 1168).unwrap();
+        assert!(index.claim(0, ReceiveRole::Root { total: segment.total }));
+        assert!(plain[root].admit_segment(segment, layout, 0, 1168, 10, &budget));
+        for id in 1..1024 {
+            let slot = index.admit_at(id, &mut plain, &mut fec, 10, grace).unwrap();
+            assert!(index.claim(id, ReceiveRole::Plain));
+            plain[slot].package_id = id;
+            assert!(plain[slot].admit(0, 1000, &budget));
+            assert_eq!(plain[slot].insert(0, &[7; 500], false), (true, false));
+            plain[slot].last_segment_ns = 10;
+        }
+        let charged = budget.used();
+        for id in 1024..4096 {
+            assert!(index.admit_at(id, &mut plain, &mut fec, 10 + grace, grace).is_none());
+            assert_eq!(index.slots.len(), 1024);
+            assert_eq!(index.roles.len(), 1024);
+        }
+        assert_eq!(budget.used(), charged);
+        assert_eq!(index.admit_at(0, &mut plain, &mut fec, 10 + grace, grace), Some(root));
+        assert!(plain[root].admit_segment(segment, layout, 1, 1168, 10 + grace, &budget));
+        // Abandoned Plain entries become reclaimable; the refreshed root does not.
+        assert!(index.admit_at(4096, &mut plain, &mut fec, 11 + grace, grace).is_some());
+        assert_eq!(index.get(0), Some(root));
+        assert!(index.admit_at(1, &mut plain, &mut fec, 11 + grace, grace).is_none());
+        assert!(index.admit(u64::MAX, &mut plain, &mut fec).is_none());
+    }
+    #[test]
+    fn receive_index_reclaims_oldest_inactive_inline_and_keeps_watermark_monotonic() {
+        let mut index = ReceiveIndex::default();
+        let mut plain = ReassemblySlot::new_ring(3);
+        let mut fec = FecRecvSlot::new_ring(3);
+        let budget = crate::receive_memory::ReceiveMemoryBudget::new(16 << 20);
+        let grace = fec_inactive_grace_ns(0, true);
+        for (id, time) in [(0, 20), (1, 30)] {
+            let slot = index.admit(id, &mut plain, &mut fec).unwrap();
+            assert!(index.claim(id, ReceiveRole::Plain));
+            assert!(plain[slot].admit(0, 1, &budget));
+            assert_eq!(plain[slot].insert(0, &[7], false), (true, false));
+            plain[slot].last_segment_ns = time;
+        }
+        let inline = index.admit(2, &mut plain, &mut fec).unwrap();
+        assert!(index.claim(2, ReceiveRole::Fec { message_len: 2272, block_bytes: 1136, segment: None }));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let workers = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        assert!(fec_receive_block(&mut fec[inline], ConnectionKey::default(), 2,
+            2272, 1136, 0, &[3; 1136], &tx, &workers, &budget).is_none());
+        assert!(fec[inline].last_block_ns > 0);
+        fec[inline].last_block_ns = 10;
+        let charged = budget.used();
+        assert!(index.admit_at(3, &mut plain, &mut fec, grace + 10, grace).is_none());
+        assert_eq!(index.admit_at(3, &mut plain, &mut fec, grace + 11, grace), Some(inline));
+        assert!(budget.used() < charged);
+        assert_eq!(index.floor, 3);
+        // Pin the new entry; then a numerically older live ID expires later.
+        assert!(plain[inline].admit(0, 1, &budget));
+        assert_eq!(plain[inline].insert(0, &[7], false), (true, false));
+        plain[inline].last_segment_ns = grace + 11;
+        assert!(index.admit_at(4, &mut plain, &mut fec, grace + 21, grace).is_some());
+        assert_eq!(index.floor, 3);
+        assert!(index.admit_at(2, &mut plain, &mut fec, grace + 21, grace).is_none());
+        assert!(index.admit_at(1, &mut plain, &mut fec, grace + 21, grace).is_some());
+    }
+    #[test]
+    fn receive_index_periodic_inline_expiry_releases_budget() {
+        let budget = crate::receive_memory::ReceiveMemoryBudget::new(16 << 20);
+        let mut fec = FecRecvSlot::new_ring(1);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let workers = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        assert!(fec_receive_block(&mut fec[0], ConnectionKey::default(), 0,
+            2272, 1136, 0, &[3; 1136], &tx, &workers, &budget).is_none());
+        assert!(matches!(fec[0].state, FecRecvState::Inline(_)));
+        let grace = fec_inactive_grace_ns(0, false);
+        fec[0].last_block_ns = 10;
+        assert_eq!(retire_inactive_fec_workers(&mut fec, grace + 10, grace, false), 0);
+        assert!(budget.used() > 0);
+        assert_eq!(retire_inactive_fec_workers(&mut fec, grace + 11, grace, false), 1);
+        assert_eq!(budget.used(), 0);
+        assert!(matches!(fec[0].state, FecRecvState::Done));
     }
     #[test]
     fn receive_lookup_has_no_modulo_alias_and_never_recycles_retired_ids() {

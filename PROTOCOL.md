@@ -246,10 +246,23 @@ queues, roots and units. Roots and their units have distinct identities. A
 sender never reuses an identity in a connection, including after its local
 lease expires or it restarts a unit with a smaller symbol layout. u64::MAX is
 reserved to force a new handshake rather than wrap. Receiver table indices
-are never message identities. This implementation maps full IDs to bounded
-storage; on pressure it permanently retires oldest identities and safely
-erases older arrivals. It does not use `id % 1024` as identity or infer a
-16-bit generation.
+are never message identities. This implementation maps full IDs to fixed
+1024-entry storage, with assembly/decoder bytes additionally charged to the
+connection receive budget. On table pressure it permanently retires a completed
+or already-erased identity older than the arriving ID first, otherwise the
+least recently active older identity inactive for more than max(4*RTT, 2s).
+If all entries are live/recent it refuses the new ID and withholds that packet's
+ACK; it does not evict already-ACKed active state. Inline FEC decoders expire
+on the same inactivity grace as workers (the outage sweep retains its existing
+longer grace). The retirement watermark only erases unretained older arrivals:
+retained active roots/units/plain messages remain usable below it. A frame for
+an unretained ID (or segmented root) below the watermark is stale: ignore it
+without allocating or reopening the ID, but acknowledge the physical packet.
+In particular surplus repair symbols for an evicted completed unit are network
+receipts, not new admission refusals or congestion evidence. Thus neither
+completed-message churn nor a flood of concurrent incomplete messages can
+evict a recently active assembly or grow the table.
+It does not use `id % 1024` as identity or infer a 16-bit generation.
 
 A message fitting one packet is not split simply because the current tail is
 too small. Whole FIFO-head fillers are preferred. The existing fill exception
