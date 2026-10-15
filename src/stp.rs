@@ -2105,7 +2105,36 @@ pub fn get_send_time_for_sequence_number(sequence_number: u64, send_time_band: &
     0 // failed lookup
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum PositiveReceipt { PendingData, PendingProbe, LateData, PreOutage }
+impl PositiveReceipt {
+    fn is_data(&self) -> bool { matches!(self, Self::PendingData | Self::LateData) }
+    fn is_pending(&self) -> bool { matches!(self, Self::PendingData | Self::PendingProbe) }
+}
+
 impl ConnectionStateConnected {
+    // The receive loop and socket-free tests share first-positive admission.
+    // Clearing either ring bit here makes duplicate receipts ineligible.
+    fn take_positive_receipt(&mut self, index: u64) -> Option<PositiveReceipt> {
+        let bit = index % PACKETS_WAITING_ACK_CAPACITY;
+        let mask = 1u64 << (bit % 64);
+        if index >= self.packets_waiting_ack_tail && index < self.send_sequence_number {
+            let word = &mut self.packets_waiting_ack_field[(bit / 64) as usize];
+            if *word & mask == 0 { return None; }
+            *word &= !mask;
+            Some(if index == self.tu_probe_sequence_number {
+                PositiveReceipt::PendingProbe
+            } else { PositiveReceipt::PendingData })
+        } else if index < self.packets_waiting_ack_tail
+            && self.packets_waiting_ack_tail - index <= PACKETS_WAITING_ACK_CAPACITY {
+            let word = &mut self.declared_lost_field[(bit / 64) as usize];
+            if *word & mask == 0 { return None; }
+            *word &= !mask;
+            Some(if index < self.outage.ignore_loss_before_seq {
+                PositiveReceipt::PreOutage
+            } else { PositiveReceipt::LateData })
+        } else { None }
+    }
     fn send_time(&self, sequence: u64) -> u64 {
         get_send_time_for_sequence_number(sequence, &self.send_time_band, self.send_time_band_head_index)
     }
@@ -3345,75 +3374,50 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 let relevant_ack = bitmap_ack.as_ref().map(|a| a.relevant(&state.packets_waiting_ack_field, &state.declared_lost_field[..]));
                                 let indices = relevant_ack.iter().flat_map(crate::ack::BitmapAck::acknowledged);
                                 for index in indices {
-                                    let mut newly_acked = false;
-                                    let mut newly_acked_data_packet = false;
                                     if index < state.send_sequence_number {
                                         state.highest_peer_acked = Some(state.highest_peer_acked.unwrap_or(index).max(index));
                                     }
-                                    if index >= state.packets_waiting_ack_tail && index < state.send_sequence_number {
-                                        let bit_index = index % PACKETS_WAITING_ACK_CAPACITY;
-                                        if state.packets_waiting_ack_field[(bit_index / 64) as usize] & (1u64 << (bit_index % 64)) != 0 {
-                                            state.packets_waiting_ack_field[(bit_index / 64) as usize] &= !(1u64 << (bit_index % 64));
-                                            state.last_ack_received_time = timestamp_ns;
-                                            state.outage.pending_since_ns = None;
-                                            if let Some(t) = &mut loss_trace { t.outcome('A', existing_connection.two_byte_send_prefix, index, timestamp_ns); }
-
-                                            newly_acked = true;
-                                            let send_time_of_latest_ns = state.send_time(index);
-                                            if send_time_of_latest_ns != 0 && send_time_of_latest_ns != u64::MAX {
-                                                oldest_newly_acked_send_time = oldest_newly_acked_send_time.min(send_time_of_latest_ns);
-                                            }
-                                            
-                                            if index == state.tu_probe_sequence_number {
-                                                state.tu_probe_sequence_number = u64::MAX;
-                                                state.last_sent_tu_probe_time_ns = 0;
-                                                state.current_tu = state.tu_probe_size;
-                                                state.tu_probe_size_advance *= 2;
-                                                state.tu_probe_failed_count = 0;
-                                            }
-                                            else {
-                                                state.ack_hole.acknowledged(index);
-                                                data_ack_progress = true;
-                                                newly_acked_data_packet = true;
-                                                assert!(state.packets_in_flight > 0, "packets_in_flight underflow");
-                                                state.packets_in_flight -= 1;
-                                            }
-                                            
-                                        }
-                                    }
-                                    else if index < state.packets_waiting_ack_tail && index + PACKETS_WAITING_ACK_CAPACITY >= state.packets_waiting_ack_tail {
-                                        // Acked after it was declared lost: the declaration was spurious.
-                                        let bit_index = index % PACKETS_WAITING_ACK_CAPACITY;
-                                        let w = &mut state.declared_lost_field[(bit_index / 64) as usize];
-                                        if *w & (1u64 << (bit_index % 64)) != 0 {
-                                            *w &= !(1u64 << (bit_index % 64));
-                                            state.stats.spurious_losses += 1;
-                                            newly_acked = true;
-                                            state.last_ack_received_time = timestamp_ns;
-                                            state.outage.pending_since_ns = None;
-                                            if index < state.outage.ignore_loss_before_seq { state.outage.ignored_spurious += 1; }
-                                            else { newly_acked_data_packet = true; }
-                                            if let Some(t) = &mut loss_trace { t.outcome('A', existing_connection.two_byte_send_prefix, index, timestamp_ns); }
-                                        }
-                                    }
-                                    if newly_acked {
-                                        let sent_ns = state.send_time(index);
+                                    let Some(receipt) = state.take_positive_receipt(index) else { continue; };
+                                    state.last_ack_received_time = timestamp_ns;
+                                    state.outage.pending_since_ns = None;
+                                    if let Some(t) = &mut loss_trace { t.outcome('A', existing_connection.two_byte_send_prefix, index, timestamp_ns); }
+                                    let sent_ns = state.send_time(index);
+                                    if receipt.is_pending() {
                                         if sent_ns != 0 && sent_ns != u64::MAX {
-                                            let raw = timestamp_ns.saturating_sub(sent_ns);
-                                            ack_latency_ns = ack_latency_ns.max(raw);
-                                            if newly_acked_data_packet {
-                                                if let Some(latency) = state.delivery_growth.receipt_latency(timestamp_ns, sent_ns) {
-                                                    newly_acked_data += 1;
-                                                    delivery_latency_ns = delivery_latency_ns.max(latency);
-                                                }
+                                            oldest_newly_acked_send_time = oldest_newly_acked_send_time.min(sent_ns);
+                                        }
+                                        if receipt == PositiveReceipt::PendingProbe {
+                                            state.tu_probe_sequence_number = u64::MAX;
+                                            state.last_sent_tu_probe_time_ns = 0;
+                                            state.current_tu = state.tu_probe_size;
+                                            state.tu_probe_size_advance *= 2;
+                                            state.tu_probe_failed_count = 0;
+                                        } else {
+                                            state.ack_hole.acknowledged(index);
+                                            data_ack_progress = true;
+                                            assert!(state.packets_in_flight > 0, "packets_in_flight underflow");
+                                            state.packets_in_flight -= 1;
+                                        }
+                                    } else {
+                                        // Acked after it was declared lost: the declaration was spurious.
+                                        state.stats.spurious_losses += 1;
+                                        if receipt == PositiveReceipt::PreOutage { state.outage.ignored_spurious += 1; }
+                                    }
+                                    if sent_ns != 0 && sent_ns != u64::MAX {
+                                        let raw = timestamp_ns.saturating_sub(sent_ns);
+                                        ack_latency_ns = ack_latency_ns.max(raw);
+                                        if receipt.is_data() {
+                                            if let Some(latency) = state.delivery_growth.receipt_latency(timestamp_ns, sent_ns) {
+                                                newly_acked_data += 1;
+                                                delivery_latency_ns = delivery_latency_ns.max(latency);
                                             }
-                                            // A late sample is still a truthful RTT measurement.
-                                            if bitmap_ack.as_ref().is_none_or(|a| index == a.sample_seq) {
-                                                let delay = bitmap_ack.as_ref().map_or(0, |a| a.delay_us as u64 * 1000);
-                                                if delay < raw {
-                                                    RTT_acc += (raw - delay).max(100_000) / 100_000;
-                                                    RTT_count += 1;
-                                                }
+                                        }
+                                        // A late sample is still a truthful RTT measurement.
+                                        if bitmap_ack.as_ref().is_none_or(|a| index == a.sample_seq) {
+                                            let delay = bitmap_ack.as_ref().map_or(0, |a| a.delay_us as u64 * 1000);
+                                            if delay < raw {
+                                                RTT_acc += (raw - delay).max(100_000) / 100_000;
+                                                RTT_count += 1;
                                             }
                                         }
                                     }
@@ -4818,7 +4822,9 @@ struct DeliveryGrowth {
     start_ns: u64,
     packets: u64,
     latency_ns: u64,
+    oldest_send_ns: u64,
     previous_packets: u64,
+    // Full evidence coverage, possibly longer than the preceding ACK window.
     previous_span_ns: u64,
     ceiling_upps: u64,
     last_rate_upps: u64,
@@ -4827,7 +4833,7 @@ struct DeliveryGrowth {
 }
 impl DeliveryGrowth {
     fn new(now: u64, floor: u64) -> Self {
-        Self { start_ns: now, packets: 0, latency_ns: 0,
+        Self { start_ns: now, packets: 0, latency_ns: 0, oldest_send_ns: u64::MAX,
             previous_packets: 0, previous_span_ns: 0, ceiling_upps: floor,
             last_rate_upps: floor, receipt_not_before_ns: now, app_limited_since_ns: now }
     }
@@ -4839,6 +4845,7 @@ impl DeliveryGrowth {
         self.start_ns = now;
         self.packets = 0;
         self.latency_ns = 0;
+        self.oldest_send_ns = u64::MAX;
         self.previous_packets = 0;
         self.previous_span_ns = 0;
         self.receipt_not_before_ns = now;
@@ -4856,18 +4863,24 @@ impl DeliveryGrowth {
         self.ceiling_upps = self.ceiling_upps.max(floor.saturating_mul(2));
         self.packets = self.packets.saturating_add(packets);
         self.latency_ns = self.latency_ns.max(latency_ns);
+        self.oldest_send_ns = self.oldest_send_ns.min(now.saturating_sub(latency_ns));
         let span = now.saturating_sub(self.start_ns);
         let feedback = rtt_ns.saturating_add(crate::ship::ACK.max_delay_us as u64 * 1000).max(self.latency_ns).max(1);
         if span < feedback { return; }
         let delivered = self.packets.saturating_add(self.previous_packets);
-        let elapsed = span.saturating_add(self.previous_span_ns);
+        // Old genuine receipts may predate both ACK windows. Cover their send
+        // interval too, and retain that coverage with the previous count. Merely
+        // waiting one raw latency loses this interval at the next window shift.
+        let coverage = span.max(now.saturating_sub(self.oldest_send_ns));
+        let elapsed = span.saturating_add(self.previous_span_ns).max(coverage);
         let rate = rate_mul_div(delivered, 1_000_000_000_000_000, elapsed);
         self.ceiling_upps = rate.max(floor).saturating_mul(2).min(MAX_CC_RATE_UPPS);
         self.previous_packets = self.packets;
-        self.previous_span_ns = span;
+        self.previous_span_ns = coverage;
         self.start_ns = now;
         self.packets = 0;
         self.latency_ns = 0;
+        self.oldest_send_ns = u64::MAX;
     }
     fn bound(&self, proposed: u64) -> u64 {
         // ACK starvation or an application pause is not evidence of congestion.
@@ -4967,6 +4980,205 @@ impl LossEpisodes {
 #[cfg(test)]
 mod congestion_tests {
     use super::*;
+
+    // Drive precisely the receive loop's bitmap intersection, first-positive
+    // admission, send-time lookup and growth accounting, without opening sockets.
+    fn growth_ack(s: &mut ConnectionStateConnected, ack: &crate::ack::BitmapAck, now: u64, rtt: u64) -> u64 {
+        let relevant = ack.relevant(&s.packets_waiting_ack_field, &s.declared_lost_field[..]);
+        let mut count = 0;
+        let mut latency = 0;
+        for seq in relevant.acknowledged() {
+            if s.take_positive_receipt(seq).is_some_and(|r| r.is_data()) {
+                if let Some(raw) = s.delivery_growth.receipt_latency(now, s.send_time(seq)) {
+                    count += 1;
+                    latency = latency.max(raw);
+                }
+            }
+        }
+        s.delivery_growth.acknowledged(now, count, latency, rtt, RATE_FLOOR_UPPS);
+        count
+    }
+
+    #[test]
+    fn delivery_growth_real_receipt_admission_is_once_only_and_data_only() {
+        let ConnectionState::Connected(mut s) = new_connection_state_connected(None, 0, 0, 0) else { unreachable!() };
+        for seq in 0..4 { s.account_send(1_000_000_000 + seq * 5_000_000); }
+        s.packets_waiting_ack_tail = 2;
+        s.packets_waiting_ack_field[0] &= !3;
+        s.declared_lost_field[0] = 3;
+        s.outage.ignore_loss_before_seq = 1;
+        s.tu_probe_sequence_number = 3;
+        let mut ack = crate::ack::BitmapAck { highest: 3, sample_seq: 3, delay_us: 0, ce_count: 0, bitmap: [0; 16] };
+        ack.bitmap[0] = 15;
+        // seq0: pre-outage; seq1: declared-lost data; seq2: pending data;
+        // seq3: pending MTU probe. Only seq1 and seq2 authorize growth.
+        assert_eq!(growth_ack(&mut s, &ack, 1_020_000_000, 1_000_000), 2);
+        assert_eq!(s.packets_waiting_ack_field[0], 0);
+        assert_eq!(s.declared_lost_field[0], 0);
+        let ceiling = s.delivery_growth.ceiling_upps;
+        assert_eq!(growth_ack(&mut s, &ack, 1_021_000_000, 1_000_000), 0);
+        assert_eq!(s.delivery_growth.ceiling_upps, ceiling);
+        assert_eq!(s.take_positive_receipt(s.send_sequence_number), None);
+        s.packets_waiting_ack_tail = PACKETS_WAITING_ACK_CAPACITY + 1;
+        s.declared_lost_field[0] = 1;
+        assert_eq!(s.take_positive_receipt(0), None); // beyond retained ring
+        assert_eq!(s.take_positive_receipt(u64::MAX), None);
+    }
+
+    #[test]
+    fn delivery_growth_quiet_watermark_uses_quantized_send_lookup() {
+        let quantum = 0x400000;
+        let origin = 100 * quantum;
+        let ConnectionState::Connected(mut s) = new_connection_state_connected(None, 0, 0, origin) else { unreachable!() };
+        let old_send = origin + 100;
+        s.account_send(old_send);
+        let resume = origin + 30_000_000;
+        s.delivery_growth.resume_after_quiet(resume, resume - old_send, 1_000_000);
+        s.account_send(resume + 1); // same timestamp bucket: conservatively excluded
+        s.account_send(resume + quantum);
+        assert!(s.send_time(0) <= old_send);
+        assert!(s.send_time(1) < resume);
+        assert!(s.send_time(2) >= resume);
+        assert_eq!(s.delivery_growth.receipt_latency(resume + 10_000_000, s.send_time(0)), None);
+        assert_eq!(s.delivery_growth.receipt_latency(resume + 10_000_000, s.send_time(1)), None);
+        let mut ack = crate::ack::BitmapAck { highest: 2, sample_seq: 2, delay_us: 0, ce_count: 0, bitmap: [0; 16] };
+        ack.bitmap[0] = 7;
+        assert_eq!(growth_ack(&mut s, &ack, resume + 10_000_000, 1_000_000), 1);
+        assert_eq!(s.packets_waiting_ack_field[0], 0); // all still ACKed normally
+        assert_eq!(growth_ack(&mut s, &ack, resume + 11_000_000, 1_000_000), 0);
+    }
+
+    #[test]
+    fn delivery_growth_million_pps_and_timestamp_extremes() {
+        assert_eq!(std::mem::size_of::<DeliveryGrowth>(), 80);
+        assert_eq!(rate_mul_div(1_000_000, 1_000_000_000_000_000, 1_000_000_000), MAX_CC_RATE_UPPS);
+        let mut g = DeliveryGrowth::new(1_000_000_000, RATE_FLOOR_UPPS);
+        g.acknowledged(2_000_000_000, 1_000_000, 1_000_000, 1_000_000, RATE_FLOOR_UPPS);
+        assert_eq!(g.ceiling_upps, MAX_CC_RATE_UPPS);
+        assert_eq!(g.limit(MAX_CC_RATE_UPPS), MAX_CC_RATE_UPPS);
+        // Backwards time cannot close a window or underflow a raw latency.
+        assert_eq!(g.receipt_latency(1_400_000_000, 1_500_000_000), Some(0));
+        g.acknowledged(1, 1, u64::MAX, u64::MAX, RATE_FLOOR_UPPS);
+        assert_eq!(g.start_ns, 2_000_000_000);
+        g.acknowledged(u64::MAX, u64::MAX, u64::MAX, u64::MAX, RATE_FLOOR_UPPS);
+        assert!(g.ceiling_upps <= MAX_CC_RATE_UPPS);
+        assert_eq!(g.packets, u64::MAX);
+        let mut saturated = DeliveryGrowth::new(0, RATE_FLOOR_UPPS);
+        saturated.acknowledged(u64::MAX, u64::MAX, u64::MAX, u64::MAX, RATE_FLOOR_UPPS);
+        assert_eq!(saturated.start_ns, u64::MAX);
+        assert_eq!(saturated.ceiling_upps, MAX_CC_RATE_UPPS);
+        assert_eq!(saturated.bound(RATE_FLOOR_UPPS / 2), RATE_FLOOR_UPPS / 2);
+    }
+
+    #[test]
+    fn delivery_growth_one_ms_path_with_real_ack_policy_and_send_lookup() {
+        let cc = crate::ship::CC;
+        let rtt = 1_000_000;
+        let origin = 1_000_000_000;
+        let target = 7_000_000_000;
+        let ConnectionState::Connected(mut s) = new_connection_state_connected(None, 0, 0, origin) else { unreachable!() };
+        let mut receiver = crate::ack::AckReceiver::default();
+        let mut timer = u64::MAX;
+        let mut forward = std::collections::VecDeque::new();
+        let mut reverse = std::collections::VecDeque::new();
+        let mut credit = 1.0f64;
+        let mut reached = None;
+        let mut baseline = None;
+        let mut quantized_samples = 0;
+        for tick in 0..=10_000u64 {
+            let age = tick * 100_000;
+            let now = origin + age;
+            while forward.front().is_some_and(|&(due, _)| due <= now) {
+                let (_, seq) = forward.pop_front().unwrap();
+                receiver.receive_with_rtt(seq, now, false, &mut timer, 1000, 1184);
+            }
+            if timer <= now {
+                reverse.push_back((now + rtt / 2, receiver.ack(now)));
+                timer = u64::MAX;
+            }
+            while reverse.front().is_some_and(|(due, _)| *due <= now) {
+                let (_, ack) = reverse.pop_front().unwrap();
+                quantized_samples += growth_ack(&mut s, &ack, now, rtt);
+            }
+            let curve = connection_rate(age, cc.initial_rate_upps, cc.recovery_rtts * rtt, &cc, false).0.min(target);
+            if curve == target && baseline.is_none() { baseline = Some(age); }
+            let command = s.delivery_growth.limit(curve);
+            if command == target { reached = Some(age); break; }
+            credit += command as f64 / 10_000_000_000.0;
+            while credit >= 1.0 {
+                credit -= 1.0;
+                let seq = s.send_sequence_number;
+                s.account_send(now);
+                let looked_up = s.send_time(seq);
+                assert!(looked_up <= now && now - looked_up < 0x400000);
+                forward.push_back((now + rtt / 2, seq));
+            }
+        }
+        let reached = reached.expect("clean 1ms path must continue ramping");
+        let baseline = baseline.expect("original curve reaches target");
+        println!("1ms RTT, real ACK policy + 4.194ms send lookup: 7000pps at {}us; original curve {}us; {} receipts",
+            reached / 1000, baseline / 1000, quantized_samples);
+        assert!(quantized_samples > 0);
+        assert!(reached <= 1_000_000_000, "1ms clean ramp stalled");
+    }
+
+    #[test]
+    fn delivery_growth_old_ack_backlog_stays_within_evidence_interval() {
+        // The review's unique-receipt reproducer: a 7000 pps path, a one-second
+        // reverse gap, recent bitmaps, then genuine old ACKs behind newer ones.
+        let floor = RATE_FLOOR_UPPS;
+        let mut g = DeliveryGrowth::new(0, floor);
+        for t in 1..=10 {
+            g.acknowledged(t * 100_000_000, 700, 1_000_000, 1_000_000, floor);
+        }
+        assert_eq!(g.limit(MAX_CC_RATE_UPPS), 14_000_000_000);
+        let origin = 1_000_000_000u64;
+        let mut acked = vec![false; 50_000];
+        let mut peak = g.ceiling_upps;
+        // Continue through subsequent shifts as well: a backlog's send-time
+        // coverage must survive exactly as long as its retained receipt count.
+        for tick in 100..=620u64 {
+            let now = origin + tick * 10_000_000;
+            if tick % 2 != 0 { continue; }
+            let highest = ((now - origin - 1_000_000) * 7000 / 1_000_000_000) as usize;
+            let mut count = 0;
+            let mut latency = 0;
+            for seq in highest.saturating_sub(1023)..=highest {
+                if !acked[seq] {
+                    acked[seq] = true;
+                    let sent = origin + seq as u64 * 1_000_000_000 / 7000;
+                    if let Some(raw) = g.receipt_latency(now, sent) {
+                        count += 1;
+                        latency = latency.max(raw);
+                    }
+                }
+            }
+            g.acknowledged(now, count, latency, 1_000_000, floor);
+            peak = peak.max(g.ceiling_upps);
+            if tick == 200 {
+                let old_ack = now + 1_000_000;
+                let mut old_count = 0;
+                let mut old_latency = 0;
+                for seq in 0..7000usize {
+                    if !acked[seq] {
+                        acked[seq] = true;
+                        let sent = origin + seq as u64 * 1_000_000_000 / 7000;
+                        if let Some(raw) = g.receipt_latency(old_ack, sent) {
+                            old_count += 1;
+                            old_latency = old_latency.max(raw);
+                        }
+                    }
+                }
+                g.acknowledged(old_ack, old_count, old_latency, 1_000_000, floor);
+                peak = peak.max(g.ceiling_upps);
+            }
+        }
+        println!("constant 7000pps delivery: peak ceiling {}pps, final {}pps",
+            peak / 1_000_000, g.ceiling_upps / 1_000_000);
+        // Inclusive sequence endpoints can add at most one receipt per window:
+        // allow 2 * 1 packet / the minimum 20ms sampled span = 100 pps.
+        assert!(peak <= 14_100_000_000, "old backlog inflated ceiling: {peak}");
+    }
 
     #[test]
     fn delivery_growth_bursty_acks_do_not_authorize_gap_growth() {
@@ -5160,9 +5372,12 @@ mod congestion_tests {
                 if command == target { reached = Some(tick); break; }
             }
             let reached_ms = reached.expect("sparse sender must recover to the 7000 pps path");
-            assert_eq!(reached_ms, baseline_ms, "RTT {rtt}: fresh delivery must not slow a clean ramp");
             println!("sparse/quiet/burst RTT={}ms: 7000 pps at {}ms, unbounded curve {}ms",
                 rtt / 1_000_000, reached_ms, baseline_ms);
+            // Covering send times as well as ACK windows may conservatively
+            // delay a fresh sparse ramp, but must not stall continuing delivery.
+            assert!(reached_ms <= baseline_ms + 4 * feedback / 1_000_000,
+                "RTT {rtt}: excessive sparse recovery hold: {reached_ms}ms");
         }
     }
 
