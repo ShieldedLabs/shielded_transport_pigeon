@@ -433,6 +433,8 @@ REKEY. A forged/far-future epoch causes no derivation loop or advance. The
 previous epoch is accepted for at most ten seconds after advancement, and
 only within replay support. Its stored keys are overwritten and dropped on
 expiry (including from the idle send timer), or earlier on another advance.
+This is logical key retirement plus best-effort overwrite of live stored keys,
+not a guarantee of compiler-resistant erasure of all process-memory copies.
 Packets older than one epoch are safely discarded even within ten seconds;
 this bounded retention is not a promise to retain arbitrary high-rate old
 epochs. Replay state never resets at rekey. Deterministic Noise REKEY protects

@@ -1913,8 +1913,10 @@ impl ConnectionCipherTriplet {
     pub fn ratchet_forward_incoming(&mut self) -> bool {
         let Some(epoch) = self.incoming_epoch.checked_add(1) else { return false; };
         self.erase_old();
-        self.old = Some(self.current.clone());
-        self.current = self.new.clone();
+        // Move the original current allocation into the previous-key slot;
+        // replacing it with a clone would drop an unwiped duplicate of that key.
+        std::mem::swap(&mut self.current, &mut self.new);
+        self.old = Some(std::mem::replace(&mut self.new, self.current.clone()));
         self.new.rekey_incoming();
         self.incoming_epoch = epoch;
         true
