@@ -13,15 +13,16 @@
 
 /// Temporary internal research selector; removed when a winner ships.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RepairPolicy { Reliability, MeanOpen, MeanTopup, Streaming }
+pub(crate) enum RepairPolicy { Reliability, MeanOpen, MeanTopup, Streaming, MessageBound }
 static RESEARCH_POLICY: std::sync::OnceLock<RepairPolicy> = std::sync::OnceLock::new();
 impl RepairPolicy {
     fn selected() -> Self { RESEARCH_POLICY.get().copied().unwrap_or(Self::Reliability) }
     fn parse(value: Option<&str>) -> Result<Self, String> {
         match value {
             Some("P1") => Ok(Self::MeanOpen), Some("P2") => Ok(Self::MeanTopup),
-            Some("P3") => Ok(Self::Streaming), Some("P0") | None => Ok(Self::Reliability),
-            Some(other) => Err(format!("unknown STP_RACE_POLICY {other:?}; expected P0, P1, P2, or P3")),
+            Some("P3") => Ok(Self::Streaming), Some("P4") => Ok(Self::MessageBound),
+            Some("P0") | None => Ok(Self::Reliability),
+            Some(other) => Err(format!("unknown STP_RACE_POLICY {other:?}; expected P0, P1, P2, P3, or P4")),
         }
     }
     pub fn feedback(self) -> bool { self != Self::MeanOpen }
@@ -220,6 +221,12 @@ pub struct FecMessageInfo {
     pub block_bytes: u32,
     pub rescue_rounds: u8,
     pub rescue_symbols: u32,
+    /// Sent repairs beyond the initial plan, attributed at plan growth to
+    /// known-loss deficit or unresolved-tail allowance (excluding P3 rescue).
+    pub during_message_topup: u32,
+    pub tail_repairs: u32,
+    /// Connection-wide peak post-send/suspended source quota; P4 never leases it.
+    pub peak_retained_source_bytes: u64,
 }
 
 /// Fixed-memory losses-in-span sketch. Sixteen dyadic sliding windows (2..65536 packets),
@@ -419,7 +426,7 @@ impl FecAdaptiveState {
         self.repair_blocks_for_group_at_tail(k, whole_message_k, groups, true)
     }
     pub fn repair_blocks_for_group_at_tail(&self, k: u64, whole_message_k: u64, groups: usize, burst_tail: bool) -> u64 {
-        if self.policy == RepairPolicy::Streaming { return 2.min(k); }
+        if matches!(self.policy, RepairPolicy::Streaming | RepairPolicy::MessageBound) { return 2.min(k); }
         if self.policy != RepairPolicy::Reliability { return mean_repairs(k, self.p); }
         let c = &self.tracker.cfg;
         let span = &self.span;
@@ -493,7 +500,7 @@ mod tests {
     #[test]
     fn research_selector_validates_before_network_start() {
         assert_eq!(RepairPolicy::parse(None).unwrap(), RepairPolicy::Reliability);
-        for value in ["P0", "P1", "P2", "P3"] { assert!(RepairPolicy::parse(Some(value)).is_ok()); }
+        for value in ["P0", "P1", "P2", "P3", "P4"] { assert!(RepairPolicy::parse(Some(value)).is_ok()); }
         assert!(RepairPolicy::parse(Some("typo")).unwrap_err().contains("expected P0"));
     }
 
