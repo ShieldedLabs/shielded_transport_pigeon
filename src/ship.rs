@@ -36,7 +36,6 @@ pub(crate) const FEC: crate::fec_adapt::AdaptiveFecConfig = crate::fec_adapt::Ad
     slot_ns: 60_000_000_000,
     slots: 10,
     window_ns: 600_000_000_000,
-    loss_delay_ns: 1_000_000_000,
 };
 
 pub(crate) const ACK: crate::ack::AckPolicy = crate::ack::AckPolicy {

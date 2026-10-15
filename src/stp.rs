@@ -4508,9 +4508,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                         connection_tracking_data.unreliable_send_buffer.set_rate(rate_mul_div(allowed_bandwidth_upps, payload_size as u64, 1_000_000));
                         {
                             let buf = &mut connection_tracking_data.unreliable_send_buffer;
-                            let (lost, spurious) = fec_learning_counters(state);
-                            let a = buf.fec_adaptive.get_or_insert_with(|| crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, current_time_now_ns, state.stats.packets_sent, lost.saturating_sub(spurious)));
-                            a.on_tick(current_time_now_ns, state.stats.packets_sent, lost, spurious);
+                            let a = buf.fec_adaptive.get_or_insert_with(|| crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, current_time_now_ns));
+                            a.on_tick(current_time_now_ns);
                             buf.set_overhead();
                             if record_fec_messages && buf.fec_record.is_none() { buf.fec_record = Some(Vec::new()); }
                         }
@@ -4774,10 +4773,6 @@ struct OutageState {
     ignored_losses: u64,
     ignored_spurious: u64,
 }
-fn fec_learning_counters(state: &ConnectionStateConnected) -> (u64, u64) {
-    (state.stats.packets_lost.saturating_sub(state.outage.ignored_losses),
-        state.stats.spurious_losses.saturating_sub(state.outage.ignored_spurious))
-}
 fn recent_outage_probe_acked(state: &ConnectionStateConnected, ack: &crate::ack::BitmapAck, now: u64) -> bool {
     ack.acknowledged().any(|seq| {
         let (record_seq, sent) = state.outage.probes[(seq % 8) as usize];
@@ -4859,10 +4854,9 @@ fn resume_outage(state: &mut ConnectionStateConnected, buf: &mut SendQueues,
     // A path outage is not a stationary 100%-loss channel. Start a fresh FEC
     // observation window; source rescue plans above remain intact.
     if buf.fec_adaptive.is_some() {
-        let (lost, spurious) = fec_learning_counters(state);
         let policy = buf.fec_adaptive.as_ref().unwrap().policy;
         let mut fresh = crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC,
-            now, state.stats.packets_sent, lost.saturating_sub(spurious));
+            now);
         fresh.policy = policy;
         buf.fec_adaptive = Some(fresh);
     }
@@ -6355,7 +6349,6 @@ mod congestion_tests {
         assert_eq!(s.packets_in_flight, flight);
         assert_eq!(s.stats.packets_lost, 0);
         assert_eq!(s.stats.spurious_losses, 0);
-        assert_eq!(fec_learning_counters(&s), (0, 0));
         assert!(s.declared_lost_field.iter().all(|&w| w == 0));
         assert_eq!(s.loss_timer.timeout_ns(100_000_000, 0, &crate::ship::CC), timeout);
         let sent = s.send_time(0);
@@ -6752,7 +6745,7 @@ mod fec_send_tests {
 
     fn new_buf() -> UnreliableSendBuffer {
         let mut b = UnreliableSendBuffer::new(1_000_000, 1 << 26, 1 << 26);
-        let a = crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0);
+        let a = crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0);
         b.fec_capacity_overhead_ppm = a.representative_ppm();
         b.fec_adaptive = Some(a);
         b
@@ -7019,7 +7012,7 @@ mod fec_send_tests {
     fn grouped_closed_loop_sizes_each_owned_tail_with_union_bound() {
         use crate::fec_adapt::*;
         let mut b = new_buf();
-        let a = FecAdaptiveState::new(AdaptiveFecConfig { eps: 0.5, ..Default::default() }, 0, 0, 0);
+        let a = FecAdaptiveState::new(AdaptiveFecConfig { eps: 0.5, ..Default::default() }, 0);
         b.fec_adaptive = Some(a.clone());
         b.start_fec(std::sync::Arc::new(msg(64001 * 32)), 32);
         let f = b.fec_send_slot.as_mut().unwrap();
@@ -7120,7 +7113,7 @@ mod fec_closed_loop_tests {
 
     fn race_buffer(policy: crate::fec_adapt::RepairPolicy) -> UnreliableSendBuffer {
         let mut b = UnreliableSendBuffer::new(1000000, 1000000, 1000000);
-        let mut a = FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0);
+        let mut a = FecAdaptiveState::new(crate::ship::FEC, 0);
         a.policy = policy; a.p = 0.02; b.fec_adaptive = Some(a);
         b
     }
@@ -7171,7 +7164,7 @@ mod fec_closed_loop_tests {
     #[test]
     fn packed_small_messages_are_send_once_even_when_lost() {
         let mut b = UnreliableSendBuffer::new(100000, 1000000, 1000000);
-        b.fec_adaptive = Some(FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0));
+        b.fec_adaptive = Some(FecAdaptiveState::new(crate::ship::FEC, 0));
         b.submit_messages(vec![vec![7; 100], vec![8; 100]]);
         b.fec_prepare_packet(0);
         for package in 0..2 {
@@ -7187,7 +7180,7 @@ mod fec_closed_loop_tests {
 
     #[test]
     fn oversized_messages_keep_floor_when_feedback_rescue_cannot_retain_them() {
-        let mut a = FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0);
+        let mut a = FecAdaptiveState::new(crate::ship::FEC, 0);
         for seq in 0..10000 {
             a.on_data_sent(seq);
             a.on_sequence_finalized(seq, false, seq * 1000);
@@ -7221,7 +7214,7 @@ mod fec_closed_loop_tests {
     #[test]
     fn retained_lifetime_scales_with_rtt_and_original_train() {
         let mut b = UnreliableSendBuffer::new(100000, 1000000, 1000000);
-        b.fec_adaptive = Some(FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0));
+        b.fec_adaptive = Some(FecAdaptiveState::new(crate::ship::FEC, 0));
         b.submit_messages(vec![vec![7; 16384]]);
         b.fec_now_ns = 1_000_000_000;
         b.fec_rtt_ns = 400_000_000;
@@ -7241,7 +7234,7 @@ mod fec_closed_loop_tests {
     #[test]
     fn retained_rescue_has_fixed_source_and_time_bounds() {
         let mut b = UnreliableSendBuffer::new(100000, 1000000, 1000000);
-        b.fec_adaptive = Some(FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0));
+        b.fec_adaptive = Some(FecAdaptiveState::new(crate::ship::FEC, 0));
         // A large coded stand-in tests accounting with an unrelated tiny ready codec.
         for package in 0..5 {
             let slot = FecSendSlot { segment: None, root_lease: None, plan_ks: None, retention_lease: None, retain_limit: FEC_RETAIN_SOURCE_BYTES, package_lease: None, dscp: Dscp::BestEffort, message: std::sync::Arc::new(vec![0; 17 * 1024 * 1024]),
@@ -7260,7 +7253,7 @@ mod fec_closed_loop_tests {
     #[test]
     fn retained_encoder_rescues_after_feedback_and_retires_after_success() {
         let mut b = UnreliableSendBuffer::new(100000, 1000000, 1000000);
-        b.fec_adaptive = Some(FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0));
+        b.fec_adaptive = Some(FecAdaptiveState::new(crate::ship::FEC, 0));
         b.fec_record = Some(Vec::new());
         b.submit_messages(vec![vec![7; 1433 * 12], vec![8; 1433 * 12]]);
         let mut seq = 0;
@@ -7297,7 +7290,7 @@ mod fec_closed_loop_tests {
     fn learned_margin_stays_small_for_both_interior_and_tail_messages() {
         let make = || {
             let mut b = UnreliableSendBuffer::new(100000, 1000000, 1000000);
-            b.fec_adaptive = Some(FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0));
+            b.fec_adaptive = Some(FecAdaptiveState::new(crate::ship::FEC, 0));
             b.submit_messages(vec![vec![0; 1433 * 12]]);
             b
         };
@@ -7326,7 +7319,7 @@ mod fec_closed_loop_tests {
         let cfg = AdaptiveFecConfig { eps: 0.5, ..Default::default() };
         let mut b = UnreliableSendBuffer::new(100000, 1000000, 1000000);
         b.fec_capacity_overhead_ppm = 10000;
-        b.fec_adaptive = Some(FecAdaptiveState::new(cfg, 0, 0, 0));
+        b.fec_adaptive = Some(FecAdaptiveState::new(cfg, 0));
         b.start_fec(std::sync::Arc::new(vec![0u8; 1428 * 64]), 1428);
         let initial_n = b.fec_send_slot.as_ref().unwrap().n;
         for seq in 0..64 {
@@ -7446,7 +7439,7 @@ mod send_queue_tests {
         use crate::fec_adapt::RepairPolicy;
         for policy in [RepairPolicy::MeanTopup, RepairPolicy::Streaming] {
             let mut s = SendQueues::new(2, (1000000, 2<<20, 2<<20));
-            let mut a = crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0);
+            let mut a = crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0);
             a.policy = policy; a.p = 0.02; s.fec_adaptive = Some(a);
             s.submit_messages(1, vec![vec![7; 1433*12]]);
             let mut seq = 0;
@@ -7520,7 +7513,7 @@ mod traffic_class_tests {
     #[test]
     fn fec_sources_and_repairs_keep_message_class() {
         let mut s = SendQueues::new(2, (1000000, 100000, 100000));
-        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0));
+        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0));
         s.submit_classified_messages(1, vec![(Dscp::Ef, vec![1; 1000]), (Dscp::Af11, vec![2; 3000])]);
         let mut p = vec![0; 1449];
         s.fec_prepare_packet(0); assert!(s.fill_packet(&mut p) > 0); assert_eq!(s.last_dscp, Dscp::Ef);
@@ -7588,7 +7581,7 @@ mod review_tests {
     #[test]
     fn review_package_window_overrun_across_queues() {
         let mut s = SendQueues::new(2, (1000000, 64<<20, 64<<20));
-        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0));
+        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0));
         s.submit_messages(1, vec![vec![7; 1433*2000]]);
         s.submit_messages(0, (0..5000).map(|i| vec![i as u8; 100]).collect());
         let mut seq = 0; let mut bulk_id = None; let mut collided_at = None;
@@ -7659,7 +7652,7 @@ mod sender_lifetime_tests {
     #[test]
     fn rescue_and_suspended_original_hold_and_release_quota_leases() {
         let mut b = UnreliableSendBuffer::new(1000000, 100000, 100000);
-        b.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0));
+        b.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0));
         b.submit_messages(vec![vec![7; 3000], vec![8; 6000]]);
         let mut seq = 0;
         loop {
@@ -7686,7 +7679,7 @@ mod sender_lifetime_tests {
     fn strict_quota_denies_unaccounted_suspension() {
         let mut b = UnreliableSendBuffer::new(1000000, 100000, 100000);
         b.retention_quota = std::sync::Arc::new(RetentionQuota { byte_limit: 6000, slot_limit: 4, used: std::sync::Mutex::new((0,0)), telemetry: Default::default() });
-        b.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0));
+        b.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0));
         b.submit_messages(vec![vec![7; 3000], vec![8; 6000]]);
         let mut seq = 0;
         loop {
@@ -7704,7 +7697,7 @@ mod sender_lifetime_tests {
     #[test]
     fn packet_owner_ring_excludes_other_queues_even_with_a_forged_alias() {
         let mut s = SendQueues::new(2, (1000000, 100000, 100000));
-        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0));
+        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0));
         s.submit_messages(1, vec![vec![7; 3000]]);
         let mut p = vec![0; 1449]; let mut seq = 0;
         while s.queues[1].has_unsent_data() { s.fec_prepare_packet(seq); s.fill_packet(&mut p); seq += 1; }
@@ -7744,7 +7737,7 @@ mod ring_pressure_rescue_tests {
     #[test]
     fn ring_pressure_preserves_retained_sources_until_feedback() {
         let mut s = SendQueues::new(1, (1_000_000, 8<<20, 8<<20));
-        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0));
+        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0));
         s.submit_messages(0, (0..1025).map(|_| vec![1; 3000]).collect());
         let mut seq = 0;
         loop {
@@ -7776,7 +7769,7 @@ mod outage_review_repros {
     }
     fn buffer() -> SendQueues {
         let mut b = SendQueues::new(1, (100000, 1000000, 1000000));
-        b.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 1_000_000_000, 0, 0)); b
+        b.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 1_000_000_000)); b
     }
     #[test]
     fn resume_preserves_ready_fec_rescue_tu() {
@@ -7860,13 +7853,15 @@ mod outage_review_repros {
         s.outage.ignored_losses = 50;
         s.outage.enter(3_000_000_000, 100_000_000);
         resume_outage(&mut s, &mut b, &mut [], 27_000_000_000, None);
-        let fresh = crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 27_000_000_000, 100, 0);
+        let fresh = crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 27_000_000_000);
         assert_eq!(b.fec_adaptive.as_ref().unwrap().repair_blocks(128), fresh.repair_blocks(128));
         assert_eq!(b.fec_adaptive.as_ref().unwrap().p, fresh.p);
         s.stats.packets_lost += 2; // genuine post-resume loss
         s.stats.spurious_losses += 3; // late outage ACKs
         s.outage.ignored_spurious += 3;
-        assert_eq!(fec_learning_counters(&s), (2, 0));
+        // Global counters (including late outage ACKs) are no longer FEC inputs.
+        b.fec_adaptive.as_mut().unwrap().on_tick(28_000_000_000);
+        assert_eq!(b.fec_adaptive.as_ref().unwrap().p, fresh.p);
     }
 }
 
@@ -7953,7 +7948,7 @@ mod byte_fair_packing_tests {
     #[test]
     fn cross_queue_packed_small_sources_are_not_retained_or_rescued() {
         let mut s = SendQueues::new(2, (1_000_000, 10000, 10000));
-        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0));
+        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0));
         for q in 0..2 { s.submit_messages(q, vec![vec![q as u8;80];7]); }
         let mut p = [0;1162]; s.fec_prepare_packet(0); s.fill_packet(&mut p);
         let f = frames(&p); assert_eq!(f.len(),14);
@@ -7966,7 +7961,7 @@ mod byte_fair_packing_tests {
     #[test]
     fn mtu_growth_tail_can_carry_another_queues_whole_messages_without_reencoding() {
         let mut s = SendQueues::new(2, (1_000_000, 1<<20, 1<<20));
-        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC,0,0,0));
+        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC,0));
         s.submit_messages(0,vec![vec![9;65536]]);
         s.fec_prepare_packet(0); s.fill_packet(&mut [0;1162]);
         assert_eq!(s.queues[0].fec_send_slot.as_ref().unwrap().block_bytes,1141);
@@ -8126,7 +8121,7 @@ use super::*;
 #[test]
 fn stalled_encoder_does_not_bank_service_credit() {
     let mut s = SendQueues::new(2, (1_000_000, 32 << 20, 32 << 20));
-    s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0));
+    s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0));
     s.submit_messages(0, vec![vec![0; 65536]]);
     let mut p = [0; 1162];
     s.fec_prepare_packet(0); assert_eq!(s.fill_packet(&mut p), 1162);
@@ -8171,7 +8166,7 @@ fn stalled_encoder_does_not_bank_service_credit() {
 fn multi_item_fec_plain_feedback_is_once_each() {
     for lost in [false,true] {
     let mut s = SendQueues::new(2, (1_000_000, 32 << 20, 32 << 20));
-    s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0));
+    s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0));
     s.submit_messages(0, vec![vec![0;65536]]);
     s.fec_prepare_packet(0); s.fill_packet(&mut [0;1162]);
     s.submit_messages(1, vec![vec![1;80];100]);
@@ -8221,7 +8216,7 @@ mod lazy_fec_segment_tests {
     #[test]
     fn segment_tail_policy_matches_actual_retained_unit_not_root_length() {
         let mut s = SendQueues::new(2, (1_000_000, 64<<20, 64<<20));
-        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0));
+        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0));
         s.submit_messages(0, vec![vec![7; 50<<20]]);
         let mut packet = vec![0; 1450];
         s.fec_prepare_packet(0);
@@ -8251,7 +8246,7 @@ mod lazy_fec_segment_tests {
     fn lazy_group_plans_use_their_own_k_after_tu_growth() {
         for learned_burst in [false, true] {
             let mut s = SendQueues::new(1, (1_000_000, 16<<20, 16<<20));
-            let mut a = crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0);
+            let mut a = crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0);
             if learned_burst {
                 // The measured trace contains 331 declared losses in a 2048-packet
                 // span. Its finer histogram upper bound is 336, plus one extra symbol.
@@ -8295,7 +8290,7 @@ mod lazy_fec_segment_tests {
     #[test]
     fn lazy_groups_pick_up_tu_growth_burst_loss_and_deliver_original_once() {
         let mut s = SendQueues::new(1, (1_000_000, 16<<20, 16<<20));
-        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC,0,0,0));
+        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC,0));
         let original = vec![91; (4<<20)+123];
         s.submit_messages(0,vec![original.clone()]);
         let mut root = ReassemblySlot::new();
@@ -8471,7 +8466,7 @@ mod lazy_fec_segment_tests {
             let payload = ASSUMED_UDP_PAYLOAD_SIZE_WITH_GUARANTEED_DELIVERY
                 - total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(magic).unwrap();
             let mut sender = SendQueues::new(1, (1_000_000, 1 << 20, 1 << 20));
-            sender.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0));
+            sender.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0));
             let mut packet = vec![0; payload];
             sender.submit_messages(0, vec![vec![7; payload - STP_WHOLE_HEADER_SIZE + 1]]);
             sender.fec_prepare_packet(0); assert!(sender.fill_packet(&mut packet) > 0);
@@ -8579,7 +8574,7 @@ mod lazy_fec_segment_tests {
     #[test]
     fn segmented_root_id_and_all_queue_ids_share_the_bounded_allocator() {
         let mut s=SendQueues::new(2,(1_000_000,64<<20,64<<20));
-        s.fec_adaptive=Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC,0,0,0));
+        s.fec_adaptive=Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC,0));
         s.submit_messages(0,vec![vec![4;4<<20]]);
         let mut p=vec![0;1162]; s.fec_prepare_packet(0); assert!(s.fill_packet(&mut p)>0);
         let f=s.queues[0].fec_send_slot.as_ref().unwrap();
@@ -8719,7 +8714,7 @@ mod lazy_fec_segment_tests {
     fn near_tu_whole_messages_use_three_byte_frame_not_fec() {
         for len in 1146..=1158 {
             let mut s=SendQueues::new(1,(1_000_000,1<<20,1<<20));
-            s.fec_adaptive=Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC,0,0,0));
+            s.fec_adaptive=Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC,0));
             s.submit_messages(0,vec![vec![8;len]]);
             let mut p=vec![0;1162]; s.fec_prepare_packet(0);
             assert_eq!(s.fill_packet(&mut p),1162);
@@ -9174,7 +9169,7 @@ mod local_backpressure_tests {
     fn refused_data_keeps_original_fec_tags_until_success() {
         let mut s = state();
         let mut b = SendQueues::new(1, (1_000_000, 8<<20, 8<<20));
-        b.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 1_000_000_000, 0, 0));
+        b.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 1_000_000_000));
         b.submit_messages(0, vec![vec![7; 3<<20]]);
         b.fec_prepare_packet(0);
         let mut plain = vec![0; 1162];
@@ -9207,7 +9202,7 @@ use crate::fec_adapt::{FecAdaptiveState, RepairPolicy};
 
 fn buffer(policy: RepairPolicy) -> UnreliableSendBuffer {
     let mut b = UnreliableSendBuffer::new(1_000_000, 1_000_000, 1_000_000);
-    let mut a = FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0);
+    let mut a = FecAdaptiveState::new(crate::ship::FEC, 0);
     a.policy = policy;
     a.p = 0.02;
     b.fec_adaptive = Some(a);
@@ -9288,7 +9283,7 @@ mod race_expiry_block_tests {
     fn retention_expires_while_locally_refused_ciphertext_remains_pending() {
         for policy in [RepairPolicy::MeanTopup, RepairPolicy::Streaming] {
             let mut q = SendQueues::new(1, (1000000, 1000000, 1000000));
-            let mut a = FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0);
+            let mut a = FecAdaptiveState::new(crate::ship::FEC, 0);
             a.policy = policy; a.p = 0.02; q.fec_adaptive = Some(a);
             q.submit_messages(0, vec![vec![7;1433*20], vec![8;1433*20]]);
             let mut seq = 0;
@@ -9317,7 +9312,7 @@ mod race_expiry_block_tests {
     #[test]
     fn reliability_rescue_can_still_refresh_an_active_round() {
         let mut b = UnreliableSendBuffer::new(1000000, 1000000, 1000000);
-        b.fec_adaptive = Some(FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0));
+        b.fec_adaptive = Some(FecAdaptiveState::new(crate::ship::FEC, 0));
         b.start_fec(std::sync::Arc::new(vec![1;1433*20]),1433);
         let f = b.fec_send_slot.as_mut().unwrap();
         f.next_id = 24; f.n = 30; f.finalized_symbols = 24; f.group_lost[0] = 10;
@@ -9334,7 +9329,7 @@ use super::*;
 #[test]
 fn review_p0_retention_must_survive_outage_send_ticks() {
     let mut b = SendQueues::new(1, (100000, 1000000, 1000000));
-    b.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 1_000_000_000, 0, 0));
+    b.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 1_000_000_000));
     let ConnectionState::Connected(mut s) = new_connection_state_connected(None, 0, 1, 1_000_000_000) else { unreachable!() };
     s.stats.cc_rate_upps = 100_000_000;
     b.set_time(1_000_000_000, 100_000_000);
@@ -9370,7 +9365,7 @@ mod race_outage_pause_tests {
         for policy in [RepairPolicy::MeanTopup, RepairPolicy::Streaming] {
             for active in [false, true] {
                 let mut b = SendQueues::new(1, (1000000,1000000,1000000));
-                let mut a = FecAdaptiveState::new(crate::ship::FEC, 1_000_000_000, 0, 0);
+                let mut a = FecAdaptiveState::new(crate::ship::FEC, 1_000_000_000);
                 a.policy = policy; a.p = 0.02; b.fec_adaptive = Some(a);
                 b.set_time(1_000_000_000, 100_000_000);
                 b.submit_messages(0,vec![vec![7;1433*20]]);
@@ -9491,7 +9486,7 @@ mod fill_rule_tests {
     #[test]
     fn sole_fillable_indebted_queue_uses_otherwise_unusable_gap() {
         let mut s = sender(2);
-        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC,0,0,0));
+        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC,0));
         s.submit_messages(0,vec![vec![9;65536]]);
         s.fec_prepare_packet(0); s.fill_packet(&mut [0;1162]);
         s.submit_messages(1,vec![vec![1;80];100]);
@@ -9522,7 +9517,7 @@ mod fill_rule_tests {
     #[test]
     fn large_symbols_are_never_gap_fillers_even_when_they_fit() {
         let mut s = sender(2);
-        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC,0,0,0));
+        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC,0));
         s.submit_messages(1, vec![vec![9;65536]]);
         s.fec_prepare_packet(0); s.fill_packet(&mut [0;1162]);
         let before = s.queues[1].fec_send_slot.as_ref().unwrap().next_id;
@@ -9551,7 +9546,7 @@ mod fill_rule_tests {
     #[test]
     fn chopped_small_requires_both_packets_and_is_never_retried() {
         let mut s=sender(1);
-        s.fec_adaptive=Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC,0,0,0));
+        s.fec_adaptive=Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC,0));
         s.submit_messages(0,vec![vec![0;1000],vec![7;1000]]);
         let p0=emit(&mut s,0); let p1=emit(&mut s,1);
         let a=heads(&p0).pop().unwrap(); let b=heads(&p1).remove(0);
@@ -9910,7 +9905,7 @@ mod p4_tests {
 
     fn buffer(policy: RepairPolicy, p: f64) -> UnreliableSendBuffer {
         let mut b = UnreliableSendBuffer::new(0, 16 << 20, 16 << 20);
-        let mut a = FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0);
+        let mut a = FecAdaptiveState::new(crate::ship::FEC, 0);
         a.policy = policy;
         a.p = p;
         b.fec_adaptive = Some(a);
@@ -10131,7 +10126,7 @@ mod p4_review_tests {
     use crate::fec_adapt::{FecAdaptiveState, RepairPolicy};
     fn buffer() -> UnreliableSendBuffer {
         let mut b = UnreliableSendBuffer::new(0, 16 << 20, 16 << 20);
-        let mut a = FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0);
+        let mut a = FecAdaptiveState::new(crate::ship::FEC, 0);
         a.policy = RepairPolicy::MessageBound;
         a.p = 0.0;
         b.fec_adaptive = Some(a);
