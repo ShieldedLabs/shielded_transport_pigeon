@@ -1983,7 +1983,7 @@ pub struct ConnectionStats {
     pub fec_decode_admission_refusals: u64,
     /// Inactive decoder workers retired after max(4 RTTs, 2 seconds).
     pub fec_decode_timeouts: u64,
-    /// Oldest inactive decoder retired under admission pressure after 2 RTTs.
+    /// Oldest inactive decoder retired under admission pressure after max(4 RTTs, 2 seconds).
     pub fec_decode_preemptions: u64,
     /// Codecs first refused or retired because a peer/global worker limit was hit.
     pub fec_worker_limit_events: u64,
@@ -2291,9 +2291,9 @@ fn fec_ingress_bytes(layout: crate::fec::MessageLayout) -> usize {
     (layout.k * (layout.block_bytes + FEC_INGRESS_SLOT_BYTES)).min(MAX_FEC_INGRESS_BYTES)
 }
 
-// Wi-Fi q2 (two queues) and fleet (one queue) both peaked at three codecs.
-// Allow one extra per queue, bounded by the network thread's eight-worker cap.
-const FEC_WORKERS_PER_QUEUE: usize = 4;
+// Provisional conservative P3 allowance: Wi-Fi fleet peaked at seven codecs
+// outside a ceiling-hit CC flood. Re-measure after CC overshoot and P4 fixes.
+const FEC_WORKERS_PER_QUEUE: usize = 8;
 fn receive_worker_limit(max_message_size: usize, queues: usize) -> usize {
     let unit = max_message_size.min(FEC_SEGMENT_BYTES);
     if unit.div_ceil(FEC_MIN_BLOCK_BYTES) <= FEC_INLINE_MAX_BLOCKS { return 0; }
@@ -2588,13 +2588,11 @@ pub const MAX_FEC_DECODE_WORKERS: usize = 8;
 /// Byte cap for each ingress level, including channel slots (not just block payload).
 pub const MAX_FEC_INGRESS_BYTES: usize = 32 << 20;
 
-fn fec_inactive_grace_ns(rtt: u16, pressure: bool) -> u64 {
-    if pressure {
-        if rtt == 0 || rtt == u16::MAX { 250_000_000 } else { 2 * rtt as u64 * 100_000 }
-    } else {
-        let rtt_ns = if rtt == u16::MAX { 0 } else { rtt as u64 * 100_000 };
-        (4 * rtt_ns).max(2_000_000_000)
-    }
+fn fec_inactive_grace_ns(rtt: u16, _pressure: bool) -> u64 {
+    // Admission pressure must not discard recently ACKed decoder state. Refuse
+    // the new codec until an old one meets the normal abandonment grace.
+    let rtt_ns = if rtt == u16::MAX { 0 } else { rtt as u64 * 100_000 };
+    (4 * rtt_ns).max(2_000_000_000)
 }
 
 /// Incomplete plain messages and roots follow fragment inactivity, not keepalive ACKs.
@@ -5715,9 +5713,13 @@ mod fec_send_tests {
         assert!(retry.admission_refused && matches!(retry.state, FecRecvState::Empty));
         assert_eq!(retry.ingress_dropped, 1);
         let grace = fec_inactive_grace_ns(200, true); // 20 ms RTT
-        assert_eq!(grace, 40_000_000);
-        assert_eq!(fec_inactive_grace_ns(u16::MAX, true), 250_000_000);
+        assert_eq!(grace, 2_000_000_000);
+        assert_eq!(fec_inactive_grace_ns(u16::MAX, true), 2_000_000_000);
         assert_eq!(fec_inactive_grace_ns(u16::MAX, false), 2_000_000_000);
+        assert_eq!(fec_inactive_grace_ns(10_000, true), 4_000_000_000);
+        // Pressure cannot retire a codec merely because a few RTTs passed.
+        assert_eq!(retire_inactive_fec_workers(&mut slots, base + 100_000_000, grace, true), 0);
+        assert!(slots.iter().all(|s| matches!(s.state, FecRecvState::Worker { .. })));
         assert_eq!(retire_inactive_fec_workers(&mut slots, base + grace, grace, true), 0);
         assert_eq!(retire_inactive_fec_workers(&mut slots, base + grace + 1, grace, true), 1);
         assert!(matches!(slots[0].state, FecRecvState::Done));
@@ -7151,7 +7153,7 @@ mod lazy_fec_segment_tests {
     #[test]
     fn default_peer_budget_fits_maximum_message_and_decoder_margin() {
         let process = Arc::new(crate::receive_memory::ReceiveMemoryBudget::default());
-        for (queues, expected) in [(1, 1_698_541_560), (2, 3_363_266_544)] {
+        for (queues, expected) in [(1, 1_750_523_632), (2, 3_363_266_544)] {
             let cap = receive_connection_memory_limit(MAX_JUMBOGRAM_LEN, queues).unwrap();
             assert_eq!(cap, expected);
             assert!(cap + RECEIVE_CONNECTION_BYTES <= process.limit());
@@ -7164,13 +7166,13 @@ mod lazy_fec_segment_tests {
         assert!(receive_connection_memory_limit(MAX_JUMBOGRAM_LEN, 3).unwrap() > process.limit());
         assert_eq!(receive_connection_memory_limit(usize::MAX, 1), receive_connection_memory_limit(MAX_JUMBOGRAM_LEN, 1));
         for (size, queues, expected) in [(65536, 1, 1_755_968), (65536, 2, 3_184_256),
-            (15_000_000, 1, 77_366_424), (15_000_000, 2, 153_946_416)] {
+            (15_000_000, 1, 129_348_496), (15_000_000, 2, 153_946_416)] {
             assert_eq!(receive_connection_memory_limit(size, queues), Some(expected));
         }
         assert_eq!(receive_worker_limit(65536, 2), 0);
         assert_eq!(receive_worker_limit(2 << 20, 1), 1);
         assert_eq!(receive_worker_limit(2 << 20, 2), 2);
-        assert_eq!(receive_worker_limit(15_000_000, 1), 4);
+        assert_eq!(receive_worker_limit(15_000_000, 1), 8);
         assert_eq!(receive_worker_limit(15_000_000, 2), 8);
         // The configured ingress upper bound covers every wire symbol width.
         let unit = FEC_SEGMENT_BYTES;
