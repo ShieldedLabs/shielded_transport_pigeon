@@ -43,6 +43,11 @@ pub(crate) const ACK: crate::ack::AckPolicy = crate::ack::AckPolicy {
     max_delay_us: 10_000,
 };
 
+/// P4 only: fixed extra initial parity, in percentage points of source K, for a
+/// logical message whose whole planned train spans [RTT/2, 2 RTT] at its queue's
+/// fair-share rate. Classified once at first plan; not an application setting.
+pub(crate) const P4_CATEGORY_BONUS_PERCENT: u32 = 10;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -55,5 +60,6 @@ mod tests {
         assert_eq!(CC.loss_threshold, 2);
         assert_eq!(FEC.eps, 0.5);
         assert_eq!((ACK.every_packets, ACK.max_delay_us), (8, 10_000));
+        assert_eq!(P4_CATEGORY_BONUS_PERCENT, 10);
     }
 }

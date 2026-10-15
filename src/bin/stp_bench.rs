@@ -422,6 +422,19 @@ fn integrated_rx_report_roundtrip() {
     assert_eq!(old.st.rx_stale_identity_frames, 0);
 }
 
+/// Fixed P4 duration-category bonus echo from the ConnectionStats poll. Repairs are
+/// planned initial-layout additions (TU restarts re-plan), not emitted packets.
+fn category_bonus_json(percent: u32, messages: u64, planned_repairs: u64) -> String {
+    format!(",\"category_bonus_percent\":{percent},\"category_bonus_messages\":{messages},\"category_bonus_repairs\":{planned_repairs},\"category_bonus_repairs_kind\":\"planned_layout_additions_not_emitted\"")
+}
+
+#[test]
+fn category_bonus_json_fields() {
+    let mut json = "{\"a\":1}\n".to_string();
+    json.insert_str(json.len() - 2, &category_bonus_json(10, 19, 237));
+    assert_eq!(json, "{\"a\":1,\"category_bonus_percent\":10,\"category_bonus_messages\":19,\"category_bonus_repairs\":237,\"category_bonus_repairs_kind\":\"planned_layout_additions_not_emitted\"}\n");
+}
+
 // Research-only sidecar: disk stream, not an unbounded in-memory result list.
 struct FecTrace(Option<std::io::BufWriter<std::fs::File>>);
 impl FecTrace {
@@ -858,6 +871,7 @@ fn send(a: &Args) {
     json.insert_str(json.len() - 2, &format!(",\"receiver_fec_decode_admission_refusals\":{},\"receiver_fec_decode_timeouts\":{},\"receiver_fec_decode_preemptions\":{},\"receiver_fec_worker_limit_events\":{},\"receiver_fec_decode_peak_workers\":{},\"receiver_plain_admission_refusals\":{}",
         rx.st.fec_decode_admission_refusals, rx.st.fec_decode_timeouts, rx.st.fec_decode_preemptions, rx.st.fec_worker_limit_events, rx.st.fec_decode_peak_workers, rx.st.rx_plain_admission_refusals));
     json.insert_str(json.len() - 2, &rx.worker_limit_json());
+    json.insert_str(json.len() - 2, &category_bonus_json(shielded_transport_pigeon::fec_adapt::category_bonus_percent(), stats.category_bonus_messages, stats.category_bonus_repairs));
     println!("UDP TU {}B | FEC blocks {{{block_sizes}}}B | receiver FEC last/max decode tail {:.3}/{:.3}ms | ingress erased {} blocks",
         stats.udp_payload_tu, rx.st.fec_decode_last_tail_ns as f64 / 1e6, rx.st.fec_decode_max_tail_ns as f64 / 1e6, rx.st.fec_ingress_dropped_blocks);
     std::fs::write(&out, json).unwrap_or_else(|e| die(&format!("writing {out}: {e}")));
@@ -1041,6 +1055,7 @@ fn send_magazines(a: &Args) {
     json.insert_str(json.len()-2, &format!(",\"max_message_size\":{max_message_size},\"receiver_fec_worker_limit_events\":{},\"receiver_stale_fragments\":{},\"receiver_partials_evicted\":{},\"receiver_insert_failures\":{}", receiver.st.fec_worker_limit_events, receiver.st.rx_stale_fragments, receiver.st.rx_partial_evicted, receiver.st.rx_insert_failures));
     json.insert_str(json.len()-2, &format!(",\"receiver_fec_decode_peak_workers\":{},\"receiver_plain_admission_refusals\":{},\"receiver_fec_decode_admission_refusals\":{},\"receiver_fec_ingress_dropped_blocks\":{},\"receiver_recv_queue_dropped_messages\":{},\"receiver_kernel_rx_drops\":{}", receiver.st.fec_decode_peak_workers, receiver.st.rx_plain_admission_refusals, receiver.st.fec_decode_admission_refusals, receiver.st.fec_ingress_dropped_blocks, receiver.th.recv_queue_dropped_messages, receiver.th.kernel_rx_drops.map_or("null".into(), |n| n.to_string())));
     json.insert_str(json.len() - 2, &receiver.worker_limit_json());
+    json.insert_str(json.len() - 2, &category_bonus_json(shielded_transport_pigeon::fec_adapt::category_bonus_percent(), stats.category_bonus_messages, stats.category_bonus_repairs));
     std::fs::write(a.str("out").unwrap_or("stp_bench_report.json"), json).unwrap();
     fec_trace.flush();
     drop(handle);

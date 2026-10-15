@@ -532,6 +532,27 @@ ACK batching cadence and native socket limits are implementation policies,
 not new identity widths or implicit wire generations. The declaration makes
 current support explicit and rejects incompatible interpretations.
 
+### Shipped sender FEC policy
+
+The default sender uses P4 (message-bound repair), with a fixed conditional
+**10-percentage-point additive parity bonus**. At a logical message's first
+FEC plan, estimate its whole initial packet train, including all segments,
+at the queue's current equal fair-share packet rate. The message qualifies
+when that duration is in **[RTT/2, 2*RTT]**, including both endpoints. This is
+a duration category, not a fixed byte-size class; segmented messages can qualify.
+The classification uses the current RTT model and is frozen for that logical
+message, including later segment starts and transmission-unit replans.
+
+Qualifying messages add 10% of their source-symbol count (rounded up across
+the logical message) to the adaptive base repair plan. Each bonused coded unit's
+planned train is capped at twice its source-symbol count. Refreshes apply the
+same bonus to the unbonused base; they do not
+compound it. This is neither a blanket parity floor nor post-send recovery.
+Small whole/plain messages remain send-once. P4 still seals and forgets at the
+end of its planned send work, and queue transmission remains serial FIFO:
+slipstream interleaving is not part of this shipped policy. The bonus is internal
+policy, not an application setting, and changes neither framing nor wire version.
+
 Tests cover every frame kind, unknown-kind skipping, the former all-ones
 padding collision, full nonces across enormous gaps, arbitrary ACK bases and
 repeated deep-window feedback, rekey budget boundaries/reordering, parameter

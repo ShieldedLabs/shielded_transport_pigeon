@@ -624,6 +624,41 @@ impl Drop for RetentionLease {
     fn drop(&mut self) { let mut used = self.quota.used.lock().unwrap(); used.0 -= self.bytes; used.1 -= 1; self.quota.telemetry.current.fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed); }
 }
 
+// P4 duration category: the planned packet train spans [RTT/2, 2 RTT], inclusive,
+// at the queue's current fair-share payload rate. set_rate is full *payload* TU
+// bytes/s, so payload TU and rate scale identically. A zero rate or RTT has no
+// category; any nonzero current RTT model value is used as is.
+fn medium_duration_class(packets: u32, payload_len: usize, rate: u64, rtt: u64) -> &'static str {
+    let duration = packets as u128 * payload_len as u128 * 1_000_000_000;
+    let horizon = rtt as u128 * rate as u128;
+    if packets == 0 || horizon == 0 { "other" }
+    else if duration * 2 < horizon { "short" }
+    else if duration > horizon.saturating_mul(2) { "long" } else { "eligible" }
+}
+
+// Metadata-only whole-logical P4 initial train. Balanced segmentation has at
+// most two distinct range lengths; no source copy, codec or worker for estimates.
+// Initial P4 really plans K + min(2,K) per range.
+fn p4_new_train(total: usize, offset: usize, payload: usize) -> (u32, u32) {
+    if total <= payload.saturating_sub(STP_WHOLE_HEADER_SIZE) || offset >= total { return (0, 0); }
+    let groups = total.div_ceil(FEC_SEGMENT_BYTES);
+    let header = if groups > 1 { STP_SEGMENT_FEC_HEADER_SIZE } else { STP_FEC_FRAGMENT_HEADER_SIZE };
+    let Some(block) = payload.checked_sub(header).filter(|b| *b > 0) else { return (0, 0); };
+    let group_len = total.div_ceil(groups);
+    let remaining = groups.saturating_sub(offset / group_len);
+    let last_len = total - (groups - 1) * group_len;
+    let unit = |len| crate::fec::MessageLayout::new(len, block).map_or((0, 0), |l| {
+        let k = l.k as u32;
+        (k, l.round_plan(k.saturating_add(2.min(k))))
+    });
+    let (k, n) = unit(group_len);
+    let (last_k, last_n) = unit(last_len);
+    ((remaining as u32 - 1) * k + last_k, (remaining as u32 - 1) * n + last_n)
+}
+// Rounded-up percentage of source K. Segments add the cumulative difference, so a
+// logical message receives ceil(total K * percent / 100) once, not per segment.
+fn source_bonus(k: u64, percent: u32) -> u32 { (k * percent as u64).div_ceil(100) as u32 }
+
 #[derive(Debug)]
 pub struct UnreliableSendBuffer {
     // A time based capacity constrained by byte counts.
@@ -678,6 +713,12 @@ pub struct UnreliableSendBuffer {
     fec_rtt_ns: u64,
     /// Cumulative source/repair progress snapshots, when recording is enabled (Some).
     pub fec_record: Option<Vec<crate::fec_adapt::FecMessageInfo>>,
+    // Fixed ship policy (0 except P4). The category is decided at the logical
+    // message's first FEC plan and frozen through segments and TU restarts.
+    category_bonus_percent: u32,
+    category_eligible: Option<bool>,
+    category_bonus_messages: u64,
+    category_bonus_repairs: u64,
 }
 
 /// Sender state of one FEC-coded message: blocks 0..k-1 are slices of the message itself and
@@ -721,6 +762,8 @@ struct RepairAccounting {
     planned_topup: u32,
     sent_topup: u32,
     sent_tail: u32,
+    unbonused_n: u32,
+    category_bonus: u32,
 }
 
 // Fixed per-connection retained-source budget and slot bound. Codec arenas add their
@@ -790,7 +833,15 @@ impl FecSendSlot {
             let layout = crate::fec::MessageLayout::new(self.message.len(), self.block_bytes).unwrap();
             let repairs = (0..layout.groups).map(|g| self.group_lost[g].saturating_add(margin).min(layout.group(g).1 as u32)).max().unwrap();
             let old_n = self.n;
-            self.n = self.n.max(layout.round_plan(self.k.saturating_add(repairs * layout.groups as u32)));
+            let base = layout.round_plan(self.k.saturating_add(repairs * layout.groups as u32));
+            let bonus = self.repair_accounting.category_bonus;
+            // Extend the unbonused adaptive base monotonically, then add the
+            // SAME source-K bonus once. Never apply a percentage to extended N
+            // or repeatedly add it to the already bonused train.
+            self.repair_accounting.unbonused_n = self.repair_accounting.unbonused_n
+                .max(self.n.saturating_sub(bonus)).max(base);
+            let target = self.repair_accounting.unbonused_n.saturating_add(bonus);
+            self.n = self.n.max(if bonus == 0 { target } else { target.min(self.k.saturating_mul(2)) });
             // Attribute each newly planned symbol once. Known-loss deficit gets
             // priority; the rest protects unresolved packets. Initial rank symbols
             // and post-message rescue are reported separately.
@@ -975,11 +1026,18 @@ impl UnreliableSendBuffer {
             fec_now_ns: 0,
             fec_rtt_ns: 0,
             fec_record: None,
+            category_bonus_percent: crate::fec_adapt::category_bonus_percent(),
+            category_eligible: None,
+            category_bonus_messages: 0,
+            category_bonus_repairs: 0,
         }
     }
 
     fn encoder_ready(f: &mut FecSendSlot) -> bool {
         if f.next_id < f.k || f.next_id >= f.n { return true; }
+        Self::encoder_initialized(f)
+    }
+    fn encoder_initialized(f: &mut FecSendSlot) -> bool {
         if let FecEncoderState::Pending(rx) = &f.encoder {
             f.encoder = match rx.try_recv() {
                 Ok(Some(e)) => FecEncoderState::Ready(e),
@@ -1322,7 +1380,29 @@ impl UnreliableSendBuffer {
         let repairs = (0..layout.groups).map(|g| a.repair_blocks_for_group_at_tail(layout.group(g).1 as u64,
             whole_k, target_groups, message.len() > self.retention_quota.byte_limit)).max().unwrap_or(0);
         let (n, loss_estimate) = (k + repairs as u32 * layout.groups as u32, a.p);
-        let n = layout.round_plan(n);
+        let n_base = layout.round_plan(n);
+        // First-plan category decision for the whole logical message. Freeze it
+        // across rate/RTT changes, later segments and TU restarts of this message.
+        let mut category_bonus = 0;
+        if a.policy == crate::fec_adapt::RepairPolicy::MessageBound && self.category_bonus_percent != 0 {
+            if self.category_eligible.is_none() {
+                let payload = block_bytes + if segment.is_some() { STP_SEGMENT_FEC_HEADER_SIZE } else { STP_FEC_FRAGMENT_HEADER_SIZE };
+                let (_, packets) = p4_new_train(total, 0, payload);
+                self.category_eligible = Some(medium_duration_class(packets, payload,
+                    self.current_bytes_per_second, self.fec_rtt_ns) == "eligible");
+                self.category_bonus_messages += u64::from(self.category_eligible == Some(true));
+            }
+            if self.category_eligible == Some(true) {
+                let prefix_k = segment.zip(plan_ks.as_ref()).map_or(0, |(seg, ks)| {
+                    let group_len = total.div_ceil(total.div_ceil(FEC_SEGMENT_BYTES));
+                    ks.lock().unwrap()[..seg.offset as usize / group_len].iter().sum::<u64>()
+                });
+                category_bonus = source_bonus(prefix_k + k as u64, self.category_bonus_percent)
+                    .saturating_sub(source_bonus(prefix_k, self.category_bonus_percent));
+            }
+        }
+        let n = if category_bonus == 0 { n_base } else { n_base.saturating_add(category_bonus).min(k.saturating_mul(2)) };
+        self.category_bonus_repairs += n.saturating_sub(n_base) as u64;
         let encoder = if k as usize <= FEC_INLINE_MAX_BLOCKS {
             match crate::fec::encode_message(message.clone(), block_bytes) { Some(e) => FecEncoderState::Ready(e), None => FecEncoderState::Failed }
         } else {
@@ -1334,7 +1414,7 @@ impl UnreliableSendBuffer {
             }
         };
         self.fec_packet_tags.get_or_insert_with(|| vec![0u128; PACKETS_WAITING_ACK_CAPACITY as usize].into_boxed_slice());
-        self.fec_send_slot = Some(FecSendSlot { segment, root_lease, plan_ks, retention_lease: None, retain_limit: self.retention_quota.byte_limit, package_lease: self.package_lease.clone(), dscp: self.current_dscp, finalized_symbols: 0, send_started_ns: self.fec_now_ns, original_send_duration_ns: None, repair_policy: a.policy, rescue_rounds: 0, retained_until_ns: None, original_symbols: None, repair_accounting: RepairAccounting::default(), group_lost: vec![0; layout.groups], message, block_bytes, k, n, next_id: 0, encoder, block_buf: vec![0u8; block_bytes], first_seq: self.next_packet_seq, lost: 0, n_planned: n, loss_estimate });
+        self.fec_send_slot = Some(FecSendSlot { segment, root_lease, plan_ks, retention_lease: None, retain_limit: self.retention_quota.byte_limit, package_lease: self.package_lease.clone(), dscp: self.current_dscp, finalized_symbols: 0, send_started_ns: self.fec_now_ns, original_send_duration_ns: None, repair_policy: a.policy, rescue_rounds: 0, retained_until_ns: None, original_symbols: None, repair_accounting: RepairAccounting { unbonused_n: n_base, category_bonus, ..Default::default() }, group_lost: vec![0; layout.groups], message, block_bytes, k, n, next_id: 0, encoder, block_buf: vec![0u8; block_bytes], first_seq: self.next_packet_seq, lost: 0, n_planned: n, loss_estimate });
     }
 
     /// Starts `msg` as the message being sent: grouped FEC if enabled and its length fits
@@ -1352,6 +1432,7 @@ impl UnreliableSendBuffer {
             self.send_package_id = lease.id;
             self.package_lease = Some(lease);
         }
+        self.category_eligible = None;
         if self.fec_adaptive.is_some() && msg.len() > FEC_SEGMENT_BYTES {
             self.segmented_send = Some(SegmentedSend { plan_ks: std::sync::Arc::new(std::sync::Mutex::new(vec![0; msg.len().div_ceil(FEC_SEGMENT_BYTES)])), message: std::sync::Arc::new(msg), offset: 0,
                 root: self.send_package_id, root_lease: self.package_lease.take() });
@@ -1491,6 +1572,23 @@ impl UnreliableSendBuffer {
                     self.start_fec_group(f.message, payload_len - STP_SEGMENT_FEC_HEADER_SIZE, f.segment, f.root_lease, f.plan_ks);
                     return self.next_fragment(payload_len, space);
                 }
+                if self.category_bonus_percent != 0 && self.fec_rescue_package.is_none() {
+                    // P4 ordinary restart keeps its frozen category: restart with
+                    // the SAME Arc, not try_unwrap-or-copy via start_message. Resolve
+                    // a pending worker first so repeated TU changes cannot leave
+                    // detached old codec jobs uncharged.
+                    if !Self::encoder_initialized(self.fec_send_slot.as_mut().unwrap()) { return None; }
+                    let lease = match self.package_allocator.clone() {
+                        Some(ids) => { let Some(lease) = ids.allocate() else { return None; }; Some(lease) },
+                        None => None,
+                    };
+                    let f = self.fec_send_slot.take().unwrap();
+                    drop(f.encoder);
+                    self.send_package_id = lease.as_ref().map_or(self.send_package_id.checked_add(1).expect("message identity exhausted"), |l| l.id);
+                    self.package_lease = lease;
+                    self.start_fec(f.message, payload_len - STP_FEC_FRAGMENT_HEADER_SIZE);
+                    return self.next_fragment(payload_len, space);
+                }
                 let f = self.fec_send_slot.take().unwrap();
                 drop(f.encoder);
                 if self.fec_rescue_package.take().is_some() {
@@ -1589,6 +1687,7 @@ pub struct SendQueues {
     fec_extra_packet_tags: HashMap<u64, Vec<u128>>,
     next_packet_seq: u64,
     fec_record: Option<Vec<crate::fec_adapt::FecMessageInfo>>,
+    total_bytes_per_second: u64,
 }
 
 impl SendQueues {
@@ -1605,7 +1704,7 @@ impl SendQueues {
             q
         }).collect();
         Self { scheduled_bytes: vec![0; count], queue_active: vec![false; count], service_clock: 0, fec_owner_tags: HashMap::new(), packet_owner: None, queues, next_queue: 0, last_queue: 0, last_dscp: Dscp::BestEffort, fec_adaptive: None,
-            fec_packet_tags: None, fec_extra_packet_tags: HashMap::new(), next_packet_seq: 0, fec_record: None }
+            fec_packet_tags: None, fec_extra_packet_tags: HashMap::new(), next_packet_seq: 0, fec_record: None, total_bytes_per_second: 0 }
     }
     pub fn submit_messages(&mut self, queue: usize, messages: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
         self.submit_classified_messages(queue, messages.into_iter().map(|m| (Dscp::BestEffort, m)).collect()).into_iter().map(|(_, m)| m).collect()
@@ -1619,8 +1718,17 @@ impl SendQueues {
         for q in &mut self.queues { q.fec_now_ns = now; q.fec_rtt_ns = rtt; q.fec_prune_retained(); q.fec_expire_active_rescue(); }
     }
     fn set_rate(&mut self, bytes_per_second: u64) {
+        self.total_bytes_per_second = bytes_per_second;
         let active = self.queues.iter().filter(|q| q.has_unsent_data()).count().max(1) as u64;
         for q in &mut self.queues { q.current_bytes_per_second = bytes_per_second / active; }
+    }
+    fn refresh_queue_rates(&mut self) {
+        // Same connection pacer, current equal-byte serviceable weights. A burst
+        // may drain/join queues between set_rate calls; only new decisions see it.
+        // Without the P4 bonus (P0-P3) the set_rate snapshot is kept exactly.
+        if self.total_bytes_per_second == 0 || !self.queues.iter().any(|q| q.category_bonus_percent != 0) { return; }
+        let active = self.queues.iter_mut().map(|q| u64::from(q.can_emit())).sum::<u64>().max(1);
+        for q in &mut self.queues { q.current_bytes_per_second = self.total_bytes_per_second / active; }
     }
     fn set_overhead(&mut self) {
         let ppm = self.fec_adaptive.as_ref().unwrap().representative_ppm();
@@ -1677,6 +1785,7 @@ impl SendQueues {
     }
     fn fill_packet(&mut self, payload: &mut [u8]) -> usize {
         let count = self.queues.len();
+        self.refresh_queue_rates();
         for i in 0..count {
             let active = self.queues[i].can_emit();
             if !self.queue_active[i] { self.scheduled_bytes[i] = self.scheduled_bytes[i].max(self.service_clock); }
@@ -1693,6 +1802,7 @@ impl SendQueues {
         let mut cursor = 0;
         let mut class = None;
         while cursor + STP_WHOLE_HEADER_SIZE <= payload.len() {
+            self.refresh_queue_rates();
             // Least served eligible queue wins; round-robin breaks equal byte ties.
             // Head: byte scheduler. Tail: whole FIFO heads, then small-message chops.
             // Every tier is charged, including framing, never padding.
@@ -2234,6 +2344,11 @@ pub struct ConnectionStats {
     pub cc_app_limited_entries: u64,
     /// Current path transmission unit, including STP header/tag inside the UDP payload.
     pub udp_payload_tu: u64,
+    /// Logical messages that received the frozen P4 duration-category parity bonus.
+    pub category_bonus_messages: u64,
+    /// Extra repair symbols PLANNED by that bonus at initial layout starts (a TU
+    /// restart plans again and counts again). Not emitted or delivered packets.
+    pub category_bonus_repairs: u64,
     /// Constant-memory send-loop burst and curve-inversion diagnostics.
     pub pacing_batches: u64,
     pub pacing_packets: u64,
@@ -3491,6 +3606,10 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                 resp.connection_stats = connections_map.iter().filter_map(|(key, value)| match &value.connection_state {
                     ConnectionState::Connected(c) => {
                         let mut st = c.stats;
+                        for q in &value.unreliable_send_buffer.queues {
+                            st.category_bonus_messages += q.category_bonus_messages;
+                            st.category_bonus_repairs += q.category_bonus_repairs;
+                        }
                         st.fec_decode_peak_workers = value.receive_budget.worker_peak() as u64;
                         st.seq_numbers_used = c.send_sequence_number;
                         st.udp_payload_tu = c.current_tu;
@@ -7170,6 +7289,7 @@ mod fec_closed_loop_tests {
     #[test]
     fn race_open_loop_does_not_refresh_or_retain() {
         let mut b = race_buffer(crate::fec_adapt::RepairPolicy::MeanOpen);
+        b.queue_bytes_filled = 1433 * 20; // Direct start bypasses normal submission accounting.
         b.start_fec(std::sync::Arc::new(vec![1; 1433*20]), 1433);
         let f = b.fec_send_slot.as_mut().unwrap();
         let n = f.n; f.lost = 19; f.group_lost[0] = 19;
@@ -10483,5 +10603,228 @@ mod p4_review_tests {
         let expected = crate::fec_adapt::mean_repairs((early.next_id - early.finalized_symbols) as u64, 0.1) as u32;
         assert!(early.n - early.k >= expected,
             "earlier segment got {} repairs, needs {} at actual source completion; stale refreshed={}", early.n - early.k, expected, b.p4_tail_refreshed);
+    }
+}
+
+#[cfg(test)]
+mod p4_category_bonus_tests {
+    use super::*;
+    use crate::fec_adapt::RepairPolicy;
+    // 1449-byte TU at 1_449_000 B/s and 100 ms RTT: RTT = 100 packets, the
+    // inclusive category window is [50, 200] packets of the whole planned train.
+    fn queues(policy: RepairPolicy, percent: u32) -> SendQueues {
+        let mut s = SendQueues::new(2, (0, 16 << 20, 16 << 20));
+        let mut a = crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0);
+        a.policy = policy;
+        a.p = 0.1;
+        s.fec_adaptive = Some(a);
+        for q in &mut s.queues { q.category_bonus_percent = percent; }
+        s.set_time(1, 100_000_000);
+        s.set_rate(1_449_000);
+        s
+    }
+    fn p4(percent: u32) -> SendQueues { queues(RepairPolicy::MessageBound, percent) }
+    fn settle(s: &mut SendQueues) {
+        for q in &mut s.queues {
+            for f in q.fec_send_slot.iter_mut().chain(q.fec_suspended.iter_mut()) {
+                if let FecEncoderState::Pending(rx) = &f.encoder {
+                    f.encoder = match rx.recv().unwrap() { Some(e) => FecEncoderState::Ready(e), None => FecEncoderState::Failed };
+                }
+            }
+        }
+    }
+    fn packet(s: &mut SendQueues, seq: u64, size: usize) {
+        settle(s);
+        s.fec_prepare_packet(seq);
+        let mut p = vec![0; size];
+        assert_eq!(s.fill_packet(&mut p), size, "seq={seq}");
+        settle(s);
+    }
+    fn slot(s: &SendQueues, q: usize) -> &FecSendSlot { s.queues[q].fec_send_slot.as_ref().unwrap() }
+
+    #[test]
+    fn shipped_default_is_p4_with_fixed_ten_and_older_policies_get_zero() {
+        assert_eq!(crate::fec_adapt::category_bonus_percent(), crate::ship::P4_CATEGORY_BONUS_PERCENT);
+        assert_eq!(UnreliableSendBuffer::new(0, 1 << 20, 1 << 20).category_bonus_percent, 10);
+        // Even a nonzero field never applies outside P4 (P0-P3 research semantics).
+        for policy in [RepairPolicy::Reliability, RepairPolicy::MeanOpen, RepairPolicy::MeanTopup, RepairPolicy::Streaming] {
+            let mut s = queues(policy, 10);
+            s.submit_messages(0, vec![vec![1; 100 * 1428]]);
+            packet(&mut s, 0, 1449);
+            assert_eq!(s.queues[0].category_eligible, None, "{policy:?}");
+            assert_eq!((s.queues[0].category_bonus_messages, s.queues[0].category_bonus_repairs), (0, 0));
+            assert_eq!(slot(&s, 0).repair_accounting.category_bonus, 0);
+        }
+    }
+
+    #[test]
+    fn duration_class_is_inclusive_and_zero_context_has_no_category() {
+        let class = |packets| medium_duration_class(packets, 1449, 1_449_000, 100_000_000);
+        assert_eq!((class(49), class(50), class(200), class(201)), ("short", "eligible", "eligible", "long"));
+        assert_eq!(medium_duration_class(100, 1449, 0, 100_000_000), "other");
+        assert_eq!(medium_duration_class(100, 1449, 1_449_000, 0), "other");
+        assert_eq!(medium_duration_class(0, 1449, 1_449_000, 100_000_000), "other");
+        // No startup special case: any nonzero RTT model value, including the
+        // pre-sample placeholder, is classified as an ordinary RTT.
+        assert_eq!(medium_duration_class(100, 1449, 1_449_000, 6_553_500_000), "short");
+        assert_eq!(medium_duration_class(6553, 1449, 1_449_000, 6_553_500_000), "eligible");
+        assert_eq!(source_bonus(1, 10), 1);
+        assert_eq!(source_bonus(100, 10), 10);
+        assert_eq!(source_bonus(101, 10), 11);
+    }
+
+    #[test]
+    fn ten_points_add_to_base_once_capped_and_never_compound() {
+        for (percent, n0, n_lost, n_lost_extra) in [(0, 102, 132, 132), (10, 112, 142, 142)] {
+            let mut s = p4(percent);
+            s.submit_messages(0, vec![vec![0xa1; 100 * 1428]]);
+            packet(&mut s, 0, 1449);
+            let a = s.fec_adaptive.clone().unwrap();
+            let q = &mut s.queues[0];
+            assert_eq!((q.category_bonus_messages, q.category_bonus_repairs), if percent == 0 { (0, 0) } else { (1, 10) });
+            let f = q.fec_send_slot.as_mut().unwrap();
+            assert_eq!((f.k, f.n, f.repair_accounting.category_bonus), (100, n0, percent));
+            f.group_lost[0] = 30;
+            f.refresh_plan(&a);
+            assert_eq!(f.n, n_lost, "adaptive base plus the fixed source-K bonus");
+            for _ in 0..30 { f.refresh_plan(&a); assert_eq!(f.n, n_lost_extra); }
+            f.next_id = f.k; f.finalized_symbols = f.next_id;
+            for _ in 0..30 { f.refresh_plan(&a); assert_eq!(f.n, n_lost_extra); }
+            f.group_lost[0] = 1000;
+            f.refresh_plan(&a);
+            assert_eq!(f.n, 200, "bonus shares the existing 2K repair cap");
+        }
+    }
+
+    #[test]
+    fn initial_bonus_respects_two_k_cap() {
+        // K=2: P4 base is already 2K=4 packets; RTT 4 ms makes it eligible.
+        let mut s = p4(10);
+        s.set_time(1, 4_000_000);
+        s.submit_messages(0, vec![vec![3; 2 * 1428]]);
+        packet(&mut s, 0, 1449);
+        let f = slot(&s, 0);
+        assert_eq!((f.k, f.n, f.repair_accounting.category_bonus), (2, 4, 1));
+        assert_eq!((s.queues[0].category_bonus_messages, s.queues[0].category_bonus_repairs), (1, 0));
+    }
+
+    #[test]
+    fn classification_uses_prebonus_train_and_freezes_through_tu_restart() {
+        let mut s = p4(10);
+        // Pre-bonus n=198 is inside 2 RTT; bonused n=218 would be outside.
+        s.submit_messages(0, vec![vec![0xa1; 196 * 1428], vec![0xb2; 80]]);
+        packet(&mut s, 0, 1449);
+        assert_eq!(s.queues[0].category_eligible, Some(true));
+        assert_eq!((slot(&s, 0).k, slot(&s, 0).n), (196, 218));
+        let first_id = s.queues[0].send_package_id;
+        // RTT/rate collapse plus a real TU shrink: re-plan, same frozen category.
+        s.set_time(2, 1); s.set_rate(1);
+        packet(&mut s, 1, 1162);
+        let q = &s.queues[0];
+        let f = slot(&s, 0);
+        assert_ne!(q.send_package_id, first_id, "TU restart is a new package identity");
+        assert!(f.k > 196);
+        assert_eq!(q.category_eligible, Some(true));
+        assert_eq!(q.category_bonus_messages, 1);
+        assert_eq!(f.repair_accounting.category_bonus, source_bonus(f.k as u64, 10));
+        assert_eq!(f.n, f.repair_accounting.unbonused_n + f.repair_accounting.category_bonus);
+        assert_eq!(q.category_bonus_repairs, 20 + f.repair_accounting.category_bonus as u64,
+            "planned additions count per layout start, fresh base each time");
+    }
+
+    #[test]
+    fn zero_rtt_context_stays_ineligible_through_restart() {
+        let mut s = p4(10);
+        s.set_time(1, 0);
+        s.submit_messages(0, vec![vec![0xa1; 100 * 1428]]);
+        packet(&mut s, 0, 1449);
+        assert_eq!(s.queues[0].category_eligible, Some(false));
+        s.set_time(2, 100_000_000);
+        packet(&mut s, 1, 1162);
+        assert!(slot(&s, 0).k > 100, "TU restart happened");
+        assert_eq!(s.queues[0].category_eligible, Some(false));
+        assert_eq!(slot(&s, 0).repair_accounting.category_bonus, 0);
+        assert_eq!((s.queues[0].category_bonus_messages, s.queues[0].category_bonus_repairs), (0, 0));
+    }
+
+    #[test]
+    fn current_fair_share_replaces_stale_set_rate_snapshot() {
+        // Snapshot taken with both queues idle (full rate each), but at the first
+        // plan both queues are serviceable: 724_500 B/s => 102 packets > 2 RTT.
+        let mut s = p4(10);
+        s.submit_messages(0, vec![vec![0xa1; 100 * 1428]]);
+        s.submit_messages(1, vec![vec![0xb2; 100 * 1428]]);
+        packet(&mut s, 0, 1449);
+        assert_eq!(s.queues[0].current_bytes_per_second, 724_500);
+        let started: Vec<_> = s.queues.iter().map(|q| q.category_eligible).filter(|c| c.is_some()).collect();
+        assert_eq!(started, vec![Some(false)]);
+        // Reverse staleness: snapshot halves, but only one queue is serviceable.
+        let mut t = p4(10);
+        t.submit_messages(0, vec![vec![0xa1; 100 * 1428]]);
+        t.submit_messages(1, vec![vec![0xb2; 80]]);
+        t.set_rate(1_449_000);
+        assert_eq!(t.queues[0].current_bytes_per_second, 724_500);
+        t.queues[1].message_queue.clear();
+        t.queues[1].queue_bytes_filled = 0;
+        packet(&mut t, 0, 1449);
+        assert_eq!(t.queues[0].current_bytes_per_second, 1_449_000);
+        assert_eq!(t.queues[0].category_eligible, Some(true));
+        // Without the bonus (P0-P3 shipping 0) the set_rate snapshot is untouched.
+        let mut u = p4(0);
+        u.submit_messages(0, vec![vec![0xa1; 100 * 1428]]);
+        u.submit_messages(1, vec![vec![0xb2; 100 * 1428]]);
+        u.set_rate(1_449_000);
+        u.queues[1].message_queue.clear();
+        u.queues[1].queue_bytes_filled = 0;
+        packet(&mut u, 0, 1449);
+        assert_eq!(u.queues[0].current_bytes_per_second, 724_500);
+    }
+
+    #[test]
+    fn tiny_send_once_and_long_giant_are_ineligible() {
+        let mut s = p4(10);
+        s.submit_messages(0, vec![vec![0xa1; 80], vec![0xb2; 80]]);
+        packet(&mut s, 0, 1449);
+        assert_eq!((s.queues[0].category_eligible, s.queues[0].category_bonus_messages), (None, 0));
+        assert!(s.queues[0].fec_send_slot.is_none());
+        let mut t = p4(10);
+        t.submit_messages(0, vec![vec![0xa1; 100 * 1428], vec![0xb2; 4 << 20]]);
+        packet(&mut t, 0, 1449);
+        t.queues[0].fec_send_slot.as_mut().map(|f| { f.next_id = f.n; f.finalized_symbols = f.n; });
+        packet(&mut t, 1, 1449);
+        assert!(slot(&t, 0).segment.is_some());
+        assert_eq!((t.queues[0].category_eligible, t.queues[0].category_bonus_messages), (Some(false), 1));
+    }
+
+    #[test]
+    fn segmented_message_is_classified_whole_with_root_ceiling_and_frozen_restart() {
+        let mut s = p4(10);
+        s.set_time(1, 3_000_000_000);
+        s.submit_messages(0, vec![vec![0xa1; 3 << 20]]);
+        packet(&mut s, 0, 1449);
+        assert_eq!(s.queues[0].category_eligible, Some(true));
+        let (first_k, first_bonus) = {
+            let f = s.queues[0].fec_send_slot.as_mut().unwrap();
+            assert_eq!(f.segment.unwrap().offset, 0);
+            let values = (f.k, f.repair_accounting.category_bonus);
+            f.next_id = f.n; f.finalized_symbols = f.n;
+            values
+        };
+        packet(&mut s, 1, 1449);
+        let f = slot(&s, 0);
+        assert!(f.segment.unwrap().offset > 0);
+        let second_k = f.k;
+        assert_eq!(first_bonus + f.repair_accounting.category_bonus, source_bonus((first_k + second_k) as u64, 10));
+        assert_eq!(s.queues[0].category_bonus_messages, 1);
+        assert_eq!(s.queues[0].category_bonus_repairs, source_bonus((first_k + second_k) as u64, 10) as u64);
+        // Segment TU restart under a context that would now be ineligible.
+        s.set_time(2, 1); s.set_rate(1);
+        packet(&mut s, 2, 1162);
+        let f = slot(&s, 0);
+        assert!(f.segment.unwrap().offset > 0 && f.k > second_k);
+        assert_eq!(s.queues[0].category_eligible, Some(true));
+        assert_eq!(s.queues[0].category_bonus_messages, 1);
+        assert_eq!(first_bonus + f.repair_accounting.category_bonus, source_bonus((first_k + f.k) as u64, 10));
+        assert_eq!(f.n, f.repair_accounting.unbonused_n + f.repair_accounting.category_bonus);
     }
 }

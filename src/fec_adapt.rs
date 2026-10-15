@@ -43,6 +43,12 @@ pub fn initialize_research_policy() -> Result<(), String> {
     Ok(())
 }
 
+/// Fixed P4 duration-category parity bonus; 0 for every older research policy.
+#[doc(hidden)]
+pub fn category_bonus_percent() -> u32 {
+    if RepairPolicy::selected() == RepairPolicy::MessageBound { crate::ship::P4_CATEGORY_BONUS_PERCENT } else { 0 }
+}
+
 /// Expected source AND repair loss, plus two decoder-rank symbols, capped at K.
 pub(crate) fn mean_repairs(k: u64, p: f64) -> u64 {
     if k == 0 { return 0; }
