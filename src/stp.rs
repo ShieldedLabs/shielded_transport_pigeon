@@ -3370,6 +3370,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 let mut data_ack_progress = false;
                                 let mut newly_acked_data = 0u64;
                                 let mut delivery_latency_ns = 0u64;
+                                let mut shadow_acked_data = 0u64;
+                                let mut shadow_latency_ns = 0u64;
                                 let mut oldest_newly_acked_send_time: u64 = u64::MAX;
                                 let relevant_ack = bitmap_ack.as_ref().map(|a| a.relevant(&state.packets_waiting_ack_field, &state.declared_lost_field[..]));
                                 let indices = relevant_ack.iter().flat_map(crate::ack::BitmapAck::acknowledged);
@@ -3407,6 +3409,10 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                         let raw = timestamp_ns.saturating_sub(sent_ns);
                                         ack_latency_ns = ack_latency_ns.max(raw);
                                         if receipt.is_data() {
+                                            if let Some(latency) = state.delivery_growth.shadow_receipt_latency(timestamp_ns, sent_ns) {
+                                                shadow_acked_data += 1;
+                                                shadow_latency_ns = shadow_latency_ns.max(latency);
+                                            }
                                             if let Some(latency) = state.delivery_growth.receipt_latency(timestamp_ns, sent_ns) {
                                                 newly_acked_data += 1;
                                                 delivery_latency_ns = delivery_latency_ns.max(latency);
@@ -3423,8 +3429,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     }
                                 }
                                 if ack_latency_ns != 0 { state.loss_timer.observe(ack_latency_ns); }
-                                state.delivery_growth.acknowledged(timestamp_ns, newly_acked_data,
-                                    delivery_latency_ns, state.RTT_mean as u64 * 100_000, cc.rate_floor_upps);
+                                state.delivery_growth.acknowledged_samples(timestamp_ns, (newly_acked_data, delivery_latency_ns),
+                                    (shadow_acked_data, shadow_latency_ns), state.RTT_mean as u64 * 100_000, cc.rate_floor_upps);
                                 if data_ack_progress {
                                     let before = state.congestion_event_time_ns;
                                     let context = loss_trace.as_ref().map(|_| cc_trace_context(state, timestamp_ns, &cc, max_pps));
@@ -4812,53 +4818,25 @@ fn apply_ecn_congestion(state: &mut ConnectionStateConnected, now: u64, cc: &Con
     println!("congestion event ECN CE ...  rate discovered: {} pps  sent:{send_mode}@{send_t_factor:.2}", state.congestion_event_rate_upps as f64 / 1000000.0);
 }
 
-/// Positive receipts authorize growth, not a new congestion signal. A complete
-/// feedback window plus the current partial window include ACK silence, not an
-/// instantaneous compressed-ACK rate. The raw latency floor includes receiver ACK
-/// batching; the delay-corrected CC RTT alone is not a feedback interval.
-/// Fixed storage, no per-packet allocation and no dependency on the curve phase.
+/// One covered delivery stream. Retained counts keep their full send-to-ACK
+/// coverage; ACK silence and raw receiver batching latency are included.
 #[derive(Debug)]
-struct DeliveryGrowth {
+struct DeliveryEvidence {
     start_ns: u64,
     packets: u64,
     latency_ns: u64,
     oldest_send_ns: u64,
     previous_packets: u64,
-    // Full evidence coverage, possibly longer than the preceding ACK window.
     previous_span_ns: u64,
     ceiling_upps: u64,
-    last_rate_upps: u64,
-    receipt_not_before_ns: u64,
-    app_limited_since_ns: u64,
 }
-impl DeliveryGrowth {
-    fn new(now: u64, floor: u64) -> Self {
+impl DeliveryEvidence {
+    fn new(now: u64, ceiling_upps: u64) -> Self {
         Self { start_ns: now, packets: 0, latency_ns: 0, oldest_send_ns: u64::MAX,
-            previous_packets: 0, previous_span_ns: 0, ceiling_upps: floor,
-            last_rate_upps: floor, receipt_not_before_ns: now, app_limited_since_ns: now }
+            previous_packets: 0, previous_span_ns: 0, ceiling_upps }
     }
-    fn resume_after_quiet(&mut self, now: u64, quiet_ns: u64, rtt_ns: u64) {
-        let feedback = rtt_ns.saturating_add(crate::ship::ACK.max_delay_us as u64 * 1000);
-        if quiet_ns < feedback { return; }
-        // Nothing queued is not a feedback gap. Do not let a long application
-        // pause poison two subsequent delivery windows, or grant new headroom.
-        self.start_ns = now;
-        self.packets = 0;
-        self.latency_ns = 0;
-        self.oldest_send_ns = u64::MAX;
-        self.previous_packets = 0;
-        self.previous_span_ns = 0;
-        self.receipt_not_before_ns = now;
-    }
-    fn receipt_latency(&self, now: u64, sent: u64) -> Option<u64> {
-        // Receipts older than the previous ACK window (or the quiet/outage
-        // epoch) still count for ACK/loss, but not growth count or coverage.
-        // A stray old receipt must not hold a fresh window open for seconds.
-        (sent != 0 && sent != u64::MAX && sent >= self.receipt_not_before_ns)
-            .then(|| now.saturating_sub(sent))
-    }
-    fn acknowledged(&mut self, now: u64, packets: u64, latency_ns: u64, rtt_ns: u64, floor: u64) {
-        if packets == 0 { return; }
+    fn acknowledged(&mut self, now: u64, packets: u64, latency_ns: u64, rtt_ns: u64, floor: u64) -> bool {
+        if packets == 0 { return false; }
         // A small fixed headroom at the rate floor also allows sparse senders to
         // fill a feedback window. It is available only after positive delivery.
         self.ceiling_upps = self.ceiling_upps.max(floor.saturating_mul(2));
@@ -4880,21 +4858,71 @@ impl DeliveryGrowth {
             // revoke the earlier complete sample's already-proven permission.
             self.ceiling_upps = if span < feedback { self.ceiling_upps.max(ceiling) } else { ceiling };
         }
-        if span < feedback { return; }
+        if span < feedback { return false; }
         self.previous_packets = self.packets;
         self.previous_span_ns = coverage;
-        // Advance only admission, not retained count coverage: those receipts
-        // may have been admitted before this horizon moved.
-        self.receipt_not_before_ns = self.start_ns;
         self.start_ns = now;
         self.packets = 0;
         self.latency_ns = 0;
         self.oldest_send_ns = u64::MAX;
+        true
     }
+}
+
+/// Positive receipts authorize growth, not a new congestion signal. The fresh
+/// horizon ignores isolated ancient receipts; the shadow admits every same-epoch
+/// receipt so sustained deep reordering cannot hide delivery forever. Each stream
+/// covers every counted receipt independently, so their maximum is covered too.
+/// Fixed storage, one shared command, no dependency on the curve phase.
+#[derive(Debug)]
+struct DeliveryGrowth {
+    fresh: DeliveryEvidence,
+    shadow: DeliveryEvidence,
+    last_rate_upps: u64,
+    receipt_not_before_ns: u64,
+    epoch_ns: u64,
+    app_limited_since_ns: u64,
+}
+impl DeliveryGrowth {
+    fn new(now: u64, floor: u64) -> Self {
+        Self { fresh: DeliveryEvidence::new(now, floor), shadow: DeliveryEvidence::new(now, floor),
+            last_rate_upps: floor, receipt_not_before_ns: now, epoch_ns: now, app_limited_since_ns: now }
+    }
+    fn resume_after_quiet(&mut self, now: u64, quiet_ns: u64, rtt_ns: u64) {
+        let feedback = rtt_ns.saturating_add(crate::ship::ACK.max_delay_us as u64 * 1000);
+        if quiet_ns < feedback { return; }
+        // Nothing queued is not a feedback gap. Discard stale measurements but
+        // preserve each earned ceiling and the shared last command.
+        self.fresh = DeliveryEvidence::new(now, self.fresh.ceiling_upps);
+        self.shadow = DeliveryEvidence::new(now, self.shadow.ceiling_upps);
+        self.receipt_not_before_ns = now;
+        self.epoch_ns = now;
+    }
+    fn receipt_latency(&self, now: u64, sent: u64) -> Option<u64> {
+        self.shadow_receipt_latency(now, sent).filter(|_| sent >= self.receipt_not_before_ns)
+    }
+    fn shadow_receipt_latency(&self, now: u64, sent: u64) -> Option<u64> {
+        (sent != 0 && sent != u64::MAX && sent >= self.epoch_ns)
+            .then(|| now.saturating_sub(sent))
+    }
+    fn acknowledged_samples(&mut self, now: u64, fresh: (u64, u64), shadow: (u64, u64), rtt_ns: u64, floor: u64) {
+        let start = self.fresh.start_ns;
+        if self.fresh.acknowledged(now, fresh.0, fresh.1, rtt_ns, floor) {
+            // Admission moves, never the retained evidence's coverage.
+            self.receipt_not_before_ns = start;
+        }
+        self.shadow.acknowledged(now, shadow.0, shadow.1, rtt_ns, floor);
+    }
+    #[cfg(test)]
+    fn acknowledged(&mut self, now: u64, packets: u64, latency_ns: u64, rtt_ns: u64, floor: u64) {
+        // Synthetic schedules whose receipts are eligible for both streams.
+        self.acknowledged_samples(now, (packets, latency_ns), (packets, latency_ns), rtt_ns, floor);
+    }
+    fn ceiling(&self) -> u64 { self.fresh.ceiling_upps.max(self.shadow.ceiling_upps) }
     fn bound(&self, proposed: u64) -> u64 {
         // ACK starvation or an application pause is not evidence of congestion.
         // Preserve the last command; only the existing loss/ECN curve may cut it.
-        proposed.min(self.ceiling_upps.max(self.last_rate_upps))
+        proposed.min(self.ceiling().max(self.last_rate_upps))
     }
     fn limit(&mut self, proposed: u64) -> u64 {
         let rate = self.bound(proposed);
@@ -4990,22 +5018,295 @@ impl LossEpisodes {
 mod congestion_tests {
     use super::*;
 
-    // Drive precisely the receive loop's bitmap intersection, first-positive
-    // admission, send-time lookup and growth accounting, without opening sockets.
-    fn growth_ack(s: &mut ConnectionStateConnected, ack: &crate::ack::BitmapAck, now: u64, rtt: u64) -> u64 {
-        let relevant = ack.relevant(&s.packets_waiting_ack_field, &s.declared_lost_field[..]);
-        let mut count = 0;
-        let mut latency = 0;
-        for seq in relevant.acknowledged() {
-            if s.take_positive_receipt(seq).is_some_and(|r| r.is_data()) {
-                if let Some(raw) = s.delivery_growth.receipt_latency(now, s.send_time(seq)) {
-                    count += 1;
-                    latency = latency.max(raw);
+    #[test]
+    fn review_fix2_quantized_compression_sweeps() {
+        let quantum = 0x400000u64;
+        let origin = 1000 * quantum;
+        for mode in 0..12u64 {
+            let ConnectionState::Connected(mut s) = new_connection_state_connected(None, 0, 0, origin) else { unreachable!() };
+            let mut events = Vec::new();
+            let rtt = if mode >= 8 { 600_000_000 } else { 1_000_000 };
+            for seq in 0..140_000u64 {
+                let sent = origin + seq * 1_000_000_000 / 7000;
+                let delay = match mode {
+                    0 => 1_000_000,
+                    1 => if seq % 97 == 0 { 4_270_000_000 } else { 1_000_000 },
+                    2 => if seq % 35_000 < 7000 { 2_000_000_000 } else { 1_000_000 },
+                    3 => if seq % 10 < 4 { 3_800_000_000 } else { 1_000_000 },
+                    4 => 1_000_000 + ((seq.wrapping_mul(6364136223846793005).wrapping_add(1)) % 4400) * 1_000_000,
+                    5 => if seq % 42_000 < 14_000 { 4_250_000_000 } else { 1_000_000 },
+                    6 => [1_000_000, 4_280_000_000, 4_290_000_000, 4_300_000_000][(seq % 4) as usize],
+                    7 => 1_000_000,
+                    8 => 600_000_000,
+                    9 => if seq % 5 == 0 { 600_000_000 } else { 1_950_000_000 },
+                    10 => if seq % 7 == 0 { 600_000_000 } else { 4_000_000_000 },
+                    _ => 600_000_000 + (seq.wrapping_mul(7499) % 3600) * 1_000_000,
+                };
+                let batch = match mode { 0 => 11_000_000, 7 => 200_000_000, 8..=11 => 10_000_000, _=>20_000_000 };
+                let due = (sent + delay).div_ceil(batch) * batch;
+                // Split compression into nearly simultaneous ACK frames.
+                let due = due + if mode == 7 { (seq % 2) * 1000 } else { 0 };
+                events.push((due, seq, sent));
+            }
+            events.sort_unstable();
+            let mut next_send = 0u64;
+            let mut peak = RATE_FLOOR_UPPS;
+            let mut unavailable = 0;
+            let mut excluded = 0;
+            let mut closes = 0;
+            let mut i = 0;
+            while i < events.len() {
+                let now = events[i].0;
+                while next_send < 140_000 && origin + next_send * 1_000_000_000 / 7000 <= now {
+                    s.account_send(origin + next_send * 1_000_000_000 / 7000);
+                    next_send += 1;
                 }
+                let mut count = 0;
+                let mut latency = 0;
+                let mut shadow_count = 0;
+                let mut shadow_latency = 0;
+                while i < events.len() && events[i].0 == now {
+                    let (_, seq, actual_sent) = events[i];
+                    assert!(s.take_positive_receipt(seq).is_some_and(|r| r.is_data()));
+                    let sent = s.send_time(seq);
+                    if sent == 0 || sent == u64::MAX { unavailable += 1; }
+                    else {
+                        assert!(sent <= actual_sent, "lookup rounded forward mode={mode}, seq={seq}");
+                        if let Some(raw) = s.delivery_growth.shadow_receipt_latency(now, sent) {
+                            shadow_count += 1; shadow_latency = shadow_latency.max(raw);
+                        }
+                        if let Some(raw) = s.delivery_growth.receipt_latency(now, sent) {
+                            count += 1; latency = latency.max(raw);
+                        } else { excluded += 1; }
+                    }
+                    i += 1;
+                }
+                let start = s.delivery_growth.fresh.start_ns;
+                s.delivery_growth.acknowledged_samples(now, (count, latency), (shadow_count, shadow_latency), rtt, RATE_FLOOR_UPPS);
+                closes += u64::from(start != s.delivery_growth.fresh.start_ns);
+                peak = peak.max(s.delivery_growth.ceiling());
+                assert!(peak <= 14_200_000_000, "inflated mode={mode} now={now} peak={peak}");
+            }
+            println!("dual evidence sweep mode={mode}: peak={}pps final={}pps unavailable={unavailable} horizon_excluded={excluded} closes={closes}",
+                peak as f64 / 1_000_000.0, s.delivery_growth.ceiling() as f64 / 1_000_000.0);
+            assert!(closes > 0);
+        }
+    }
+
+    #[test]
+    fn review_fix2_real_policy_reorder_starvation() {
+        let origin = 1000 * 0x400000u64;
+        let ConnectionState::Connected(mut s) = new_connection_state_connected(None, 0, 0, origin) else { unreachable!() };
+        let mut all_evidence = DeliveryEvidence::new(origin, RATE_FLOOR_UPPS);
+        let mut receiver = crate::ack::AckReceiver::default();
+        let mut arrivals = std::collections::BTreeMap::<u64, Vec<u64>>::new();
+        let mut reverse = std::collections::VecDeque::new();
+        let mut timer = u64::MAX;
+        let mut rtt = 600_000_000u64;
+        let mut samples = std::collections::VecDeque::new();
+        let mut accepted = 0;
+        let mut rejected = 0;
+        let mut slow_acked = 0;
+        let mut max_ceiling = 0;
+        let mut max_rtt = 0;
+        let mut min_permission = u64::MAX;
+        for tick in 0..=4000u64 {
+            let now = origin + tick * 10_000_000;
+            // Five unique sends / 10ms = 500pps, initially all fast. Later
+            // only one in five is fast; slow forward arrivals remain in the
+            // bitmap (675 sequence positions behind), and sample_seq is fast.
+            for j in 0..5u64 {
+                let seq = tick * 5 + j;
+                let sent = now + j * 2_000_000;
+                s.account_send(sent);
+                let forward = if tick < 400 || seq % 5 == 0 { 300_000_000 } else { 1_650_000_000 };
+                let due = (sent + forward - origin).div_ceil(10_000_000) * 10_000_000 + origin;
+                arrivals.entry(due).or_default().push(seq);
+            }
+            if let Some(mut seqs) = arrivals.remove(&now) {
+                seqs.sort_unstable();
+                for seq in seqs { receiver.receive_with_rtt(seq, now, false, &mut timer, rtt / 1000, 1184); }
+            }
+            if timer <= now {
+                reverse.push_back((now + 300_000_000, receiver.ack(now)));
+                receiver.sent(now);
+                timer = u64::MAX;
+            }
+            while reverse.front().is_some_and(|(due, _)| *due <= now) {
+                let (_, ack) = reverse.pop_front().unwrap();
+                let relevant = ack.relevant(&s.packets_waiting_ack_field, &s.declared_lost_field[..]);
+                let mut n = 0;
+                let mut raw = 0;
+                let mut all_n = 0;
+                let mut all_raw = 0;
+                for seq in relevant.acknowledged() {
+                    if s.take_positive_receipt(seq).is_some_and(|p| p.is_data()) {
+                        let sent = s.send_time(seq);
+                        if sent == 0 || sent == u64::MAX { continue; }
+                        let latency = now - sent;
+                        all_n += 1; all_raw = all_raw.max(latency);
+                        if let Some(latency) = s.delivery_growth.receipt_latency(now, sent) {
+                            n += 1; raw = raw.max(latency);
+                            if tick > 1200 { accepted += 1; }
+                        } else if tick > 1200 { rejected += 1; }
+                        if tick > 1200 && latency > 1_900_000_000 { slow_acked += 1; }
+                        if seq == ack.sample_seq && ack.delay_us as u64 * 1000 < latency {
+                            samples.push_back(latency - ack.delay_us as u64 * 1000);
+                            if samples.len() > 16 { samples.pop_front(); }
+                        }
+                    }
+                }
+                s.delivery_growth.acknowledged_samples(now, (n, raw), (all_n, all_raw), rtt, RATE_FLOOR_UPPS);
+                all_evidence.acknowledged(now, all_n, all_raw, rtt, RATE_FLOOR_UPPS);
+                assert_eq!(s.delivery_growth.shadow.ceiling_upps, all_evidence.ceiling_upps);
+                if !samples.is_empty() { rtt = samples.iter().sum::<u64>() / samples.len() as u64 / 100_000 * 100_000; }
+            }
+            if tick < 400 { s.delivery_growth.limit(500_000_000); }
+            if tick > 1200 {
+                max_ceiling = max_ceiling.max(s.delivery_growth.ceiling());
+                max_rtt = max_rtt.max(rtt);
+                min_permission = min_permission.min(s.delivery_growth.ceiling());
+                assert!(s.delivery_growth.limit(MAX_CC_RATE_UPPS) > 500_000_000);
             }
         }
-        s.delivery_growth.acknowledged(now, count, latency, rtt, RATE_FLOOR_UPPS);
-        count
+        println!("real ACK policy: rate=500pps command={}pps max ceiling={}pps minimum permission={}pps max RTT={}ms accepted={accepted} rejected={rejected} slow positively ACKed={slow_acked}",
+            s.delivery_growth.last_rate_upps as f64/1e6, max_ceiling as f64/1e6, min_permission as f64/1e6, max_rtt as f64/1e6);
+        assert!(slow_acked > 10000);
+        assert_eq!(s.delivery_growth.epoch_ns, origin);
+        assert_eq!(s.delivery_growth.fresh.ceiling_upps, 200_000_000);
+        assert!(max_ceiling > 500_000_000);
+        assert!(min_permission > 500_000_000);
+        println!("dual evidence reordered path: minimum permission={}pps > held500pps",min_permission as f64/1e6);
+        assert!(max_rtt < 620_000_000);
+    }
+
+    #[test]
+    fn review_fix2_dual_evidence_stray_and_backlog() {
+        let floor = RATE_FLOOR_UPPS;
+        let mut g = DeliveryGrowth::new(0, floor);
+        for tick in 1..=250 {
+            g.acknowledged(tick * 20_000_000, 140, 1_000_000, 1_000_000, floor);
+        }
+        let old_ack = 5_001_000_000;
+        let old_send = 751_000_000;
+        assert_eq!(g.receipt_latency(old_ack, old_send), None);
+        let raw = g.shadow_receipt_latency(old_ack, old_send).unwrap();
+        g.acknowledged_samples(old_ack, (0, 0), (1, raw), 1_000_000, floor);
+        let mut min_dual = g.ceiling();
+        let mut first_fresh_close = None;
+        for tick in 1..=500u64 {
+            let now = 5_000_000_000 + tick * 20_000_000;
+            let start = g.fresh.start_ns;
+            g.acknowledged(now, 140, 1_000_000, 1_000_000, floor);
+            if start != g.fresh.start_ns && first_fresh_close.is_none() { first_fresh_close = Some(now); }
+            min_dual = min_dual.min(g.ceiling());
+        }
+        assert!(first_fresh_close.unwrap() <= old_ack + 100_000_000);
+        assert!(min_dual >= 14_000_000_000);
+        println!("dual evidence stray: first fresh closure={}ms min ceiling={}pps", (first_fresh_close.unwrap()-old_ack)/1_000_000, min_dual/1_000_000);
+
+        let mut g = DeliveryGrowth::new(0, floor);
+        for tick in 1..=50u64 {
+            g.acknowledged(tick * 20_000_000, 140, 1_000_000, 1_000_000, floor);
+        }
+        let origin = 1_000_000_000u64;
+        let mut acked = vec![false; 50_000];
+        let mut peak = g.ceiling();
+        for tick in 100..=620u64 {
+            let now = origin + tick * 10_000_000;
+            if tick % 2 != 0 { continue; }
+            let highest = ((now-origin-1_000_000)*7000/1_000_000_000) as usize;
+            let mut receipts = Vec::new();
+            for seq in highest.saturating_sub(1023)..=highest {
+                if !acked[seq] { acked[seq]=true; receipts.push(origin + seq as u64 * 1_000_000_000/7000); }
+            }
+            growth_receipts(&mut g, now, &receipts, 1_000_000);
+            peak=peak.max(g.ceiling());
+            if tick==200 {
+                let now=now+1_000_000;
+                receipts.clear();
+                for seq in 0..7000usize {
+                    if !acked[seq] { acked[seq]=true; receipts.push(origin + seq as u64*1_000_000_000/7000); }
+                }
+                growth_receipts(&mut g, now, &receipts, 1_000_000);
+                peak=peak.max(g.ceiling());
+            }
+        }
+        println!("dual evidence backlog: peak={}pps final={}pps",peak/1_000_000,g.ceiling()/1_000_000);
+        assert!(peak<=14_100_000_000);
+        assert!(g.ceiling()>13_000_000_000);
+    }
+
+    #[test]
+    fn review_fix2_long_reorder_evidence_starvation() {
+        let origin = 1_000_000_000;
+        let rtt = 600_000_000;
+        let mut g = DeliveryGrowth::new(origin, RATE_FLOOR_UPPS);
+        let mut events = Vec::new();
+        for seq in 0..40_000u64 {
+            let sent = origin + seq * 1_000_000;
+            let delay = if seq < 4000 || seq % 5 == 0 { rtt } else { 1_950_000_000 };
+            events.push(((sent + delay).div_ceil(10_000_000) * 10_000_000, sent));
+        }
+        events.sort_unstable();
+        let mut i = 0;
+        let mut late_total = 0;
+        let mut late_excluded = 0;
+        let mut max_after = 0;
+        g.limit(1_000_000_000);
+        while i < events.len() {
+            let now = events[i].0;
+            let mut n = 0;
+            let mut latency = 0;
+            let mut shadow_n = 0;
+            let mut shadow_latency = 0;
+            while i < events.len() && events[i].0 == now {
+                let (_, sent) = events[i];
+                let raw = g.receipt_latency(now, sent);
+                if let Some(raw) = g.shadow_receipt_latency(now, sent) {
+                    shadow_n += 1; shadow_latency = shadow_latency.max(raw);
+                }
+                if sent > origin + 10_000_000_000 && now < origin + 39_000_000_000 && now - sent >= 1_950_000_000 {
+                    late_total += 1; late_excluded += u64::from(raw.is_none());
+                }
+                if let Some(raw) = raw { n += 1; latency = latency.max(raw); }
+                i += 1;
+            }
+            g.acknowledged_samples(now, (n, latency), (shadow_n, shadow_latency), rtt, RATE_FLOOR_UPPS);
+            if now < origin + 4_000_000_000 { g.limit(1_000_000_000); }
+            if now > origin + 12_000_000_000 && now < origin + 39_000_000_000 {
+                max_after = max_after.max(g.ceiling());
+                assert!(g.limit(MAX_CC_RATE_UPPS) > 1_000_000_000);
+            }
+        }
+        println!("long reorder: max steady ceiling={}pps last command={}pps late fresh-excluded={late_excluded}/{late_total}", max_after/1_000_000, g.last_rate_upps/1_000_000);
+        assert_eq!(late_excluded, late_total);
+        assert!(max_after > 1_000_000_000);
+    }
+
+    fn growth_receipts(g: &mut DeliveryGrowth, now: u64, sends: &[u64], rtt: u64) -> u64 {
+        let mut fresh = (0, 0u64);
+        let mut shadow = (0, 0u64);
+        for &sent in sends {
+            if let Some(raw) = g.receipt_latency(now, sent) {
+                fresh.0 += 1; fresh.1 = fresh.1.max(raw);
+            }
+            if let Some(raw) = g.shadow_receipt_latency(now, sent) {
+                shadow.0 += 1; shadow.1 = shadow.1.max(raw);
+            }
+        }
+        g.acknowledged_samples(now, fresh, shadow, rtt, RATE_FLOOR_UPPS);
+        fresh.0
+    }
+
+    // Drive precisely the receive loop's bitmap intersection, first-positive
+    // admission, send-time lookup and both growth streams, without sockets.
+    fn growth_ack(s: &mut ConnectionStateConnected, ack: &crate::ack::BitmapAck, now: u64, rtt: u64) -> u64 {
+        let relevant = ack.relevant(&s.packets_waiting_ack_field, &s.declared_lost_field[..]);
+        let sends: Vec<_> = relevant.acknowledged().filter_map(|seq| {
+            s.take_positive_receipt(seq).filter(|r| r.is_data()).map(|_| s.send_time(seq))
+        }).collect();
+        growth_receipts(&mut s.delivery_growth, now, &sends, rtt)
     }
 
     #[test]
@@ -5013,24 +5314,26 @@ mod congestion_tests {
         let floor = RATE_FLOOR_UPPS;
         let mut g = DeliveryGrowth::new(0, floor);
         g.acknowledged(20_000_000, 100, 1_000_000, 1_000_000, floor);
-        assert_eq!(g.ceiling_upps, 10_000_000_000);
+        assert_eq!(g.ceiling(), 10_000_000_000);
         g.acknowledged(21_000_000, 20, 1_000_000, 1_000_000, floor);
         let refreshed = 2 * rate_mul_div(120, 1_000_000_000_000_000, 21_000_000);
-        assert_eq!(g.ceiling_upps, refreshed);
+        assert_eq!(g.ceiling(), refreshed);
         assert!(refreshed > 10_000_000_000);
-        assert_eq!((g.start_ns, g.previous_packets, g.packets), (20_000_000, 100, 20));
+        assert_eq!((g.fresh.start_ns, g.fresh.previous_packets, g.fresh.packets), (20_000_000, 100, 20));
         // A lower partial sample does not prematurely revoke complete evidence.
         g.acknowledged(25_000_000, 1, 1_000_000, 1_000_000, floor);
-        assert_eq!(g.ceiling_upps, refreshed);
-        assert_eq!(g.start_ns, 20_000_000);
+        assert_eq!(g.ceiling(), refreshed);
+        assert_eq!(g.fresh.start_ns, 20_000_000);
         // Closure still replaces the sample and shifts only current evidence.
         g.acknowledged(31_000_000, 10, 1_000_000, 1_000_000, floor);
-        assert_eq!(g.ceiling_upps, 2 * rate_mul_div(131, 1_000_000_000_000_000, 31_000_000));
-        assert!(g.ceiling_upps < refreshed);
-        assert_eq!((g.start_ns, g.previous_packets, g.previous_span_ns), (31_000_000, 31, 11_000_000));
+        assert_eq!(g.ceiling(), 2 * rate_mul_div(131, 1_000_000_000_000_000, 31_000_000));
+        assert!(g.ceiling() < refreshed);
+        assert_eq!((g.fresh.start_ns, g.fresh.previous_packets, g.fresh.previous_span_ns), (31_000_000, 31, 11_000_000));
         assert_eq!(g.receipt_not_before_ns, 20_000_000);
         assert_eq!(g.receipt_latency(31_000_001, 19_999_999), None);
         assert_eq!(g.receipt_latency(31_000_001, 20_000_000), Some(11_000_001));
+        assert_eq!(g.epoch_ns, 0);
+        assert_eq!(g.shadow_receipt_latency(31_000_001, 19_999_999), Some(11_000_002));
     }
 
     #[test]
@@ -5051,17 +5354,19 @@ mod congestion_tests {
         ack.bitmap[0] = 1;
         let growth_receipts = growth_ack(&mut s, &ack, old_ack, 1_000_000);
         assert_eq!(s.packets_waiting_ack_field[0] & 1, 0);
+        assert_eq!(s.delivery_growth.shadow.packets, 1);
         assert_eq!(growth_ack(&mut s, &ack, old_ack + 1, 1_000_000), 0);
+        assert_eq!(s.delivery_growth.shadow.packets, 1);
         let mut first_close = None;
         let mut recovered = None;
-        let mut min_ceiling = s.delivery_growth.ceiling_upps;
+        let mut min_ceiling = s.delivery_growth.ceiling();
         for tick in 1..=500u64 {
             let now = 5_000_000_000 + tick * 20_000_000;
-            let start = s.delivery_growth.start_ns;
+            let start = s.delivery_growth.fresh.start_ns;
             s.delivery_growth.acknowledged(now, 140, 1_000_000, 1_000_000, floor);
-            if s.delivery_growth.start_ns != start && first_close.is_none() { first_close = Some(now); }
-            min_ceiling = min_ceiling.min(s.delivery_growth.ceiling_upps);
-            if first_close.is_some() && s.delivery_growth.ceiling_upps >= 13_000_000_000 && recovered.is_none() {
+            if s.delivery_growth.fresh.start_ns != start && first_close.is_none() { first_close = Some(now); }
+            min_ceiling = min_ceiling.min(s.delivery_growth.ceiling());
+            if first_close.is_some() && s.delivery_growth.ceiling() >= 13_000_000_000 && recovered.is_none() {
                 recovered = Some(now);
             }
             assert!(s.delivery_growth.limit(MAX_CC_RATE_UPPS) >= 7_000_000_000);
@@ -5069,9 +5374,9 @@ mod congestion_tests {
         println!("single 4.25s-old receipt: growth receipts={growth_receipts}, next close={}ms, recovery={}ms after receipt, min ceiling={}pps",
             (first_close.unwrap() - old_ack) / 1_000_000,
             (recovered.unwrap() - old_ack) / 1_000_000, min_ceiling / 1_000_000);
-        assert_eq!(growth_receipts, 0, "old receipt must not enter growth numerator or coverage");
+        assert_eq!(growth_receipts, 0, "old receipt must not enter fresh numerator or coverage");
         assert!(recovered.unwrap() <= old_ack + 100_000_000, "stray receipt stalled fresh growth");
-        assert_eq!(s.delivery_growth.previous_span_ns, 20_000_000);
+        assert_eq!(s.delivery_growth.fresh.previous_span_ns, 20_000_000);
     }
 
     #[test]
@@ -5090,9 +5395,9 @@ mod congestion_tests {
         assert_eq!(growth_ack(&mut s, &ack, 1_020_000_000, 1_000_000), 2);
         assert_eq!(s.packets_waiting_ack_field[0], 0);
         assert_eq!(s.declared_lost_field[0], 0);
-        let ceiling = s.delivery_growth.ceiling_upps;
+        let ceiling = s.delivery_growth.ceiling();
         assert_eq!(growth_ack(&mut s, &ack, 1_021_000_000, 1_000_000), 0);
-        assert_eq!(s.delivery_growth.ceiling_upps, ceiling);
+        assert_eq!(s.delivery_growth.ceiling(), ceiling);
         assert_eq!(s.take_positive_receipt(s.send_sequence_number), None);
         s.packets_waiting_ack_tail = PACKETS_WAITING_ACK_CAPACITY + 1;
         s.declared_lost_field[0] = 1;
@@ -5125,23 +5430,23 @@ mod congestion_tests {
 
     #[test]
     fn delivery_growth_million_pps_and_timestamp_extremes() {
-        assert_eq!(std::mem::size_of::<DeliveryGrowth>(), 80);
+        assert_eq!(std::mem::size_of::<DeliveryGrowth>(), 144);
         assert_eq!(rate_mul_div(1_000_000, 1_000_000_000_000_000, 1_000_000_000), MAX_CC_RATE_UPPS);
         let mut g = DeliveryGrowth::new(1_000_000_000, RATE_FLOOR_UPPS);
         g.acknowledged(2_000_000_000, 1_000_000, 1_000_000, 1_000_000, RATE_FLOOR_UPPS);
-        assert_eq!(g.ceiling_upps, MAX_CC_RATE_UPPS);
+        assert_eq!(g.ceiling(), MAX_CC_RATE_UPPS);
         assert_eq!(g.limit(MAX_CC_RATE_UPPS), MAX_CC_RATE_UPPS);
         // Backwards time cannot close a window or underflow a raw latency.
         assert_eq!(g.receipt_latency(1_400_000_000, 1_500_000_000), Some(0));
         g.acknowledged(1, 1, u64::MAX, u64::MAX, RATE_FLOOR_UPPS);
-        assert_eq!(g.start_ns, 2_000_000_000);
+        assert_eq!(g.fresh.start_ns, 2_000_000_000);
         g.acknowledged(u64::MAX, u64::MAX, u64::MAX, u64::MAX, RATE_FLOOR_UPPS);
-        assert!(g.ceiling_upps <= MAX_CC_RATE_UPPS);
-        assert_eq!(g.packets, u64::MAX);
+        assert!(g.ceiling() <= MAX_CC_RATE_UPPS);
+        assert_eq!(g.fresh.packets, u64::MAX);
         let mut saturated = DeliveryGrowth::new(0, RATE_FLOOR_UPPS);
         saturated.acknowledged(u64::MAX, u64::MAX, u64::MAX, u64::MAX, RATE_FLOOR_UPPS);
-        assert_eq!(saturated.start_ns, u64::MAX);
-        assert_eq!(saturated.ceiling_upps, MAX_CC_RATE_UPPS);
+        assert_eq!(saturated.fresh.start_ns, u64::MAX);
+        assert_eq!(saturated.ceiling(), MAX_CC_RATE_UPPS);
         assert_eq!(saturated.bound(RATE_FLOOR_UPPS / 2), RATE_FLOOR_UPPS / 2);
     }
 
@@ -5211,7 +5516,7 @@ mod congestion_tests {
         assert_eq!(g.limit(MAX_CC_RATE_UPPS), 14_000_000_000);
         let origin = 1_000_000_000u64;
         let mut acked = vec![false; 50_000];
-        let mut peak = g.ceiling_upps;
+        let mut peak = g.ceiling();
         // Continue through subsequent shifts as well: a backlog's send-time
         // coverage must survive exactly as long as its retained receipt count.
         for tick in 100..=620u64 {
@@ -5231,7 +5536,7 @@ mod congestion_tests {
                 }
             }
             g.acknowledged(now, count, latency, 1_000_000, floor);
-            peak = peak.max(g.ceiling_upps);
+            peak = peak.max(g.ceiling());
             if tick == 200 {
                 let old_ack = now + 1_000_000;
                 let mut old_count = 0;
@@ -5247,11 +5552,11 @@ mod congestion_tests {
                     }
                 }
                 g.acknowledged(old_ack, old_count, old_latency, 1_000_000, floor);
-                peak = peak.max(g.ceiling_upps);
+                peak = peak.max(g.ceiling());
             }
         }
         println!("constant 7000pps delivery: peak ceiling {}pps, final {}pps",
-            peak / 1_000_000, g.ceiling_upps / 1_000_000);
+            peak / 1_000_000, g.ceiling() / 1_000_000);
         // Inclusive sequence endpoints can add at most one receipt per window:
         // allow 2 * 1 packet / the minimum 20ms sampled span = 100 pps.
         assert!(peak <= 14_100_000_000, "old backlog inflated ceiling: {peak}");
@@ -5286,7 +5591,7 @@ mod congestion_tests {
             let now = burst * 200_000_000;
             for offset in [0, 1000] {
                 g.acknowledged(now + offset, 500, 200_000_000, 5_000_000, floor);
-                assert!(g.ceiling_upps <= 10_000_000_000);
+                assert!(g.ceiling() <= 10_000_000_000);
                 assert!(g.limit(MAX_CC_RATE_UPPS) <= 10_000_000_000);
             }
         }
@@ -5361,8 +5666,13 @@ mod congestion_tests {
                 // recent ACK. It must not erase the actual application's pause.
                 s.congestion_event_time_ns = resume - 1;
                 update_app_limit(&mut s, resume, true);
-                assert_eq!(s.delivery_growth.start_ns, resume);
-                assert_eq!(s.delivery_growth.previous_span_ns, 0);
+                assert_eq!(s.delivery_growth.fresh.start_ns, resume);
+                assert_eq!(s.delivery_growth.fresh.previous_span_ns, 0);
+                assert_eq!(s.delivery_growth.shadow.previous_span_ns, 0);
+                assert_eq!(s.delivery_growth.shadow.packets, 0);
+                assert_eq!(s.delivery_growth.epoch_ns, resume);
+                assert_eq!(s.delivery_growth.shadow_receipt_latency(resume + rtt, resume - 1), None);
+                assert_eq!(s.delivery_growth.shadow_receipt_latency(resume + rtt, resume), Some(rtt));
                 assert_eq!(s.delivery_growth.receipt_latency(resume + rtt, resume - 1), None);
                 assert_eq!(s.delivery_growth.receipt_latency(resume + rtt, resume), Some(rtt));
                 assert_eq!(s.delivery_growth.receipt_latency(resume + rtt, 0), None);
@@ -5402,8 +5712,8 @@ mod congestion_tests {
         let mut g = DeliveryGrowth::new(0, RATE_FLOOR_UPPS);
         g.acknowledged(20_000_000, 10, 20_000_000, 20_000_000, RATE_FLOOR_UPPS);
         for tick in 1..=20 { g.resume_after_quiet(20_000_000 + tick * 1000, 1000, 20_000_000); }
-        assert_eq!(g.start_ns, 0);
-        assert_eq!(g.packets, 10);
+        assert_eq!(g.fresh.start_ns, 0);
+        assert_eq!(g.fresh.packets, 10);
         assert_eq!(g.receipt_not_before_ns, 0);
     }
 
@@ -5467,6 +5777,9 @@ mod congestion_tests {
         let mut buf = SendQueues::new(1, (1000, 1 << 20, 1 << 24));
         resume_outage(&mut s, &mut buf, &mut [], 61_000_000_000, None);
         assert_eq!(s.delivery_growth.limit(MAX_CC_RATE_UPPS), crate::ship::CC.initial_rate_upps);
+        assert_eq!(s.delivery_growth.shadow.previous_packets, 0);
+        assert_eq!(s.delivery_growth.epoch_ns, 61_000_000_000);
+        assert_eq!(s.delivery_growth.shadow_receipt_latency(61_100_000_000, 1_000_000_000), None);
         for tick in 1..=4 {
             s.delivery_growth.acknowledged(61_000_000_000 + tick * 100_000_000, 500, 50_000_000, 50_000_000, RATE_FLOOR_UPPS);
         }
@@ -5684,7 +5997,7 @@ mod congestion_tests {
         s.congestion_event_time_ns = 0;
         s.congestion_event_rate_upps = 2_000_000_000;
         // Prove enough delivery to inspect the unclipped curve first.
-        s.delivery_growth.ceiling_upps = MAX_CC_RATE_UPPS;
+        s.delivery_growth.fresh.ceiling_upps = MAX_CC_RATE_UPPS;
         let k = cc.recovery_rtts * s.RTT_mean as u64 * 100_000;
         for done in [false, true] {
             s.cc_startup_done = done;
@@ -5708,7 +6021,7 @@ mod congestion_tests {
         assert_eq!(idle.slope_ppsps, 0.0);
         assert_eq!(idle.pps, connection_rate(k, s.congestion_event_rate_upps, k, &cc, true).0 as f64 / 1_000_000.0);
         s.is_app_limited = false;
-        s.delivery_growth.ceiling_upps = 2_000_000_000;
+        s.delivery_growth.fresh.ceiling_upps = 2_000_000_000;
         let delivery_capped = cc_trace_context(&s, 4 * k, &cc, None);
         assert_eq!(delivery_capped.pps, 2000.0);
         assert_eq!(delivery_capped.slope_ppsps, 0.0);
