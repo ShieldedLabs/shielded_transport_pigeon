@@ -427,7 +427,7 @@ impl FecTrace {
         use std::io::Write;
         Self(a.str("loss-trace").map(|p| {
             let mut w = std::io::BufWriter::new(std::fs::File::create(std::path::Path::new(p).with_extension("fec.csv")).unwrap());
-            writeln!(w, "time_ns,package_id,root_id,offset,tag,message_len,block_bytes,k,n_planned,n_sent,lost,rescue_rounds,rescue_symbols").unwrap();
+            writeln!(w, "time_ns,package_id,root_id,offset,tag,message_len,block_bytes,k,n_planned,n_sent,lost,rescue_rounds,rescue_symbols,during_message_topup,tail_repairs,peak_retained_source_bytes").unwrap();
             w
         }))
     }
@@ -435,9 +435,9 @@ impl FecTrace {
         use std::io::Write;
         if let Some(w) = &mut self.0 {
             for (_, m) in rows {
-                writeln!(w, "{},{},{},{},{},{},{},{},{},{},{},{},{}", time_ns, m.package_id, m.root_id,
+                writeln!(w, "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}", time_ns, m.package_id, m.root_id,
                     m.segment_offset, m.tag, m.message_len, m.block_bytes, m.k, m.n_planned, m.n_sent,
-                    m.lost_during_send, m.rescue_rounds, m.rescue_symbols).unwrap();
+                    m.lost_during_send, m.rescue_rounds, m.rescue_symbols, m.during_message_topup, m.tail_repairs, m.peak_retained_source_bytes).unwrap();
             }
         }
     }
