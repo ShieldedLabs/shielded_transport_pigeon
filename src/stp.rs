@@ -1155,7 +1155,12 @@ impl UnreliableSendBuffer {
         let layout = crate::fec::MessageLayout::new(message.len(), block_bytes).unwrap();
         let k = layout.k as u32;
         let a = self.fec_adaptive.as_ref().expect("adaptive FEC initialized before coding");
-        if a.policy == crate::fec_adapt::RepairPolicy::MessageBound { self.p4_open = true; }
+        if a.policy == crate::fec_adapt::RepairPolicy::MessageBound {
+            self.p4_open = true;
+            // A new layout (including a TU-shrink restart of the final segment)
+            // has sources still to send. Revisit open tails at its completion.
+            self.p4_tail_refreshed = false;
+        }
         let total = segment.map_or(message.len(), |s| s.total as usize);
         if let (Some(segment), Some(ks)) = (segment, &plan_ks) {
             let group_len = total.div_ceil(total.div_ceil(FEC_SEGMENT_BYTES));
@@ -8338,5 +8343,110 @@ mod p4_tests {
             assert_eq!(b.fec_retained.is_empty(), policy == RepairPolicy::MeanOpen);
             if policy.feedback() { assert!(b.retained_bytes > 0); }
         }
+    }
+}
+
+#[cfg(test)]
+mod p4_review_tests {
+    use super::*;
+    use crate::fec_adapt::{FecAdaptiveState, RepairPolicy};
+    fn buffer() -> UnreliableSendBuffer {
+        let mut b = UnreliableSendBuffer::new(0, 16 << 20, 16 << 20);
+        let mut a = FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0);
+        a.policy = RepairPolicy::MessageBound;
+        a.p = 0.0;
+        b.fec_adaptive = Some(a);
+        b
+    }
+    fn emit(b: &mut UnreliableSendBuffer, seq: &mut u64, size: usize) -> bool {
+        b.fec_prepare_packet(*seq);
+        if let Some(f) = &mut b.fec_send_slot {
+            if matches!(f.encoder, FecEncoderState::Pending(_)) {
+                f.encoder = FecEncoderState::Ready(crate::fec::encode_message(f.message.clone(), f.block_bytes).unwrap());
+            }
+        }
+        let sent = b.next_fragment(size, size).is_some();
+        if sent { *seq += 1; }
+        sent
+    }
+    #[test]
+    fn review_p4_scheduler_growth_fill_feedback_and_forget() {
+        let mut s = SendQueues::new(2, (0, 16 << 20, 16 << 20));
+        s.fec_adaptive = buffer().fec_adaptive;
+        s.fec_adaptive.as_mut().unwrap().p = 0.1;
+        s.submit_messages(0, vec![vec![7; 3 << 20], vec![9; 80]]);
+        s.submit_messages(1, vec![vec![8; 1000]; 3000]);
+        let mut seq = 0;
+        let mut attempts = 0;
+        let mut next_message_seen = false;
+        let mut small_parts = HashMap::<u16, usize>::new();
+        while s.has_unsent_data() {
+            attempts += 1;
+            assert!(attempts < 20000, "sender stalled");
+            for q in &mut s.queues {
+                for f in q.fec_send_slot.iter_mut().chain(q.fec_suspended.iter_mut()).chain(q.fec_retained.values_mut().map(|r| &mut r.slot)) {
+                    if matches!(f.encoder, FecEncoderState::Pending(_)) {
+                        f.encoder = FecEncoderState::Ready(crate::fec::encode_message(f.message.clone(), f.block_bytes).unwrap());
+                    }
+                }
+            }
+            // Growth during the first segment must not change its existing codec.
+            let mut p = vec![0; if seq < 30 { 1449 } else { 9194 }];
+            s.fec_prepare_packet(seq);
+            if s.fill_packet(&mut p) == 0 { continue; }
+            let mut cursor = 0;
+            while let Some((h, header)) = read_fragment_header(&p[cursor..]) {
+                let header = if h & 1 != 0 { fec_fragment_header_size(&p[cursor..]).unwrap() } else { header };
+                let len = ((h >> 18) & 0x3fff) as usize;
+                let data = &p[cursor + header..cursor + header + len];
+                if h & 1 != 0 { assert!(!next_message_seen, "P4 repair/source followed next FIFO message"); }
+                else if data.first() == Some(&9) { next_message_seen = true; }
+                else if data.first() == Some(&8) { *small_parts.entry(((h >> 2) & 0xffff) as u16).or_default() += 1; }
+                cursor += header + len;
+            }
+            if seq >= 64 { s.fec_on_packet_finalized(seq - 64, (seq - 64) % 19 == 0); }
+            seq += 1;
+        }
+        assert!(next_message_seen);
+        assert_eq!(small_parts.len(), 3000);
+        assert!(small_parts.values().all(|&parts| parts <= 2));
+        for old in seq.saturating_sub(64)..seq { s.fec_on_packet_finalized(old, true); }
+        assert!(!s.has_unsent_data());
+        for q in &mut s.queues {
+            q.reclaim_finished_partial();
+            assert!(!q.p4_open && !q.p4_closing);
+            assert!(q.fec_send_slot.is_none() && q.fec_suspended.is_none() && q.fec_retained.is_empty());
+            assert_eq!(q.retained_bytes, 0);
+            assert_eq!(*q.retention_quota.used.lock().unwrap(), (0, 0));
+        }
+    }
+    #[test]
+    fn review_p4_tu_restart_must_refresh_open_segments_at_actual_source_completion() {
+        let mut b = buffer();
+        b.submit_messages(vec![vec![7; 3 << 20]]);
+        let mut seq = 0;
+        assert!(emit(&mut b, &mut seq, 1449));
+        let first = b.send_package_id;
+        while b.fec_send_slot.as_ref().unwrap().next_id < b.fec_send_slot.as_ref().unwrap().n {
+            assert!(emit(&mut b, &mut seq, 1449));
+        }
+        assert!(emit(&mut b, &mut seq, 1449));
+        while b.fec_send_slot.as_ref().unwrap().next_id < b.fec_send_slot.as_ref().unwrap().k {
+            assert!(emit(&mut b, &mut seq, 1449));
+        }
+        assert!(!b.p4_tail_refreshed);
+        // The next attempt refreshes tails, discovers a TU shrink, and restarts
+        // the final segment. Source completion is now in the future again.
+        assert!(emit(&mut b, &mut seq, 1162));
+        assert!(b.fec_send_slot.as_ref().unwrap().next_id < b.fec_send_slot.as_ref().unwrap().k);
+        b.fec_adaptive.as_mut().unwrap().p = 0.1;
+        while b.fec_send_slot.as_ref().unwrap().next_id < b.fec_send_slot.as_ref().unwrap().k {
+            assert!(emit(&mut b, &mut seq, 1162));
+        }
+        b.p4_refresh_tail();
+        let early = &b.fec_retained[&first].slot;
+        let expected = crate::fec_adapt::mean_repairs((early.next_id - early.finalized_symbols) as u64, 0.1) as u32;
+        assert!(early.n - early.k >= expected,
+            "earlier segment got {} repairs, needs {} at actual source completion; stale refreshed={}", early.n - early.k, expected, b.p4_tail_refreshed);
     }
 }
