@@ -151,6 +151,13 @@ impl RxReport {
         v.extend_from_slice(&[s.fec_decode_admission_refusals, s.fec_decode_timeouts, s.fec_decode_preemptions, s.fec_worker_limit_events, s.fec_decode_peak_workers, s.rx_plain_admission_refusals]);
         v
     }
+    // Preserve the aggregate wire counter; partition its two disjoint causes
+    // for reports without changing the backwards-compatible STATUS prefix.
+    fn worker_limit_json(&self) -> String {
+        let retired = self.st.fec_decode_preemptions;
+        let refused = self.st.fec_worker_limit_events.saturating_sub(retired);
+        format!(",\"receiver_fec_worker_refusals\":{refused},\"receiver_fec_worker_pressure_retirements\":{retired}")
+    }
     const WORDS: usize = 43;
     fn from_words(w: &[u64]) -> Option<RxReport> {
         if w.len() < 37 { return None; }
@@ -406,6 +413,8 @@ fn integrated_rx_report_roundtrip() {
     assert_eq!(&words[28..32], &[11, 12, 13, 1472]);
     assert_eq!(&words[32..37], &[21, 22, 23, 24, 25]);
     assert_eq!(&words[37..40], &[31, 32, 33]);
+    assert_eq!(decoded.worker_limit_json(), ",\"receiver_fec_worker_refusals\":1,\"receiver_fec_worker_pressure_retirements\":33");
+    assert_eq!(RxReport::default().worker_limit_json(), ",\"receiver_fec_worker_refusals\":0,\"receiver_fec_worker_pressure_retirements\":0");
     // Old receivers still report the original prefix without the new counters.
     let old = RxReport::from_words(&words[..37]).unwrap();
     assert_eq!(old.st.fec_decode_admission_refusals, 0);
@@ -846,6 +855,7 @@ fn send(a: &Args) {
         stats.udp_payload_tu, rx.st.fec_decode_last_tail_ns as f64 / 1e6, rx.st.fec_decode_max_tail_ns as f64 / 1e6, rx.st.fec_ingress_dropped_blocks));
     json.insert_str(json.len() - 2, &format!(",\"receiver_fec_decode_admission_refusals\":{},\"receiver_fec_decode_timeouts\":{},\"receiver_fec_decode_preemptions\":{},\"receiver_fec_worker_limit_events\":{},\"receiver_fec_decode_peak_workers\":{},\"receiver_plain_admission_refusals\":{}",
         rx.st.fec_decode_admission_refusals, rx.st.fec_decode_timeouts, rx.st.fec_decode_preemptions, rx.st.fec_worker_limit_events, rx.st.fec_decode_peak_workers, rx.st.rx_plain_admission_refusals));
+    json.insert_str(json.len() - 2, &rx.worker_limit_json());
     println!("UDP TU {}B | FEC blocks {{{block_sizes}}}B | receiver FEC last/max decode tail {:.3}/{:.3}ms | ingress erased {} blocks",
         stats.udp_payload_tu, rx.st.fec_decode_last_tail_ns as f64 / 1e6, rx.st.fec_decode_max_tail_ns as f64 / 1e6, rx.st.fec_ingress_dropped_blocks);
     std::fs::write(&out, json).unwrap_or_else(|e| die(&format!("writing {out}: {e}")));
@@ -1028,6 +1038,7 @@ fn send_magazines(a: &Args) {
     json.insert_str(json.len()-2, &format!(",\"packets_sent\":{},\"packets_lost\":{},\"spurious_losses\":{},\"receiver_rx_lost\":{},\"receiver_rx_reordered\":{},\"receiver_rx_late_beyond_window\":{},\"cc_rate_pps\":{:.3}", stats.packets_sent, stats.packets_lost, stats.spurious_losses, receiver.st.rx_lost, receiver.st.rx_reordered, receiver.st.rx_late_beyond_window, stats.cc_rate_upps as f64/1e6));
     json.insert_str(json.len()-2, &format!(",\"max_message_size\":{max_message_size},\"receiver_fec_worker_limit_events\":{},\"receiver_stale_fragments\":{},\"receiver_partials_evicted\":{},\"receiver_insert_failures\":{}", receiver.st.fec_worker_limit_events, receiver.st.rx_stale_fragments, receiver.st.rx_partial_evicted, receiver.st.rx_insert_failures));
     json.insert_str(json.len()-2, &format!(",\"receiver_fec_decode_peak_workers\":{},\"receiver_plain_admission_refusals\":{},\"receiver_fec_decode_admission_refusals\":{},\"receiver_fec_ingress_dropped_blocks\":{},\"receiver_recv_queue_dropped_messages\":{},\"receiver_kernel_rx_drops\":{}", receiver.st.fec_decode_peak_workers, receiver.st.rx_plain_admission_refusals, receiver.st.fec_decode_admission_refusals, receiver.st.fec_ingress_dropped_blocks, receiver.th.recv_queue_dropped_messages, receiver.th.kernel_rx_drops.map_or("null".into(), |n| n.to_string())));
+    json.insert_str(json.len() - 2, &receiver.worker_limit_json());
     std::fs::write(a.str("out").unwrap_or("stp_bench_report.json"), json).unwrap();
     fec_trace.flush();
     drop(handle);
