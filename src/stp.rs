@@ -6835,7 +6835,9 @@ mod fec_send_tests {
 
     #[test]
     fn fec_small_inline_encoder() {
+        // This regression exercises P0 retention/reliability, not the shipped P4 lifecycle.
         let mut b = new_buf();
+        b.fec_adaptive.as_mut().unwrap().policy = crate::fec_adapt::RepairPolicy::Reliability;
         let (m1, m2, m3) = (msg(100_000), msg(500), msg(1146 * 2));
         assert!(b.submit_messages(vec![m1.clone(), m2.clone(), m3.clone()]).is_empty());
         let frags: Vec<Frag> = drain(&mut b, 1162, 1000).into_iter().flatten().collect();
@@ -7017,9 +7019,11 @@ mod fec_send_tests {
 
     #[test]
     fn grouped_closed_loop_sizes_each_owned_tail_with_union_bound() {
+        // This regression exercises P0 retention/reliability, not the shipped P4 lifecycle.
         use crate::fec_adapt::*;
         let mut b = new_buf();
-        let a = FecAdaptiveState::new(AdaptiveFecConfig { eps: 0.5, ..Default::default() }, 0);
+        b.fec_adaptive.as_mut().unwrap().policy = crate::fec_adapt::RepairPolicy::Reliability;
+        let a = FecAdaptiveState::reliability_for_test(AdaptiveFecConfig { eps: 0.5, ..Default::default() }, 0);
         b.fec_adaptive = Some(a.clone());
         b.start_fec(std::sync::Arc::new(msg(64001 * 32)), 32);
         let f = b.fec_send_slot.as_mut().unwrap();
@@ -7220,8 +7224,9 @@ mod fec_closed_loop_tests {
 
     #[test]
     fn retained_lifetime_scales_with_rtt_and_original_train() {
+        // This regression exercises P0 retention/reliability, not the shipped P4 lifecycle.
         let mut b = UnreliableSendBuffer::new(100000, 1000000, 1000000);
-        b.fec_adaptive = Some(FecAdaptiveState::new(crate::ship::FEC, 0));
+        b.fec_adaptive = Some(FecAdaptiveState::reliability_for_test(crate::ship::FEC, 0));
         b.submit_messages(vec![vec![7; 16384]]);
         b.fec_now_ns = 1_000_000_000;
         b.fec_rtt_ns = 400_000_000;
@@ -7259,8 +7264,9 @@ mod fec_closed_loop_tests {
 
     #[test]
     fn retained_encoder_rescues_after_feedback_and_retires_after_success() {
+        // This regression exercises P0 retention/reliability, not the shipped P4 lifecycle.
         let mut b = UnreliableSendBuffer::new(100000, 1000000, 1000000);
-        b.fec_adaptive = Some(FecAdaptiveState::new(crate::ship::FEC, 0));
+        b.fec_adaptive = Some(FecAdaptiveState::reliability_for_test(crate::ship::FEC, 0));
         b.fec_record = Some(Vec::new());
         b.submit_messages(vec![vec![7; 1433 * 12], vec![8; 1433 * 12]]);
         let mut seq = 0;
@@ -7295,9 +7301,10 @@ mod fec_closed_loop_tests {
 
     #[test]
     fn learned_margin_stays_small_for_both_interior_and_tail_messages() {
+        // This regression exercises P0 retention/reliability, not the shipped P4 lifecycle.
         let make = || {
             let mut b = UnreliableSendBuffer::new(100000, 1000000, 1000000);
-            b.fec_adaptive = Some(FecAdaptiveState::new(crate::ship::FEC, 0));
+            b.fec_adaptive = Some(FecAdaptiveState::reliability_for_test(crate::ship::FEC, 0));
             b.submit_messages(vec![vec![0; 1433 * 12]]);
             b
         };
@@ -7658,8 +7665,9 @@ mod sender_lifetime_tests {
     }
     #[test]
     fn rescue_and_suspended_original_hold_and_release_quota_leases() {
+        // This regression exercises P0 retention/reliability, not the shipped P4 lifecycle.
         let mut b = UnreliableSendBuffer::new(1000000, 100000, 100000);
-        b.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0));
+        b.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::reliability_for_test(crate::ship::FEC, 0));
         b.submit_messages(vec![vec![7; 3000], vec![8; 6000]]);
         let mut seq = 0;
         loop {
@@ -7684,9 +7692,10 @@ mod sender_lifetime_tests {
     }
     #[test]
     fn strict_quota_denies_unaccounted_suspension() {
+        // This regression exercises P0 retention/reliability, not the shipped P4 lifecycle.
         let mut b = UnreliableSendBuffer::new(1000000, 100000, 100000);
         b.retention_quota = std::sync::Arc::new(RetentionQuota { byte_limit: 6000, slot_limit: 4, used: std::sync::Mutex::new((0,0)), telemetry: Default::default() });
-        b.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0));
+        b.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::reliability_for_test(crate::ship::FEC, 0));
         b.submit_messages(vec![vec![7; 3000], vec![8; 6000]]);
         let mut seq = 0;
         loop {
@@ -7703,8 +7712,9 @@ mod sender_lifetime_tests {
     }
     #[test]
     fn packet_owner_ring_excludes_other_queues_even_with_a_forged_alias() {
+        // This regression exercises P0 retention/reliability, not the shipped P4 lifecycle.
         let mut s = SendQueues::new(2, (1000000, 100000, 100000));
-        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0));
+        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::reliability_for_test(crate::ship::FEC, 0));
         s.submit_messages(1, vec![vec![7; 3000]]);
         let mut p = vec![0; 1449]; let mut seq = 0;
         while s.queues[1].has_unsent_data() { s.fec_prepare_packet(seq); s.fill_packet(&mut p); seq += 1; }
@@ -7743,8 +7753,9 @@ mod ring_pressure_rescue_tests {
     use super::*;
     #[test]
     fn ring_pressure_preserves_retained_sources_until_feedback() {
+        // This regression exercises P0 retention/reliability, not the shipped P4 lifecycle.
         let mut s = SendQueues::new(1, (1_000_000, 8<<20, 8<<20));
-        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0));
+        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::reliability_for_test(crate::ship::FEC, 0));
         s.submit_messages(0, (0..1025).map(|_| vec![1; 3000]).collect());
         let mut seq = 0;
         loop {
@@ -7780,7 +7791,10 @@ mod outage_review_repros {
     }
     #[test]
     fn resume_preserves_ready_fec_rescue_tu() {
-        let mut b = buffer(); let mut s = state(); s.stats.cc_rate_upps = 100_000_000;
+        // This regression exercises P0 retention/reliability, not the shipped P4 lifecycle.
+        let mut b = buffer();
+        b.fec_adaptive.as_mut().unwrap().policy = crate::fec_adapt::RepairPolicy::Reliability;
+        let mut s = state(); s.stats.cc_rate_upps = 100_000_000;
         s.current_tu = 1472;
         b.queues[0].fec_now_ns = 1_000_000_000;
         b.submit_messages(0, vec![vec![7; 1433 * 12]]);
@@ -7817,7 +7831,10 @@ mod outage_review_repros {
     }
     #[test]
     fn entry_does_not_resurrect_source_already_outside_retention() {
-        let mut b = buffer(); let mut s = state();
+        // This regression exercises P0 retention/reliability, not the shipped P4 lifecycle.
+        let mut b = buffer();
+        b.fec_adaptive.as_mut().unwrap().policy = crate::fec_adapt::RepairPolicy::Reliability;
+        let mut s = state();
         b.queues[0].fec_now_ns = 1_000_000_000;
         b.submit_messages(0, vec![vec![7; 3000]]);
         let mut seq = 0;
@@ -8222,8 +8239,9 @@ mod lazy_fec_segment_tests {
 
     #[test]
     fn segment_tail_policy_matches_actual_retained_unit_not_root_length() {
+        // This regression exercises P0 retention/reliability, not the shipped P4 lifecycle.
         let mut s = SendQueues::new(2, (1_000_000, 64<<20, 64<<20));
-        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0));
+        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::reliability_for_test(crate::ship::FEC, 0));
         s.submit_messages(0, vec![vec![7; 50<<20]]);
         let mut packet = vec![0; 1450];
         s.fec_prepare_packet(0);
@@ -8251,9 +8269,10 @@ mod lazy_fec_segment_tests {
 
     #[test]
     fn lazy_group_plans_use_their_own_k_after_tu_growth() {
+        // This regression exercises P0 retention/reliability, not the shipped P4 lifecycle.
         for learned_burst in [false, true] {
             let mut s = SendQueues::new(1, (1_000_000, 16<<20, 16<<20));
-            let mut a = crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0);
+            let mut a = crate::fec_adapt::FecAdaptiveState::reliability_for_test(crate::ship::FEC, 0);
             if learned_burst {
                 // The measured trace contains 331 declared losses in a 2048-packet
                 // span. Its finer histogram upper bound is 336, plus one extra symbol.
@@ -9318,8 +9337,9 @@ mod race_expiry_block_tests {
     }
     #[test]
     fn reliability_rescue_can_still_refresh_an_active_round() {
+        // This regression exercises P0 retention/reliability, not the shipped P4 lifecycle.
         let mut b = UnreliableSendBuffer::new(1000000, 1000000, 1000000);
-        b.fec_adaptive = Some(FecAdaptiveState::new(crate::ship::FEC, 0));
+        b.fec_adaptive = Some(FecAdaptiveState::reliability_for_test(crate::ship::FEC, 0));
         b.start_fec(std::sync::Arc::new(vec![1;1433*20]),1433);
         let f = b.fec_send_slot.as_mut().unwrap();
         f.next_id = 24; f.n = 30; f.finalized_symbols = 24; f.group_lost[0] = 10;
@@ -9335,8 +9355,9 @@ use super::*;
 
 #[test]
 fn review_p0_retention_must_survive_outage_send_ticks() {
+        // This regression exercises P0 retention/reliability, not the shipped P4 lifecycle.
     let mut b = SendQueues::new(1, (100000, 1000000, 1000000));
-    b.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 1_000_000_000));
+    b.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::reliability_for_test(crate::ship::FEC, 1_000_000_000));
     let ConnectionState::Connected(mut s) = new_connection_state_connected(None, 0, 1, 1_000_000_000) else { unreachable!() };
     s.stats.cc_rate_upps = 100_000_000;
     b.set_time(1_000_000_000, 100_000_000);
