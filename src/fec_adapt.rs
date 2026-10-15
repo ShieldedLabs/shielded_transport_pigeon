@@ -16,6 +16,21 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RepairPolicy { Reliability, MeanOpen, MeanTopup, Streaming, MessageBound }
 static RESEARCH_POLICY: std::sync::OnceLock<RepairPolicy> = std::sync::OnceLock::new();
+/// RESEARCH ONLY (benchmark process-start env, never an application knob): P4 tail floor as a
+/// percentage f of the unresolved exposure U (emitted, not yet ACKed/declared symbols, repairs
+/// included). 0, the default, is the shipped planner. Not a loss probability, and not a
+/// guaranteed parity/source overhead: refreshes at the final repair see earlier repairs in U, so
+/// a no-feedback train converges near K*f/(1-f) repairs, always capped at the group's K.
+static RESEARCH_P4_TAIL_PERCENT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+fn parse_research_p4_tail_percent(value: Option<&str>, policy: RepairPolicy) -> Result<u32, String> {
+    let Some(value) = value else { return Ok(0) };
+    let percent = value.parse::<u32>().ok().filter(|&p| p <= 100)
+        .ok_or_else(|| format!("STP_RESEARCH_P4_TAIL_PERCENT {value:?} must be an integer 0..=100"))?;
+    if percent != 0 && policy != RepairPolicy::MessageBound {
+        return Err("STP_RESEARCH_P4_TAIL_PERCENT applies only to P4".to_string());
+    }
+    Ok(percent)
+}
 impl RepairPolicy {
     fn selected() -> Self { RESEARCH_POLICY.get().copied().unwrap_or(Self::MessageBound) }
     fn parse(value: Option<&str>) -> Result<Self, String> {
@@ -39,7 +54,13 @@ pub fn initialize_research_policy() -> Result<(), String> {
         Err(_) => return Err("STP_RACE_POLICY must be valid Unicode".to_string()),
     };
     let policy = RepairPolicy::parse(value.as_deref())?;
+    let percent = match std::env::var("STP_RESEARCH_P4_TAIL_PERCENT") {
+        Ok(value) => parse_research_p4_tail_percent(Some(&value), policy)?,
+        Err(std::env::VarError::NotPresent) => 0,
+        Err(_) => return Err("STP_RESEARCH_P4_TAIL_PERCENT must be valid Unicode".to_string()),
+    };
     let _ = RESEARCH_POLICY.set(policy);
+    let _ = RESEARCH_P4_TAIL_PERCENT.set(percent);
     Ok(())
 }
 
@@ -48,6 +69,15 @@ pub(crate) fn mean_repairs(k: u64, p: f64) -> u64 {
     if k == 0 { return 0; }
     ((k as f64 * p.clamp(0.0, 0.9) / (1.0 - p.clamp(0.0, 0.9))).ceil() as u64)
         .saturating_add(2).min(k)
+}
+
+/// Total P4/P3 unresolved-tail margin (rank symbols included) for U unresolved symbols.
+/// percent == 0 is exactly the shipped `mean_repairs(U, p).max(2)`. A research percent
+/// raises it to at least ceil(U * percent / 100) + 2; callers keep the per-group K cap.
+pub(crate) fn p4_tail_margin(pending: u64, p: f64, percent: u32) -> u64 {
+    let mean = mean_repairs(pending, p).max(2);
+    if percent == 0 { return mean; }
+    mean.max(pending.saturating_mul(percent as u64).div_ceil(100).saturating_add(2))
 }
 
 /// Internal span-tail protection policy. The sole configuration lives in ship.rs.
@@ -376,6 +406,8 @@ impl SpanLossProfile {
 pub(crate) struct FecAdaptiveState {
     pub tracker: LossTracker,
     pub policy: RepairPolicy,
+    /// Research-only P4 tail floor percent; always 0 outside a benchmark env override.
+    pub p4_tail_percent: u32,
     last_finalized: u64,
     last_lost: u64,
     /// Floored loss estimate used for new messages.
@@ -394,7 +426,7 @@ impl FecAdaptiveState {
 
     pub fn new(cfg: AdaptiveFecConfig, now_ns: u64) -> Self {
         let tracker = LossTracker::new(cfg, now_ns);
-        FecAdaptiveState { tracker, policy: RepairPolicy::selected(), last_finalized: 0, last_lost: 0, p: tracker.estimate().max(cfg.min_loss), span: Box::new(SpanLossProfile::default()) }
+        FecAdaptiveState { tracker, policy: RepairPolicy::selected(), p4_tail_percent: RESEARCH_P4_TAIL_PERCENT.get().copied().unwrap_or(0), last_finalized: 0, last_lost: 0, p: tracker.estimate().max(cfg.min_loss), span: Box::new(SpanLossProfile::default()) }
     }
     /// Both counters describe the same DATA outcomes, attributed at ordered retirement.
     /// Like the span sketch, declarations remain conservative if later ACKed: subtracting
@@ -494,6 +526,37 @@ mod tests {
         let mut n = k;
         while fail_prob(k, n, p) > eps { n += 1; }
         n
+    }
+
+    #[test]
+    fn research_p4_tail_margin_zero_is_shipped_and_floor_is_monotone() {
+        assert_eq!(FecAdaptiveState::new(crate::ship::FEC, 0).p4_tail_percent, 0);
+        for u in 0..3000u64 {
+            for p in [0.0, 0.001, 0.01, 0.05, 0.1, 0.3, 0.9] {
+                assert_eq!(p4_tail_margin(u, p, 0), mean_repairs(u, p).max(2));
+                let mut last = 0;
+                for f in [0u32, 2, 5, 10, 20, 35, 50, 100] {
+                    let m = p4_tail_margin(u, p, f);
+                    // Exact formula: max(mean.max(2), 2 + ceil(f*U)); rank 2 is outside the fraction.
+                    assert_eq!(m, mean_repairs(u, p).max(2).max(if f == 0 { 0 } else { 2 + (u * f as u64).div_ceil(100) }));
+                    assert!(m >= last); last = m;
+                }
+            }
+        }
+        assert_eq!(p4_tail_margin(100, 0.0, 5), 7);
+        assert_eq!(p4_tail_margin(101, 0.0, 10), 13);
+        assert_eq!(p4_tail_margin(u32::MAX as u64, 0.0, 100), u32::MAX as u64 + 2); // caller U is u32; no overflow
+    }
+
+    #[test]
+    fn research_p4_tail_percent_validates() {
+        let m = RepairPolicy::MessageBound;
+        assert_eq!(parse_research_p4_tail_percent(None, m), Ok(0));
+        assert_eq!(parse_research_p4_tail_percent(None, RepairPolicy::Streaming), Ok(0));
+        for f in [0, 2, 5, 10, 20, 35, 50, 100] { assert_eq!(parse_research_p4_tail_percent(Some(&f.to_string()), m), Ok(f)); }
+        for bad in ["", "-1", "101", "0.05", "5%", " 5"] { assert!(parse_research_p4_tail_percent(Some(bad), m).is_err(), "{bad}"); }
+        assert_eq!(parse_research_p4_tail_percent(Some("0"), RepairPolicy::Streaming), Ok(0));
+        assert!(parse_research_p4_tail_percent(Some("5"), RepairPolicy::Streaming).is_err());
     }
 
     #[test]

@@ -786,7 +786,9 @@ impl FecSendSlot {
             // Earlier losses are replaced one-for-one at this group's extension.
             // Only the unresolved in-flight tail gets expected-loss protection.
             let pending = if self.next_id >= self.k { self.next_id.saturating_sub(self.finalized_symbols) } else { 0 };
-            let margin = crate::fec_adapt::mean_repairs(pending as u64, a.p).max(2) as u32;
+            // Research tail floor is P4-only; percent 0 is the shipped mean margin.
+            let percent = if a.policy == RepairPolicy::MessageBound { a.p4_tail_percent } else { 0 };
+            let margin = crate::fec_adapt::p4_tail_margin(pending as u64, a.p, percent) as u32;
             let layout = crate::fec::MessageLayout::new(self.message.len(), self.block_bytes).unwrap();
             let repairs = (0..layout.groups).map(|g| self.group_lost[g].saturating_add(margin).min(layout.group(g).1 as u32)).max().unwrap();
             let old_n = self.n;
@@ -10377,6 +10379,155 @@ mod p4_tests {
             if policy.feedback() { assert!(b.retained_bytes > 0); }
         }
     }
+
+    fn research_buffer(policy: RepairPolicy, p: f64, percent: u32) -> UnreliableSendBuffer {
+        let mut b = buffer(policy, p);
+        b.fec_adaptive.as_mut().unwrap().p4_tail_percent = percent;
+        b
+    }
+    const K100: usize = (1449 - STP_FEC_FRAGMENT_HEADER_SIZE) * 100;
+    /// Reference of the exact planner on a no-feedback single-group train: refreshes at source
+    /// completion (U = K) and before each final planned symbol (U = n - 1), never past seal.
+    fn no_feedback_model(k: u64, initial_n: u64, p: f64, percent: u32) -> u64 {
+        let mut n = initial_n;
+        let mut next = k;
+        while next < n {
+            if next == k || next + 1 >= n {
+                n = n.max(k + crate::fec_adapt::p4_tail_margin(next, p, percent).min(k));
+            }
+            next += 1;
+        }
+        n
+    }
+    fn no_feedback_total(policy: RepairPolicy, p: f64, percent: u32, len: usize) -> (u64, u32, u32) {
+        let mut b = research_buffer(policy, p, percent);
+        b.submit_messages(vec![vec![7; len]]);
+        let mut seq = 0;
+        emit(&mut b, &mut seq);
+        let (k, n0) = { let f = b.fec_send_slot.as_ref().unwrap(); (f.k, f.n_planned) };
+        drain(&mut b, &mut seq);
+        if policy == RepairPolicy::MessageBound {
+            assert_forgotten(&mut b);
+            // Late feedback after seal cannot reopen or extend the message.
+            for old in 0..seq { b.fec_on_packet_finalized(old, true); }
+            assert!(emit(&mut b, &mut seq).is_none());
+            assert_forgotten(&mut b);
+        }
+        (seq, k, n0)
+    }
+
+    #[test]
+    fn research_p4_tail_zero_exact_and_sweep_monotone_bounded_no_feedback() {
+        for (len, p) in [(K100, 0.0), (K100, 0.1), (64 << 10, 0.0), (64 << 10, 0.01), (1 << 20, 0.0), (1449 * 3, 0.0)] {
+            let mut last = 0;
+            for percent in [0, 2, 5, 10, 20, 35, 50, 100] {
+                let (sent, k, n0) = no_feedback_total(RepairPolicy::MessageBound, p, percent, len);
+                let model = no_feedback_model(k as u64, n0 as u64, p, percent);
+                eprintln!("research_p4_tail len={len} p={p} f={percent}% K={k} initial={n0} sent={sent} repairs={} repairs/K={:.4} model={model}", sent - k as u64, (sent - k as u64) as f64 / k as f64);
+                assert_eq!(sent, model, "len={len} p={p} f={percent}");
+                assert!(sent >= last && sent <= 2 * k as u64);
+                last = sent;
+            }
+        }
+        // Clean f=0 baseline: exactly the shipped initial rank plan, no tail growth.
+        assert_eq!(no_feedback_total(RepairPolicy::MessageBound, 0.0, 0, K100).0, 102);
+        // Measured no-feedback overhead: f/(1-f)-like convergence, deterministic, K-capped.
+        assert_eq!(no_feedback_total(RepairPolicy::MessageBound, 0.0, 5, K100).0, 108);
+        assert_eq!(no_feedback_total(RepairPolicy::MessageBound, 0.0, 10, K100).0, 114);
+        assert_eq!(no_feedback_total(RepairPolicy::MessageBound, 0.0, 20, K100).0, 128);
+        assert_eq!(no_feedback_total(RepairPolicy::MessageBound, 0.0, 50, K100).0, 200);
+    }
+
+    #[test]
+    fn research_p4_tail_floor_does_not_change_p0_through_p3() {
+        for policy in [RepairPolicy::Reliability, RepairPolicy::MeanOpen, RepairPolicy::MeanTopup, RepairPolicy::Streaming] {
+            let base = no_feedback_total(policy, 0.1, 0, K100);
+            assert_eq!(no_feedback_total(policy, 0.1, 50, K100), base, "{policy:?}");
+        }
+    }
+
+    #[test]
+    fn research_p4_tail_floor_covers_only_unresolved_pending() {
+        for percent in [0, 50, 100] {
+            let mut b = research_buffer(RepairPolicy::MessageBound, 0.0, percent);
+            b.submit_messages(vec![vec![7; K100]]);
+            let mut seq = 0;
+            // Every symbol is ACKed before the next refresh: U stays zero, no extra parity.
+            while emit(&mut b, &mut seq).is_some() { b.fec_on_packet_finalized(seq - 1, false); }
+            assert_eq!(seq, 102, "f={percent}");
+            assert_forgotten(&mut b);
+        }
+    }
+
+    #[test]
+    fn research_p4_tail_known_deficit_adds_to_floor() {
+        for (percent, expected) in [(0, 107), (10, 118)] {
+            let mut b = research_buffer(RepairPolicy::MessageBound, 0.0, percent);
+            b.submit_messages(vec![vec![7; K100]]);
+            let mut seq = 0;
+            for _ in 0..50 { emit(&mut b, &mut seq); }
+            for old in 0..10 { b.fec_on_packet_finalized(old, old < 5); }
+            drain(&mut b, &mut seq);
+            // f=10: completion U=90 -> 5 + (2 + 9) = 16; final refreshes U=105,107 -> 5 + 13.
+            assert_eq!(seq, expected, "f={percent}");
+            assert_forgotten(&mut b);
+        }
+    }
+
+    #[test]
+    fn research_p4_tail_final_repair_losses_extend_before_seal_only() {
+        let mut b = research_buffer(RepairPolicy::MessageBound, 0.0, 10);
+        b.submit_messages(vec![vec![7; K100]]);
+        let mut seq = 0;
+        while seq < 105 { emit(&mut b, &mut seq); }
+        for old in 100..103 { b.fec_on_packet_finalized(old, true); }
+        drain(&mut b, &mut seq);
+        // Loss refresh U=102 -> 3+13 = 116; final refreshes U=112,113 -> 3+14 = 117.
+        assert_eq!(seq, 117);
+        assert_forgotten(&mut b);
+        for old in 0..seq { b.fec_on_packet_finalized(old, true); }
+        assert!(emit(&mut b, &mut seq).is_none());
+        assert_forgotten(&mut b);
+    }
+
+    #[test]
+    fn research_p4_tail_refresh_covers_open_segments_and_forgets() {
+        let mut repairs = Vec::new();
+        for percent in [0, 20] {
+            let mut b = research_buffer(RepairPolicy::MessageBound, 0.0, percent);
+            b.submit_messages(vec![vec![7; 3 << 20]]);
+            let mut seq = 0;
+            let first = emit(&mut b, &mut seq).unwrap().0;
+            while b.fec_send_slot.as_ref().unwrap().next_id < b.fec_send_slot.as_ref().unwrap().n { emit(&mut b, &mut seq); }
+            emit(&mut b, &mut seq); // second segment
+            while b.fec_send_slot.as_ref().unwrap().next_id < b.fec_send_slot.as_ref().unwrap().k { emit(&mut b, &mut seq); }
+            b.p4_refresh_tail();
+            let f = &b.fec_retained[&first].slot;
+            let pending = (f.next_id - f.finalized_symbols) as u64;
+            let margin = crate::fec_adapt::p4_tail_margin(pending, 0.0, percent).min(f.k as u64) as u32;
+            assert!(f.n - f.k >= margin && f.n - f.k <= f.k, "f={percent} n-k={} margin={margin}", f.n - f.k);
+            repairs.push(f.n - f.k);
+            drain(&mut b, &mut seq);
+            assert_forgotten(&mut b);
+        }
+        assert_eq!(repairs[0], 2);
+        assert!(repairs[1] > repairs[0]);
+    }
+
+    #[test]
+    fn research_p4_tail_adds_no_per_message_or_history_state() {
+        // The only new state is one u32 in the per-connection estimator; send slots unchanged.
+        eprintln!("research_p4_tail sizes: FecAdaptiveState={} FecSendSlot={}", std::mem::size_of::<FecAdaptiveState>(), std::mem::size_of::<FecSendSlot>());
+        let mut b = research_buffer(RepairPolicy::MessageBound, 0.0, 50);
+        b.submit_messages(vec![vec![7; 3 << 20]]);
+        let mut seq = 0;
+        while emit(&mut b, &mut seq).is_some() {
+            assert!(b.fec_extra_packet_tags.is_empty());
+            assert_eq!(b.rescue_ready.len(), 0);
+            assert_eq!(*b.retention_quota.used.lock().unwrap(), (0, 0));
+        }
+        assert_forgotten(&mut b);
+    }
 }
 
 #[cfg(test)]
@@ -10483,5 +10634,30 @@ mod p4_review_tests {
         let expected = crate::fec_adapt::mean_repairs((early.next_id - early.finalized_symbols) as u64, 0.1) as u32;
         assert!(early.n - early.k >= expected,
             "earlier segment got {} repairs, needs {} at actual source completion; stale refreshed={}", early.n - early.k, expected, b.p4_tail_refreshed);
+    }
+    #[test]
+    fn research_p4_tail_tu_restart_refreshes_open_segments_with_floor() {
+        let mut b = buffer();
+        b.fec_adaptive.as_mut().unwrap().p4_tail_percent = 20;
+        b.submit_messages(vec![vec![7; 3 << 20]]);
+        let mut seq = 0;
+        assert!(emit(&mut b, &mut seq, 1449));
+        let first = b.send_package_id;
+        while b.fec_send_slot.as_ref().unwrap().next_id < b.fec_send_slot.as_ref().unwrap().n { assert!(emit(&mut b, &mut seq, 1449)); }
+        assert!(emit(&mut b, &mut seq, 1449));
+        while b.fec_send_slot.as_ref().unwrap().next_id < b.fec_send_slot.as_ref().unwrap().k { assert!(emit(&mut b, &mut seq, 1449)); }
+        assert!(emit(&mut b, &mut seq, 1162));
+        assert!(b.fec_send_slot.as_ref().unwrap().next_id < b.fec_send_slot.as_ref().unwrap().k);
+        while b.fec_send_slot.as_ref().unwrap().next_id < b.fec_send_slot.as_ref().unwrap().k { assert!(emit(&mut b, &mut seq, 1162)); }
+        b.p4_refresh_tail();
+        let early = &b.fec_retained[&first].slot;
+        let pending = (early.next_id - early.finalized_symbols) as u64;
+        let expected = crate::fec_adapt::p4_tail_margin(pending, 0.0, 20).min(early.k as u64) as u32;
+        assert!(early.n - early.k >= expected && early.n - early.k <= early.k, "{} vs {expected}", early.n - early.k);
+        for _ in 0..200000 { if !emit(&mut b, &mut seq, 1162) && !b.has_unsent_data() { break; } }
+        assert!(!b.has_unsent_data());
+        b.reclaim_finished_partial();
+        assert!(!b.p4_open && b.fec_retained.is_empty() && b.fec_send_slot.is_none());
+        assert_eq!(b.retained_bytes, 0);
     }
 }
