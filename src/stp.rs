@@ -2074,7 +2074,9 @@ pub struct ConnectionStateConnected {
     ack_hole: AckHole,
     delivery_growth: DeliveryGrowth,
 
-    // Note(Sam): HARD ASSUMPTION that no link ever has a greater RTT than 4.295 seconds.
+    // Finite timestamp history: receipts older than ~4.3 s (bucket-phase dependent)
+    // cannot feed RTT or either delivery-growth stream, even if ACK history retains them.
+    // A sustained majority beyond that horizon can pin growth; fail closed, never guess a send time.
     pub send_time_band: [u64; 1024], // 1024 buckets of 4.194 ms giving 4.295 seconds of tracking.
     pub send_time_band_head_index: u64, // monotonic time ns / 4_194_304 aka 0x400000
     
@@ -5233,13 +5235,13 @@ struct DeliveryEvidence {
     latency_ns: u64,
     oldest_send_ns: u64,
     previous_packets: u64,
-    previous_span_ns: u64,
+    previous_coverage_ns: u64,
     ceiling_upps: u64,
 }
 impl DeliveryEvidence {
     fn new(now: u64, ceiling_upps: u64) -> Self {
         Self { start_ns: now, packets: 0, latency_ns: 0, oldest_send_ns: u64::MAX,
-            previous_packets: 0, previous_span_ns: 0, ceiling_upps }
+            previous_packets: 0, previous_coverage_ns: 0, ceiling_upps }
     }
     fn acknowledged(&mut self, now: u64, packets: u64, latency_ns: u64, rtt_ns: u64, floor: u64) -> bool {
         if packets == 0 { return false; }
@@ -5252,10 +5254,10 @@ impl DeliveryEvidence {
         let span = now.saturating_sub(self.start_ns);
         let feedback = rtt_ns.saturating_add(crate::ship::ACK.max_delay_us as u64 * 1000).max(self.latency_ns).max(1);
         let coverage = span.max(now.saturating_sub(self.oldest_send_ns));
-        // The prior complete count is covered back to start - previous_span;
+        // The prior complete count is covered back to start - previous_coverage;
         // the current (possibly partial) count back to min(start, oldest_send).
         // Their union remains covered by this elapsed interval on every ACK.
-        let elapsed = span.saturating_add(self.previous_span_ns).max(coverage);
+        let elapsed = span.saturating_add(self.previous_coverage_ns).max(coverage);
         if elapsed >= feedback && (self.previous_packets != 0 || span >= feedback) {
             let delivered = self.packets.saturating_add(self.previous_packets);
             let rate = rate_mul_div(delivered, 1_000_000_000_000_000, elapsed);
@@ -5266,7 +5268,7 @@ impl DeliveryEvidence {
         }
         if span < feedback { return false; }
         self.previous_packets = self.packets;
-        self.previous_span_ns = coverage;
+        self.previous_coverage_ns = coverage;
         self.start_ns = now;
         self.packets = 0;
         self.latency_ns = 0;
@@ -5276,8 +5278,9 @@ impl DeliveryEvidence {
 }
 
 /// Positive receipts authorize growth, not a new congestion signal. The fresh
-/// horizon ignores isolated ancient receipts; the shadow admits every same-epoch
-/// receipt so sustained deep reordering cannot hide delivery forever. Each stream
+/// horizon ignores isolated ancient receipts; the shadow admits same-epoch
+/// receipts with retained valid send timestamps. Deep reordering beyond the
+/// ~4.3 s send-history capacity can still hide delivery and pin growth. Each stream
 /// covers every counted receipt independently, so their maximum is covered too.
 /// Fixed storage, one shared command, no dependency on the curve phase.
 #[derive(Debug)]
@@ -5734,7 +5737,7 @@ mod congestion_tests {
         g.acknowledged(31_000_000, 10, 1_000_000, 1_000_000, floor);
         assert_eq!(g.ceiling(), 2 * rate_mul_div(131, 1_000_000_000_000_000, 31_000_000));
         assert!(g.ceiling() < refreshed);
-        assert_eq!((g.fresh.start_ns, g.fresh.previous_packets, g.fresh.previous_span_ns), (31_000_000, 31, 11_000_000));
+        assert_eq!((g.fresh.start_ns, g.fresh.previous_packets, g.fresh.previous_coverage_ns), (31_000_000, 31, 11_000_000));
         assert_eq!(g.receipt_not_before_ns, 20_000_000);
         assert_eq!(g.receipt_latency(31_000_001, 19_999_999), None);
         assert_eq!(g.receipt_latency(31_000_001, 20_000_000), Some(11_000_001));
@@ -5782,7 +5785,7 @@ mod congestion_tests {
             (recovered.unwrap() - old_ack) / 1_000_000, min_ceiling / 1_000_000);
         assert_eq!(growth_receipts, 0, "old receipt must not enter fresh numerator or coverage");
         assert!(recovered.unwrap() <= old_ack + 100_000_000, "stray receipt stalled fresh growth");
-        assert_eq!(s.delivery_growth.fresh.previous_span_ns, 20_000_000);
+        assert_eq!(s.delivery_growth.fresh.previous_coverage_ns, 20_000_000);
     }
 
     #[test]
@@ -6073,8 +6076,8 @@ mod congestion_tests {
                 s.congestion_event_time_ns = resume - 1;
                 update_app_limit(&mut s, resume, true);
                 assert_eq!(s.delivery_growth.fresh.start_ns, resume);
-                assert_eq!(s.delivery_growth.fresh.previous_span_ns, 0);
-                assert_eq!(s.delivery_growth.shadow.previous_span_ns, 0);
+                assert_eq!(s.delivery_growth.fresh.previous_coverage_ns, 0);
+                assert_eq!(s.delivery_growth.shadow.previous_coverage_ns, 0);
                 assert_eq!(s.delivery_growth.shadow.packets, 0);
                 assert_eq!(s.delivery_growth.epoch_ns, resume);
                 assert_eq!(s.delivery_growth.shadow_receipt_latency(resume + rtt, resume - 1), None);
