@@ -4812,9 +4812,9 @@ fn apply_ecn_congestion(state: &mut ConnectionStateConnected, now: u64, cc: &Con
     println!("congestion event ECN CE ...  rate discovered: {} pps  sent:{send_mode}@{send_t_factor:.2}", state.congestion_event_rate_upps as f64 / 1000000.0);
 }
 
-/// Positive receipts authorize growth, not a new congestion signal. Two complete
-/// feedback windows include ACK silence and avoid treating a compressed batch as
-/// an instantaneous delivery rate. The raw latency floor includes receiver ACK
+/// Positive receipts authorize growth, not a new congestion signal. A complete
+/// feedback window plus the current partial window include ACK silence, not an
+/// instantaneous compressed-ACK rate. The raw latency floor includes receiver ACK
 /// batching; the delay-corrected CC RTT alone is not a feedback interval.
 /// Fixed storage, no per-packet allocation and no dependency on the curve phase.
 #[derive(Debug)]
@@ -4851,8 +4851,9 @@ impl DeliveryGrowth {
         self.receipt_not_before_ns = now;
     }
     fn receipt_latency(&self, now: u64, sent: u64) -> Option<u64> {
-        // Old receipts must not inflate the first post-quiet window or latch
-        // its raw latency to the entire quiet interval. RTT/loss still see them.
+        // Receipts older than the previous ACK window (or the quiet/outage
+        // epoch) still count for ACK/loss, but not growth count or coverage.
+        // A stray old receipt must not hold a fresh window open for seconds.
         (sent != 0 && sent != u64::MAX && sent >= self.receipt_not_before_ns)
             .then(|| now.saturating_sub(sent))
     }
@@ -4866,17 +4867,25 @@ impl DeliveryGrowth {
         self.oldest_send_ns = self.oldest_send_ns.min(now.saturating_sub(latency_ns));
         let span = now.saturating_sub(self.start_ns);
         let feedback = rtt_ns.saturating_add(crate::ship::ACK.max_delay_us as u64 * 1000).max(self.latency_ns).max(1);
-        if span < feedback { return; }
-        let delivered = self.packets.saturating_add(self.previous_packets);
-        // Old genuine receipts may predate both ACK windows. Cover their send
-        // interval too, and retain that coverage with the previous count. Merely
-        // waiting one raw latency loses this interval at the next window shift.
         let coverage = span.max(now.saturating_sub(self.oldest_send_ns));
+        // The prior complete count is covered back to start - previous_span;
+        // the current (possibly partial) count back to min(start, oldest_send).
+        // Their union remains covered by this elapsed interval on every ACK.
         let elapsed = span.saturating_add(self.previous_span_ns).max(coverage);
-        let rate = rate_mul_div(delivered, 1_000_000_000_000_000, elapsed);
-        self.ceiling_upps = rate.max(floor).saturating_mul(2).min(MAX_CC_RATE_UPPS);
+        if elapsed >= feedback && (self.previous_packets != 0 || span >= feedback) {
+            let delivered = self.packets.saturating_add(self.previous_packets);
+            let rate = rate_mul_div(delivered, 1_000_000_000_000_000, elapsed);
+            let ceiling = rate.max(floor).saturating_mul(2).min(MAX_CC_RATE_UPPS);
+            // Partial evidence can add permission before closure; it need not
+            // revoke the earlier complete sample's already-proven permission.
+            self.ceiling_upps = if span < feedback { self.ceiling_upps.max(ceiling) } else { ceiling };
+        }
+        if span < feedback { return; }
         self.previous_packets = self.packets;
         self.previous_span_ns = coverage;
+        // Advance only admission, not retained count coverage: those receipts
+        // may have been admitted before this horizon moved.
+        self.receipt_not_before_ns = self.start_ns;
         self.start_ns = now;
         self.packets = 0;
         self.latency_ns = 0;
@@ -5000,6 +5009,72 @@ mod congestion_tests {
     }
 
     #[test]
+    fn delivery_growth_partial_window_refresh_retains_complete_permission() {
+        let floor = RATE_FLOOR_UPPS;
+        let mut g = DeliveryGrowth::new(0, floor);
+        g.acknowledged(20_000_000, 100, 1_000_000, 1_000_000, floor);
+        assert_eq!(g.ceiling_upps, 10_000_000_000);
+        g.acknowledged(21_000_000, 20, 1_000_000, 1_000_000, floor);
+        let refreshed = 2 * rate_mul_div(120, 1_000_000_000_000_000, 21_000_000);
+        assert_eq!(g.ceiling_upps, refreshed);
+        assert!(refreshed > 10_000_000_000);
+        assert_eq!((g.start_ns, g.previous_packets, g.packets), (20_000_000, 100, 20));
+        // A lower partial sample does not prematurely revoke complete evidence.
+        g.acknowledged(25_000_000, 1, 1_000_000, 1_000_000, floor);
+        assert_eq!(g.ceiling_upps, refreshed);
+        assert_eq!(g.start_ns, 20_000_000);
+        // Closure still replaces the sample and shifts only current evidence.
+        g.acknowledged(31_000_000, 10, 1_000_000, 1_000_000, floor);
+        assert_eq!(g.ceiling_upps, 2 * rate_mul_div(131, 1_000_000_000_000_000, 31_000_000));
+        assert!(g.ceiling_upps < refreshed);
+        assert_eq!((g.start_ns, g.previous_packets, g.previous_span_ns), (31_000_000, 31, 11_000_000));
+        assert_eq!(g.receipt_not_before_ns, 20_000_000);
+        assert_eq!(g.receipt_latency(31_000_001, 19_999_999), None);
+        assert_eq!(g.receipt_latency(31_000_001, 20_000_000), Some(11_000_001));
+    }
+
+    #[test]
+    fn delivery_growth_stray_old_receipt_does_not_stall_fresh_delivery() {
+        let floor = RATE_FLOOR_UPPS;
+        let ConnectionState::Connected(mut s) = new_connection_state_connected(None, 0, 0, 0) else { unreachable!() };
+        // A real retained timestamp near the send-history edge, acknowledged
+        // after many newer windows. Normal ACK bookkeeping must still clear it.
+        s.account_send(751_000_000);
+        for tick in 1..=250u64 {
+            s.delivery_growth.acknowledged(tick * 20_000_000, 140, 1_000_000, 1_000_000, floor);
+        }
+        assert_eq!(s.delivery_growth.limit(7_000_000_000), 7_000_000_000);
+        let old_ack = 5_001_000_000;
+        let old_sent = s.send_time(0);
+        assert!(old_sent <= 751_000_000 && old_ack - old_sent >= 4_250_000_000);
+        let mut ack = crate::ack::BitmapAck { highest: 0, sample_seq: 0, delay_us: 0, ce_count: 0, bitmap: [0; 16] };
+        ack.bitmap[0] = 1;
+        let growth_receipts = growth_ack(&mut s, &ack, old_ack, 1_000_000);
+        assert_eq!(s.packets_waiting_ack_field[0] & 1, 0);
+        assert_eq!(growth_ack(&mut s, &ack, old_ack + 1, 1_000_000), 0);
+        let mut first_close = None;
+        let mut recovered = None;
+        let mut min_ceiling = s.delivery_growth.ceiling_upps;
+        for tick in 1..=500u64 {
+            let now = 5_000_000_000 + tick * 20_000_000;
+            let start = s.delivery_growth.start_ns;
+            s.delivery_growth.acknowledged(now, 140, 1_000_000, 1_000_000, floor);
+            if s.delivery_growth.start_ns != start && first_close.is_none() { first_close = Some(now); }
+            min_ceiling = min_ceiling.min(s.delivery_growth.ceiling_upps);
+            if first_close.is_some() && s.delivery_growth.ceiling_upps >= 13_000_000_000 && recovered.is_none() {
+                recovered = Some(now);
+            }
+            assert!(s.delivery_growth.limit(MAX_CC_RATE_UPPS) >= 7_000_000_000);
+        }
+        println!("single 4.25s-old receipt: growth receipts={growth_receipts}, next close={}ms, recovery={}ms after receipt, min ceiling={}pps",
+            (first_close.unwrap() - old_ack) / 1_000_000,
+            (recovered.unwrap() - old_ack) / 1_000_000, min_ceiling / 1_000_000);
+        assert_eq!(growth_receipts, 0, "old receipt must not enter growth numerator or coverage");
+        assert!(recovered.unwrap() <= old_ack + 100_000_000, "stray receipt stalled fresh growth");
+        assert_eq!(s.delivery_growth.previous_span_ns, 20_000_000);
+    }
+
+    #[test]
     fn delivery_growth_real_receipt_admission_is_once_only_and_data_only() {
         let ConnectionState::Connected(mut s) = new_connection_state_connected(None, 0, 0, 0) else { unreachable!() };
         for seq in 0..4 { s.account_send(1_000_000_000 + seq * 5_000_000); }
@@ -5094,6 +5169,7 @@ mod congestion_tests {
             }
             if timer <= now {
                 reverse.push_back((now + rtt / 2, receiver.ack(now)));
+                receiver.sent(now); // successful ACK send, as in production
                 timer = u64::MAX;
             }
             while reverse.front().is_some_and(|(due, _)| *due <= now) {
@@ -5119,7 +5195,8 @@ mod congestion_tests {
         println!("1ms RTT, real ACK policy + 4.194ms send lookup: 7000pps at {}us; original curve {}us; {} receipts",
             reached / 1000, baseline / 1000, quantized_samples);
         assert!(quantized_samples > 0);
-        assert!(reached <= 1_000_000_000, "1ms clean ramp stalled");
+        // 127.5 ms with covered partial-window refresh; modest regression headroom.
+        assert!(reached <= 135_000_000, "1ms clean ramp regressed: {reached}ns");
     }
 
     #[test]
