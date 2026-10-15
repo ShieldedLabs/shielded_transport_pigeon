@@ -1754,6 +1754,7 @@ pub struct ConnectionStateConnected {
     pub peer_ce_count: u32,
     loss_timer: LossTimer,
     ack_hole: AckHole,
+    delivery_growth: DeliveryGrowth,
 
     // Note(Sam): HARD ASSUMPTION that no link ever has a greater RTT than 4.295 seconds.
     pub send_time_band: [u64; 1024], // 1024 buckets of 4.194 ms giving 4.295 seconds of tracking.
@@ -1825,6 +1826,7 @@ pub fn new_connection_state_connected(cipher: Option<ConnectionCipherTriplet>, m
         peer_ce_count: 0,
         loss_timer: LossTimer::default(),
         ack_hole: AckHole::default(),
+        delivery_growth: DeliveryGrowth::new(timestamp_ns, RATE_FLOOR_UPPS),
         send_time_band: [0; 1024],
         send_time_band_head_index: 0,
         RTT_sample_sums: [0; 16],
@@ -3337,11 +3339,14 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 let mut ack_latency_ns = 0u64;
                                 
                                 let mut data_ack_progress = false;
+                                let mut newly_acked_data = 0u64;
+                                let mut delivery_latency_ns = 0u64;
                                 let mut oldest_newly_acked_send_time: u64 = u64::MAX;
                                 let relevant_ack = bitmap_ack.as_ref().map(|a| a.relevant(&state.packets_waiting_ack_field, &state.declared_lost_field[..]));
                                 let indices = relevant_ack.iter().flat_map(crate::ack::BitmapAck::acknowledged);
                                 for index in indices {
                                     let mut newly_acked = false;
+                                    let mut newly_acked_data_packet = false;
                                     if index < state.send_sequence_number {
                                         state.highest_peer_acked = Some(state.highest_peer_acked.unwrap_or(index).max(index));
                                     }
@@ -3369,6 +3374,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                             else {
                                                 state.ack_hole.acknowledged(index);
                                                 data_ack_progress = true;
+                                                newly_acked_data_packet = true;
                                                 assert!(state.packets_in_flight > 0, "packets_in_flight underflow");
                                                 state.packets_in_flight -= 1;
                                             }
@@ -3386,6 +3392,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                             state.last_ack_received_time = timestamp_ns;
                                             state.outage.pending_since_ns = None;
                                             if index < state.outage.ignore_loss_before_seq { state.outage.ignored_spurious += 1; }
+                                            else { newly_acked_data_packet = true; }
                                             if let Some(t) = &mut loss_trace { t.outcome('A', existing_connection.two_byte_send_prefix, index, timestamp_ns); }
                                         }
                                     }
@@ -3394,6 +3401,12 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                         if sent_ns != 0 && sent_ns != u64::MAX {
                                             let raw = timestamp_ns.saturating_sub(sent_ns);
                                             ack_latency_ns = ack_latency_ns.max(raw);
+                                            if newly_acked_data_packet {
+                                                if let Some(latency) = state.delivery_growth.receipt_latency(timestamp_ns, sent_ns) {
+                                                    newly_acked_data += 1;
+                                                    delivery_latency_ns = delivery_latency_ns.max(latency);
+                                                }
+                                            }
                                             // A late sample is still a truthful RTT measurement.
                                             if bitmap_ack.as_ref().is_none_or(|a| index == a.sample_seq) {
                                                 let delay = bitmap_ack.as_ref().map_or(0, |a| a.delay_us as u64 * 1000);
@@ -3406,6 +3419,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     }
                                 }
                                 if ack_latency_ns != 0 { state.loss_timer.observe(ack_latency_ns); }
+                                state.delivery_growth.acknowledged(timestamp_ns, newly_acked_data,
+                                    delivery_latency_ns, state.RTT_mean as u64 * 100_000, cc.rate_floor_upps);
                                 if data_ack_progress {
                                     let before = state.congestion_event_time_ns;
                                     let context = loss_trace.as_ref().map(|_| cc_trace_context(state, timestamp_ns, &cc, max_pps));
@@ -3901,26 +3916,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
 
 
                         // ECN congestion event: the receiver saw CE-marked packets and relayed it via the ack's IP header
-                        if take_ecn_signal(state, cc.event_guard_rtts) {
-                            let send_dt = state.ecn_oldest_send_time - state.congestion_event_time_ns;
-                            let send_t_factor = send_dt as f64 / time_to_bandwidth_recovery as f64;
-                            let (_, send_mode) = cc_rate(send_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery, state.cc_startup_done);
-                            let discover_dt = if send_mode == 'P' { (time_to_bandwidth_recovery + send_dt) / 2 } else { send_dt };
-                            let mut discovered = cc_rate(discover_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery, state.cc_startup_done).0;
-                            if send_mode == 'I' {
-                                discovered = cc_rate(send_dt.saturating_sub((state.RTT_mean as f64 * 100_000.0 * cc.startup_backoff_rtts) as u64), state.congestion_event_rate_upps, time_to_bandwidth_recovery, false).0;
-                            } else if send_mode == 'G' || send_mode == 'S' {
-                                let r_pg = (state.congestion_event_rate_upps as f64 * cc.rate_pg) as u64;
-                                discovered = r_pg + ((discovered.saturating_sub(r_pg)) as f64 * 0.5) as u64;
-                            }
-                            // Discovery must reflect a locally capped sender as well: otherwise
-                            // a loss above a stale curve anchor would not lower actual pacing.
-                            state.congestion_event_rate_upps = local_rate_limit(discovered, max_pps);
-                            state.congestion_event_time_ns = current_time_now_ns;
-                            state.app_limit_time_offset = 0;
-                            state.cc_startup_done = true;
-                            println!("congestion event ECN CE ...  rate discovered: {} pps  sent:{send_mode}@{send_t_factor:.2}", state.congestion_event_rate_upps as f64 / 1000000.0);
-                        }
+                        apply_ecn_congestion(state, current_time_now_ns, &cc, max_pps);
 
                         let time_to_considered_dropped = state.loss_timer.timeout_ns(
                             state.RTT_mean as u64 * 100_000,
@@ -4003,6 +3999,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                         };
                         // A local pacing ceiling is not evidence of network congestion.
                         let allowed_bandwidth_upps = local_rate_limit(allowed_bandwidth_upps.max(cc.rate_floor_upps), max_pps);
+                        let allowed_bandwidth_upps = state.delivery_growth.limit(allowed_bandwidth_upps);
                         state.stats.cc_rate_upps = allowed_bandwidth_upps;
                         if let Some(t) = &mut loss_trace {
                             let mut context = cc_trace_context(state, current_time_now_ns, &cc, max_pps);
@@ -4463,6 +4460,7 @@ fn resume_outage(state: &mut ConnectionStateConnected, buf: &mut SendQueues,
     state.outage.ignore_loss_before_seq = state.send_sequence_number;
     state.congestion_event_rate_upps = local_rate_limit(state.outage.resume_rate_upps, max_pps).max(1);
     state.congestion_event_time_ns = now;
+    state.delivery_growth = DeliveryGrowth::new(now, state.congestion_event_rate_upps);
     state.cc_startup_done = false;
     state.RTT_sample_sums.fill(0);
     state.RTT_sample_counts.fill(0);
@@ -4626,8 +4624,12 @@ fn update_app_limit(state: &mut ConnectionStateConnected, now_ns: u64, has_data:
     if !has_data && !state.is_app_limited {
         state.stats.cc_app_limited_entries += 1;
         state.app_limit_time_offset = now_ns.saturating_sub(state.congestion_event_time_ns);
+        state.delivery_growth.app_limited_since_ns = now_ns;
         state.is_app_limited = true;
     } else if has_data && state.is_app_limited {
+        let quiet_start = state.delivery_growth.app_limited_since_ns;
+        state.delivery_growth.resume_after_quiet(now_ns, now_ns.saturating_sub(quiet_start),
+            state.RTT_mean as u64 * 100_000);
         state.congestion_event_time_ns = now_ns.saturating_sub(state.app_limit_time_offset);
         state.is_app_limited = false;
     }
@@ -4650,7 +4652,7 @@ fn cc_trace_context(state: &ConnectionStateConnected, now: u64, cc: &CongestionP
     let age = if state.is_app_limited { state.app_limit_time_offset }
         else { now.saturating_sub(state.congestion_event_time_ns) };
     let (rate, mode) = connection_rate(age, state.congestion_event_rate_upps, k, cc, state.cc_startup_done);
-    let capped = |r: u64| local_rate_limit(r.max(cc.rate_floor_upps), max_pps);
+    let capped = |r: u64| state.delivery_growth.bound(local_rate_limit(r.max(cc.rate_floor_upps), max_pps));
     let rate = capped(rate);
     let next = capped(connection_rate(age.saturating_add(1_000_000), state.congestion_event_rate_upps, k, cc, state.cc_startup_done).0);
     crate::loss_trace::CcContext { pps: rate as f64 / 1_000_000.0,
@@ -4777,6 +4779,108 @@ fn local_rate_limit(rate: u64, max_pps: Option<u64>) -> u64 {
     max_pps.map_or(rate, |limit| rate.min(limit.saturating_mul(1_000_000).max(1))).min(MAX_CC_RATE_UPPS)
 }
 
+// A clipped curve is not a rate we ever sent. Loss/ECN must cut actual pacing,
+// not discover an arbitrarily high rate on the hidden time-based curve.
+fn congestion_discovery_rate(state: &ConnectionStateConnected, discovered: u64, max_pps: Option<u64>) -> u64 {
+    let actual = state.stats.cc_rate_upps;
+    local_rate_limit(if actual == 0 { discovered } else { discovered.min(actual) }, max_pps)
+}
+
+// Kept separate so tests exercise the same ECN cut as the send loop.
+fn apply_ecn_congestion(state: &mut ConnectionStateConnected, now: u64, cc: &CongestionPolicy, max_pps: Option<u64>) {
+    if !take_ecn_signal(state, cc.event_guard_rtts) { return; }
+    let k = cc.recovery_rtts * state.RTT_mean as u64 * 100_000;
+    let send_dt = state.ecn_oldest_send_time - state.congestion_event_time_ns;
+    let send_t_factor = send_dt as f64 / k as f64;
+    let (_, send_mode) = connection_rate(send_dt, state.congestion_event_rate_upps, k, cc, state.cc_startup_done);
+    let discover_dt = if send_mode == 'P' { (k + send_dt) / 2 } else { send_dt };
+    let mut discovered = connection_rate(discover_dt, state.congestion_event_rate_upps, k, cc, state.cc_startup_done).0;
+    if send_mode == 'I' {
+        discovered = connection_rate(send_dt.saturating_sub((state.RTT_mean as f64 * 100_000.0 * cc.startup_backoff_rtts) as u64), state.congestion_event_rate_upps, k, cc, false).0;
+    } else if send_mode == 'G' || send_mode == 'S' {
+        let r_pg = (state.congestion_event_rate_upps as f64 * cc.rate_pg) as u64;
+        discovered = r_pg + ((discovered.saturating_sub(r_pg)) as f64 * 0.5) as u64;
+    }
+    state.congestion_event_rate_upps = congestion_discovery_rate(state, discovered, max_pps);
+    state.congestion_event_time_ns = now;
+    state.app_limit_time_offset = 0;
+    state.cc_startup_done = true;
+    println!("congestion event ECN CE ...  rate discovered: {} pps  sent:{send_mode}@{send_t_factor:.2}", state.congestion_event_rate_upps as f64 / 1000000.0);
+}
+
+/// Positive receipts authorize growth, not a new congestion signal. Two complete
+/// feedback windows include ACK silence and avoid treating a compressed batch as
+/// an instantaneous delivery rate. The raw latency floor includes receiver ACK
+/// batching; the delay-corrected CC RTT alone is not a feedback interval.
+/// Fixed storage, no per-packet allocation and no dependency on the curve phase.
+#[derive(Debug)]
+struct DeliveryGrowth {
+    start_ns: u64,
+    packets: u64,
+    latency_ns: u64,
+    previous_packets: u64,
+    previous_span_ns: u64,
+    ceiling_upps: u64,
+    last_rate_upps: u64,
+    receipt_not_before_ns: u64,
+    app_limited_since_ns: u64,
+}
+impl DeliveryGrowth {
+    fn new(now: u64, floor: u64) -> Self {
+        Self { start_ns: now, packets: 0, latency_ns: 0,
+            previous_packets: 0, previous_span_ns: 0, ceiling_upps: floor,
+            last_rate_upps: floor, receipt_not_before_ns: now, app_limited_since_ns: now }
+    }
+    fn resume_after_quiet(&mut self, now: u64, quiet_ns: u64, rtt_ns: u64) {
+        let feedback = rtt_ns.saturating_add(crate::ship::ACK.max_delay_us as u64 * 1000);
+        if quiet_ns < feedback { return; }
+        // Nothing queued is not a feedback gap. Do not let a long application
+        // pause poison two subsequent delivery windows, or grant new headroom.
+        self.start_ns = now;
+        self.packets = 0;
+        self.latency_ns = 0;
+        self.previous_packets = 0;
+        self.previous_span_ns = 0;
+        self.receipt_not_before_ns = now;
+    }
+    fn receipt_latency(&self, now: u64, sent: u64) -> Option<u64> {
+        // Old receipts must not inflate the first post-quiet window or latch
+        // its raw latency to the entire quiet interval. RTT/loss still see them.
+        (sent != 0 && sent != u64::MAX && sent >= self.receipt_not_before_ns)
+            .then(|| now.saturating_sub(sent))
+    }
+    fn acknowledged(&mut self, now: u64, packets: u64, latency_ns: u64, rtt_ns: u64, floor: u64) {
+        if packets == 0 { return; }
+        // A small fixed headroom at the rate floor also allows sparse senders to
+        // fill a feedback window. It is available only after positive delivery.
+        self.ceiling_upps = self.ceiling_upps.max(floor.saturating_mul(2));
+        self.packets = self.packets.saturating_add(packets);
+        self.latency_ns = self.latency_ns.max(latency_ns);
+        let span = now.saturating_sub(self.start_ns);
+        let feedback = rtt_ns.saturating_add(crate::ship::ACK.max_delay_us as u64 * 1000).max(self.latency_ns).max(1);
+        if span < feedback { return; }
+        let delivered = self.packets.saturating_add(self.previous_packets);
+        let elapsed = span.saturating_add(self.previous_span_ns);
+        let rate = rate_mul_div(delivered, 1_000_000_000_000_000, elapsed);
+        self.ceiling_upps = rate.max(floor).saturating_mul(2).min(MAX_CC_RATE_UPPS);
+        self.previous_packets = self.packets;
+        self.previous_span_ns = span;
+        self.start_ns = now;
+        self.packets = 0;
+        self.latency_ns = 0;
+    }
+    fn bound(&self, proposed: u64) -> u64 {
+        // ACK starvation or an application pause is not evidence of congestion.
+        // Preserve the last command; only the existing loss/ECN curve may cut it.
+        proposed.min(self.ceiling_upps.max(self.last_rate_upps))
+    }
+    fn limit(&mut self, proposed: u64) -> u64 {
+        let rate = self.bound(proposed);
+        self.last_rate_upps = rate;
+        rate
+    }
+}
+
 fn apply_loss_congestion(state: &mut ConnectionStateConnected, send_time: u64, current_time_now_ns: u64, cc: &CongestionPolicy, max_pps: Option<u64>) {
     let rtt_ns = state.RTT_mean as u64 * 100_000;
     // An RTT re-anchor may have moved the origin while a cohort was retiring.
@@ -4798,7 +4902,7 @@ fn apply_loss_congestion(state: &mut ConnectionStateConnected, send_time: u64, c
         let boundary = (state.congestion_event_rate_upps as f64 * cc.rate_rp) as u64;
         discovered = (discovered + boundary) / 2;
     }
-    state.congestion_event_rate_upps = local_rate_limit(discovered, max_pps);
+    state.congestion_event_rate_upps = congestion_discovery_rate(state, discovered, max_pps);
     state.congestion_event_time_ns = current_time_now_ns;
     state.app_limit_time_offset = 0;
     state.loss_count_in_window = 0;
@@ -4863,6 +4967,236 @@ impl LossEpisodes {
 #[cfg(test)]
 mod congestion_tests {
     use super::*;
+
+    #[test]
+    fn delivery_growth_bursty_acks_do_not_authorize_gap_growth() {
+        let floor = RATE_FLOOR_UPPS;
+        let mut g = DeliveryGrowth::new(0, floor);
+        assert_eq!(g.limit(MAX_CC_RATE_UPPS), floor); // no delivery at all
+        // 1000 receipts every 200 ms: 5000 pps, despite a 5 ms corrected RTT.
+        for burst in 1..=20 {
+            let now = burst * 200_000_000;
+            g.acknowledged(now, 1000, 200_000_000, 5_000_000, floor);
+            let rate = g.limit(MAX_CC_RATE_UPPS);
+            assert!(rate <= 10_000_000_000, "burst {burst}: {rate}");
+            for _ in 0..200 { assert_eq!(g.limit(MAX_CC_RATE_UPPS), rate); }
+            // Duplicate/empty ACKs must not authorize any further growth.
+            g.acknowledged(now + 1, 0, 1, 5_000_000, floor);
+            assert_eq!(g.limit(MAX_CC_RATE_UPPS), rate);
+        }
+        assert_eq!(g.last_rate_upps, 10_000_000_000);
+    }
+
+    #[test]
+    fn delivery_growth_compressed_acks_across_window_boundaries_stay_bounded() {
+        let floor = RATE_FLOOR_UPPS;
+        let mut g = DeliveryGrowth::new(0, floor);
+        // Split each 1000-packet batch over two ACKs 1 us apart. Only
+        // 5000 packets/s were delivered; the second ACK is not 500 Mpps.
+        for burst in 1..=20 {
+            let now = burst * 200_000_000;
+            for offset in [0, 1000] {
+                g.acknowledged(now + offset, 500, 200_000_000, 5_000_000, floor);
+                assert!(g.ceiling_upps <= 10_000_000_000);
+                assert!(g.limit(MAX_CC_RATE_UPPS) <= 10_000_000_000);
+            }
+        }
+    }
+
+    #[test]
+    fn delivery_growth_clean_ramp_is_unchanged_in_every_curve_phase() {
+        let cc = crate::ship::CC;
+        for rtt in [20_000_000, 40_000_000, 200_000_000, 600_000_000] {
+            for done in [false, true] {
+                let mut g = DeliveryGrowth::new(0, cc.rate_floor_upps);
+                let k = rtt * cc.recovery_rtts;
+                let anchor = if done { 10_000_000_000 } else { cc.initial_rate_upps };
+                // Loss/ECN do not reset delivery history. Establish the receipts
+                // that authorized a post-loss sender's pre-cut command, rather
+                // than fabricating a high last command with no delivery proof.
+                let origin = if done {
+                    let feedback = rtt + crate::ship::ACK.max_delay_us as u64 * 1000;
+                    for window in 1..=2 {
+                        g.acknowledged(window * feedback,
+                            rate_mul_div(anchor, feedback, 1_000_000_000_000_000),
+                            rtt, rtt, cc.rate_floor_upps);
+                    }
+                    g.limit(anchor);
+                    2 * feedback
+                } else {
+                    // The first positive ACK establishes the RTT and starts
+                    // active curve time. Subsequent receipts lag sends.
+                    g.acknowledged(rtt, 1, rtt, rtt, cc.rate_floor_upps);
+                    rtt
+                };
+                let mut ack_credit = 0f64;
+                for tick in 1..=4000 {
+                    let age: u64 = tick * 1_000_000;
+                    let now = origin + age;
+                    let old = connection_rate(age.saturating_sub(rtt), anchor, k, &cc, done).0;
+                    ack_credit += old as f64 / 1_000_000_000.0;
+                    let packets = ack_credit as u64;
+                    ack_credit -= packets as f64;
+                    g.acknowledged(now, packets, rtt, rtt, cc.rate_floor_upps);
+                    let proposed = connection_rate(age, anchor, k, &cc, done).0;
+                    assert_eq!(g.limit(proposed), proposed, "RTT {rtt}, phase {done}, time {now}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn delivery_growth_app_limit_preserves_command_and_recovers() {
+        let cc = crate::ship::CC;
+        for rtt in [20_000_000, 200_000_000, 600_000_000] {
+            let feedback = rtt + crate::ship::ACK.max_delay_us as u64 * 1000;
+            for cause in ["none", "loss", "ecn"] {
+                let origin = 2 * feedback;
+                let ConnectionState::Connected(mut s) = new_connection_state_connected(None, 0, 0, 0) else { unreachable!() };
+                s.RTT_mean = (rtt / 100_000) as u16;
+                s.congestion_event_rate_upps = 5_000_000_000;
+                s.congestion_event_time_ns = origin;
+                for window in 1..=2 {
+                    s.delivery_growth.acknowledged(window * feedback,
+                        rate_mul_div(5_000_000_000, feedback, 1_000_000_000_000_000),
+                        rtt, rtt, cc.rate_floor_upps);
+                }
+                s.stats.cc_rate_upps = s.delivery_growth.limit(5_000_000_000);
+                update_app_limit(&mut s, origin, false);
+                let resume = origin + 60_000_000_000;
+                // A sparse/late receipt during quiet can reduce the delivery
+                // ceiling, but cannot lower the existing 5000 pps command.
+                s.delivery_growth.acknowledged(resume - 1, 1, rtt, rtt, cc.rate_floor_upps);
+                assert_eq!(s.delivery_growth.limit(5_000_000_000), 5_000_000_000);
+                // RTT re-anchoring while idle can move the curve origin to a
+                // recent ACK. It must not erase the actual application's pause.
+                s.congestion_event_time_ns = resume - 1;
+                update_app_limit(&mut s, resume, true);
+                assert_eq!(s.delivery_growth.start_ns, resume);
+                assert_eq!(s.delivery_growth.previous_span_ns, 0);
+                assert_eq!(s.delivery_growth.receipt_latency(resume + rtt, resume - 1), None);
+                assert_eq!(s.delivery_growth.receipt_latency(resume + rtt, resume), Some(rtt));
+                assert_eq!(s.delivery_growth.receipt_latency(resume + rtt, 0), None);
+                assert_eq!(s.delivery_growth.receipt_latency(resume + rtt, u64::MAX), None);
+                let event = resume + rtt;
+                if cause == "loss" {
+                    apply_loss_congestion(&mut s, event, event, &cc, None);
+                } else if cause == "ecn" {
+                    s.ecn_oldest_send_time = event;
+                    s.ecn_congestion_received = true;
+                    apply_ecn_congestion(&mut s, event, &cc, None);
+                    assert!(!s.ecn_congestion_received);
+                }
+                let k = cc.recovery_rtts * rtt;
+                let proposed = |s: &ConnectionStateConnected, now: u64|
+                    connection_rate(now - s.congestion_event_time_ns,
+                        s.congestion_event_rate_upps, k, &cc, s.cc_startup_done).0;
+                let held = s.delivery_growth.limit(proposed(&s, event));
+                if cause != "none" { assert!(held < 5_000_000_000); }
+                let fresh = resume + feedback;
+                assert_eq!(s.delivery_growth.limit(proposed(&s, fresh - 1)), held);
+                s.delivery_growth.acknowledged(fresh,
+                    rate_mul_div(held, feedback, 1_000_000_000_000_000),
+                    feedback, rtt, cc.rate_floor_upps);
+                let curve = proposed(&s, fresh);
+                let grown = s.delivery_growth.limit(curve);
+                assert_eq!(grown, curve, "RTT {rtt}, {cause}: delivery must no longer hold the curve");
+                assert!(grown > held, "RTT {rtt}, {cause}");
+                println!("quiet/resume RTT={}ms cause={cause}: fresh growth after {}ms; command {} -> {} pps",
+                    rtt / 1_000_000, feedback / 1_000_000, held / 1_000_000, grown / 1_000_000);
+            }
+        }
+    }
+
+    #[test]
+    fn delivery_growth_brief_app_starvation_keeps_partial_window() {
+        let mut g = DeliveryGrowth::new(0, RATE_FLOOR_UPPS);
+        g.acknowledged(20_000_000, 10, 20_000_000, 20_000_000, RATE_FLOOR_UPPS);
+        for tick in 1..=20 { g.resume_after_quiet(20_000_000 + tick * 1000, 1000, 20_000_000); }
+        assert_eq!(g.start_ns, 0);
+        assert_eq!(g.packets, 10);
+        assert_eq!(g.receipt_not_before_ns, 0);
+    }
+
+    #[test]
+    fn delivery_growth_sparse_sender_reaches_path_rate_after_quiet() {
+        let cc = crate::ship::CC;
+        let target = 7_000_000_000;
+        for rtt in [20_000_000, 200_000_000, 600_000_000] {
+            let feedback = rtt + crate::ship::ACK.max_delay_us as u64 * 1000;
+            let ConnectionState::Connected(mut s) = new_connection_state_connected(None, 0, 0, 0) else { unreachable!() };
+            s.RTT_mean = (rtt / 100_000) as u16;
+            s.congestion_event_time_ns = 2_000_000_000;
+            // A 50 pps application never fills even the rate floor.
+            for tick in 1..=20 {
+                s.delivery_growth.acknowledged(tick * 100_000_000, 5, rtt, rtt, cc.rate_floor_upps);
+                s.delivery_growth.limit(cc.rate_floor_upps);
+            }
+            update_app_limit(&mut s, 2_000_000_000, false);
+            let resume = 62_000_000_000;
+            update_app_limit(&mut s, resume, true);
+            // Causal receipts: only packets sent at an actually commanded rate
+            // return after a full feedback interval; ACK frames batch 10 ms.
+            let mut pipe = std::collections::VecDeque::from(vec![0u64; (feedback / 1_000_000) as usize]);
+            let mut send_credit = 0f64;
+            let mut ack_packets = 0u64;
+            let mut reached = None;
+            let baseline_ms = ((target as f64 / cc.initial_rate_upps as f64).ln()
+                / cc.startup_multiplier.ln() * rtt as f64 / 1_000_000.0).ceil() as u64;
+            for tick in 1..=40_000 {
+                let now = resume + tick * 1_000_000;
+                ack_packets += pipe.pop_front().unwrap();
+                if tick % 10 == 0 {
+                    s.delivery_growth.acknowledged(now, ack_packets, feedback + 9_000_000, rtt, cc.rate_floor_upps);
+                    ack_packets = 0;
+                }
+                let curve = connection_rate(tick * 1_000_000, cc.initial_rate_upps,
+                    cc.recovery_rtts * rtt, &cc, false).0.min(target);
+                let command = s.delivery_growth.limit(curve);
+                send_credit += command as f64 / 1_000_000_000.0;
+                let packets = send_credit as u64;
+                send_credit -= packets as f64;
+                pipe.push_back(packets);
+                if command == target { reached = Some(tick); break; }
+            }
+            let reached_ms = reached.expect("sparse sender must recover to the 7000 pps path");
+            assert_eq!(reached_ms, baseline_ms, "RTT {rtt}: fresh delivery must not slow a clean ramp");
+            println!("sparse/quiet/burst RTT={}ms: 7000 pps at {}ms, unbounded curve {}ms",
+                rtt / 1_000_000, reached_ms, baseline_ms);
+        }
+    }
+
+    #[test]
+    fn delivery_growth_outage_reset_discards_old_permission_and_recovers() {
+        let ConnectionState::Connected(mut s) = new_connection_state_connected(None, 0, 0, 0) else { unreachable!() };
+        s.delivery_growth.acknowledged(100_000_000, 1000, 50_000_000, 50_000_000, RATE_FLOOR_UPPS);
+        assert_eq!(s.delivery_growth.limit(MAX_CC_RATE_UPPS), 20_000_000_000);
+        s.outage.enter(1_000_000_000, 20_000_000_000);
+        let mut buf = SendQueues::new(1, (1000, 1 << 20, 1 << 24));
+        resume_outage(&mut s, &mut buf, &mut [], 61_000_000_000, None);
+        assert_eq!(s.delivery_growth.limit(MAX_CC_RATE_UPPS), crate::ship::CC.initial_rate_upps);
+        for tick in 1..=4 {
+            s.delivery_growth.acknowledged(61_000_000_000 + tick * 100_000_000, 500, 50_000_000, 50_000_000, RATE_FLOOR_UPPS);
+        }
+        assert_eq!(s.delivery_growth.limit(MAX_CC_RATE_UPPS), 10_000_000_000);
+    }
+
+    #[test]
+    fn delivery_growth_loss_discovery_uses_actual_not_hidden_curve() {
+        let mut s = hole_state();
+        s.stats.cc_rate_upps = 3_000_000_000;
+        assert_eq!(congestion_discovery_rate(&s, MAX_CC_RATE_UPPS, None), 3_000_000_000);
+        assert_eq!(congestion_discovery_rate(&s, MAX_CC_RATE_UPPS, Some(1000)), 1_000_000_000);
+        let before = s.stats.cc_rate_upps;
+        s.delivery_growth.acknowledged(200_000_000, 600, 100_000_000, 100_000_000, RATE_FLOOR_UPPS);
+        assert_eq!(s.delivery_growth.limit(before), before);
+        apply_loss_congestion(&mut s, 1_000_000_000, 1_200_000_000, &crate::ship::CC, None);
+        assert!(s.congestion_event_rate_upps <= before);
+        assert!(s.cc_startup_done);
+        let cut = connection_rate(0, s.congestion_event_rate_upps,
+            s.RTT_mean as u64 * 100_000 * crate::ship::CC.recovery_rtts, &crate::ship::CC, true).0;
+        assert!(s.delivery_growth.limit(cut) < before);
+    }
 
     fn hole_state() -> ConnectionStateConnected {
         let ConnectionState::Connected(mut s) = new_connection_state_connected(None, 0, 0, 0) else { unreachable!() };
@@ -5057,6 +5391,8 @@ mod congestion_tests {
         let cc = crate::ship::CC;
         s.congestion_event_time_ns = 0;
         s.congestion_event_rate_upps = 2_000_000_000;
+        // Prove enough delivery to inspect the unclipped curve first.
+        s.delivery_growth.ceiling_upps = MAX_CC_RATE_UPPS;
         let k = cc.recovery_rtts * s.RTT_mean as u64 * 100_000;
         for done in [false, true] {
             s.cc_startup_done = done;
@@ -5079,6 +5415,11 @@ mod congestion_tests {
         assert_eq!(idle.mode, 'A');
         assert_eq!(idle.slope_ppsps, 0.0);
         assert_eq!(idle.pps, connection_rate(k, s.congestion_event_rate_upps, k, &cc, true).0 as f64 / 1_000_000.0);
+        s.is_app_limited = false;
+        s.delivery_growth.ceiling_upps = 2_000_000_000;
+        let delivery_capped = cc_trace_context(&s, 4 * k, &cc, None);
+        assert_eq!(delivery_capped.pps, 2000.0);
+        assert_eq!(delivery_capped.slope_ppsps, 0.0);
     }
 
     #[test]
