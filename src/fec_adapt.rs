@@ -1,12 +1,13 @@
 //! Adaptive FEC redundancy: a per-connection packet-loss estimate and the per-message number of
 //! Wirehair blocks it implies.
 //!
-//! The sender feeds its own cumulative (packets_sent, packets_lost) counters into a
+//! The sender feeds cumulative finalized DATA outcomes (ACKed or declared lost) into a
 //! [`LossTracker`] once per network-thread tick. The tracker turns them into short-term loss
-//! samples (one per `bucket_ns`, and only once `min_packets` were sent in the bucket, so a sample
+//! samples (one per `bucket_ns`, and only once `min_packets` were finalized in the bucket, so a sample
 //! is never a handful of packets), and an estimator turns the samples into a loss estimate that
-//! latches up quickly and comes down slowly. Everything is O(1) per tick with small fixed memory
-//! (16 max-hold slots and the span-tail sketch) and no allocation.
+//! pools finalized counts over a bounded time window. Clean traffic dilutes old loss rather
+//! than holding one burst at its maximum. Everything is O(1) per tick with small fixed memory
+//! (16 count slots and the span-tail sketch) and no allocation.
 //!
 //! [`repair_blocks`] picks, for a message of K source blocks, the smallest N with
 //! P(fewer than K of N blocks arrive) <= eps under independent loss p.
@@ -61,7 +62,6 @@ pub(crate) struct AdaptiveFecConfig {
     pub slot_ns: u64,
     pub slots: usize,
     pub window_ns: u64,
-    pub loss_delay_ns: u64,
 }
 impl Default for AdaptiveFecConfig {
     fn default() -> Self { crate::ship::FEC }
@@ -69,8 +69,6 @@ impl Default for AdaptiveFecConfig {
 // Retainable messages have feedback rescue as a delivery backstop. Pre-sent parity
 // targets a 2% chance of needing that extra RTT, not packet-loss-scale reliability.
 const RESCUE_LATENCY_TAIL: f64 = 0.02;
-const LOSS_SIGNAL_SNAPSHOT_NS: u64 = 50_000_000;
-const LOSS_SIGNAL_RING: usize = 64;
 
 /// Upper-tail standard normal quantile: z with P(Z > z) = eps (Abramowitz-Stegun 26.2.23,
 /// |error| < 4.5e-4). eps is clamped to [1e-300, 0.5].
@@ -129,16 +127,16 @@ pub fn repair_blocks(k: u64, p: f64, z: f64, eps: f64, extra: u32, max_redundanc
     r.clamp(1, cap)
 }
 
-/// Accumulates sent/lost deltas into short-term loss samples.
+/// Accumulates finalized/lost DATA deltas into short-term loss samples.
 #[derive(Clone, Copy, Debug)]
-struct ShortTerm { start_ns: u64, sent: u64, lost: u64 }
+struct ShortTerm { start_ns: u64, finalized: u64, lost: u64 }
 
 /// Per-connection loss tracker: short-term buckets plus one estimator. Fixed size, no allocation.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct LossTracker {
     cfg: AdaptiveFecConfig,
     st: ShortTerm,
-    ring: [(u64, f32); 16],
+    ring: [(u64, u64, u64); 16],
     have_sample: bool,
     last_sample: f64,
     cached: f64,
@@ -148,30 +146,29 @@ pub(crate) struct LossTracker {
 
 impl LossTracker {
     pub fn new(cfg: AdaptiveFecConfig, now_ns: u64) -> Self {
-        LossTracker { cfg, st: ShortTerm { start_ns: now_ns, sent: 0, lost: 0 }, ring: [(u64::MAX, 0.0); 16], have_sample: false, last_sample: 0.0, cached: cfg.initial_loss, mean: cfg.initial_loss, last_refresh_ns: now_ns }
+        LossTracker { cfg, st: ShortTerm { start_ns: now_ns, finalized: 0, lost: 0 }, ring: [(u64::MAX, 0, 0); 16], have_sample: false, last_sample: 0.0, cached: cfg.initial_loss, mean: cfg.initial_loss, last_refresh_ns: now_ns }
     }
 
     /// Feed counter deltas since the previous call. O(1) (refresh is a fixed 16-slot loop at
     /// most once per `bucket_ns`).
-    pub fn on_tick(&mut self, now_ns: u64, sent_delta: u64, lost_delta: u64) {
-        self.st.sent += sent_delta;
+    pub fn on_tick(&mut self, now_ns: u64, finalized_delta: u64, lost_delta: u64) {
+        debug_assert!(lost_delta <= finalized_delta);
+        self.st.finalized += finalized_delta;
         self.st.lost += lost_delta;
         let elapsed = now_ns.saturating_sub(self.st.start_ns);
-        if elapsed >= self.cfg.bucket_ns && self.st.sent >= self.cfg.min_packets.max(1) {
-            let loss = (self.st.lost as f64 / self.st.sent as f64).min(1.0);
-            self.st = ShortTerm { start_ns: now_ns, sent: 0, lost: 0 };
-            self.on_sample(now_ns, loss);
-        } else if self.st.sent < self.cfg.min_packets && elapsed >= self.cfg.bucket_ns && self.st.lost * 4 >= self.cfg.min_packets.max(4) {
-            // A burst so large it is unambiguous even on a short sample: lost >= min_packets/4.
-            let loss = (self.st.lost as f64 / self.st.sent.max(1) as f64).min(1.0);
-            self.st = ShortTerm { start_ns: now_ns, sent: 0, lost: 0 };
-            self.on_sample(now_ns, loss);
+        if elapsed >= self.cfg.bucket_ns && (self.st.finalized >= self.cfg.min_packets.max(1)
+            || self.st.lost >= self.cfg.min_packets.max(4).div_ceil(4)) {
+            // Preserve prompt sampling of substantial loss even on sparse paths.
+            let sample = self.st;
+            self.st = ShortTerm { start_ns: now_ns, finalized: 0, lost: 0 };
+            self.on_sample(now_ns, sample.finalized, sample.lost);
         } else if now_ns.saturating_sub(self.last_refresh_ns) >= self.cfg.bucket_ns {
             self.refresh(now_ns);
         }
     }
 
-    fn on_sample(&mut self, now_ns: u64, loss: f64) {
+    fn on_sample(&mut self, now_ns: u64, finalized: u64, lost: u64) {
+        let loss = lost as f64 / finalized as f64;
         self.mean = if self.have_sample { self.mean * 0.875 + loss * 0.125 } else { loss };
         self.have_sample = true;
         self.last_sample = loss;
@@ -179,8 +176,9 @@ impl LossTracker {
         let n = cfg.slots.clamp(1, 16);
         let idx = now_ns / cfg.slot_ns.max(1);
         let s = &mut self.ring[(idx % n as u64) as usize];
-        if s.0 != idx { *s = (idx, 0.0); }
-        s.1 = s.1.max(loss as f32);
+        if s.0 != idx { *s = (idx, 0, 0); }
+        s.1 += finalized;
+        s.2 += lost;
         self.refresh(now_ns);
     }
 
@@ -190,7 +188,12 @@ impl LossTracker {
         let cfg = self.cfg;
         let n = cfg.slots.clamp(1, 16) as u64;
         let idx = now_ns / cfg.slot_ns.max(1);
-        self.cached = self.ring.iter().filter(|s| s.0 != u64::MAX && s.0 + n > idx).map(|s| s.1 as f64).fold(0.0, f64::max);
+        // Pool counts, not maxima of ratios: clean outcomes dilute a burst immediately.
+        // The existing time horizon still bounds memory and expires stale evidence.
+        let (finalized, lost) = self.ring.iter()
+            .filter(|s| s.0 != u64::MAX && s.0 + n > idx)
+            .fold((0u64, 0u64), |(f, l), s| (f + s.1, l + s.2));
+        self.cached = lost as f64 / finalized.max(1) as f64;
     }
 
     /// Current loss estimate (raw; before the `min_loss` floor). `initial_loss` until the first sample.
@@ -366,11 +369,8 @@ impl SpanLossProfile {
 pub(crate) struct FecAdaptiveState {
     pub tracker: LossTracker,
     pub policy: RepairPolicy,
-    last_sent: u64,
+    last_finalized: u64,
     last_lost: u64,
-    /// Net-of-spurious: (time, sent, declared lost) snapshots every LOSS_SIGNAL_SNAPSHOT_NS.
-    ring: [(u64, u64, u64); LOSS_SIGNAL_RING],
-    ring_head: usize,
     /// Floored loss estimate used for new messages.
     pub p: f64,
     /// Fixed size, independent of bandwidth and packet rate.
@@ -378,27 +378,19 @@ pub(crate) struct FecAdaptiveState {
 }
 
 impl FecAdaptiveState {
-    pub fn new(cfg: AdaptiveFecConfig, now_ns: u64, sent: u64, lost: u64) -> Self {
+    pub fn new(cfg: AdaptiveFecConfig, now_ns: u64) -> Self {
         let tracker = LossTracker::new(cfg, now_ns);
-        FecAdaptiveState { tracker, policy: RepairPolicy::selected(), last_sent: sent, last_lost: lost, ring: [(now_ns, sent, lost); LOSS_SIGNAL_RING], ring_head: 0, p: tracker.estimate().max(cfg.min_loss), span: Box::new(SpanLossProfile::default()) }
+        FecAdaptiveState { tracker, policy: RepairPolicy::selected(), last_finalized: 0, last_lost: 0, p: tracker.estimate().max(cfg.min_loss), span: Box::new(SpanLossProfile::default()) }
     }
-    /// Feed the connection's cumulative counters: packets sent, declared lost, and declarations
-    /// found spurious so far.
-    pub fn on_tick(&mut self, now_ns: u64, sent: u64, lost: u64, spurious: u64) {
-        if now_ns.saturating_sub(self.ring[self.ring_head].0) >= LOSS_SIGNAL_SNAPSHOT_NS {
-            self.ring_head = (self.ring_head + 1) % LOSS_SIGNAL_RING;
-            self.ring[self.ring_head] = (now_ns, sent, lost);
-        }
-        // Net of spurious declarations, delayed so late ACKs can cancel false losses.
-        let delay_ns = self.tracker.cfg.loss_delay_ns;
-        let back = ((delay_ns + LOSS_SIGNAL_SNAPSHOT_NS - 1) / LOSS_SIGNAL_SNAPSHOT_NS).min(LOSS_SIGNAL_RING as u64 - 1) as usize;
-        let (_, sent, lost) = self.ring[(self.ring_head + LOSS_SIGNAL_RING - back) % LOSS_SIGNAL_RING];
-        let lost = lost.saturating_sub(spurious);
-        // Monotone: a correction that arrives after its loss was consumed nets out of later losses.
-        let (ds, dl) = (sent.saturating_sub(self.last_sent), lost.saturating_sub(self.last_lost));
-        self.last_sent = self.last_sent.max(sent);
-        self.last_lost = self.last_lost.max(lost);
-        self.tracker.on_tick(now_ns, ds, dl);
+    /// Both counters describe the same DATA outcomes, attributed at ordered retirement.
+    /// Like the span sketch, declarations remain conservative if later ACKed: subtracting
+    /// global spurious counters could credit unrelated DATA losses or include control packets.
+    pub fn on_tick(&mut self, now_ns: u64) {
+        let finalized = self.span.seen;
+        let lost = self.span.lost_total;
+        self.tracker.on_tick(now_ns, finalized - self.last_finalized, lost - self.last_lost);
+        self.last_finalized = finalized;
+        self.last_lost = lost;
         self.p = if self.policy == RepairPolicy::Reliability { self.tracker.estimate().max(self.tracker.cfg.min_loss) }
             else { self.tracker.mean };
     }
@@ -501,12 +493,12 @@ mod tests {
     fn mean_policy_is_a_mean_not_a_max_hold_or_tail() {
         let cfg = AdaptiveFecConfig { min_packets: 100, ..Default::default() };
         let mut t = LossTracker::new(cfg, 0);
-        t.on_sample(1, 0.02);
-        t.on_sample(2, 0.10);
+        t.on_sample(1, 100, 2);
+        t.on_sample(2, 100, 10);
         assert!((t.mean - 0.03).abs() < 1e-9);
-        t.on_sample(3, 0.02);
+        t.on_sample(3, 100, 2);
         assert!(t.mean < 0.03);
-        assert!(t.estimate() > 0.09);
+        assert!((t.estimate() - 14.0 / 300.0).abs() < 1e-9);
         assert_eq!(mean_repairs(1000, 0.02), 23);
         for k in [0, 1, 2, 12, 1000, u32::MAX as u64] {
             assert!(mean_repairs(k, 0.9) <= k);
@@ -548,43 +540,95 @@ mod tests {
         assert_eq!(repair_blocks(2, 0.5, z, 1e-6, 1, 1.0), 2); // capped at 100%
     }
 
-    fn feed(t: &mut LossTracker, from_s: f64, to_s: f64, loss: f64, pps: u64) {
-        // Ticks every 100 ms on exact integer times.
-        for i in (from_s * 10.0).round() as u64..(to_s * 10.0).round() as u64 {
-            let lost = (pps as f64 * 0.1 * loss).round() as u64;
-            t.on_tick((i + 1) * 100_000_000, pps / 10, lost);
-        }
-    }
-
     #[test]
-    fn v1_latches_and_steps_down() {
-        let cfg = AdaptiveFecConfig { slot_ns: 1_000_000_000, slots: 10, min_packets: 100, ..Default::default() };
+    fn finalized_loss_burst_dilutes_instead_of_ten_minute_max_hold() {
+        let cfg = AdaptiveFecConfig::default();
         let mut t = LossTracker::new(cfg, 0);
-        feed(&mut t, 0.0, 5.0, 0.01, 1000);
-        assert!((t.estimate() - 0.01).abs() < 1e-3);
-        feed(&mut t, 5.0, 6.0, 0.05, 1000); // spike
-        assert!((t.estimate() - 0.05).abs() < 2e-3, "spike: {} {}", t.estimate(), t.last_sample());
-        feed(&mut t, 6.0, 15.5, 0.0, 1000);
-        assert!((t.estimate() - 0.05).abs() < 2e-3, "held: {}", t.estimate());
-        feed(&mut t, 15.5, 17.5, 0.0, 1000);
-        assert!(t.estimate() < 0.011, "expired to next level: {}", t.estimate());
+        // Reference reproduces the previous max-over-slots algorithm, but receives
+        // correctly matched cohorts too, isolating retention from the population bug.
+        let mut old = [(u64::MAX, 0.0f64); 16];
+        let mut old_recovery = None;
+        let mut new_recovery = None;
+        let mut mean_recovery = None;
+        for second in 1..=600u64 {
+            let lost = if second == 1 { 500 } else { 0 };
+            let now = second * 1_000_000_000;
+            t.on_tick(now, 1000, lost);
+            let idx = now / cfg.slot_ns;
+            let s = &mut old[idx as usize % cfg.slots];
+            if s.0 != idx { *s = (idx, 0.0); }
+            s.1 = s.1.max(lost as f64 / 1000.0);
+            let max_hold = old.iter().filter(|s| s.0 != u64::MAX && s.0 + cfg.slots as u64 > idx)
+                .map(|s| s.1).fold(0.0, f64::max);
+            if max_hold <= 0.01 && old_recovery.is_none() { old_recovery = Some(second - 1); }
+            if t.estimate() <= 0.01 && new_recovery.is_none() { new_recovery = Some(second - 1); }
+            if t.mean <= 0.01 && mean_recovery.is_none() { mean_recovery = Some(second - 1); }
+            if second < 600 {
+                assert!((max_hold - 0.5).abs() < 1e-9);
+                assert!((t.estimate() - 0.5 / second as f64).abs() < 1e-9);
+            }
+        }
+        assert_eq!(old_recovery, Some(599));
+        assert_eq!(new_recovery, Some(49));
+        assert_eq!(mean_recovery, Some(30));
+        assert_eq!(t.estimate(), 0.0);
+        println!("50% loss for 1s then clean 1000 finalized DATA/s: p>1% duration after burst old_max=599s pooled=49s research_EWMA=30s; old stays 50% until expiry, pooled halves after 1s");
     }
 
     #[test]
-    fn net_of_spurious_cancels_late_acked_declarations() {
-        // 1% declared loss at 10k pps for 30 s, all of it found spurious ~200 ms later.
-        let base = AdaptiveFecConfig { slot_ns: 1_000_000_000, slots: 10, min_packets: 100, ..Default::default() };
-        let mut a = FecAdaptiveState::new(base, 0, 0, 0);
-        for i in 1..=3000u64 {
-            let t = i * 10_000_000;
-            a.on_tick(t, i * 100, i, i.saturating_sub(20));
+    fn finalized_loss_weights_packets_and_expires_without_new_traffic() {
+        let cfg = AdaptiveFecConfig::default();
+        let mut t = LossTracker::new(cfg, 0);
+        t.on_tick(1_000_000_000, 1000, 500);
+        t.on_tick(2_000_000_000, 10000, 0);
+        assert!((t.estimate() - 500.0 / 11000.0).abs() < 1e-9);
+        t.on_tick(600_000_000_000, 0, 0);
+        assert_eq!(t.estimate(), 0.0);
+        // A real all-lost small cohort remains bounded and is diluted by clean finalizations.
+        let mut t = LossTracker::new(cfg, 0);
+        t.on_tick(1_000_000_000, 125, 125);
+        assert_eq!(t.estimate(), 1.0);
+        t.on_tick(2_000_000_000, 500, 0);
+        assert_eq!(t.estimate(), 0.2);
+    }
+
+    #[test]
+    fn finalized_loss_delayed_burst_uses_one_data_population() {
+        for policy in [RepairPolicy::Reliability, RepairPolicy::Streaming] {
+            let mut a = FecAdaptiveState::new(Default::default(), 0);
+            a.policy = policy;
+            // Send 1000 DATA plus interleaved controls, then stop sending. No outcomes yet.
+            for seq in 0..1000 { a.on_data_sent(2 * seq); }
+            a.on_tick(1_000_000_000);
+            assert_eq!(a.tracker.estimate(), crate::ship::FEC.initial_loss);
+            // One delayed retirement batch: 20% lost, despite zero new sends this tick.
+            // The old lost/sent drought branch would sample min(200/1, 1) = 100%.
+            for seq in 0..1000 {
+                a.on_sequence_finalized(2 * seq, seq < 200, 2_000_000_000);
+                a.on_sequence_finalized(2 * seq + 1, true, 2_000_000_000);
+                // Duplicate retirement / late ACK cannot add a second outcome or credit another loss.
+                a.on_sequence_finalized(2 * seq, false, 2_100_000_000);
+            }
+            a.on_tick(3_000_000_000);
+            assert_eq!(a.span.seen, 1000);
+            assert_eq!(a.span.lost_total, 200);
+            assert!((a.tracker.last_sample() - 0.2).abs() < 1e-9);
+            assert!((a.p - 0.2).abs() < 1e-7, "{}", a.p);
         }
-        let net = a.tracker.estimate();
-        assert!(net < 0.001, "{net}");
-        // Genuine loss (never acked) still gets through, just 1 s later.
-        let mut a = FecAdaptiveState::new(base, 0, 0, 0);
-        for i in 1..=3000u64 { a.on_tick(i * 10_000_000, i * 100, i, 0); }
-        assert!(a.tracker.estimate() > 0.009, "{}", a.tracker.estimate());
+    }
+
+    #[test]
+    fn finalized_loss_steady_one_percent() {
+        let mut a = FecAdaptiveState::new(Default::default(), 0);
+        for second in 1..=120 {
+            for i in 0..1000 {
+                let seq = (second - 1) * 1000 + i;
+                a.on_data_sent(seq);
+                a.on_sequence_finalized(seq, i % 100 == 0, second * 1_000_000_000);
+            }
+            a.on_tick(second * 1_000_000_000);
+            assert!((a.p - 0.01).abs() < 1e-7, "second={second} p={}", a.p);
+        }
     }
 
     #[test]
@@ -653,7 +697,7 @@ mod tests {
 
     #[test]
     fn rescue_latency_budget_ignores_rare_loss_blips() {
-        let mut a = FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0);
+        let mut a = FecAdaptiveState::new(crate::ship::FEC, 0);
         // Six isolated losses in 100,000 packets must not set a reliability-scale tail.
         for base in (0..100000).step_by(20) {
             for seq in base..base+20 { a.on_data_sent(seq); }
@@ -671,7 +715,7 @@ mod tests {
 
     #[test]
     fn interior_margin_keeps_loss_risk_without_absolute_burst_floor() {
-        let mut a = FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0);
+        let mut a = FecAdaptiveState::new(crate::ship::FEC, 0);
         for seq in 0..10000 {
             a.on_data_sent(seq);
             a.on_sequence_finalized(seq, false, seq * 1000);
@@ -703,7 +747,7 @@ mod tests {
     #[test]
     fn span_closed_loop_counts_pending_and_budgets_only_tail() {
         let cfg = AdaptiveFecConfig { eps: 0.5, ..Default::default() };
-        let mut a = FecAdaptiveState::new(cfg, 0, 0, 0);
+        let mut a = FecAdaptiveState::new(cfg, 0);
         for seq in 0..10000 {
             a.on_data_sent(seq * 2);
             a.on_sequence_finalized(seq * 2, seq % 10000 == 3, seq * 1000);
@@ -723,7 +767,7 @@ mod tests {
         assert_eq!(a.extra_repair_blocks_needed_now(k, k, 0, k*2), k);
         let initial = a.repair_blocks(k);
         assert!(initial < 30, "tail initial {initial}");
-        let limited = FecAdaptiveState::new(AdaptiveFecConfig { max_redundancy: 0.01, ..cfg }, 0, 0, 0);
+        let limited = FecAdaptiveState::new(AdaptiveFecConfig { max_redundancy: 0.01, ..cfg }, 0);
         assert_eq!(limited.repair_blocks(740), 8);
         assert_eq!(limited.extra_repair_blocks_needed_now(740, 740, 0, 80), 8);
     }
@@ -755,7 +799,7 @@ mod tests {
         for i in 0..100000 { std::hint::black_box(s.repair_blocks(2 + i % 63000, &cfg, 3.09)); }
         println!("repair_query_ns={:.2}", now.elapsed().as_nanos() as f64 / 100000.0);
         let cfg = AdaptiveFecConfig { eps: 0.5, ..Default::default() };
-        let mut a = FecAdaptiveState::new(cfg, 0, 0, 0);
+        let mut a = FecAdaptiveState::new(cfg, 0);
         for i in n..n+1000 { s.on_data_sent(i); }
         a.span = Box::new(s);
         let now = std::time::Instant::now();
