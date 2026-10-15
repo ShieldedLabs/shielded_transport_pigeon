@@ -9,8 +9,10 @@ impl ReceiveMemoryBudget {
     }
     /// A peer cannot occupy more than its share, even across workers and completed
     /// application-queue entries. Every child charge also belongs to the process.
+    /// Half the default 4 GiB process budget fits the public 1 GiB message limit,
+    /// including geometric prefix capacity, sparse parts and bounded FEC workers.
     pub(crate) fn connection_share(parent: &Arc<Self>) -> Arc<Self> {
-        Arc::new(Self { limit: parent.limit / 4, used: AtomicUsize::new(0),
+        Arc::new(Self { limit: parent.limit / 2, used: AtomicUsize::new(0),
             peak: AtomicUsize::new(0), parent: Some(parent.clone()) })
     }
     pub fn limit(&self) -> usize { self.limit }
@@ -64,7 +66,7 @@ mod tests {
     }
     #[test]
     fn peer_share_charges_parent_and_rolls_back_refused_growth() {
-        let process = ReceiveMemoryBudget::new(400);
+        let process = ReceiveMemoryBudget::new(200);
         let peer = ReceiveMemoryBudget::connection_share(&process);
         let mut r = peer.reserve(80).unwrap();
         assert_eq!(process.used(), 80);
@@ -74,7 +76,7 @@ mod tests {
         r.shrink(20); assert_eq!(process.used(), 20);
         assert!(r.grow(100)); assert_eq!(process.used(), 100);
         drop(r); assert_eq!(peer.used(), 0); assert_eq!(process.used(), 0);
-        let global = process.reserve(350).unwrap();
+        let global = process.reserve(150).unwrap();
         assert!(peer.reserve(51).is_none()); assert_eq!(peer.used(), 0);
         drop(global);
     }

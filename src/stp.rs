@@ -2282,7 +2282,7 @@ impl ReassemblySlot {
     /// Message bytes received so far.
     pub fn bytes_received(&self) -> u64 {
         self.segment_parts.as_ref().map_or_else(|| self.received.iter().map(|&(s, e)| (e - s) as u64).sum(),
-            |parts| parts.iter().map(|(_, bytes)| bytes.len() as u64).sum())
+            |parts| self.buf.len() as u64 + parts.iter().map(|(_, bytes)| bytes.len() as u64).sum::<u64>())
     }
 
     pub fn new_ring(size: usize) -> Vec<ReassemblySlot> {
@@ -2323,7 +2323,7 @@ impl ReassemblySlot {
         self.package_id = segment.root;
         if self.completed { return true; }
         if self.total_len.is_some_and(|n| n != segment.total) ||
-            (!self.buf.is_empty() || !self.received.is_empty()) { return false; }
+            (!self.buf.is_empty() && self.segment_parts.is_none()) || !self.received.is_empty() { return false; }
         if self.reservation.is_none() {
             let groups = (segment.total as usize).div_ceil(FEC_SEGMENT_BYTES);
             let Some(r) = budget.reserve(256 + groups * 64) else { return false; };
@@ -2340,26 +2340,42 @@ impl ReassemblySlot {
         if self.package_id != segment.root || self.completed || self.total_len != Some(segment.total) ||
             !segment.valid(message.len()) { return None; }
         let parts = self.segment_parts.as_mut()?;
-        let groups = (segment.total as usize).div_ceil(FEC_SEGMENT_BYTES);
-        let metadata = 256 + groups * 64;
+        let total = segment.total as usize;
+        let metadata = 256 + total.div_ceil(FEC_SEGMENT_BYTES) * 64;
         let reservation = self.reservation.as_mut()?;
         let mut bytes: usize = parts.iter().map(|(_, bytes)| bytes.capacity()).sum();
-        if !parts.iter().any(|(offset, _)| *offset == segment.offset) {
-            if !reservation.grow(metadata + bytes + message.len()) { return None; }
+        if segment.offset as usize >= self.buf.len() && !parts.iter().any(|(offset, _)| *offset == segment.offset) {
+            if !reservation.grow(metadata + self.buf.capacity() + bytes + message.len()) { return None; }
             parts.push((segment.offset, message.to_vec()));
             bytes += message.len();
         }
-        if parts.len() != groups { return None; }
-        parts.sort_unstable_by_key(|(offset, _)| *offset);
-        // Concatenation's temporary second allocation is admitted too; no sparse
-        // high-water allocation from an unmaterialised claimed total or offset.
-        let total = segment.total as usize;
-        let first_cap = parts[0].1.capacity();
-        if !reservation.grow(metadata + bytes + total - first_cap) { return None; }
-        let mut parts = self.segment_parts.take().unwrap().into_iter();
-        let mut message = parts.next().unwrap().1;
-        message.reserve_exact(total - message.len());
-        for (_, part) in parts { message.extend_from_slice(&part); }
+        // Only a contiguous completed prefix grows the destination. A high-offset
+        // segment remains sparse; neither a header nor one decoded group can pin
+        // the claimed total. Geometric growth avoids quadratic realloc/copy work.
+        // At a growth step, capacity <= min(2 * old_prefix, total), and remaining
+        // sparse bytes <= total - old_prefix: peak <= 1.5 * total + one segment
+        // plus metadata. Do not concatenate into a second full-message buffer.
+        while let Some(index) = parts.iter().position(|(offset, _)| *offset as usize == self.buf.len()) {
+            if self.buf.is_empty() {
+                let (_, part) = parts.swap_remove(index);
+                bytes -= part.capacity();
+                self.buf = part;
+            } else {
+                let end = self.buf.len() + parts[index].1.len();
+                let capacity = if end > self.buf.capacity() {
+                    (self.buf.capacity() * 2).max(end).min(total)
+                } else { self.buf.capacity() };
+                if !reservation.grow(metadata + capacity + bytes) { return None; }
+                self.buf.reserve_exact(capacity - self.buf.len());
+                let (_, part) = parts.swap_remove(index);
+                self.buf.extend_from_slice(&part);
+                bytes -= part.capacity();
+            }
+            reservation.shrink(metadata + self.buf.capacity() + bytes);
+        }
+        if self.buf.len() != total { return None; }
+        self.segment_parts = None;
+        let message = std::mem::take(&mut self.buf);
         let mut reservation = self.reservation.take().unwrap();
         reservation.shrink(message.capacity() + 256);
         self.completed = true;
@@ -7006,6 +7022,45 @@ mod lazy_fec_segment_tests {
     }
 
     #[test]
+    fn giant_segment_reassembly_does_not_need_a_second_message_buffer() {
+        // Keep the test small, but below the old concatenation peak of 2 * total.
+        // Reverse order exercises sparse high offsets and every prefix growth step.
+        let total = 32 << 20;
+        let budget = crate::receive_memory::ReceiveMemoryBudget::new(52 << 20);
+        let layout = crate::fec::MessageLayout::new(FEC_SEGMENT_BYTES, 1000).unwrap();
+        let mut root = ReassemblySlot::new();
+        let mut delivered = None;
+        for group in (0..total / FEC_SEGMENT_BYTES).rev() {
+            let segment = FecSegment { root: 13, total: total as u32,
+                offset: (group * FEC_SEGMENT_BYTES) as u32 };
+            assert!(root.admit_segment(segment, layout, 0, 1000, 1, &budget));
+            delivered = root.finish_segment(segment, &vec![group as u8; FEC_SEGMENT_BYTES]);
+            if group != 0 {
+                assert!(delivered.is_none());
+                assert_eq!(root.buf.capacity(), 0); // no sparse high-water allocation
+            }
+        }
+        let (message, reservation) = delivered.expect("all segments must fit without 2x concatenation");
+        assert_eq!(message.len(), total);
+        for (group, part) in message.chunks(FEC_SEGMENT_BYTES).enumerate() {
+            assert!(part.iter().all(|&byte| byte == group as u8));
+        }
+        assert!(budget.peak() < 2 * total);
+        drop(message); drop(reservation); assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn default_peer_budget_fits_maximum_message_and_decoder_margin() {
+        let process = Arc::new(crate::receive_memory::ReceiveMemoryBudget::default());
+        let peer = crate::receive_memory::ReceiveMemoryBudget::connection_share(&process);
+        // Out-of-order assembly can hold up to 1.5x the payload in capacities.
+        let charge = MAX_JUMBOGRAM_LEN + MAX_JUMBOGRAM_LEN / 2 + (64 << 20);
+        let reservation = peer.reserve(charge).expect("default peer share must fit the public message limit");
+        assert_eq!(process.used(), charge);
+        drop(reservation); assert_eq!(process.used(), 0);
+    }
+
+    #[test]
     fn segment_root_admission_is_before_ack_and_survives_out_of_order_completion() {
         let budget=crate::receive_memory::ReceiveMemoryBudget::new(8<<20);
         let refused=crate::receive_memory::ReceiveMemoryBudget::new(256);
@@ -7160,7 +7215,7 @@ mod lazy_fec_segment_tests {
         assert_eq!(budget.used(), 0);
         let smaller_process = crate::receive_memory::ReceiveMemoryBudget::new(512 << 20);
         let share = crate::receive_memory::ReceiveMemoryBudget::connection_share(&smaller_process);
-        let over_share = FecSegment { total: 256 << 20, ..segment };
+        let over_share = FecSegment { total: 384 << 20, ..segment };
         assert!(over_share.valid(layout.len)); // valid wire length, outside peer share
         assert!(!ReassemblySlot::new().admit_segment(over_share, layout, 0, 1000, 1, &share));
         assert_eq!(smaller_process.used(), 0);
