@@ -227,6 +227,12 @@ pub fn update_ce_count(previous: &mut u64, incoming: u64) -> bool {
     true
 }
 
+/// A peer cannot have admitted more unique CE packets than we sent. Reject an
+/// impossible count before touching the baseline; delayed lower counts are inert.
+pub fn update_ce_count_bounded(previous: &mut u64, incoming: u64, sent: u64) -> bool {
+    incoming <= sent && update_ce_count(previous, incoming)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,4 +455,18 @@ mod tests {
             assert!(ACK_PAYLOAD_LEN + overhead < ASSUMED_UDP_PAYLOAD_SIZE_WITH_GUARANTEED_DELIVERY);
         }
     }
+    #[test]
+    fn impossible_ce_counts_never_poison_the_baseline() {
+        let mut ce = 3;
+        for bad in [2, 3, 11, u64::MAX] {
+            assert!(!update_ce_count_bounded(&mut ce, bad, 10));
+            assert_eq!(ce, 3);
+        }
+        assert!(update_ce_count_bounded(&mut ce, 5, 10));
+        assert_eq!(ce, 5);
+        assert!(!update_ce_count_bounded(&mut ce, 4, 12));
+        assert!(update_ce_count_bounded(&mut ce, 12, 12));
+        assert_eq!(ce, 12);
+    }
+
 }

@@ -263,8 +263,8 @@ pub const fn total_packet_payload_overhead_from_connect_magic1_inside_udp_payloa
 
 /// Prefix (2), full nonce (8), explicit directional key epoch (4).
 pub const CONNECTED_HEADER_SIZE: usize = 14;
-const REKEY_PACKETS: u64 = 1 << 24;
-const REKEY_BYTES: u64 = 1 << 40;
+const REKEY_PACKETS: u64 = 1 << 48;
+const REKEY_BYTES: u64 = 1 << 60;
 const REKEY_AGE_NS: u64 = 600_000_000_000;
 const PREVIOUS_KEY_NS: u64 = 10_000_000_000;
 
@@ -533,9 +533,24 @@ impl Drop for PackageLease {
 /// Full-ID lookup into bounded storage, never `id % capacity`. On pressure the
 /// oldest identity is retired permanently; late packets are erased, not aliased.
 #[derive(Debug, Default)]
-struct ReceiveIndex { slots: std::collections::BTreeMap<u64, usize>, floor: u64 }
+struct ReceiveIndex { slots: std::collections::BTreeMap<u64, usize>, floor: u64, roles: Vec<Option<ReceiveRole>> }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReceiveRole {
+    Plain,
+    Root { total: u32 },
+    Fec { message_len: usize, block_bytes: usize, segment: Option<FecSegment> },
+}
 impl ReceiveIndex {
     fn get(&self, id: u64) -> Option<usize> { self.slots.get(&id).copied() }
+    // Identity metadata survives decoder/assembly retirement, until the ID itself
+    // is permanently retired. Both tables share this one immutable role binding.
+    fn claim(&mut self, id: u64, role: ReceiveRole) -> bool {
+        let Some(index) = self.get(id) else { return false; };
+        match self.roles[index] {
+            Some(old) => old == role,
+            None => { self.roles[index] = Some(role); true }
+        }
+    }
     fn admit(&mut self, id: u64, plain: &mut [ReassemblySlot], fec: &mut [FecRecvSlot]) -> Option<usize> {
         if id < self.floor || id == u64::MAX { return None; }
         if let Some(index) = self.get(id) { return Some(index); }
@@ -549,6 +564,8 @@ impl ReceiveIndex {
                 fec[index] = FecRecvSlot::default();
                 index
             };
+        if self.roles.len() <= index { self.roles.push(None); }
+        self.roles[index] = None;
         self.slots.insert(id, index);
         Some(index)
     }
@@ -1764,7 +1781,7 @@ impl ConnectionTrackingData {
 
 #[derive(Debug, Clone)]
 pub struct ConnectionCipherTriplet {
-    pub old: snow::StatelessTransportState,
+    pub old: Option<snow::StatelessTransportState>,
     pub current: snow::StatelessTransportState,
     pub new: snow::StatelessTransportState,
     outgoing_epoch: u32,
@@ -1772,72 +1789,109 @@ pub struct ConnectionCipherTriplet {
     outgoing_packets: u64,
     outgoing_bytes: u64,
     outgoing_started_ns: Option<u64>,
+    outgoing_confirmed: bool,
+    outgoing_first_data_nonce: Option<u64>,
     previous_until_ns: u64,
 }
 impl ConnectionCipherTriplet {
-    pub fn new_from_old_init_only(mut old: snow::StatelessTransportState) -> Self {
-        old.rekey_outgoing();
-        let mut current = old.clone();
+    pub fn new_from_old_init_only(mut current: snow::StatelessTransportState) -> Self {
+        current.rekey_outgoing();
         current.rekey_incoming();
         let mut new = current.clone();
         new.rekey_incoming();
-        Self { old, current, new, outgoing_epoch: 0, incoming_epoch: 0,
+        Self { old: None, current, new, outgoing_epoch: 0, incoming_epoch: 0,
             outgoing_packets: 0, outgoing_bytes: 0, outgoing_started_ns: None,
-            previous_until_ns: 0 }
+            outgoing_confirmed: true, outgoing_first_data_nonce: None, previous_until_ns: 0 }
     }
-    pub fn ratchet_forward_incoming(&mut self) {
-        self.old.rekey_incoming();
-        self.current.rekey_incoming();
+    fn erase_old(&mut self) {
+        if let Some(mut old) = self.old.take() {
+            // Snow's manual rekey overwrites both stored ChaChaPoly key arrays.
+            old.rekey_manually(Some(&[0; 32]), Some(&[0; 32]));
+        }
+    }
+    fn expire_previous(&mut self, now: u64) {
+        if now > self.previous_until_ns { self.erase_old(); }
+    }
+    pub fn ratchet_forward_incoming(&mut self) -> bool {
+        let Some(epoch) = self.incoming_epoch.checked_add(1) else { return false; };
+        self.erase_old();
+        self.old = Some(self.current.clone());
+        self.current = self.new.clone();
         self.new.rekey_incoming();
-        self.incoming_epoch = self.incoming_epoch.checked_add(1).expect("key epoch exhausted");
+        self.incoming_epoch = epoch;
+        true
     }
-    pub fn advance_outgoing(&mut self) {
-        self.old.rekey_outgoing();
+    pub fn advance_outgoing(&mut self) -> bool {
+        let Some(epoch) = self.outgoing_epoch.checked_add(1) else { return false; };
+        if !self.outgoing_confirmed { return false; }
+        if let Some(old) = &mut self.old { old.rekey_outgoing(); }
         self.current.rekey_outgoing();
         self.new.rekey_outgoing();
-        self.outgoing_epoch = self.outgoing_epoch.checked_add(1).expect("key epoch exhausted");
+        self.outgoing_epoch = epoch;
         self.outgoing_packets = 0;
         self.outgoing_bytes = 0;
         self.outgoing_started_ns = None;
+        self.outgoing_confirmed = false;
+        self.outgoing_first_data_nonce = None;
+        true
     }
-    fn prepare_outgoing(&mut self, now: u64, bytes: usize) -> u32 {
-        if self.outgoing_packets >= REKEY_PACKETS || self.outgoing_bytes.saturating_add(bytes as u64) > REKEY_BYTES ||
-            self.outgoing_started_ns.is_some_and(|t| now.saturating_sub(t) >= REKEY_AGE_NS) {
-            self.advance_outgoing();
+    fn confirm_outgoing(&mut self, highest_receipt: u64) {
+        if self.outgoing_first_data_nonce.is_some_and(|first| highest_receipt >= first) {
+            self.outgoing_confirmed = true;
+        }
+    }
+    fn prepare_outgoing(&mut self, now: u64, bytes: usize, nonce: u64) -> Option<u32> {
+        let safety_limit = self.outgoing_packets >= REKEY_PACKETS ||
+            self.outgoing_bytes.saturating_add(bytes as u64) > REKEY_BYTES;
+        let aged = self.outgoing_started_ns.is_some_and(|t| now.saturating_sub(t) >= REKEY_AGE_NS);
+        // Confirmation loss delays an age-only update, never kills a healthy
+        // idle/ACK-only connection. A hard safety budget instead closes cleanly.
+        if safety_limit || (aged && self.outgoing_confirmed) {
+            if !self.advance_outgoing() { return None; }
         }
         self.outgoing_started_ns.get_or_insert(now);
         self.outgoing_packets += 1;
         self.outgoing_bytes += bytes as u64;
-        self.outgoing_epoch
+        if !crate::sequence::is_ack_space(nonce) { self.outgoing_first_data_nonce.get_or_insert(nonce); }
+        Some(self.outgoing_epoch)
     }
     fn open(&mut self, nonce: u64, epoch: u32, header: &[u8], ciphertext: &[u8], out: &mut [u8], now: u64) -> Result<usize, snow::Error> {
+        self.expire_previous(now);
         if epoch == self.incoming_epoch {
             self.current.read_message_with_additional_data(nonce, header, ciphertext, out)
         } else if self.incoming_epoch.checked_sub(1) == Some(epoch) && now <= self.previous_until_ns {
-            self.old.read_message_with_additional_data(nonce, header, ciphertext, out)
+            self.old.as_ref().ok_or(snow::Error::Decrypt)?.read_message_with_additional_data(nonce, header, ciphertext, out)
         } else if self.incoming_epoch.checked_add(1) == Some(epoch) {
-            // Untrusted epochs never trigger unbounded key derivation or change state.
+            // Exactly one derivation after one successful AEAD, regardless of header.
             let n = self.new.read_message_with_additional_data(nonce, header, ciphertext, out)?;
-            self.ratchet_forward_incoming();
+            if !self.ratchet_forward_incoming() { return Err(snow::Error::Decrypt); }
             self.previous_until_ns = now.saturating_add(PREVIOUS_KEY_NS);
             Ok(n)
         } else { Err(snow::Error::Decrypt) }
     }
 }
+impl Drop for ConnectionCipherTriplet {
+    fn drop(&mut self) {
+        self.erase_old();
+        self.current.rekey_manually(Some(&[0; 32]), Some(&[0; 32]));
+        self.new.rekey_manually(Some(&[0; 32]), Some(&[0; 32]));
+    }
+}
 
 /// Encrypt once, then retain the exact result across local WouldBlock retries.
+/// None closes the connection before exhaustion or a hard unconfirmed budget.
 fn seal_connected_packet(cipher: &mut Option<ConnectionCipherTriplet>, prefix: u16,
-    nonce: u64, payload: &[u8], out: &mut [u8], now: u64) -> usize {
-    assert_ne!(nonce, u64::MAX, "Noise reserved nonce exhausted");
-    let epoch = cipher.as_mut().map_or(0, |c| c.prepare_outgoing(now, payload.len() + 16));
+    nonce: u64, payload: &[u8], out: &mut [u8], now: u64) -> Option<usize> {
+    if nonce == u64::MAX || nonce == crate::sequence::ACK_SPACE - 1 { return None; }
+    let epoch = if let Some(c) = cipher { c.prepare_outgoing(now, payload.len() + 16, nonce)? } else { 0 };
     store_u16(&mut out[..2], prefix);
     store_u64(&mut out[2..10], nonce);
     store_u32(&mut out[10..14], epoch);
     let (header, body) = out.split_at_mut(CONNECTED_HEADER_SIZE);
     let n = if let Some(c) = cipher {
-        c.current.write_message_with_additional_data(nonce, header, payload, body).unwrap()
-    } else { body[..payload.len()].copy_from_slice(payload); payload.len() };
-    CONNECTED_HEADER_SIZE + n
+        c.current.write_message_with_additional_data(nonce, header, payload, body).ok()?
+    } else { body.get_mut(..payload.len())?.copy_from_slice(payload); payload.len() };
+    Some(CONNECTED_HEADER_SIZE + n)
 }
 
 #[derive(Debug)]
@@ -1935,6 +1989,8 @@ pub struct ConnectionStateConnected {
     pub packets_waiting_ack_tail: u64,
     
     pub current_tu: u64,
+    // Effective TU cannot change while an immutable current-TU datagram retries.
+    deferred_tu: Option<u64>,
     pub last_sent_tu_probe_time_ns: u64,
     pub tu_probe_sequence_number: u64,
     pub tu_probe_size: u64,
@@ -2000,6 +2056,7 @@ pub fn new_connection_state_connected(cipher: Option<ConnectionCipherTriplet>, m
         packets_waiting_ack_tail: 0,
         
         current_tu: ASSUMED_UDP_PAYLOAD_SIZE_WITH_GUARANTEED_DELIVERY as u64,
+        deferred_tu: None,
         last_sent_tu_probe_time_ns: 0,
         tu_probe_sequence_number: u64::MAX,
         tu_probe_size: 0,
@@ -2272,12 +2329,29 @@ pub fn get_send_time_for_sequence_number(sequence_number: u64, send_time_band: &
 }
 
 impl ConnectionStateConnected {
+    fn send_exhausted(&self, buf: &SendQueues) -> bool {
+        self.send_sequence_number >= crate::sequence::ACK_SPACE - 1 || self.send_ack_sequence_number == u64::MAX ||
+            buf.queues.first().and_then(|q| q.package_allocator.as_ref())
+                .is_some_and(|ids| ids.load(std::sync::atomic::Ordering::Relaxed) == u64::MAX)
+    }
+    fn reserve_ack_nonce(&mut self) -> Option<u64> {
+        let nonce = self.send_ack_sequence_number;
+        if nonce == u64::MAX { return None; }
+        self.send_ack_sequence_number = nonce.checked_add(1)?;
+        Some(nonce)
+    }
+    fn promote_tu(&mut self, tu: u64) {
+        if self.pending_send.as_ref().is_some_and(|p| matches!(p.kind,
+            PendingSendKind::Data | PendingSendKind::Keepalive | PendingSendKind::Outage)) {
+            self.deferred_tu = Some(tu);
+        } else { self.current_tu = tu; }
+    }
     fn send_time(&self, sequence: u64) -> u64 {
         get_send_time_for_sequence_number(sequence, &self.send_time_band, self.send_time_band_head_index)
     }
     fn account_send(&mut self, actual_ns: u64) {
         self.outage.pending_since_ns.get_or_insert(actual_ns);
-        assert!(self.send_sequence_number < crate::sequence::ACK_SPACE - 1, "data nonce space exhausted");
+        if self.send_sequence_number >= crate::sequence::ACK_SPACE - 1 { return; }
         increment_sequence_number_and_account(actual_ns, &mut self.send_sequence_number,
             &mut self.send_time_band, &mut self.send_time_band_head_index, &mut self.packets_waiting_ack_field);
     }
@@ -2684,7 +2758,7 @@ impl ReassemblySlot {
 }
 
 /// Receiver state of one FEC-coded package, kept in a ring parallel to `unreliable_reassembly`
-/// and indexed the same way (package id % ring size).
+/// and addressed by the shared full-ID ReceiveIndex.
 #[derive(Default)]
 pub struct FecRecvSlot {
     pub package_id: u64,
@@ -2707,7 +2781,7 @@ enum FecRecvState {
     Inline(crate::fec::MessageDecoder),
     /// Big message: a byte-bounded, nonblocking ingress queue feeds a decoder thread.
     /// Dropping the sender (eviction, disconnect) ends it and frees the decoder.
-    Worker { tx: std::sync::mpsc::SyncSender<(u32, Vec<u8>)>, message_len: usize, block_bytes: usize },
+    Worker { tx: std::sync::mpsc::SyncSender<(u32, Vec<u8>)>, message_len: usize, block_bytes: usize, generation: std::sync::Arc<()> },
     /// Delivered (or given up): late surplus blocks of this package are ignored.
     Done,
 }
@@ -2766,7 +2840,7 @@ fn valid_fec_symbol(layout: crate::fec::MessageLayout, block_id: u32, data_len: 
 
 /// Closing ingress lets the worker finish queued work and release its admission
 /// guard. Never decrement its counters here: it may still be inside Wirehair.
-/// A completed queued decode may still deliver before this package is evicted.
+/// Explicit retirement makes queued completion ineligible, even before ID eviction.
 fn retire_inactive_fec_workers(slots: &mut [FecRecvSlot], now_ns: u64, grace_ns: u64, oldest_only: bool) -> u64 {
     let eligible = |s: &FecRecvSlot| matches!(s.state, FecRecvState::Worker { .. }) && now_ns.saturating_sub(s.last_block_ns) > grace_ns;
     if oldest_only {
@@ -2786,6 +2860,21 @@ fn retire_inactive_fec_workers(slots: &mut [FecRecvSlot], now_ns: u64, grace_ns:
     retired
 }
 
+struct FecCompletion {
+    connection_key: ConnectionKey,
+    package_id: u64,
+    message: Vec<u8>,
+    reservation: crate::receive_memory::Reservation,
+    decoder_generation: std::sync::Arc<()>,
+    connection_generation: std::sync::Arc<crate::receive_memory::ReceiveMemoryBudget>,
+}
+impl FecCompletion {
+    fn owns(&self, slot: &FecRecvSlot, budget: &std::sync::Arc<crate::receive_memory::ReceiveMemoryBudget>) -> bool {
+        self.package_id == slot.package_id && std::sync::Arc::ptr_eq(&self.connection_generation, budget) &&
+            matches!(&slot.state, FecRecvState::Worker { generation, .. } if std::sync::Arc::ptr_eq(generation, &self.decoder_generation))
+    }
+}
+
 struct FecWorkerGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>, std::sync::Arc<crate::receive_memory::ReceiveMemoryBudget>);
 impl Drop for FecWorkerGuard {
     fn drop(&mut self) {
@@ -2799,7 +2888,7 @@ impl Drop for FecWorkerGuard {
 fn fec_receive_block(
     slot: &mut FecRecvSlot, connection_key: ConnectionKey, package_id: u64,
     message_len: usize, block_bytes: usize, block_id: u32, data: &[u8],
-    done_tx: &std::sync::mpsc::Sender<(ConnectionKey, u64, Vec<u8>, crate::receive_memory::Reservation)>,
+    done_tx: &std::sync::mpsc::Sender<FecCompletion>,
     workers: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
     budget: &std::sync::Arc<crate::receive_memory::ReceiveMemoryBudget>,
 ) -> Option<(Vec<u8>, crate::receive_memory::Reservation)> {
@@ -2808,10 +2897,7 @@ fn fec_receive_block(
     slot.blocks_received = slot.blocks_received.saturating_add(1);
     let layout = MessageLayout::new(message_len, block_bytes)?;
     if !valid_fec_symbol(layout, block_id, data.len()) { return None; }
-    if slot.params().is_some_and(|p| p != (message_len, block_bytes)) {
-        slot.state = FecRecvState::Empty;
-        slot.reservation = None;
-    }
+    if slot.params().is_some_and(|p| p != (message_len, block_bytes)) { return None; }
     if !slot.in_use() {
         let worker = layout.k > FEC_INLINE_MAX_BLOCKS;
         let ingress_bytes = fec_ingress_bytes(layout);
@@ -2833,6 +2919,11 @@ fn fec_receive_block(
             let done_tx = done_tx.clone();
             workers.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             let guard = FecWorkerGuard(workers.clone(), budget.clone());
+            let generation = std::sync::Arc::new(());
+            let decoder_generation = generation.clone();
+            // Each connection owns a freshly allocated budget. Retaining its Arc
+            // is a non-reusable connection-generation token across reconnects.
+            let connection_generation = budget.clone();
             let r = std::thread::Builder::new().name("stp-fec-decode".into()).spawn(move || {
                 let _guard = guard;
                 // Move the capture into a later local: on decode failure its
@@ -2841,10 +2932,10 @@ fn fec_receive_block(
                 if let Some(m) = decode_message_blocks(layout, rx, ingress_bytes) {
                     // Keep the admission charge through the completion channel, including
                     // when the network thread is stalled or this connection is evicted.
-                    let _ = done_tx.send((connection_key, package_id, m, reservation));
+                    let _ = done_tx.send(FecCompletion { connection_key, package_id, message: m, reservation, decoder_generation, connection_generation });
                 }
             });
-            if r.is_ok() { slot.state = FecRecvState::Worker { tx, message_len, block_bytes }; }
+            if r.is_ok() { slot.state = FecRecvState::Worker { tx, message_len, block_bytes, generation }; }
             else { slot.ingress_dropped += 1; return None; }
         } else {
             slot.state = match MessageDecoder::new(message_len, block_bytes) {
@@ -2866,7 +2957,9 @@ fn fec_receive_block(
             match tx.try_send((block_id, data.to_vec())) {
                 Ok(()) => slot.last_block_ns = monotonic_clock_ns(),
                 Err(std::sync::mpsc::TrySendError::Full(_)) => slot.ingress_dropped += 1,
-                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => slot.state = FecRecvState::Done,
+                // A successful completion may already be queued. Keep this
+                // exact Worker live until it is drained or explicitly retired.
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => (),
             }
             None
         }
@@ -3095,7 +3188,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
         let mut packet_memory_send      = new_packet_memory(); // Outgoing Decrypted
 
         let mut receive_queue = ReceiveQueue::default();
-        let (fec_done_tx, fec_done_rx) = std::sync::mpsc::channel::<(ConnectionKey, u64, Vec<u8>, crate::receive_memory::Reservation)>();
+        let (fec_done_tx, fec_done_rx) = std::sync::mpsc::channel::<FecCompletion>();
         let fec_workers = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut fec_sweep_ns = 0;
 
@@ -3587,6 +3680,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 let bitmap_ack = if payload.len() == crate::ack::ACK_PAYLOAD_LEN {
                                     let Some(a) = crate::ack::BitmapAck::decode(payload) else { break 'conn; };
                                     if a.highest >= state.send_sequence_number { break 'conn; }
+                                    if let Some(cipher) = &mut state.cipher { cipher.confirm_outgoing(a.highest); }
                                     state.peer_ack_delay_us = a.delay_us;
                                     Some(a)
                                 } else { None };
@@ -3629,7 +3723,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                             if index == state.tu_probe_sequence_number {
                                                 state.tu_probe_sequence_number = u64::MAX;
                                                 state.last_sent_tu_probe_time_ns = 0;
-                                                state.current_tu = state.tu_probe_size;
+                                                state.promote_tu(state.tu_probe_size);
                                                 state.tu_probe_size_advance *= 2;
                                                 state.tu_probe_failed_count = 0;
                                             }
@@ -3684,7 +3778,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     }
                                 }
 
-                                let ce_feedback = bitmap_ack.as_ref().is_some_and(|a| crate::ack::update_ce_count(&mut state.peer_ce_count, a.ce_count));
+                                let ce_feedback = bitmap_ack.as_ref().is_some_and(|a| crate::ack::update_ce_count_bounded(&mut state.peer_ce_count, a.ce_count, state.send_sequence_number));
                                 if ecn_marked || ce_feedback {
                                     // A reordered ACK can advance CE even when all its packets were
                                     // acknowledged already. Do not consume that cumulative event silently.
@@ -3769,10 +3863,16 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     let Some(layout) = wire_fec_layout(message_len, block_bytes) else { continue; };
                                     if !valid_fec_symbol(layout, block_id, data.len()) { continue; }
                                     if (kind == STP_EXT_KIND_GROUPED_FEC) != (layout.groups > 1) { continue; }
+                                    if segment.is_some_and(|s| !s.valid(message_len) || s.root == package_id) { continue; }
+                                    let Some(slot_idx) = existing_connection.receive_index.admit(package_id,
+                                        &mut existing_connection.unreliable_reassembly, &mut existing_connection.unreliable_fec) else { memory_erased = true; continue; };
+                                    if !existing_connection.receive_index.claim(package_id, ReceiveRole::Fec { message_len, block_bytes, segment }) { continue; }
                                     if let Some(segment) = segment {
-                                        if !segment.valid(message_len) || segment.root == package_id { continue; }
                                         let Some(root_idx) = existing_connection.receive_index.admit(segment.root,
                                             &mut existing_connection.unreliable_reassembly, &mut existing_connection.unreliable_fec) else { memory_erased = true; continue; };
+                                        if !existing_connection.receive_index.claim(segment.root, ReceiveRole::Root { total: segment.total }) { continue; }
+                                        // Root admission may have retired the unit in a very small table.
+                                        if existing_connection.receive_index.get(package_id) != Some(slot_idx) { memory_erased = true; continue; }
                                         let fec_root = &mut existing_connection.unreliable_fec[root_idx];
                                         if fec_root.in_use() && fec_root.package_id != segment.root {
                                             if segment.root < fec_root.package_id { continue; }
@@ -3782,8 +3882,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                             memory_erased = true; continue;
                                         }
                                     }
-                                    let Some(slot_idx) = existing_connection.receive_index.admit(package_id,
-                                        &mut existing_connection.unreliable_reassembly, &mut existing_connection.unreliable_fec) else { memory_erased = true; continue; };
+
                                     {
                                         // Same eviction rule as plain packages below, across both rings.
                                         let slot = &mut existing_connection.unreliable_fec[slot_idx];
@@ -3857,6 +3956,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 let Some(slot_idx) = existing_connection.receive_index.admit(package_id,
                                     &mut existing_connection.unreliable_reassembly, &mut existing_connection.unreliable_fec) else { memory_erased = true; continue; };
 
+                                if !existing_connection.receive_index.claim(package_id, ReceiveRole::Plain) { continue; }
                                 {
                                     let slot = &mut existing_connection.unreliable_reassembly[slot_idx];
                                     let slot_in_use = slot.completed || slot.total_len.is_some() || !slot.received.is_empty();
@@ -3908,11 +4008,13 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
 //////// END RECEIVE ////////////////////////////////////////////////////////////////////////
 
                 // Messages finished by FEC decoder threads.
-                while let Ok((key, package_id, message, mut _reservation)) = fec_done_rx.try_recv() {
+                while let Ok(completion) = fec_done_rx.try_recv() {
+                    let key = completion.connection_key;
                     if let Some(conn) = connections_map.get_mut(&key) {
-                        let Some(idx) = conn.receive_index.get(package_id) else { continue; };
+                        let Some(idx) = conn.receive_index.get(completion.package_id) else { continue; };
                         let slot = &mut conn.unreliable_fec[idx];
-                        if slot.package_id != package_id || !slot.in_use() { continue; } // evicted worker completion
+                        if !completion.owns(slot, &conn.receive_budget) { continue; }
+                        let FecCompletion { message, reservation: mut _reservation, .. } = completion;
                         let tail = monotonic_clock_ns().saturating_sub(slot.last_block_ns);
                         slot.state = FecRecvState::Done;
                         let completed = if let Some(segment) = slot.segment {
@@ -3979,6 +4081,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 &hello_packet_payload, Dscp::Af21, false));
                     }
                     ConnectionState::SendingServerHello { magic1, magic2: _, cipher, last_sent_time_ns, hello_packet_payload } => {
+                        cipher.expire_previous(current_time_now_ns);
                         return retry_handshake(connection_tracking_data.creation_time_ns, last_sent_time_ns,
                             current_time_now_ns, 15_000_000_000, || udp_send_with_congestion_and_dscp(socket,
                                 connection_tracking_data.other_ip, connection_tracking_data.other_port,
@@ -3986,6 +4089,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                     }
                     ConnectionState::Connected(state) => {
                         debug_assert!(state.magic2 != 0, "Connection entered Connected state without negotiating magic2");
+                        if let Some(cipher) = &mut state.cipher { cipher.expire_previous(current_time_now_ns); }
+                        if state.send_exhausted(&connection_tracking_data.unreliable_send_buffer) { return false; }
                         if OutageState::expired(current_time_now_ns, state.last_ack_received_time) {
                             if VERBOSE { println!("Disconnected from: {:?}.", connection_tracking_data.other_transport_identity); }
                             return false; // connection timeout
@@ -4001,7 +4106,9 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     cc_trace_context(state, current_time_now_ns, &cc, max_pps));
                             }
                             #[cfg(test)]
-                            datagram_expectation.set((pending.kind.name(), Some(pending.bytes.len())));
+                            datagram_expectation.set((pending.kind.name(), Some(if pending.kind == PendingSendKind::MtuProbe {
+                                state.tu_probe_size as usize
+                            } else { state.current_tu as usize })));
                             let sent = udp_send_with_congestion_and_dscp(socket,
                                 connection_tracking_data.other_ip, connection_tracking_data.other_port,
                                 &pending.bytes, pending.dscp, false);
@@ -4017,13 +4124,12 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
 
                         if current_time_now_ns > state.ack_timer {
                             { // send ack
-                                let virtual_nonce = state.send_ack_sequence_number;
-                                state.send_ack_sequence_number = state.send_ack_sequence_number.checked_add(1).expect("ACK nonce space exhausted");
+                                let Some(virtual_nonce) = state.reserve_ack_nonce() else { return false; };
                                 let a = state.ack_receiver.ack(current_time_now_ns);
                                 state.stats.ack_delay_us_max = state.stats.ack_delay_us_max.max(a.delay_us);
                                 let encoded = a.encode();
-                                let o = seal_connected_packet(&mut state.cipher, connection_tracking_data.two_byte_send_prefix,
-                                    virtual_nonce, &encoded, &mut packet_memory_send[..], current_time_now_ns);
+                                let Some(o) = seal_connected_packet(&mut state.cipher, connection_tracking_data.two_byte_send_prefix,
+                                    virtual_nonce, &encoded, &mut packet_memory_send[..], current_time_now_ns) else { return false; };
                                 #[cfg(test)]
                                 datagram_expectation.set(("ack", Some(crate::ack::ACK_PAYLOAD_LEN + total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(state.magic1).unwrap())));
                                 let sent = udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_send[..o], Dscp::Af21, false);
@@ -4045,8 +4151,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 let seq = state.send_sequence_number;
                                 let probe_payload_len = state.current_tu as usize - total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(state.magic1).unwrap();
                                 packet_memory_send[..probe_payload_len].fill(0xff);
-                                let packet_len = seal_connected_packet(&mut state.cipher, connection_tracking_data.two_byte_send_prefix,
-                                    seq, &packet_memory_send[..probe_payload_len], &mut packet_memory_encrypted[..], current_time_now_ns);
+                                let Some(packet_len) = seal_connected_packet(&mut state.cipher, connection_tracking_data.two_byte_send_prefix,
+                                    seq, &packet_memory_send[..probe_payload_len], &mut packet_memory_encrypted[..], current_time_now_ns) else { return false; };
                                 #[cfg(test)]
                                 datagram_expectation.set(("outage", Some(state.current_tu as usize)));
                                 let send_time = udp_send_with_congestion_and_dscp(socket,
@@ -4264,8 +4370,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             
                         
                             let virtual_nonce = state.send_sequence_number;
-                            let packet_len = seal_connected_packet(&mut state.cipher, connection_tracking_data.two_byte_send_prefix,
-                                virtual_nonce, &null_bytes[..payload_size], &mut packet_memory_encrypted[..], current_time_now_ns);
+                            let Some(packet_len) = seal_connected_packet(&mut state.cipher, connection_tracking_data.two_byte_send_prefix,
+                                virtual_nonce, &null_bytes[..payload_size], &mut packet_memory_encrypted[..], current_time_now_ns) else { return false; };
 
                             #[cfg(test)]
                             datagram_expectation.set(("mtu_probe", Some(state.tu_probe_size as usize)));
@@ -4281,8 +4387,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             let null_bytes = [0xffu8; ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE];
                         
                             let virtual_nonce = state.send_sequence_number;
-                            let packet_len = seal_connected_packet(&mut state.cipher, connection_tracking_data.two_byte_send_prefix,
-                                virtual_nonce, &null_bytes[..payload_size], &mut packet_memory_encrypted[..], current_time_now_ns);
+                            let Some(packet_len) = seal_connected_packet(&mut state.cipher, connection_tracking_data.two_byte_send_prefix,
+                                virtual_nonce, &null_bytes[..payload_size], &mut packet_memory_encrypted[..], current_time_now_ns) else { return false; };
 
                             #[cfg(test)]
                             datagram_expectation.set(("keepalive", Some(state.current_tu as usize)));
@@ -4310,8 +4416,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                         } {
                         
                             let virtual_nonce = state.send_sequence_number;
-                            let packet_len = seal_connected_packet(&mut state.cipher, connection_tracking_data.two_byte_send_prefix,
-                                virtual_nonce, &packet_memory_send[..unreliable_payload_size], &mut packet_memory_encrypted[..], current_time_now_ns);
+                            let Some(packet_len) = seal_connected_packet(&mut state.cipher, connection_tracking_data.two_byte_send_prefix,
+                                virtual_nonce, &packet_memory_send[..unreliable_payload_size], &mut packet_memory_encrypted[..], current_time_now_ns) else { return false; };
 
                             should_sleep = false;
                             let test_drop = if test_drop_burst_left > 0 { test_drop_burst_left -= 1; true } else {
@@ -4817,6 +4923,9 @@ fn commit_connected_send(state: &mut ConnectionStateConnected, buf: &mut SendQue
     state.packets_in_flight += 1;
     state.stats.packets_sent += 1;
     state.stats.bytes_sent += len as u64;
+    // The accepted datagram used the old effective TU. Promote before framing
+    // any later current-TU datagram, never by changing/resealing its ciphertext.
+    if let Some(tu) = state.deferred_tu.take() { state.current_tu = tu; }
     state.max_in_flight_since_last_print = state.max_in_flight_since_last_print.max(state.packets_in_flight);
 }
 
@@ -5822,7 +5931,7 @@ mod fec_send_tests {
             fec_receive_block(&mut retry, key, 100, message.len(), 32, id, &block[..n], &done, &workers, &budget);
             assert!(workers.load(Acquire) <= MAX_FEC_DECODE_WORKERS);
         }
-        let (_, id, decoded, _reservation) = completions.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        let FecCompletion { package_id: id, message: decoded, reservation: _reservation, .. } = completions.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
         assert_eq!(id, 100);
         assert_eq!(decoded, *message);
         // With no admission pressure, periodic retirement also releases every dead tail.
@@ -6650,7 +6759,7 @@ mod outage_review_repros {
     fn receiver_decoder_has_full_grace_after_resume() {
         let mut s = state(); let mut b = buffer(); s.stats.cc_rate_upps = 100_000_000;
         let (tx, _rx) = std::sync::mpsc::sync_channel(1);
-        let mut slots = [FecRecvSlot { segment: None, reservation: None, package_id: 0, state: FecRecvState::Worker { tx, message_len: 1_000_000, block_bytes: 1000 }, blocks_received: 1, last_block_ns: 1_000_000_000, ingress_dropped: 0, admission_refused: false, worker_limit_refused: false }];
+        let mut slots = [FecRecvSlot { segment: None, reservation: None, package_id: 0, state: FecRecvState::Worker { tx, message_len: 1_000_000, block_bytes: 1000, generation: Default::default() }, blocks_received: 1, last_block_ns: 1_000_000_000, ingress_dropped: 0, admission_refused: false, worker_limit_refused: false }];
         s.account_send(6_000_000_000); s.packets_in_flight = 1;
         enter_outage(&mut s, &mut b, 6_001_000_000, 0, None);
         assert_eq!(retire_inactive_fec_workers(&mut slots, 25_000_000_000, OUTAGE_TIMEOUT_NS, false), 0);
@@ -7487,7 +7596,7 @@ mod lazy_fec_segment_tests {
                 message.len(), 32, id, &message[id as usize*32..(id as usize+1)*32],
                 &done, &workers, &budget).is_none());
         }
-        let (_, package, decoded, reservation) = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let FecCompletion { package_id: package, message: decoded, reservation, .. } = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
         assert_eq!(package,5);
         assert_eq!(decoded,message);
         assert!(budget.used()>0, "successful completion must retain its charge");
@@ -8443,7 +8552,7 @@ mod wire_v2_tests {
     }
     fn packet(c: &mut Option<ConnectionCipherTriplet>, seq: u64, now: u64) -> Vec<u8> {
         let mut p = vec![0; 128];
-        let n = seal_connected_packet(c, 42, seq, b"wire epoch test", &mut p, now);
+        let n = seal_connected_packet(c, 42, seq, b"wire epoch test", &mut p, now).unwrap();
         p.truncate(n); p
     }
     #[test]
@@ -8537,8 +8646,11 @@ mod wire_v2_tests {
         let a = packet(&mut sender, 0, 100); open(&mut receiver,&a,100).unwrap();
         let b = packet(&mut sender, crate::sequence::ACK_SPACE, 100+REKEY_AGE_NS);
         assert_eq!(load_u32(&b[10..14]),1); open(&mut receiver,&b,101+REKEY_AGE_NS).unwrap();
+        let keepalive = packet(&mut sender, 1, 101+REKEY_AGE_NS);
+        open(&mut receiver, &keepalive, 101+REKEY_AGE_NS).unwrap();
+        sender.as_mut().unwrap().confirm_outgoing(1);
         sender.as_mut().unwrap().outgoing_bytes=REKEY_BYTES;
-        let c = packet(&mut sender,1,102+REKEY_AGE_NS);
+        let c = packet(&mut sender,2,102+REKEY_AGE_NS);
         assert_eq!(load_u32(&c[10..14]),2); open(&mut receiver,&c,103+REKEY_AGE_NS).unwrap();
         // More than one complete missing epoch is bounded recovery, not a derivation loop.
         let (_, mut fresh_receiver)=ciphers(); assert!(open(&mut fresh_receiver,&c,104+REKEY_AGE_NS).is_err());
@@ -8562,4 +8674,186 @@ mod wire_v2_tests {
         let minimum=ASSUMED_UDP_PAYLOAD_SIZE_WITH_GUARANTEED_DELIVERY;
         assert!(minimum >= CONNECTED_HEADER_SIZE+16+STP_SEGMENT_FEC_HEADER_SIZE+FEC_MIN_BLOCK_BYTES);
     }
+    #[test]
+    fn independent_review_same_id_layout_change_is_rejected() {
+        let budget = crate::receive_memory::ReceiveMemoryBudget::new(16 << 20);
+        let workers = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut slot = FecRecvSlot { package_id: 42, ..Default::default() };
+        assert!(fec_receive_block(&mut slot, ConnectionKey::default(), 42,
+            3000, 1500, 0, &[1; 1500], &tx, &workers, &budget).is_none());
+        for block in 0..2 {
+            assert!(fec_receive_block(&mut slot, ConnectionKey::default(), 42,
+                2272, 1136, block, &[2; 1136], &tx, &workers, &budget).is_none());
+        }
+        assert_eq!(slot.params(), Some((3000, 1500)));
+        let (message, _) = fec_receive_block(&mut slot, ConnectionKey::default(), 42,
+            3000, 1500, 1, &[1; 1500], &tx, &workers, &budget).unwrap();
+        assert_eq!(message, vec![1; 3000]);
+    }
+    #[test]
+    fn independent_review_worker_completion_owns_exact_live_instance_and_connection() {
+        let budget = crate::receive_memory::ReceiveMemoryBudget::new(64 << 20);
+        let workers = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let key = ConnectionKey::default();
+        let mut slot = FecRecvSlot { package_id: 42, ..Default::default() };
+        for block in 0..300 {
+            assert!(fec_receive_block(&mut slot, key, 42,
+                300 * 1136, 1136, block, &[1; 1136], &tx, &workers, &budget).is_none());
+        }
+        let completion = rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
+        assert_eq!(completion.message, vec![1; 300 * 1136]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while workers.load(std::sync::atomic::Ordering::Acquire) != 0 {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        // A surplus symbol can arrive after worker exit but before the network
+        // loop drains its completion. Disconnected ingress is not retirement.
+        assert!(fec_receive_block(&mut slot, key, 42,
+            300 * 1136, 1136, 0, &[1; 1136], &tx, &workers, &budget).is_none());
+        assert!(completion.owns(&slot, &budget));
+        for block in 0..2 {
+            assert!(fec_receive_block(&mut slot, key, 42,
+                2272, 1136, block, &[2; 1136], &tx, &workers, &budget).is_none());
+        }
+        assert!(completion.owns(&slot, &budget));
+        let reconnected_budget = crate::receive_memory::ReceiveMemoryBudget::new(64 << 20);
+        assert!(!completion.owns(&slot, &reconnected_budget)); // same ConnectionKey, new handshake
+        if let FecRecvState::Worker { generation, .. } = &mut slot.state {
+            let original = generation.clone();
+            *generation = Default::default();
+            assert!(!completion.owns(&slot, &budget)); // same ID/layout, replacement decoder
+            if let FecRecvState::Worker { generation, .. } = &mut slot.state { *generation = original; }
+        } else { panic!("expected worker"); }
+        slot.state = FecRecvState::Done;
+        assert!(!completion.owns(&slot, &budget)); // delivery or retirement is final
+    }
+    #[test]
+    fn independent_review_identity_roles_and_segment_layout_are_immutable() {
+        let mut index = ReceiveIndex::default();
+        let mut plain = ReassemblySlot::new_ring(4); let mut fec = FecRecvSlot::new_ring(4);
+        let segment = FecSegment { root: 4, total: 4 << 20, offset: 0 };
+        for (id, role) in [(4, ReceiveRole::Root { total: segment.total }), (5, ReceiveRole::Plain),
+            (6, ReceiveRole::Fec { message_len: 2 << 20, block_bytes: 1136, segment: Some(segment) })] {
+            index.admit(id, &mut plain, &mut fec).unwrap(); assert!(index.claim(id, role));
+            for conflict in [ReceiveRole::Plain, ReceiveRole::Root { total: 8 << 20 },
+                ReceiveRole::Fec { message_len: 10000, block_bytes: 1500, segment: None },
+                ReceiveRole::Fec { message_len: 2 << 20, block_bytes: 1136,
+                    segment: Some(FecSegment { offset: 2 << 20, ..segment }) }] {
+                if conflict != role { assert!(!index.claim(id, conflict)); }
+            }
+            // Expiring decoder/root storage must not erase its immutable role.
+            let i = index.get(id).unwrap(); plain[i] = ReassemblySlot::new(); fec[i] = Default::default();
+            assert!(index.claim(id, role));
+        }
+    }
+
+    #[test]
+    fn independent_review_pending_data_defers_current_tu_promotion() {
+        for kind in [PendingSendKind::Data, PendingSendKind::Keepalive, PendingSendKind::Outage] {
+            let ConnectionState::Connected(mut state) = new_connection_state_connected(
+                None, CONNECT_MAGIC1_PLAIN_TEXT, MAGIC2_APP_CROSSLINK, 1_000_000_000) else { unreachable!() };
+            let mut queues = SendQueues::new(1, (1_000_000, 1 << 20, 1 << 20));
+            let bytes = vec![0; state.current_tu as usize];
+            assert!(!finish_connected_send(&mut state, &mut queues, kind,
+                None, 1_000_000_000, &bytes, &[], Dscp::Af21, 0, None));
+            state.promote_tu(1472); // same operation as receipt of the outstanding probe
+            assert_eq!(state.current_tu, 1204);
+            assert_eq!(state.deferred_tu, Some(1472));
+            let pending = state.pending_send.take().unwrap();
+            assert_eq!(pending.bytes.len(), state.current_tu as usize);
+            assert_eq!(pending.bytes, bytes);
+            commit_connected_send(&mut state, &mut queues, pending.kind, 1_000_001_000,
+                pending.bytes.len(), &pending.plaintext, 0, None);
+            assert_eq!(state.send_sequence_number, 1);
+            assert_eq!(state.current_tu, 1472);
+            assert_eq!(state.deferred_tu, None);
+        }
+    }
+
+    #[test]
+    fn independent_review_lost_epoch_is_retried_not_skipped() {
+        let (sender, mut receiver) = ciphers(); let mut sender = Some(sender);
+        open(&mut receiver, &packet(&mut sender, 0, 1), 1).unwrap();
+        sender.as_mut().unwrap().outgoing_packets = REKEY_PACKETS;
+        let lost_epoch_one = packet(&mut sender, 1, 2);
+        assert_eq!(load_u32(&lost_epoch_one[10..14]), 1);
+        // Lose the whole first age interval of epoch 1. Age alone MUST neither
+        // strand the receiver with epoch 2 nor close a still-usable connection.
+        let retry = packet(&mut sender, 2, 2 + REKEY_AGE_NS);
+        assert_eq!(load_u32(&retry[10..14]), 1);
+        assert_eq!(open(&mut receiver, &retry, 3 + REKEY_AGE_NS).unwrap(), b"wire epoch test");
+        sender.as_mut().unwrap().confirm_outgoing(2);
+        let two = packet(&mut sender, 3, 4 + REKEY_AGE_NS);
+        assert_eq!(load_u32(&two[10..14]), 2);
+        open(&mut receiver, &two, 5 + REKEY_AGE_NS).unwrap();
+        assert_eq!(receiver.incoming_epoch, 2);
+    }
+    #[test]
+    fn unconfirmed_hard_budget_closes_before_skipping_epoch() {
+        for bytes in [false, true] {
+            let (sender, _) = ciphers(); let mut sender = Some(sender);
+            sender.as_mut().unwrap().outgoing_packets = REKEY_PACKETS;
+            let _lost_epoch_one = packet(&mut sender, 0, 1);
+            if bytes { sender.as_mut().unwrap().outgoing_bytes = REKEY_BYTES; }
+            else { sender.as_mut().unwrap().outgoing_packets = REKEY_PACKETS; }
+            let mut out = [0; 128];
+            assert!(seal_connected_packet(&mut sender, 42, 1, b"must not seal epoch 2", &mut out, 2).is_none());
+            assert_eq!(sender.as_ref().unwrap().outgoing_epoch, 1);
+        }
+    }
+    #[test]
+    fn ack_only_and_idle_directions_confirm_updates_via_keepalive() {
+        let (sender, mut receiver) = ciphers(); let mut sender = Some(sender);
+        open(&mut receiver, &packet(&mut sender, crate::sequence::ACK_SPACE, 1), 1).unwrap();
+        let ack = packet(&mut sender, crate::sequence::ACK_SPACE + 1, 1 + REKEY_AGE_NS);
+        open(&mut receiver, &ack, 1 + REKEY_AGE_NS).unwrap();
+        assert!(!sender.as_ref().unwrap().outgoing_confirmed);
+        assert_eq!(sender.as_ref().unwrap().outgoing_first_data_nonce, None);
+        // Even no application traffic produces a current-TU keepalive within
+        // five seconds; its positive ACK provides confirmation, not ACK-of-ACK.
+        let mut keepalive = [0; 1204];
+        let n = seal_connected_packet(&mut sender, 42, 0, &[255; 1174], &mut keepalive,
+            5_000_000_001 + REKEY_AGE_NS).unwrap();
+        assert_eq!(open(&mut receiver, &keepalive[..n], 5_000_000_002 + REKEY_AGE_NS).unwrap(), [255; 1174]);
+        sender.as_mut().unwrap().confirm_outgoing(0);
+        assert!(sender.as_ref().unwrap().outgoing_confirmed);
+        let ack2 = packet(&mut sender, crate::sequence::ACK_SPACE + 2, 1 + 2 * REKEY_AGE_NS);
+        assert_eq!(load_u32(&ack2[10..14]), 2);
+        open(&mut receiver, &ack2, 2 + 2 * REKEY_AGE_NS).unwrap();
+        assert!(receiver.old.is_some());
+        receiver.expire_previous(3 + 2 * REKEY_AGE_NS + PREVIOUS_KEY_NS);
+        assert!(receiver.old.is_none()); // timer expiry, even without more received data
+    }
+    #[test]
+    fn nonce_epoch_and_identity_exhaustion_are_clean_close_conditions() {
+        let (mut sender, mut receiver) = ciphers();
+        sender.outgoing_epoch = u32::MAX; sender.outgoing_packets = REKEY_PACKETS;
+        let mut sender = Some(sender); let mut out = [0; 128];
+        assert!(seal_connected_packet(&mut sender, 42, 0, b"x", &mut out, 0).is_none());
+        assert_eq!(sender.as_ref().unwrap().outgoing_packets, REKEY_PACKETS);
+        for nonce in [u64::MAX, crate::sequence::ACK_SPACE - 1] {
+            assert!(seal_connected_packet(&mut None, 42, nonce, b"x", &mut out, 0).is_none());
+        }
+        receiver.incoming_epoch = u32::MAX;
+        assert!(!receiver.ratchet_forward_incoming());
+        let ConnectionState::Connected(mut state) = new_connection_state_connected(
+            None, CONNECT_MAGIC1_PLAIN_TEXT, MAGIC2_APP_CROSSLINK, 1) else { unreachable!() };
+        let queues = SendQueues::new(1, (1_000_000, 1 << 20, 1 << 20));
+        state.send_ack_sequence_number = u64::MAX - 1;
+        assert_eq!(state.reserve_ack_nonce(), Some(u64::MAX - 1));
+        assert_eq!(state.reserve_ack_nonce(), None);
+        assert!(state.send_exhausted(&queues));
+        state.send_ack_sequence_number = crate::sequence::ACK_SPACE;
+        state.send_sequence_number = crate::sequence::ACK_SPACE - 1;
+        assert!(state.send_exhausted(&queues));
+        state.account_send(2); assert_eq!(state.send_sequence_number, crate::sequence::ACK_SPACE - 1);
+        state.send_sequence_number = 0;
+        assert!(!state.send_exhausted(&queues));
+        queues.queues[0].package_allocator.as_ref().unwrap().store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+        assert!(state.send_exhausted(&queues));
+    }
+
 }

@@ -124,7 +124,7 @@ mod tests {
             if seq == boundary-1 { sender.advance_outgoing(); }
         }
         for (nonce, packet) in delayed {
-            receiver.old.read_message(nonce, &packet, &mut dec).unwrap();
+            receiver.old.as_ref().unwrap().read_message(nonce, &packet, &mut dec).unwrap();
             assert!(!seqs.commit(nonce)); // Rekey cannot reset the anti-replay history.
         }
     }

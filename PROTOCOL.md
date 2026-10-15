@@ -60,6 +60,70 @@ key[32], server payload[40], total 78 bytes. Handshake packets are dispatched
 before ordinary size-based ACK classification. Retransmissions reuse the
 original handshake bytes, not a new Noise transcript.
 
+### Handshake confirmation and simultaneous initiation
+
+The states in each endpoint are ClientHello-sending, ServerHello-sending
+(awaiting confirmation), Connected, and Closed. A valid ClientHello selects
+an application/profile and creates the responder's ServerHello-sending state.
+A valid ServerHello finishes the initiator's Noise IK exchange and enters
+Connected. Noise completion alone does **not** tell the responder that its
+reply arrived: the initiator MUST send an ordinary, authenticated data-class
+packet within five seconds of accepting ServerHello, even if the application
+is idle. An all-padding current-TU keepalive suffices. It MUST keep sending
+ACK-eliciting keepalives as specified below until the responder is confirmed.
+The responder enters Connected on the first successfully authenticated
+ordinary packet under the split/rekeyed keys, then processes that packet
+normally, including positive receipt feedback. There is no third Noise flight.
+It does not send ordinary application traffic before confirmation. The
+plaintext developer variant follows the transitions without authentication.
+
+If both peers initiate concurrently with the same identities and selector,
+compare the complete 32-byte static public keys lexicographically as byte
+strings: the smaller remains initiator; the larger abandons its pending client
+flight and answers as responder. Self-connections are not initiated. A hello
+for an existing Connected association does not reset it or its counters.
+A fresh association requires discarding the old state and a fresh Noise
+handshake; endpoints must not reinterpret a new hello as a connected rekey.
+
+Handshake retransmissions reuse the exact saved flight. This implementation
+expires a client attempt after 30 seconds from creation and a responder
+attempt after 15 seconds. Its first successful send is followed after about
+10 ms, then at 2.5-second intervals; local refusal does not advance that
+schedule. An interoperating peer MUST tolerate duplicate flights and provide
+confirmation within the responder lifetime. Precise retry pacing is local
+policy, not a dependency of key or packet identity.
+
+### Connected liveness and outage
+
+Every Connected endpoint, including an application-idle or ACK-only endpoint,
+MUST emit an ACK-eliciting data-class packet at least once per five seconds
+when locally able to send; ordinary data substitutes for an idle keepalive.
+Keepalives are all-padding current-TU packets with fresh data-space nonces.
+A receiver sends normal fixed-size positive receipt feedback for them; ACKs
+themselves never elicit ACKs. This supplies round-trip liveness and confirms
+key updates in otherwise receive-only directions without an ACK-of-ACK.
+
+This implementation enters outage after two seconds without positive ACK
+progress while a data-class packet is outstanding (measured from the later
+of the first outstanding send and last progress). It stops application sends
+and MTU discovery but continues receive/ACK processing. It immediately sends
+an all-padding current-TU outage probe, then probes after 250 ms, 500 ms,
+1 s, 2 s, and at most every 4 s. Probes use fresh data nonces; ACKs/probes are
+subject to the same local-refusal and cryptographic-budget rules as data.
+Only an authenticated ACK positively receipting a still-outstanding recorded
+outage probe younger than max(4 s, twice the pre-outage RTT) resumes sending.
+Old withheld/replayed feedback cannot prove recovery. Recovery retains TU,
+nonce/epoch histories and message identities, resets pacing credit and RTT
+sampling, and resumes startup at no more than the pre-outage/initial rate.
+Local bounded FEC retention may pause over a real outage; it cannot resurrect
+already-expired sources or change identities. This is a recovery policy, not
+a reliability promise. After 120 seconds without new positive ACK progress
+the association closes, even if local sends have all been refused. A new
+association uses a fresh handshake, never reset transport keys/counters.
+Other implementations may choose different local outage pacing/timeouts;
+they MUST maintain periodic ACK-eliciting traffic and MUST NOT treat mere
+inbound traffic or ACK-of-ACK as round-trip confirmation.
+
 ### Transport declaration (32 bytes)
 
 | Offset | Width | Field | This implementation sends |
@@ -126,10 +190,18 @@ This is resource capacity, not a fundamental 262144-packet format horizon.
 
 ACK plaintext is recognized **only by its exact size, 152 bytes**. This
 classification must agree with the nonce's high bit; otherwise the packet is
-rejected. Data/probe/keepalive plaintext must never be 152 bytes. No packet-type
+rejected. This implementation also rejects non-ACK plaintext shorter than
+517 bytes; conforming current-TU/probe packets are larger. Data/probe/keepalive
+plaintext must never be 152 bytes. No packet-type
 byte replaces the size test. Ordinary sender data packets and idle/outage
 keepalives fill exactly the current transmission unit (TU); MTU probes fill
 exactly their probed TU. Handshakes are the explicitly separate exception.
+TU is the effective sender transmission unit: if an MTU-probe ACK arrives
+while a locally refused current-TU ciphertext is pending, its discovered
+larger TU is recorded but promotion is deferred until that immutable datagram
+is accepted. Every retry is therefore still exactly the effective current TU.
+Promote before framing the next datagram; never reseal changed plaintext under
+the pending nonce. MTU probes retain their explicit probe-size exception.
 
 ## Frame stream
 
@@ -195,8 +267,14 @@ coded segmentation for larger original messages.
 
 ### Wirehair symbol and segmentation validation
 
-The codec is the bundled Wirehair construction, systematic source IDs first,
-with immutable grouped-symbol mapping for the declared group maximum. K is
+The normative codec/reference is the exact `third_party/wirehair` source tree
+at STP commit `4bdea0bde6a8794ee0f7606bdb62f657bc2a36a9`, Git tree object
+`3d8e99a30a94ac1d0fd66762baef5eeb3d791a45`. Its coefficient/seed generation,
+GF(256) arithmetic, peel/dense/heavy construction and repair-ID interpretation
+are part of the codec, not implementation-selected random choices. This pins
+the complete reference, including the bundled fixup tables; merely agreeing
+on the name Wirehair is insufficient. Source IDs are systematic first, with
+immutable grouped-symbol mapping for the declared group maximum. K is
 `ceil(unit_len / block_bytes)`; Wirehair supports K in 2..64000 per codec.
 Up to K=64000 there is one codec (ordinary kind 4). Above that threshold,
 grouped kind 5 uses G=ceil(K/32000) balanced codecs. Set B=floor(K/G) and
@@ -219,7 +297,13 @@ The receiving ordinary profile requires `block_bytes >= 1136`, a unit at most
 kind 5 is structurally parseable and round-trip tested, but cannot be needed
 by a valid current-profile production unit; tiny-symbol or oversized-unit
 uses are rejected. Kind 6 requires the unit itself to have one codec.
-A layout's length, width, and segment metadata cannot change under an ID.
+An admitted ID has one immutable role (plain fragmented message, FEC unit,
+or segmented root). A unit's length, width, and full segment tuple and a
+root's total cannot change under an ID. Conflicting frames are discarded,
+never used to reset/rebind an existing decoder or completed identity.
+Resource retirement may erase content, but not reopen the ID for another
+role/layout. Asynchronous completion is delivered only for its exact still-live
+decoder instance and connection generation, once; a Done slot is not live.
 
 Version 2 declares the current balanced segmentation layout explicitly. For
 `total > max_unit`, let `groups = ceil(total / max_unit)` and
@@ -270,8 +354,12 @@ Delay uses microseconds, saturates at u32::MAX, and applies only to the timing
 sample, not every bitmap receipt. CE is a monotone u64 cumulative count of
 unique admitted data/probe/keepalive packets; old/repeated counts do not move
 the sender's remembered count backwards. Exhaustion requires a fresh
-handshake; it must never wrap. CE feedback is idempotent under ACK loss,
-duplication and reordering.
+handshake; it must never wrap. Counts decreasing or greater than the sender's
+total sent data-class packets MUST NOT change its remembered CE baseline.
+A lower delayed count is harmless and does not invalidate its other positive
+receipts. CE feedback is idempotent under ACK loss, duplication and reordering.
+An authenticated receiver is still trusted to report CE honestly: plausibility
+is not proof that any particular packet really experienced congestion.
 
 ## Key epochs and operational rotation
 
@@ -281,36 +369,84 @@ the Noise IK split transport keys after **one Noise REKEY** per direction
 Noise REKEY of epoch n's directional key. ACK and data share the directional
 key but have distinct, persistent nonce spaces.
 
-Before encryption, rotate when the current directional key has already
-performed 2^24 encryptions, when the next ciphertext would exceed 2^40 bytes,
-or after 600 seconds since its first encryption, whichever occurs first.
-Both ACK and data-class encryptions count, including locally refused sends.
-These are conservative **operational budgets, not a claimed hard
-ChaChaPoly packet limit or a formal security proof**. Noise's reserved nonce
-and record-size rules still apply. A different cryptographic budget/profile
-requires review; nonce width alone is not a security-advantage bound.
+Before encryption, rotate after at most **2^48 encryptions** or before the
+next ciphertext would exceed **2^60 bytes** under that directional key.
+ACK and data-class encryptions both count, including locally refused sends.
+Also attempt an age-based update 600 seconds after the first encryption.
+Age is an operational hygiene target, not an AEAD exhaustion limit, and is
+deferred while the current update is unconfirmed.
 
-The sender writes the chosen epoch in the authenticated packet header.
-Locally blocked data sends retain/retry the exact ciphertext; they do not
-re-encrypt a different snapshot under its nonce. A refused time-sensitive ACK
-burns its nonce before generating a later snapshot.
+Budget rationale: the actual AEAD is the IETF ChaCha20-Poly1305 construction
+used by Noise ChaChaPoly (64-bit Noise nonces in its 96-bit nonce field).
+[RFC 8439 sections 2.8 and 4](https://www.rfc-editor.org/rfc/rfc8439#section-4)
+requires unique nonces and limits an invocation to fewer than 2^32 64-byte
+blocks; our 65535-byte record cap is far below this. For records of this size,
+[RFC 9001 section 6.6](https://www.rfc-editor.org/rfc/rfc9001#section-6.6)
+documents a ChaCha20-Poly1305 confidentiality limit greater than 2^62 packets.
+The 2^48 encryption budget leaves at least a 2^14 packet margin to that bound;
+the 2^60 byte budget is an additional conservative volume guard, not an
+invented ChaChaPoly hard byte limit. In contrast, 2^24 packets would rotate
+about every 0.2 seconds at 1 Tbit/s and TU1472 for no documented AEAD reason.
+The new packet budget alone covers about 38 days at that rate; ordinarily the
+600-second target rotates much sooner. These are fixed protocol rules, not
+user knobs. Nonce exhaustion and Noise's reserved nonce/record rules still
+apply independently. This is not a new formal multi-user security proof.
+RFC 9001 also identifies an integrity limit of 2^36 **failed verifications**;
+STP does not presently enforce a per-key failed-verification limit or claim
+that bound against an unlimited active forger. Failed attempts are silent,
+make no state changes except expired-key erasure, and do not cause a cheap
+attacker-driven rekey/close. Global verification throttling/attempt accounting
+is separate unimplemented hardening; encryption budgets do not bound forgeries.
 
-A receiver holds current, previous and one prederived next incoming key.
-Only a valid tag for **exactly current+1** advances its incoming epoch; a forged
-or far-future epoch causes no derivation loop or state mutation. The previous
-epoch is accepted for at most ten seconds after advancement and only while
-its packet is within replay support. Packets older than one key epoch are
-safely discarded even within that ten-second time bound: this is a bounded
-implementation capability, not a promise to cover ten seconds across an
-arbitrary number of high-rate updates. Replay state is never reset at rekey.
+### Confirmed, loss-tolerant key updates
 
-There are no update control messages whose loss would strand a single key
-change; any authenticated packet in the next epoch proves the transition.
-A receiver missing **more than one complete epoch** cannot catch up in this
-bounded-ratchet profile and requires a fresh handshake. u32 epoch exhaustion
-also requires a new handshake. Invalid tags do not result in ACKs or frame
-allocation. Verification-attempt throttling/formal multi-user cryptographic
-bounds are not claimed by this implementation.
+Epoch zero starts confirmed. After rotating to epoch e+1, the sender MUST NOT
+rotate again until an authenticated, plausible positive ACK receipts a
+data-class nonce actually emitted in e+1. Because nonces never reset and
+outgoing epochs never decrease, remembering the first data nonce sealed in
+the current epoch and comparing a validated highest positive receipt suffices;
+a receipt for an allocated-but-not-yet-accepted pending send is not plausible.
+This also works for updates first used by an ACK: the next periodic keepalive
+(or ordinary data/probe) provides a receiptable nonce in the new epoch.
+ACK-only and idle directions therefore do not depend on application traffic.
+
+Without confirmation, age alone MUST NOT rotate again or close the
+association; continue sending in e+1 within its hard safety budgets. If either
+hard encryption budget is reached before confirmation, stop encryption and
+close, requiring a fresh handshake. Do not exceed the budget or send e+2.
+Consequently loss of **all** e+1 packets cannot strand a conforming receiver
+at e with an endless stream of undecryptable e+2 packets: the sender retries
+e+1, receives confirmation, or cleanly closes at its safety/liveness boundary.
+No reliable key-update control flight, ACK-of-ACK, new wire field or unbounded
+catch-up derivation is required. A malicious authenticated receiver can lie
+about receipts and harm its own association, as with ordinary ACK feedback.
+
+The sender writes its chosen epoch in the authenticated packet header.
+Locally blocked data sends retain/retry exact ciphertext at the effective TU;
+they do not re-encrypt a different snapshot under its nonce. A refused
+time-sensitive ACK burns its nonce before generating a later snapshot.
+
+A receiver holds current, optional previous, and one prederived next incoming
+key. Only a valid tag for **exactly current+1** advances its incoming epoch.
+Each packet selects at most one AEAD key; successful advancement performs one
+REKEY. A forged/far-future epoch causes no derivation loop or advance. The
+previous epoch is accepted for at most ten seconds after advancement, and
+only within replay support. Its stored keys are overwritten and dropped on
+expiry (including from the idle send timer), or earlier on another advance.
+Packets older than one epoch are safely discarded even within ten seconds;
+this bounded retention is not a promise to retain arbitrary high-rate old
+epochs. Replay state never resets at rekey. Deterministic Noise REKEY protects
+past erased epoch keys against compromise of a later key; it does **not**
+provide post-compromise recovery or hide future keys from a transport-key
+compromise. A fresh authenticated handshake is needed for fresh DH entropy.
+
+Before nonce, u32 epoch or u64 identity exhaustion, implementations MUST
+stop sealing and close or arrange a fresh handshake, never wrap or abort the
+process. This implementation closes cleanly and reports the association gone;
+the caller may request reconnection. It conservatively reserves the last
+data nonce rather than trying to allocate beyond it. No old worker completion
+may deliver into a replacement connection with the same endpoint lookup key.
+Invalid tags elicit neither ACKs nor frame allocation.
 
 ## Minimum TU and byte costs
 
@@ -347,6 +483,32 @@ still uniformly padded. Packed whole IDs are deliberately omitted instead
 of paying eight bytes per message; u64 IDs on fragmented/coded frames keep
 parsing cheap, bounded and generation-free. The overhead increase on a
 1136-byte segmented repair is 48 -> 67 bytes before uniform padding.
+
+## Security and traffic-analysis boundaries
+
+ClientHello authentication requires Noise IK DH work before return routability
+is known. Anyone knowing the responder's public key can generate a valid
+hello, and matching-selector garbage still incurs responder DH attempts.
+Half-open state is memory-bounded and expires after 15 seconds, but CPU cost
+is not rate-limited. The initial 391-byte request/94-byte response is not
+large-response reflection; retransmitted responses before confirmation can
+exceed the original request cumulatively. A future **handshake version** will
+put a stateless return-routability retry cookie before expensive DH/allocation,
+with an aggregate pre-confirmation response budget. That cookie is not part
+of version 2 and no current anti-spoofing/strict anti-amplification guarantee
+is claimed.
+
+Uniform current-TU padding hides application message sizes, fragment shape
+and packing boundaries, not all metadata. The clear full nonce reveals packet
+counts, gaps and rate; the clear epoch reveals update cadence, including the
+600-second target. The static-key-derived 15-bit sender prefix permits
+cross-address correlation and leaks those key bits. ACKs are intentionally
+identifiable by their fixed size, and their cadence exposes receive timing.
+Probe sizes, handshake sizes, DSCP, outage/idle timing and IP/UDP endpoints
+are also observable. Version 2 does not provide traffic-flow confidentiality,
+constant-rate cover traffic, unlinkable connection identifiers or epoch-age
+jitter. These residual surfaces are deployment threat-model considerations,
+not removed by encrypting/padding message frames.
 
 ## Implementation and verification boundaries
 
