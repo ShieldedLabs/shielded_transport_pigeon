@@ -67,9 +67,12 @@ fn main() {
     if mode == "pressure" { pressure(kp, count, size); return; }
     // Reserve an ephemeral port before starting STP, whose API does not expose the bound port.
     let probe = UdpSocket::bind("127.0.0.1:0").unwrap(); let port = probe.local_addr().unwrap().port(); drop(probe);
-    let _server = new_network_thread_with_options(vec![kp.clone()], port, None, (1_000_000, 1<<20, 1<<20),
+    let cap = receive_connection_memory_limit(size, 1).expect("message-size receive cap");
+    let process = (256 << 20).max(cap + (1 << 20));
+    println!("max_message_size={size} per_connection_cap={cap} process_budget={process}");
+    let _server = new_network_thread_with_options(vec![kp.clone()], port, None, (1_000_000, 1<<20, 1<<20), size,
         NetworkThreadOptions { bind_ip: Some("127.0.0.1".parse().unwrap()),
-            receive_memory: Some(shielded_transport_pigeon::receive_memory::ReceiveMemoryBudget::new(256<<20)), ..Default::default() });
+            receive_memory: Some(shielded_transport_pigeon::receive_memory::ReceiveMemoryBudget::new(process)), ..Default::default() });
     std::thread::sleep(Duration::from_millis(50));
     println!("baseline {}", rss());
     let mut peers = Vec::new();
@@ -91,7 +94,7 @@ fn main() {
                     }
                 },
                 "inline" | "workers" | "tiny" => {
-                    let block = if mode == "inline" {size.div_ceil(256)} else if mode == "tiny" {1} else {1000};
+                    let block = if mode == "inline" {size.div_ceil(256).max(FEC_MIN_BLOCK_BYTES)} else if mode == "tiny" {1} else {FEC_MIN_BLOCK_BYTES};
                     assert!(block <= 16383);
                     let layout = shielded_transport_pigeon::fec::MessageLayout::new(size, block).unwrap();
                     let kind = if layout.groups > 1 {STP_EXT_KIND_GROUPED_FEC} else {STP_EXT_KIND_FEC};
@@ -119,10 +122,13 @@ fn pressure(server_key: IdentityKeyPair, seconds: usize, size: usize) {
     use std::time::Instant;
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap(); let port = socket.local_addr().unwrap().port(); drop(socket);
     let address = STPAddress::from("127.0.0.1".parse::<std::net::Ipv4Addr>().unwrap().to_ipv6_mapped(), port, &server_key);
-    let budget = shielded_transport_pigeon::receive_memory::ReceiveMemoryBudget::new(4<<20);
-    let server = new_network_thread_with_options(vec![server_key], port, None, (1_000_000,1<<20,1<<20),
+    let cap = receive_connection_memory_limit(size, 1).expect("message-size receive cap");
+    let process = (4 << 20).max(cap + (1 << 20));
+    println!("pressure max_message_size={size} per_connection_cap={cap} process_budget={process}");
+    let budget = shielded_transport_pigeon::receive_memory::ReceiveMemoryBudget::new(process);
+    let server = new_network_thread_with_options(vec![server_key], port, None, (1_000_000,1<<20,1<<20), size,
         NetworkThreadOptions { receive_memory: Some(budget.clone()), bind_ip: Some("127.0.0.1".parse().unwrap()), ..Default::default() });
-    let client = new_network_thread(vec![new_keypair_from_connect_magic1(address.magic1).unwrap()], 0, None, (1_000_000,1<<20,1<<20));
+    let client = new_network_thread(vec![new_keypair_from_connect_magic1(address.magic1).unwrap()], 0, None, (1_000_000,1<<20,1<<20), size);
     service_connections(&client, NetworkThreadPush { initiate_connections: vec![address], ..Default::default() }).unwrap();
     let start = Instant::now(); let mut client_wanted = Vec::new(); let mut server_wanted = Vec::new();
     let mut key = None; let mut pending = Vec::new(); let mut submitted = 0; let mut received = 0; let mut last_second = usize::MAX;

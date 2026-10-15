@@ -96,7 +96,7 @@ impl Args {
             "count" | "min" | "max" | "timeout" | "idle" | "out" | "giant" |
             "giant-warmup" | "queue-us" | "queue-min" | "queue-max" | "max-pps" |
             "duration" | "send-on-ms" | "send-off-ms" | "mix" | "classes" |
-            "loss-trace" | "loss-episodes" | "queues" | "workload" | "bulk-size" | "small-rate" | "small-size" | "traffic-classes" | "small-class")
+            "max-message-size" | "loss-trace" | "loss-episodes" | "queues" | "workload" | "bulk-size" | "small-rate" | "small-size" | "traffic-classes" | "small-class")
     }
     fn parse(it: impl Iterator<Item = String>) -> Args {
         let mut m = HashMap::new();
@@ -117,6 +117,23 @@ impl Args {
     }
 }
 
+fn bench_receive_budget(max_message_size: usize, queues: usize) -> std::sync::Arc<shielded_transport_pigeon::receive_memory::ReceiveMemoryBudget> {
+    let cap = receive_connection_memory_limit(max_message_size, queues).unwrap_or_else(|| die("invalid queue/message-size configuration"));
+    // Bench is the application: explicitly provision unusually large queue counts,
+    // rather than asking the library to silently accept an impossible configuration.
+    let process = (4usize << 30).max(cap + (1 << 20));
+    println!("application max_message_size={max_message_size} queues={queues} per_connection_receive_cap={cap} process_receive_budget={process}");
+    shielded_transport_pigeon::receive_memory::ReceiveMemoryBudget::new(process)
+}
+
+fn service_connections(handle: &NetworkThreadHandle, request: NetworkThreadPush) -> Option<NetworkThreadPull> {
+    let response = shielded_transport_pigeon::stp::service_connections(handle, request)?;
+    if let Some((_, _, _, message)) = response.send_unreliable_oversized.first() {
+        die(&format!("{}-byte submission exceeds application max_message_size; increase --max-message-size", message.len()));
+    }
+    Some(response)
+}
+
 /// Server-side ground truth sent in every STATUS reply: that connection's receiver counters,
 /// the server network thread's counters and the server process CPU time.
 #[derive(Clone, Copy, Debug, Default)]
@@ -131,10 +148,10 @@ impl RxReport {
             s.rx_messages_completed, s.rx_partial_evicted, s.rx_partial_evicted_bytes, s.rx_insert_failures, s.rx_stale_fragments]);
         v.extend_from_slice(&[s.fec_decode_last_tail_ns, s.fec_decode_max_tail_ns, s.fec_ingress_dropped_blocks, s.udp_payload_tu]);
         v.extend_from_slice(&[s.ack_packets_sent, s.ack_bytes_sent, s.ack_packets_received, s.ack_delay_us_max as u64, s.rtt_samples]);
-        v.extend_from_slice(&[s.fec_decode_admission_refusals, s.fec_decode_timeouts, s.fec_decode_preemptions]);
+        v.extend_from_slice(&[s.fec_decode_admission_refusals, s.fec_decode_timeouts, s.fec_decode_preemptions, s.fec_worker_limit_events, s.fec_decode_peak_workers, s.rx_plain_admission_refusals]);
         v
     }
-    const WORDS: usize = 40;
+    const WORDS: usize = 43;
     fn from_words(w: &[u64]) -> Option<RxReport> {
         if w.len() < 37 { return None; }
         let mut st = ConnectionStats { rx_packets: w[0], rx_seq_span: w[1], rx_lost: w[2], rx_reordered: w[3], rx_late_beyond_window: w[4], rx_duplicates: w[5], rx_bursts: w[6], ..Default::default() };
@@ -150,6 +167,9 @@ impl RxReport {
         st.fec_decode_admission_refusals = w.get(37).copied().unwrap_or(0);
         st.fec_decode_timeouts = w.get(38).copied().unwrap_or(0);
         st.fec_decode_preemptions = w.get(39).copied().unwrap_or(0);
+        st.fec_worker_limit_events = w.get(40).copied().unwrap_or(0);
+        st.fec_decode_peak_workers = w.get(41).copied().unwrap_or(0);
+        st.rx_plain_admission_refusals = w.get(42).copied().unwrap_or(0);
         Some(RxReport { st, th, cpu_user_us: w[21], cpu_sys_us: w[22] })
     }
 }
@@ -226,7 +246,11 @@ fn serve(a: &Args) {
     let kp = new_keypair_from_connect_magic1_with_seed(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, seed).unwrap();
     let addr = STPAddress::from(to_v6(advertise), port, &kp);
 
-    let handle = new_network_thread_with_options(vec![kp], port, max_pps(a), send_buffer_params(a), NetworkThreadOptions { bind_ip: bind, send_queue_count: a.num("queues", 1), ..Default::default() });
+    // General-purpose bench endpoint: explicitly accept the largest supported
+    // workload unless the operator supplies a narrower application limit.
+    let max_message_size = a.num("max-message-size", MAX_JUMBOGRAM_LEN).min(MAX_JUMBOGRAM_LEN);
+    let queues = a.num("queues", 1);
+    let handle = new_network_thread_with_options(vec![kp], port, max_pps(a), send_buffer_params(a), max_message_size, NetworkThreadOptions { receive_memory: Some(bench_receive_budget(max_message_size, queues)), bind_ip: bind, send_queue_count: queues, ..Default::default() });
     println!("stp_bench serve: bound {}:{port}", bind.map(|b| b.to_string()).unwrap_or("[::]".into()));
     println!("STP address: {:?}", addr);
 
@@ -374,7 +398,7 @@ fn send_duty_boundaries() {
 
 #[test]
 fn integrated_rx_report_roundtrip() {
-    let r = RxReport { st: ConnectionStats { fec_decode_last_tail_ns: 11, fec_decode_max_tail_ns: 12, fec_ingress_dropped_blocks: 13, udp_payload_tu: 1472, ack_packets_sent: 21, ack_bytes_sent: 22, ack_packets_received: 23, ack_delay_us_max: 24, rtt_samples: 25, fec_decode_admission_refusals: 31, fec_decode_timeouts: 32, fec_decode_preemptions: 33, ..Default::default() }, ..Default::default() };
+    let r = RxReport { st: ConnectionStats { fec_decode_last_tail_ns: 11, fec_decode_max_tail_ns: 12, fec_ingress_dropped_blocks: 13, udp_payload_tu: 1472, ack_packets_sent: 21, ack_bytes_sent: 22, ack_packets_received: 23, ack_delay_us_max: 24, rtt_samples: 25, fec_decode_admission_refusals: 31, fec_decode_timeouts: 32, fec_decode_preemptions: 33, fec_worker_limit_events: 34, fec_decode_peak_workers: 35, rx_plain_admission_refusals: 36, ..Default::default() }, ..Default::default() };
     let words = r.to_words();
     assert_eq!(words.len(), RxReport::WORDS);
     let decoded = RxReport::from_words(&words).unwrap();
@@ -474,7 +498,12 @@ fn send(a: &Args) {
     }
 
     let kp = new_keypair_from_connect_magic1(to.magic1).unwrap_or_else(|| die("unsupported crypto in --to"));
-    let handle = new_network_thread_with_options(vec![kp], 0, max_pps(a), send_buffer_params(a), NetworkThreadOptions { send_queue_count: a.num("queues", 1), bind_ip: None, record_loss_episodes: a.num::<u8>("loss-episodes", 0) != 0, record_fec_messages: true, loss_trace: a.str("loss-trace").map(std::path::PathBuf::from), ..Default::default() });
+    // The receiver also accepts complete STATUS replies, not just data messages.
+    let workload_max = sizes.iter().copied().max().unwrap().max(HEADER + 8 + 13 * count as usize + 8 * RxReport::default().to_words().len());
+    let max_message_size = a.num("max-message-size", workload_max).min(MAX_JUMBOGRAM_LEN);
+    if max_message_size < workload_max { die("--max-message-size is smaller than workload data/status messages"); }
+    let queues = a.num("queues", 1);
+    let handle = new_network_thread_with_options(vec![kp], 0, max_pps(a), send_buffer_params(a), max_message_size, NetworkThreadOptions { receive_memory: Some(bench_receive_budget(max_message_size, queues)), send_queue_count: queues, bind_ip: None, record_loss_episodes: a.num::<u8>("loss-episodes", 0) != 0, record_fec_messages: true, loss_trace: a.str("loss-trace").map(std::path::PathBuf::from), ..Default::default() });
     // Per data id: (k, blocks sent, blocks planned, loss estimate) of its FEC coding, if coded.
     let mut fec_info: HashMap<u32, (u32, u32, u32, f64)> = HashMap::new();
     // One sample per second, with the CC command and queue-empty transition count.
@@ -811,12 +840,12 @@ fn send(a: &Args) {
         stats.pacing_commanded_packets, stats.pacing_error_samples, stats.pacing_error_abs_sum_ns, stats.pacing_error_max_ns, stats.pacing_history_records,
         stats.network_cpu_user_us, stats.network_cpu_sys_us, sender_cpu_user_us, sender_cpu_sys_us, load_start, load_average());
     let queues = queue_report(nqueues, &sizes, &(0..count).map(|id| id as usize % nqueues).collect::<Vec<_>>(), &first_submit_ns, &recs, offset, wall_s, None);
-    json.insert_str(json.len() - 2, &format!(",\"queues\":[{}]", queues.join(",")));
+    json.insert_str(json.len() - 2, &format!(",\"max_message_size\":{max_message_size},\"queues\":[{}]", queues.join(",")));
     let block_sizes = fec_info.iter().map(|(&id, &(k, _, _, _))| format!("\"{id}\":{}", sizes[id as usize].div_ceil(k as usize))).collect::<Vec<_>>().join(",");
     json.insert_str(json.len() - 2, &format!(",\"udp_payload_tu\":{},\"fec_block_bytes_by_id\":{{{block_sizes}}},\"tu_warmup_seconds\":{warmup_elapsed_s:.6},\"receiver_fec_decode_last_tail_ms\":{:.3},\"receiver_fec_decode_max_tail_ms\":{:.3},\"receiver_fec_ingress_dropped_blocks\":{}",
         stats.udp_payload_tu, rx.st.fec_decode_last_tail_ns as f64 / 1e6, rx.st.fec_decode_max_tail_ns as f64 / 1e6, rx.st.fec_ingress_dropped_blocks));
-    json.insert_str(json.len() - 2, &format!(",\"receiver_fec_decode_admission_refusals\":{},\"receiver_fec_decode_timeouts\":{},\"receiver_fec_decode_preemptions\":{}",
-        rx.st.fec_decode_admission_refusals, rx.st.fec_decode_timeouts, rx.st.fec_decode_preemptions));
+    json.insert_str(json.len() - 2, &format!(",\"receiver_fec_decode_admission_refusals\":{},\"receiver_fec_decode_timeouts\":{},\"receiver_fec_decode_preemptions\":{},\"receiver_fec_worker_limit_events\":{},\"receiver_fec_decode_peak_workers\":{},\"receiver_plain_admission_refusals\":{}",
+        rx.st.fec_decode_admission_refusals, rx.st.fec_decode_timeouts, rx.st.fec_decode_preemptions, rx.st.fec_worker_limit_events, rx.st.fec_decode_peak_workers, rx.st.rx_plain_admission_refusals));
     println!("UDP TU {}B | FEC blocks {{{block_sizes}}}B | receiver FEC last/max decode tail {:.3}/{:.3}ms | ingress erased {} blocks",
         stats.udp_payload_tu, rx.st.fec_decode_last_tail_ns as f64 / 1e6, rx.st.fec_decode_max_tail_ns as f64 / 1e6, rx.st.fec_ingress_dropped_blocks);
     std::fs::write(&out, json).unwrap_or_else(|e| die(&format!("writing {out}: {e}")));
@@ -870,7 +899,9 @@ fn send_magazines(a: &Args) {
     let to = STPAddress::parse(a.str("to").unwrap_or_else(|| die("send needs --to"))).unwrap_or_else(|| die("bad --to"));
     let key = to.to_connection_key();
     let kp = new_keypair_from_connect_magic1(to.magic1).unwrap();
-    let handle = new_network_thread_with_options(vec![kp], 0, max_pps(a), send_buffer_params(a), NetworkThreadOptions { send_queue_count: n, record_fec_messages: true, record_loss_episodes: a.num::<u8>("loss-episodes", 0) != 0, loss_trace: a.str("loss-trace").map(std::path::PathBuf::from), ..Default::default() });
+    let max_message_size = a.num("max-message-size", bulk_size.max(small_size)).min(MAX_JUMBOGRAM_LEN);
+    if max_message_size < bulk_size.max(small_size) { die("--max-message-size is smaller than workload messages"); }
+    let handle = new_network_thread_with_options(vec![kp], 0, max_pps(a), send_buffer_params(a), max_message_size, NetworkThreadOptions { receive_memory: Some(bench_receive_budget(max_message_size, n)), send_queue_count: n, record_fec_messages: true, record_loss_episodes: a.num::<u8>("loss-episodes", 0) != 0, loss_trace: a.str("loss-trace").map(std::path::PathBuf::from), ..Default::default() });
     let mut wanted = service_connections(&handle, NetworkThreadPush { initiate_connections: vec![to], ..Default::default() }).unwrap().current_connections;
     let mut outbox = Vec::new();
     let epoch = Instant::now(); let ns = || epoch.elapsed().as_nanos() as u64;
@@ -995,7 +1026,8 @@ fn send_magazines(a: &Args) {
     println!("{delivered}/{} delivered, total goodput {gp:.3} Mbit/s", sizes.len());
     let mut json = json;
     json.insert_str(json.len()-2, &format!(",\"packets_sent\":{},\"packets_lost\":{},\"spurious_losses\":{},\"receiver_rx_lost\":{},\"receiver_rx_reordered\":{},\"receiver_rx_late_beyond_window\":{},\"cc_rate_pps\":{:.3}", stats.packets_sent, stats.packets_lost, stats.spurious_losses, receiver.st.rx_lost, receiver.st.rx_reordered, receiver.st.rx_late_beyond_window, stats.cc_rate_upps as f64/1e6));
-    json.insert_str(json.len()-2, &format!(",\"receiver_stale_fragments\":{},\"receiver_partials_evicted\":{},\"receiver_insert_failures\":{}", receiver.st.rx_stale_fragments, receiver.st.rx_partial_evicted, receiver.st.rx_insert_failures));
+    json.insert_str(json.len()-2, &format!(",\"max_message_size\":{max_message_size},\"receiver_fec_worker_limit_events\":{},\"receiver_stale_fragments\":{},\"receiver_partials_evicted\":{},\"receiver_insert_failures\":{}", receiver.st.fec_worker_limit_events, receiver.st.rx_stale_fragments, receiver.st.rx_partial_evicted, receiver.st.rx_insert_failures));
+    json.insert_str(json.len()-2, &format!(",\"receiver_fec_decode_peak_workers\":{},\"receiver_plain_admission_refusals\":{},\"receiver_fec_decode_admission_refusals\":{},\"receiver_fec_ingress_dropped_blocks\":{},\"receiver_recv_queue_dropped_messages\":{},\"receiver_kernel_rx_drops\":{}", receiver.st.fec_decode_peak_workers, receiver.st.rx_plain_admission_refusals, receiver.st.fec_decode_admission_refusals, receiver.st.fec_ingress_dropped_blocks, receiver.th.recv_queue_dropped_messages, receiver.th.kernel_rx_drops.map_or("null".into(), |n| n.to_string())));
     std::fs::write(a.str("out").unwrap_or("stp_bench_report.json"), json).unwrap();
     fec_trace.flush();
     drop(handle);

@@ -18,8 +18,8 @@ pub fn ack_test() {
     socket_setup();
     monotonic_clock_setup();
 
-    let network_thread_handle1 = new_network_thread(vec![kp1.clone()], 58493, None, (1_000_000, 256 * 1024 * 1024, 256 * 1024 * 1024));
-    let network_thread_handle2 = new_network_thread(vec![kp2.clone()], 23843, None, (1_000_000, 256 * 1024 * 1024, 256 * 1024 * 1024));
+    let network_thread_handle1 = new_network_thread(vec![kp1.clone()], 58493, None, (1_000_000, 256 * 1024 * 1024, 256 * 1024 * 1024), 256 << 20);
+    let network_thread_handle2 = new_network_thread(vec![kp2.clone()], 23843, None, (1_000_000, 256 * 1024 * 1024, 256 * 1024 * 1024), 256 << 20);
 
     let initiate_connections = vec![ STPAddress { ip: Ipv6Addr::LOCALHOST, port: 58493, magic1: CONNECT_MAGIC1_PLAIN_TEXT, key: kp1_pub, } ];
     let ret = service_connections(&network_thread_handle2, NetworkThreadPush { initiate_connections, send_unreliable: vec![], ..Default::default() }).unwrap_or_default();
@@ -122,11 +122,11 @@ pub fn ack_test() {
     println!("Order:      {:?}", receive_order);
 }
 
-pub fn do_the_test_program3(port: u16, my_keypair: IdentityKeyPair, beam_to: Option<STPAddress>, max_pps: Option<u64>, send_buffer_params: (u32, u32, u32)) {
+pub fn do_the_test_program3(port: u16, my_keypair: IdentityKeyPair, beam_to: Option<STPAddress>, max_pps: Option<u64>, send_buffer_params: (u32, u32, u32), max_message_size: usize) {
     socket_setup();
     monotonic_clock_setup();
 
-    let network_thread_handle2 = new_network_thread(vec![my_keypair], port, max_pps, send_buffer_params);
+    let network_thread_handle2 = new_network_thread(vec![my_keypair], port, max_pps, send_buffer_params, max_message_size);
     
     if let Some(other) = beam_to {
         let initiate_connections = vec![other];
@@ -681,6 +681,19 @@ pub const STP_EXT_KIND_FEC: u64 = 1;
 const STP_EXT_KIND_SEGMENT_FEC: u64 = 3;
 const STP_SEGMENT_FEC_HEADER_SIZE: usize = 26;
 const FEC_SEGMENT_BYTES: usize = 2 << 20;
+/// Minimum honest symbol width: guaranteed UDP TU minus the largest supported
+/// crypto overhead (6-byte prefix + 16-byte AEAD tag) and the segment header.
+/// Ordinary FEC uses 10 more bytes; even the smallest coded message has K >= 2.
+pub const FEC_MIN_BLOCK_BYTES: usize = ASSUMED_UDP_PAYLOAD_SIZE_WITH_GUARANTEED_DELIVERY - (6 + 16) - STP_SEGMENT_FEC_HEADER_SIZE;
+pub const FEC_MAX_SOURCE_BLOCKS: usize = FEC_SEGMENT_BYTES.div_ceil(FEC_MIN_BLOCK_BYTES);
+
+// Current senders segment every message above 2 MiB. Refuse legacy jumbo codecs
+// and tiny attacker-chosen symbols before any root/decoder memory admission.
+fn wire_fec_layout(len: usize, block_bytes: usize) -> Option<crate::fec::MessageLayout> {
+    if len > FEC_SEGMENT_BYTES || block_bytes < FEC_MIN_BLOCK_BYTES { return None; }
+    let layout = crate::fec::MessageLayout::new(len, block_bytes)?;
+    (layout.k <= FEC_MAX_SOURCE_BLOCKS).then_some(layout)
+}
 
 /// Independently coded, fixed byte-range group of one application message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1972,6 +1985,12 @@ pub struct ConnectionStats {
     pub fec_decode_timeouts: u64,
     /// Oldest inactive decoder retired under admission pressure after 2 RTTs.
     pub fec_decode_preemptions: u64,
+    /// Codecs first refused or retired because a peer/global worker limit was hit.
+    pub fec_worker_limit_events: u64,
+    /// Peak concurrently open asynchronous FEC codecs, including draining workers.
+    pub fec_decode_peak_workers: u64,
+    /// Plain fragments refused by the receive budget, including small whole messages.
+    pub rx_plain_admission_refusals: u64,
 }
 
 /// Burst-length class boundaries of `ConnectionStats::rx_burst_hist` (inclusive upper bounds).
@@ -2178,6 +2197,8 @@ pub fn connect_to_endpoint(
     send_buffer_params: (u32, u32, u32),
     send_queue_count: usize,
     budget: &std::sync::Arc<crate::receive_memory::ReceiveMemoryBudget>,
+    connection_receive_limit: usize,
+    max_message_size: usize,
 ) {
     let Some(receive_reservation) = budget.reserve(RECEIVE_CONNECTION_BYTES) else { return; };
     assert!(my_connect_keypair.magic1 == endpoint.magic1);
@@ -2195,7 +2216,7 @@ pub fn connect_to_endpoint(
             ConnectionKey::from(endpoint),
             ConnectionTrackingData {
                 receive_reservation,
-                receive_budget: crate::receive_memory::ReceiveMemoryBudget::connection_share(budget),
+                receive_budget: crate::receive_memory::ReceiveMemoryBudget::connection_with_limit(budget, connection_receive_limit).with_worker_limit(receive_worker_limit(max_message_size, send_queue_count)),
                 creation_time_ns: monotonic_clock_ns(),
                 my_ip,
                 my_transport_identity_keypair: my_connect_keypair.clone(),
@@ -2230,7 +2251,7 @@ pub fn connect_to_endpoint(
             ConnectionKey::from(endpoint),
             ConnectionTrackingData {
                 receive_reservation,
-                receive_budget: crate::receive_memory::ReceiveMemoryBudget::connection_share(budget),
+                receive_budget: crate::receive_memory::ReceiveMemoryBudget::connection_with_limit(budget, connection_receive_limit).with_worker_limit(receive_worker_limit(max_message_size, send_queue_count)),
                 creation_time_ns: monotonic_clock_ns(),
                 my_ip,
                 my_transport_identity_keypair: my_connect_keypair.clone(),
@@ -2252,6 +2273,55 @@ const        VERBOSE                :bool=0!=                (1);
 const OVERLY_VERBOSE                :bool=0!=                (0);
 
 macro_rules! pod { ($($item:item)*) => { $(#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)] $item)* }; }
+
+// This formula and finish_segment's geometric prefix growth form one policy.
+// A resize can hold min(2*prefix,total) destination bytes plus total-prefix
+// sparse bytes and the group being copied: at most ceil(1.5*total)+one group.
+fn segment_reassembly_peak(total: usize) -> usize {
+    total + total.div_ceil(2) + total.min(FEC_SEGMENT_BYTES)
+        + 256 + total.div_ceil(FEC_SEGMENT_BYTES) * 64
+}
+
+const FEC_INGRESS_SLOT_BYTES: usize = std::mem::size_of::<(u32, Vec<u8>)>() + 128;
+
+fn fec_ingress_bytes(layout: crate::fec::MessageLayout) -> usize {
+    // One complete source unit, including channel slots, at EACH ingress level.
+    // A 2 MiB unit absorbs ~28 ms at 600 Mbit/s. Unlike a fixed 32 MiB per
+    // level this scales down with the codec; decoding drains concurrently.
+    (layout.k * (layout.block_bytes + FEC_INGRESS_SLOT_BYTES)).min(MAX_FEC_INGRESS_BYTES)
+}
+
+// Wi-Fi q2 (two queues) and fleet (one queue) both peaked at three codecs.
+// Allow one extra per queue, bounded by the network thread's eight-worker cap.
+const FEC_WORKERS_PER_QUEUE: usize = 4;
+fn receive_worker_limit(max_message_size: usize, queues: usize) -> usize {
+    let unit = max_message_size.min(FEC_SEGMENT_BYTES);
+    if unit.div_ceil(FEC_MIN_BLOCK_BYTES) <= FEC_INLINE_MAX_BLOCKS { return 0; }
+    (queues * max_message_size.div_ceil(unit).min(FEC_WORKERS_PER_QUEUE)).min(MAX_FEC_DECODE_WORKERS)
+}
+
+/// Hard per-peer receive cap derived only from REQUIRED local application configuration.
+/// Completed-but-unpulled messages share this cap, so a stalled application can
+/// cause backpressure; pulling hands ownership to the application and releases it.
+pub fn receive_connection_memory_limit(max_message_size: usize, queues: usize) -> Option<usize> {
+    if !(1..=64).contains(&queues) { return None; }
+    let max_message_size = max_message_size.min(MAX_JUMBOGRAM_LEN);
+    let unit = max_message_size.min(FEC_SEGMENT_BYTES);
+    let workers = receive_worker_limit(max_message_size, queues);
+    let decoder = if unit > FEC_MIN_BLOCK_BYTES {
+        let layout = wire_fec_layout(unit, FEC_MIN_BLOCK_BYTES)?;
+        // k*block_bytes < unit+block_bytes, and every wire width fits u16.
+        // This upper bound covers all allowed widths, not just honest TU sizes.
+        let ingress = (unit + u16::MAX as usize + layout.k * FEC_INGRESS_SLOT_BYTES).min(MAX_FEC_INGRESS_BYTES);
+        crate::fec::receive_memory_charge(layout, workers != 0, ingress)?
+    } else { 0 };
+    // Inline-only peers need no workers or worker ingress; their FIFO queues can
+    // each have one inline codec. Hostile extra roots still share the hard cap.
+    let codecs = if workers != 0 { workers } else { queues };
+    let metadata = 1024 * (256 + max_message_size.div_ceil(FEC_SEGMENT_BYTES) * 64);
+    queues.checked_mul(segment_reassembly_peak(max_message_size))?
+        .checked_add(codecs.checked_mul(decoder)?)?.checked_add(metadata)
+}
 
 #[derive(Debug, Default)]
 pub struct ReassemblySlot {
@@ -2473,6 +2543,7 @@ pub struct FecRecvSlot {
     last_block_ns: u64,
     ingress_dropped: u64,
     admission_refused: bool,
+    worker_limit_refused: bool,
 }
 
 #[derive(Default)]
@@ -2564,9 +2635,10 @@ fn retire_inactive_fec_workers(slots: &mut [FecRecvSlot], now_ns: u64, grace_ns:
     retired
 }
 
-struct FecWorkerGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+struct FecWorkerGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>, std::sync::Arc<crate::receive_memory::ReceiveMemoryBudget>);
 impl Drop for FecWorkerGuard {
     fn drop(&mut self) {
+        self.1.release_worker();
         self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
@@ -2591,26 +2663,31 @@ fn fec_receive_block(
     }
     if !slot.in_use() {
         let worker = layout.k > FEC_INLINE_MAX_BLOCKS;
-        let charge = receive_memory_charge(layout, worker, MAX_FEC_INGRESS_BYTES)?;
+        let ingress_bytes = fec_ingress_bytes(layout);
+        let charge = receive_memory_charge(layout, worker, ingress_bytes)?;
         let reservation = if !worker || workers.load(std::sync::atomic::Ordering::Acquire) < MAX_FEC_DECODE_WORKERS {
             budget.reserve(charge)
-        } else { None };
+        } else { slot.worker_limit_refused = true; None };
         let Some(reservation) = reservation else {
             slot.admission_refused = true;
             slot.ingress_dropped += 1;
             return None;
         };
         if worker {
-            let (tx, rx) = std::sync::mpsc::sync_channel::<(u32, Vec<u8>)>(ingress_slots(MAX_FEC_INGRESS_BYTES, block_bytes));
+            if !budget.acquire_worker() {
+                slot.worker_limit_refused = true;
+                slot.admission_refused = true; slot.ingress_dropped += 1; return None;
+            }
+            let (tx, rx) = std::sync::mpsc::sync_channel::<(u32, Vec<u8>)>(ingress_slots(ingress_bytes, block_bytes));
             let done_tx = done_tx.clone();
             workers.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-            let guard = FecWorkerGuard(workers.clone());
+            let guard = FecWorkerGuard(workers.clone(), budget.clone());
             let r = std::thread::Builder::new().name("stp-fec-decode".into()).spawn(move || {
                 let _guard = guard;
                 // Move the capture into a later local: on decode failure its
                 // budget must be released before the worker count reaches zero.
                 let reservation = reservation;
-                if let Some(m) = decode_message_blocks(layout, rx, MAX_FEC_INGRESS_BYTES) {
+                if let Some(m) = decode_message_blocks(layout, rx, ingress_bytes) {
                     // Keep the admission charge through the completion channel, including
                     // when the network thread is stalled or this connection is evicted.
                     let _ = done_tx.send((connection_key, package_id, m, reservation));
@@ -2671,6 +2748,9 @@ pub struct NetworkThreadPull {
     /// connection with that key exists. Per connection AND queue they keep the order they were pushed in.
     /// Nothing is dropped; resubmit them later or discard them yourself.
     pub send_unreliable_rejected: Vec<(ConnectionKey, usize, Dscp, Vec<u8>)>,
+    /// Permanent submission error: message exceeds local `max_message_size`.
+    /// Returned untouched; retrying without changing size/configuration cannot succeed.
+    pub send_unreliable_oversized: Vec<(ConnectionKey, usize, Dscp, Vec<u8>)>,
     /// Distinct application error: queue index outside the fixed initialization bound.
     /// Messages are untouched, but retrying without changing the index cannot succeed.
     pub send_unreliable_invalid_queue: Vec<(ConnectionKey, usize, Dscp, Vec<u8>)>,
@@ -2714,16 +2794,16 @@ impl Drop for NetworkThreadHandle {
     }
 }
 
-pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_pps: Option<u64>, send_buffer_params: (u32, u32, u32)) -> NetworkThreadHandle {
-    new_network_thread_with_bind(my_keypairs, my_port, max_pps, send_buffer_params, None)
+pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_pps: Option<u64>, send_buffer_params: (u32, u32, u32), max_message_size: usize) -> NetworkThreadHandle {
+    new_network_thread_with_bind(my_keypairs, my_port, max_pps, send_buffer_params, max_message_size, None)
 }
 
 /// Like `new_network_thread`, but `bind_ip: Some(ip)` binds the UDP socket to that one local
 /// address instead of the dual-stack wildcard, so replies leave from it (Fly.io UDP needs the
 /// `fly-global-services` IPv4 address). An IPv4 bind only reaches IPv4 peers, an IPv6 bind only
 /// IPv6 peers. Linux only; elsewhere a specific bind fails. `None` is `new_network_thread`.
-pub fn new_network_thread_with_bind(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_pps: Option<u64>, send_buffer_params: (u32, u32, u32), bind_ip: Option<std::net::IpAddr>) -> NetworkThreadHandle {
-    new_network_thread_with_options(my_keypairs, my_port, max_pps, send_buffer_params, NetworkThreadOptions { bind_ip, ..Default::default() })
+pub fn new_network_thread_with_bind(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_pps: Option<u64>, send_buffer_params: (u32, u32, u32), max_message_size: usize, bind_ip: Option<std::net::IpAddr>) -> NetworkThreadHandle {
+    new_network_thread_with_options(my_keypairs, my_port, max_pps, send_buffer_params, max_message_size, NetworkThreadOptions { bind_ip, ..Default::default() })
 }
 
 /// Internal loss/ECN-driven packet-rate policy. Values are fixed in ship.rs.
@@ -2772,7 +2852,7 @@ pub struct NetworkThreadOptions {
     pub datagram_log: Option<std::sync::Arc<std::sync::Mutex<Vec<SentDatagram>>>>,
     #[cfg(test)]
     send_failure: Option<std::sync::Arc<std::sync::Mutex<TestSendFailure>>>,
-    /// Fixed number of sender-only FIFO queues per connection (1..=64).
+    /// Fixed number of FIFO queues per connection (1..=64), also sizing the peer receive cap.
     /// Total app capacity is N x max_queue_size_bytes (plus the inherited oversized-alone
     /// exception). Rescue reservations are 64 MiB/N and 4096/N per magazine, no borrowing.
     pub send_queue_count: usize,
@@ -2793,12 +2873,21 @@ impl Default for NetworkThreadOptions {
     fn default() -> Self { Self { #[cfg(test)] datagram_log: None, #[cfg(test)] send_failure: None, send_queue_count: 1, receive_memory: None, bind_ip: None, record_fec_messages: false, record_loss_episodes: false, loss_trace: None } }
 }
 
-pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_pps: Option<u64>, send_buffer_params: (u32, u32, u32), options: NetworkThreadOptions) -> NetworkThreadHandle {
+/// `max_message_size` is required local application configuration in both directions,
+/// clamped to 1 GiB. Oversized submissions return in `send_unreliable_oversized`.
+/// Both applications must configure compatible limits; no negotiation is added.
+/// Panics synchronously if its receive cap plus bookkeeping cannot fit the budget.
+pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_pps: Option<u64>, send_buffer_params: (u32, u32, u32), max_message_size: usize, options: NetworkThreadOptions) -> NetworkThreadHandle {
     let bind_ip = options.bind_ip;
     let send_queue_count = options.send_queue_count;
     assert!((1..=64).contains(&send_queue_count), "send_queue_count must be 1..=64");
     static DEFAULT_RECEIVE_MEMORY: std::sync::OnceLock<std::sync::Arc<crate::receive_memory::ReceiveMemoryBudget>> = std::sync::OnceLock::new();
     let receive_memory = options.receive_memory.unwrap_or_else(|| DEFAULT_RECEIVE_MEMORY.get_or_init(|| std::sync::Arc::new(Default::default())).clone());
+    let max_message_size = max_message_size.min(MAX_JUMBOGRAM_LEN);
+    let connection_receive_limit = receive_connection_memory_limit(max_message_size, send_queue_count)
+        .expect("receive cap arithmetic overflow");
+    assert!(connection_receive_limit.checked_add(RECEIVE_CONNECTION_BYTES).is_some_and(|n| n <= receive_memory.limit()),
+        "max_message_size={max_message_size} with {send_queue_count} queues requires {connection_receive_limit} receive bytes plus connection bookkeeping; process budget is {}", receive_memory.limit());
     // One measured policy, not application configuration.
     let cc = crate::ship::CC;
     let cc_rate = move |t, r, k, startup_done| connection_rate(t, r, k, &cc, startup_done);
@@ -2930,7 +3019,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                     }
                     for keypair in &my_keypairs {
                         if w.magic1 == keypair.magic1 {
-                            connect_to_endpoint(&mut connections_map, keypair, w, send_buffer_params, send_queue_count, &receive_memory);
+                            connect_to_endpoint(&mut connections_map, keypair, w, send_buffer_params, send_queue_count, &receive_memory, connection_receive_limit, max_message_size);
                             break;
                         }
                     }
@@ -2950,7 +3039,10 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                     while j < req.send_unreliable.len() && req.send_unreliable[j].0 == key && req.send_unreliable[j].1 == queue { j += 1; }
                     let mut batch = Vec::with_capacity(j - i);
                     while i < j {
-                        batch.push((req.send_unreliable[i].2, std::mem::take(&mut req.send_unreliable[i].3)));
+                        let (dscp, message) = (req.send_unreliable[i].2, std::mem::take(&mut req.send_unreliable[i].3));
+                        if message.len() > max_message_size {
+                            resp.send_unreliable_oversized.push((key, queue, dscp, message));
+                        } else { batch.push((dscp, message)); }
                         i += 1;
                     }
                     let rejected = if let Some(tracking_data) = connections_map.get_mut(&key) {
@@ -2980,6 +3072,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                 resp.connection_stats = connections_map.iter().filter_map(|(key, value)| match &value.connection_state {
                     ConnectionState::Connected(c) => {
                         let mut st = c.stats;
+                        st.fec_decode_peak_workers = value.receive_budget.worker_peak() as u64;
                         st.seq_numbers_used = c.send_sequence_number;
                         st.udp_payload_tu = c.current_tu;
                         st.network_cpu_user_us = network_cpu.0;
@@ -3098,7 +3191,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                                 connection_key,
                                                 ConnectionTrackingData {
                                                     receive_reservation,
-                                                    receive_budget: crate::receive_memory::ReceiveMemoryBudget::connection_share(&receive_memory),
+                                                    receive_budget: crate::receive_memory::ReceiveMemoryBudget::connection_with_limit(&receive_memory, connection_receive_limit).with_worker_limit(receive_worker_limit(max_message_size, send_queue_count)),
                                                     creation_time_ns: monotonic_clock_ns(),
                                                     my_ip,
                                                     my_transport_identity_keypair: my_kp.clone(),
@@ -3182,7 +3275,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                                     connection_key,
                                                     ConnectionTrackingData {
                                                         receive_reservation,
-                                                        receive_budget: crate::receive_memory::ReceiveMemoryBudget::connection_share(&receive_memory),
+                                                        receive_budget: crate::receive_memory::ReceiveMemoryBudget::connection_with_limit(&receive_memory, connection_receive_limit).with_worker_limit(receive_worker_limit(max_message_size, send_queue_count)),
                                                         creation_time_ns: monotonic_clock_ns(),
                                                         my_ip,
                                                         my_transport_identity_keypair: my_kp.clone(),
@@ -3522,12 +3615,12 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     let block_id = (header >> 32) as u32;
                                     let message_len = (word1 & 0xffff_ffff) as usize;
                                     let block_bytes = ((word1 >> 32) & 0xffff) as usize;
-                                    if message_len > MAX_JUMBOGRAM_LEN {
-                                        if VERBOSE { println!("Error, FEC message length ({message_len}) exceeds MAX_JUMBOGRAM_LEN from {connection_key:?}. Disconnecting..."); }
+                                    if message_len > max_message_size || segment.is_some_and(|s| s.total as usize > max_message_size) {
+                                        if VERBOSE { println!("Error, FEC message exceeds local max_message_size ({max_message_size}) from {connection_key:?}. Disconnecting..."); }
                                         connections_map.remove(&connection_key);
                                         break 'conn;
                                     }
-                                    let Some(layout) = crate::fec::MessageLayout::new(message_len, block_bytes) else { continue; };
+                                    let Some(layout) = wire_fec_layout(message_len, block_bytes) else { continue; };
                                     if !valid_fec_symbol(layout, block_id, data.len()) { continue; }
                                     if (kind == STP_EXT_KIND_GROUPED_FEC) != (layout.groups > 1) { continue; }
                                     if let Some(segment) = segment {
@@ -3566,10 +3659,13 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                         }
                                     }
                                     if layout.k > FEC_INLINE_MAX_BLOCKS && !existing_connection.unreliable_fec[slot_idx].in_use()
-                                        && fec_workers.load(std::sync::atomic::Ordering::Acquire) >= MAX_FEC_DECODE_WORKERS {
+                                        && (fec_workers.load(std::sync::atomic::Ordering::Acquire) >= MAX_FEC_DECODE_WORKERS || existing_connection.receive_budget.worker_limit_reached()) {
                                         let grace = fec_inactive_grace_ns(state.RTT_mean, true);
-                                        state.stats.fec_decode_preemptions += retire_inactive_fec_workers(&mut existing_connection.unreliable_fec, timestamp_ns, grace, true);
+                                        let retired = retire_inactive_fec_workers(&mut existing_connection.unreliable_fec, timestamp_ns, grace, true);
+                                        state.stats.fec_decode_preemptions += retired;
+                                        state.stats.fec_worker_limit_events += retired;
                                     }
+                                    let worker_refused_before = existing_connection.unreliable_fec[slot_idx].worker_limit_refused;
                                     let refused_before = existing_connection.unreliable_fec[slot_idx].admission_refused;
                                     let dropped_before = existing_connection.unreliable_fec[slot_idx].ingress_dropped;
                                     if let Some((message, mut _reservation)) = fec_receive_block(&mut existing_connection.unreliable_fec[slot_idx], connection_key, package_id, message_len, block_bytes, block_id, data, &fec_done_tx, &fec_workers, &existing_connection.receive_budget) {
@@ -3587,6 +3683,9 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     state.stats.fec_ingress_dropped_blocks += existing_connection.unreliable_fec[slot_idx].ingress_dropped - dropped_before;
                                     if !refused_before && existing_connection.unreliable_fec[slot_idx].admission_refused {
                                         state.stats.fec_decode_admission_refusals += 1;
+                                    }
+                                    if !worker_refused_before && existing_connection.unreliable_fec[slot_idx].worker_limit_refused {
+                                        state.stats.fec_worker_limit_events += 1;
                                     }
                                     continue;
                                 }
@@ -3610,8 +3709,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     connections_map.remove(&connection_key);
                                     break 'conn;
                                 }
-                                if frag_offset + frag_len > MAX_JUMBOGRAM_LEN as u64 {
-                                    if VERBOSE { println!("Error, frag_offset + frag_len ({}) exceeds MAX_JUMBOGRAM_LEN from {connection_key:?}. Disconnecting...", frag_offset + frag_len); }
+                                if frag_offset + frag_len > max_message_size as u64 {
+                                    if VERBOSE { println!("Error, frag_offset + frag_len ({}) exceeds local max_message_size ({max_message_size}) from {connection_key:?}. Disconnecting...", frag_offset + frag_len); }
                                     connections_map.remove(&connection_key);
                                     break 'conn;
                                 }
@@ -3652,13 +3751,13 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     }
                                 }
 
-                                if !existing_connection.unreliable_reassembly[slot_idx].admit(frag_offset as usize, frag_data.len(), &existing_connection.receive_budget) { memory_erased = true; continue; }
+                                if !existing_connection.unreliable_reassembly[slot_idx].admit(frag_offset as usize, frag_data.len(), &existing_connection.receive_budget) { state.stats.rx_plain_admission_refusals += 1; memory_erased = true; continue; }
                                 let (mut success, mut complete) = existing_connection.unreliable_reassembly[slot_idx].insert(frag_offset as usize, frag_data, is_fin);
                                 if !success {
                                     state.stats.rx_insert_failures += 1;
                                     existing_connection.unreliable_reassembly[slot_idx] = ReassemblySlot::new();
                                     existing_connection.unreliable_reassembly[slot_idx].package_id = package_id;
-                                    if !existing_connection.unreliable_reassembly[slot_idx].admit(frag_offset as usize, frag_data.len(), &existing_connection.receive_budget) { memory_erased = true; continue; }
+                                    if !existing_connection.unreliable_reassembly[slot_idx].admit(frag_offset as usize, frag_data.len(), &existing_connection.receive_budget) { state.stats.rx_plain_admission_refusals += 1; memory_erased = true; continue; }
                                     (success, complete) = existing_connection.unreliable_reassembly[slot_idx].insert(frag_offset as usize, frag_data, is_fin);
                                     assert!(success);
                                 }
@@ -5321,8 +5420,8 @@ mod precise_pacing_tests {
             let server_key = new_keypair_from_connect_magic1(CONNECT_MAGIC1_PLAIN_TEXT).unwrap();
             let address = STPAddress { ip: Ipv6Addr::LOCALHOST, port, magic1: CONNECT_MAGIC1_PLAIN_TEXT, key: server_key.public.clone() };
             let key = address.to_connection_key();
-            let server = new_network_thread(vec![server_key], port, Some(pps), (1_000_000,1<<20,1<<20));
-            let client = new_network_thread(vec![new_keypair_from_connect_magic1(CONNECT_MAGIC1_PLAIN_TEXT).unwrap()], 0, Some(pps), (1_000_000,1<<20,1<<20));
+            let server = new_network_thread(vec![server_key], port, Some(pps), (1_000_000,1<<20,1<<20), 1 << 20);
+            let client = new_network_thread(vec![new_keypair_from_connect_magic1(CONNECT_MAGIC1_PLAIN_TEXT).unwrap()], 0, Some(pps), (1_000_000,1<<20,1<<20), 1 << 20);
             service_connections(&client, NetworkThreadPush { initiate_connections: vec![address], ..Default::default() }).unwrap();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             let mut wanted = Vec::new();
@@ -5353,8 +5452,8 @@ mod precise_pacing_tests {
         let server_key = new_keypair_from_connect_magic1(CONNECT_MAGIC1_PLAIN_TEXT).unwrap();
         let address = STPAddress { ip: Ipv6Addr::LOCALHOST, port, magic1: CONNECT_MAGIC1_PLAIN_TEXT, key: server_key.public.clone() };
         let opts = NetworkThreadOptions::default;
-        let server = new_network_thread_with_options(vec![server_key], port, None, (1_000_000,1<<20,1<<20), opts());
-        let client = new_network_thread_with_options(vec![new_keypair_from_connect_magic1(CONNECT_MAGIC1_PLAIN_TEXT).unwrap()], 0, None, (1_000_000,1<<20,1<<20), opts());
+        let server = new_network_thread_with_options(vec![server_key], port, None, (1_000_000,1<<20,1<<20), 1 << 20, opts());
+        let client = new_network_thread_with_options(vec![new_keypair_from_connect_magic1(CONNECT_MAGIC1_PLAIN_TEXT).unwrap()], 0, None, (1_000_000,1<<20,1<<20), 1 << 20, opts());
         service_connections(&client, NetworkThreadPush { initiate_connections: vec![address], ..Default::default() }).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
@@ -6464,7 +6563,7 @@ mod outage_review_repros {
     fn receiver_decoder_has_full_grace_after_resume() {
         let mut s = state(); let mut b = buffer(); s.stats.cc_rate_upps = 100_000_000;
         let (tx, _rx) = std::sync::mpsc::sync_channel(1);
-        let mut slots = [FecRecvSlot { segment: None, reservation: None, package_id: 0, state: FecRecvState::Worker { tx, message_len: 1_000_000, block_bytes: 1000 }, blocks_received: 1, last_block_ns: 1_000_000_000, ingress_dropped: 0, admission_refused: false }];
+        let mut slots = [FecRecvSlot { segment: None, reservation: None, package_id: 0, state: FecRecvState::Worker { tx, message_len: 1_000_000, block_bytes: 1000 }, blocks_received: 1, last_block_ns: 1_000_000_000, ingress_dropped: 0, admission_refused: false, worker_limit_refused: false }];
         s.account_send(6_000_000_000); s.packets_in_flight = 1;
         enter_outage(&mut s, &mut b, 6_001_000_000, 0, None);
         assert_eq!(retire_inactive_fec_workers(&mut slots, 25_000_000_000, OUTAGE_TIMEOUT_NS, false), 0);
@@ -6684,10 +6783,10 @@ mod uniform_udp_capture_tests {
         let address = STPAddress { ip: "127.0.0.1".parse::<std::net::Ipv4Addr>().unwrap().to_ipv6_mapped(), port: relay_port, magic1: server_key.magic1, key: server_key.public.clone() };
         let key = address.to_connection_key();
         let options = || NetworkThreadOptions { send_queue_count: 2, datagram_log: Some(log.clone()), ..Default::default() };
-        let mut server = new_network_thread_with_options(vec![server_key], port, Some(1000), (1_000_000, 16<<20, 16<<20), options());
+        let mut server = new_network_thread_with_options(vec![server_key], port, Some(1000), (1_000_000, 16<<20, 16<<20), 16 << 20, options());
         let refused = Arc::new(Mutex::new(TestSendFailure { kind: Some("data"), remaining: 8, ..Default::default() }));
         let client_options = NetworkThreadOptions { send_failure: Some(refused.clone()), ..options() };
-        let mut client = new_network_thread_with_options(vec![new_keypair_from_connect_magic1(address.magic1).unwrap()], 0, Some(1000), (1_000_000, 16<<20, 16<<20), client_options);
+        let mut client = new_network_thread_with_options(vec![new_keypair_from_connect_magic1(address.magic1).unwrap()], 0, Some(1000), (1_000_000, 16<<20, 16<<20), 16 << 20, client_options);
         server.join_on_drop = true; client.join_on_drop = true;
         let mut cw = service_connections(&client, NetworkThreadPush { initiate_connections: vec![address], ..Default::default() }).unwrap().current_connections;
         let mut sw = Vec::new(); let mut received = Vec::new();
@@ -7052,12 +7151,172 @@ mod lazy_fec_segment_tests {
     #[test]
     fn default_peer_budget_fits_maximum_message_and_decoder_margin() {
         let process = Arc::new(crate::receive_memory::ReceiveMemoryBudget::default());
-        let peer = crate::receive_memory::ReceiveMemoryBudget::connection_share(&process);
-        // Out-of-order assembly can hold up to 1.5x the payload in capacities.
-        let charge = MAX_JUMBOGRAM_LEN + MAX_JUMBOGRAM_LEN / 2 + (64 << 20);
-        let reservation = peer.reserve(charge).expect("default peer share must fit the public message limit");
-        assert_eq!(process.used(), charge);
-        drop(reservation); assert_eq!(process.used(), 0);
+        for (queues, expected) in [(1, 1_698_541_560), (2, 3_363_266_544)] {
+            let cap = receive_connection_memory_limit(MAX_JUMBOGRAM_LEN, queues).unwrap();
+            assert_eq!(cap, expected);
+            assert!(cap + RECEIVE_CONNECTION_BYTES <= process.limit());
+            let peer = crate::receive_memory::ReceiveMemoryBudget::connection_with_limit(&process, cap);
+            let reservation = peer.reserve(cap).unwrap();
+            assert!(peer.reserve(1).is_none());
+            assert_eq!(process.used(), cap);
+            drop(reservation); assert_eq!(process.used(), 0);
+        }
+        assert!(receive_connection_memory_limit(MAX_JUMBOGRAM_LEN, 3).unwrap() > process.limit());
+        assert_eq!(receive_connection_memory_limit(usize::MAX, 1), receive_connection_memory_limit(MAX_JUMBOGRAM_LEN, 1));
+        for (size, queues, expected) in [(65536, 1, 1_755_968), (65536, 2, 3_184_256),
+            (15_000_000, 1, 77_366_424), (15_000_000, 2, 153_946_416)] {
+            assert_eq!(receive_connection_memory_limit(size, queues), Some(expected));
+        }
+        assert_eq!(receive_worker_limit(65536, 2), 0);
+        assert_eq!(receive_worker_limit(2 << 20, 1), 1);
+        assert_eq!(receive_worker_limit(2 << 20, 2), 2);
+        assert_eq!(receive_worker_limit(15_000_000, 1), 4);
+        assert_eq!(receive_worker_limit(15_000_000, 2), 8);
+        // The configured ingress upper bound covers every wire symbol width.
+        let unit = FEC_SEGMENT_BYTES;
+        let worst = unit + u16::MAX as usize + FEC_MAX_SOURCE_BLOCKS * FEC_INGRESS_SLOT_BYTES;
+        for width in FEC_MIN_BLOCK_BYTES..=u16::MAX as usize {
+            let layout = wire_fec_layout(unit, width).unwrap();
+            assert!(fec_ingress_bytes(layout) <= worst);
+        }
+    }
+
+    #[test]
+    fn maximum_message_reverse_order_completes_at_derived_cap() {
+        let total = MAX_JUMBOGRAM_LEN;
+        let cap = receive_connection_memory_limit(total, 1).unwrap();
+        let process = crate::receive_memory::ReceiveMemoryBudget::new(cap);
+        let peer = crate::receive_memory::ReceiveMemoryBudget::connection_with_limit(&process, cap);
+        // Occupy the entire non-assembly allowance, including every configured
+        // worker reservation. Only the exact derived per-queue peak remains.
+        let overhead = peer.reserve(cap - segment_reassembly_peak(total)).unwrap();
+        let layout = wire_fec_layout(FEC_SEGMENT_BYTES, FEC_MIN_BLOCK_BYTES).unwrap();
+        let mut root = ReassemblySlot::new();
+        let mut delivered = None;
+        for group in (0..total / FEC_SEGMENT_BYTES).rev() {
+            let segment = FecSegment { root: 13, total: total as u32,
+                offset: (group * FEC_SEGMENT_BYTES) as u32 };
+            assert!(root.admit_segment(segment, layout, 0, FEC_MIN_BLOCK_BYTES, 1, &peer));
+            delivered = root.finish_segment(segment, &vec![group as u8; FEC_SEGMENT_BYTES]);
+            if group != 0 {
+                assert!(delivered.is_none());
+                assert_eq!(root.buf.capacity(), 0);
+                assert_eq!(root.bytes_received(), (total - group * FEC_SEGMENT_BYTES) as u64);
+            }
+        }
+        let (message, reservation) = delivered.expect("maximum message must complete at derived cap");
+        assert_eq!(message.len(), total);
+        for (group, part) in message.chunks(FEC_SEGMENT_BYTES).enumerate() {
+            assert!(part.iter().all(|&byte| byte == group as u8));
+        }
+        assert!(peer.peak() <= cap);
+        drop(message); drop(reservation); drop(overhead);
+        assert_eq!(process.used(), 0);
+    }
+
+    #[test]
+    fn tiny_wire_symbols_are_refused_before_receive_admission() {
+        let budget = crate::receive_memory::ReceiveMemoryBudget::new(4 << 30);
+        let mut root = ReassemblySlot::new();
+        let segment = FecSegment { root: 13, total: MAX_JUMBOGRAM_LEN as u32, offset: 0 };
+        for width in [0, 1, 32, FEC_MIN_BLOCK_BYTES - 1] {
+            // This is the production wire gate, before root and decoder admission.
+            if let Some(layout) = wire_fec_layout(FEC_SEGMENT_BYTES, width) {
+                root.admit_segment(segment, layout, 0, width, 1, &budget);
+            }
+            assert_eq!(budget.used(), 0);
+            assert!(root.segment_parts.is_none());
+        }
+        assert_eq!(FEC_MIN_BLOCK_BYTES, 1136);
+        assert_eq!(FEC_MAX_SOURCE_BLOCKS, 1847);
+        assert!(wire_fec_layout(FEC_SEGMENT_BYTES + 1, FEC_MIN_BLOCK_BYTES).is_none());
+        assert!(wire_fec_layout(FEC_SEGMENT_BYTES, FEC_MIN_BLOCK_BYTES).is_some());
+        // Both supported cipher modes, both header sizes and the smallest coded
+        // message respect the protocol floor even at the guaranteed minimum TU.
+        for magic in [CONNECT_MAGIC1_PLAIN_TEXT, CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s] {
+            let payload = ASSUMED_UDP_PAYLOAD_SIZE_WITH_GUARANTEED_DELIVERY
+                - total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(magic).unwrap();
+            let mut sender = SendQueues::new(1, (1_000_000, 1 << 20, 1 << 20));
+            sender.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0, 0, 0));
+            let mut packet = vec![0; payload];
+            sender.submit_messages(0, vec![vec![7; payload - STP_WHOLE_HEADER_SIZE + 1]]);
+            sender.fec_prepare_packet(0); assert!(sender.fill_packet(&mut packet) > 0);
+            assert!(sender.queues[0].fec_send_slot.as_ref().unwrap().block_bytes >= FEC_MIN_BLOCK_BYTES);
+            assert!(payload - STP_SEGMENT_FEC_HEADER_SIZE >= FEC_MIN_BLOCK_BYTES);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "requires")]
+    fn incompatible_receive_configuration_fails_at_init() {
+        new_network_thread_with_options(Vec::new(), 0, None, (1_000_000, 1 << 20, 1 << 20), MAX_JUMBOGRAM_LEN,
+            NetworkThreadOptions { send_queue_count: 3, receive_memory: Some(Arc::new(Default::default())), ..Default::default() });
+    }
+
+    #[test]
+    fn oversized_submission_is_a_permanent_distinct_error() {
+        let mut network = new_network_thread_with_options(Vec::new(), 0, None, (1_000_000, 1024, 1024), 32,
+            NetworkThreadOptions::default());
+        network.join_on_drop = true;
+        let response = service_connections(&network, NetworkThreadPush {
+            send_unreliable: vec![(ConnectionKey::default(), 0, Dscp::BestEffort, vec![7; 33])],
+            ..Default::default()
+        }).unwrap();
+        assert!(response.send_unreliable_rejected.is_empty());
+        assert_eq!(response.send_unreliable_oversized.len(), 1);
+        assert_eq!(response.send_unreliable_oversized[0].3, vec![7; 33]);
+    }
+
+    #[test]
+    fn worker_limit_refusal_is_visible_and_releases_admission() {
+        let process = crate::receive_memory::ReceiveMemoryBudget::new(16 << 20);
+        let peer = crate::receive_memory::ReceiveMemoryBudget::connection_with_limit(&process, 16 << 20).with_worker_limit(0);
+        let workers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (done, _rx) = std::sync::mpsc::channel();
+        let mut slot = FecRecvSlot::default();
+        assert!(fec_receive_block(&mut slot, ConnectionKey::default(), 1,
+            300 * FEC_MIN_BLOCK_BYTES, FEC_MIN_BLOCK_BYTES, 0, &vec![0; FEC_MIN_BLOCK_BYTES],
+            &done, &workers, &peer).is_none());
+        assert!(slot.worker_limit_refused && slot.admission_refused);
+        assert_eq!(workers.load(std::sync::atomic::Ordering::Acquire), 0);
+        assert_eq!(process.used(), 0);
+    }
+
+    #[test]
+    fn configured_receive_limit_rejects_plain_fec_and_segment_roots_before_admission() {
+        use std::time::{Duration, Instant};
+        for (size, limit) in [(512, 256), (4096, 2048), (4 << 20, 3 << 20)] {
+            let port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+            let magic = CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s;
+            let keypair = new_keypair_from_connect_magic1(magic).unwrap();
+            let address = STPAddress::from("127.0.0.1".parse::<std::net::Ipv4Addr>().unwrap().to_ipv6_mapped(), port, &keypair);
+            let process = Arc::new(crate::receive_memory::ReceiveMemoryBudget::default());
+            let mut server = new_network_thread_with_options(vec![keypair], port, Some(10000), (1_000_000, 8 << 20, 8 << 20), limit,
+                NetworkThreadOptions { receive_memory: Some(process.clone()), ..Default::default() });
+            let mut client = new_network_thread(vec![new_keypair_from_connect_magic1(magic).unwrap()], 0, Some(10000), (1_000_000, 8 << 20, 8 << 20), size);
+            server.join_on_drop = true; client.join_on_drop = true;
+            let mut cw = service_connections(&client, NetworkThreadPush { initiate_connections: vec![address.clone()], ..Default::default() }).unwrap().current_connections;
+            let mut sw = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let s = service_connections(&server, NetworkThreadPush { wanted_connections: sw.clone(), ..Default::default() }).unwrap(); sw = s.current_connections;
+                let c = service_connections(&client, NetworkThreadPush { wanted_connections: cw.clone(), ..Default::default() }).unwrap(); cw = c.current_connections;
+                if !sw.is_empty() && !c.connection_stats.is_empty() { break; }
+                assert!(Instant::now() < deadline, "handshake stalled");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let response = service_connections(&client, NetworkThreadPush { wanted_connections: cw,
+                send_unreliable: vec![(address.to_connection_key(), 0, Dscp::BestEffort, vec![7; size])], ..Default::default() }).unwrap();
+            assert!(response.send_unreliable_oversized.is_empty() && response.send_unreliable_rejected.is_empty());
+            loop {
+                let response = service_connections(&server, NetworkThreadPush { wanted_connections: sw.clone(), ..Default::default() }).unwrap(); sw = response.current_connections;
+                assert!(response.received_unreliable_messages.is_empty());
+                if sw.is_empty() { break; }
+                assert!(Instant::now() < deadline, "oversized wire message was not refused");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(process.used(), 0, "oversized message reached receive admission");
+        }
     }
 
     #[test]
@@ -7545,8 +7804,8 @@ mod local_backpressure_tests {
         let remote = new_keypair_from_connect_magic1(magic).unwrap();
         let address = STPAddress { ip: "127.0.0.1".parse::<std::net::Ipv4Addr>().unwrap().to_ipv6_mapped(), port, magic1: magic, key: remote.public.clone() };
         let refused = Arc::new(AtomicBool::new(true));
-        let mut server = new_network_thread_with_options(vec![remote], port, Some(100), (100000,1000000,1000000), NetworkThreadOptions { send_failure: Some(Arc::new(std::sync::Mutex::new(TestSendFailure { kind: Some("ack"), blocked: Some(refused.clone()), ..Default::default() }))), ..Default::default() });
-        let mut client = new_network_thread_with_options(vec![new_keypair_from_connect_magic1(magic).unwrap()], 0, Some(100), (100000,1000000,1000000), Default::default());
+        let mut server = new_network_thread_with_options(vec![remote], port, Some(100), (100000,1000000,1000000), 1 << 20, NetworkThreadOptions { send_failure: Some(Arc::new(std::sync::Mutex::new(TestSendFailure { kind: Some("ack"), blocked: Some(refused.clone()), ..Default::default() }))), ..Default::default() });
+        let mut client = new_network_thread_with_options(vec![new_keypair_from_connect_magic1(magic).unwrap()], 0, Some(100), (100000,1000000,1000000), 1 << 20, Default::default());
         server.join_on_drop = true; client.join_on_drop = true;
         let mut cw = service_connections(&client, NetworkThreadPush { initiate_connections: vec![address], ..Default::default() }).unwrap().current_connections;
         let mut sw = Vec::new();

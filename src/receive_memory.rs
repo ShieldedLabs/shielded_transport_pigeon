@@ -2,18 +2,36 @@
 use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 
 #[derive(Debug)]
-pub struct ReceiveMemoryBudget { limit: usize, used: AtomicUsize, peak: AtomicUsize, parent: Option<Arc<Self>> }
+pub struct ReceiveMemoryBudget { limit: usize, used: AtomicUsize, peak: AtomicUsize, parent: Option<Arc<Self>>,
+    workers: AtomicUsize, worker_peak: AtomicUsize, worker_limit: usize }
 impl ReceiveMemoryBudget {
     pub fn new(limit: usize) -> Arc<Self> {
-        Arc::new(Self { limit, used: AtomicUsize::new(0), peak: AtomicUsize::new(0), parent: None })
+        Arc::new(Self { limit, ..Default::default() })
     }
-    /// A peer cannot occupy more than its share, even across workers and completed
+    /// The application-derived peer cap covers workers, roots and completed
     /// application-queue entries. Every child charge also belongs to the process.
-    /// Half the default 4 GiB process budget fits the public 1 GiB message limit,
-    /// including geometric prefix capacity, sparse parts and bounded FEC workers.
+    pub(crate) fn connection_with_limit(parent: &Arc<Self>, limit: usize) -> Arc<Self> {
+        assert!(limit <= parent.limit, "connection receive cap exceeds process budget");
+        Arc::new(Self { limit, parent: Some(parent.clone()), ..Default::default() })
+    }
+    pub(crate) fn with_worker_limit(mut self: Arc<Self>, limit: usize) -> Arc<Self> {
+        assert!(limit <= crate::stp::MAX_FEC_DECODE_WORKERS);
+        Arc::get_mut(&mut self).expect("configure worker limit before sharing budget").worker_limit = limit;
+        self
+    }
+    pub(crate) fn acquire_worker(&self) -> bool {
+        if let Ok(old) = self.workers.fetch_update(Ordering::AcqRel, Ordering::Acquire,
+            |n| (n < self.worker_limit).then_some(n + 1)) {
+            self.worker_peak.fetch_max(old + 1, Ordering::Relaxed); true
+        } else { false }
+    }
+    pub(crate) fn worker_peak(&self) -> usize { self.worker_peak.load(Ordering::Relaxed) }
+    pub(crate) fn release_worker(&self) { self.workers.fetch_sub(1, Ordering::AcqRel); }
+    pub(crate) fn worker_limit_reached(&self) -> bool { self.workers.load(Ordering::Acquire) >= self.worker_limit }
+
+    #[cfg(test)]
     pub(crate) fn connection_share(parent: &Arc<Self>) -> Arc<Self> {
-        Arc::new(Self { limit: parent.limit / 2, used: AtomicUsize::new(0),
-            peak: AtomicUsize::new(0), parent: Some(parent.clone()) })
+        Self::connection_with_limit(parent, parent.limit / 2)
     }
     pub fn limit(&self) -> usize { self.limit }
     pub fn used(&self) -> usize { self.used.load(Ordering::Acquire) }
@@ -34,7 +52,8 @@ impl ReceiveMemoryBudget {
     }
 }
 impl Default for ReceiveMemoryBudget {
-    fn default() -> Self { Self { limit: 4 << 30, used: AtomicUsize::new(0), peak: AtomicUsize::new(0), parent: None } }
+    fn default() -> Self { Self { limit: 4 << 30, used: AtomicUsize::new(0), peak: AtomicUsize::new(0), parent: None,
+        workers: AtomicUsize::new(0), worker_peak: AtomicUsize::new(0), worker_limit: crate::stp::MAX_FEC_DECODE_WORKERS } }
 }
 #[derive(Debug)]
 pub(crate) struct Reservation { budget: Arc<ReceiveMemoryBudget>, bytes: usize }
@@ -79,6 +98,17 @@ mod tests {
         let global = process.reserve(150).unwrap();
         assert!(peer.reserve(51).is_none()); assert_eq!(peer.used(), 0);
         drop(global);
+    }
+    #[test]
+    fn connection_worker_permits_are_bounded_and_reusable() {
+        let process = ReceiveMemoryBudget::new(100);
+        let peer = ReceiveMemoryBudget::connection_with_limit(&process, 100).with_worker_limit(1);
+        assert!(peer.acquire_worker()); assert!(!peer.acquire_worker());
+        assert_eq!(peer.worker_peak(), 1);
+        peer.release_worker(); assert!(peer.acquire_worker()); peer.release_worker();
+        assert_eq!(peer.worker_peak(), 1);
+        let inline = ReceiveMemoryBudget::connection_with_limit(&process, 100).with_worker_limit(0);
+        assert!(!inline.acquire_worker());
     }
     #[test]
     fn shared_budget_never_overcommits() {
