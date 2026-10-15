@@ -39,16 +39,15 @@ impl LossTrace {
         }
         writeln!(self.0, "S,{connection},{seq},{time},{},0,-1,-1,0,,,,,,,", payload.len()).expect("write loss trace");
         let mut cursor = 0;
-        while let Some((word, plain_header)) = crate::stp::read_fragment_header(&payload[cursor..]) {
-            let fec = word & 1 != 0;
-            let len = ((word >> 18) & 0x3fff) as usize;
-            let header = if fec {
-                let Some(size) = crate::stp::fec_fragment_header_size(&payload[cursor..]) else { break; };
-                size
-            } else { plain_header };
-            if cursor + header + len > payload.len() { break; }
-            writeln!(self.0, "F,{connection},{seq},{time},{len},0,{},{},{},,,,,,,", (word >> 2) & 0xffff, word >> 32, fec as u8).expect("write loss trace");
-            cursor += header + len;
+        while let Some((frame, consumed)) = crate::stp::read_frame(&payload[cursor..]) {
+            use crate::stp::WireFrame;
+            match frame {
+                WireFrame::Whole(data) => writeln!(self.0, "F,{connection},{seq},{time},{},0,-1,{cursor},0,,,,,,,", data.len()).expect("write loss trace"),
+                WireFrame::Plain { id, offset, data, .. } => writeln!(self.0, "F,{connection},{seq},{time},{},0,{id},{offset},0,,,,,,,", data.len()).expect("write loss trace"),
+                WireFrame::Fec { id, block_id, data, .. } => writeln!(self.0, "F,{connection},{seq},{time},{},0,{id},{block_id},1,,,,,,,", data.len()).expect("write loss trace"),
+                WireFrame::Unknown => (),
+            }
+            cursor += consumed;
         }
     }
 }
@@ -61,7 +60,9 @@ mod tests {
         let p = std::env::temp_dir().join(format!("stp-trace-test-{}", std::process::id()));
         {
             let mut t = LossTrace::open(&p).unwrap();
-            let mut b = Vec::from((2u64 | (7 << 2) | (3 << 18) | (4 << 32)).to_le_bytes());
+            let mut b = vec![3, 15, 0];
+            b.extend_from_slice(&7u64.to_le_bytes());
+            b.extend_from_slice(&4u32.to_le_bytes());
             b.extend_from_slice(&[1, 2, 3]);
             let c = CcContext { pps: 1000.0, slope_ppsps: 25.0, rtt_ns: 200_000_000, feedback_ns: 222_500_000, mode: 'P' };
             t.set_cc(8, c);

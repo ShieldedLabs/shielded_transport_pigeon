@@ -172,12 +172,48 @@ pub fn crypto_string_from_connect_magic1(magic: u64) -> Option<&'static str> {
     }
 }
 
-pub const MAGIC2_BLOCK_SIZE: usize = 1 + 32 * 8; // 257 bytes: 1 byte count + 32 × 8-byte magic2 values. Always send full block for constant-size.
+pub const PROTOCOL_VERSION: u16 = 2;
+pub const TRANSPORT_PARAMETERS_LEN: usize = 32;
+const MAGIC2_LIST_SIZE: usize = 1 + 32 * 8;
+pub const MAGIC2_BLOCK_SIZE: usize = MAGIC2_LIST_SIZE + TRANSPORT_PARAMETERS_LEN;
+const SERVER_HELLO_PAYLOAD_LEN: usize = 8 + TRANSPORT_PARAMETERS_LEN;
+
+fn transport_parameters(max_message_size: usize) -> [u8; TRANSPORT_PARAMETERS_LEN] {
+    let mut p = [0; TRANSPORT_PARAMETERS_LEN];
+    store_u16(&mut p[..2], PROTOCOL_VERSION);
+    store_u16(&mut p[2..4], TRANSPORT_PARAMETERS_LEN as u16);
+    store_u32(&mut p[4..8], FEC_SEGMENT_BYTES as u32);
+    store_u32(&mut p[8..12], crate::fec::GROUP_MAX_BLOCKS as u32);
+    store_u16(&mut p[12..14], 1136);
+    store_u16(&mut p[14..16], 65535);
+    store_u32(&mut p[16..20], crate::ship::ACK.max_delay_us);
+    store_u32(&mut p[20..24], max_message_size as u32);
+    store_u32(&mut p[24..28], (PREVIOUS_KEY_NS / 1000) as u32);
+    store_u32(&mut p[28..32], 262144);
+    p
+}
+fn validate_transport_parameters(p: &[u8]) -> Option<usize> {
+    if p.len() != TRANSPORT_PARAMETERS_LEN || load_u16(&p[..2]) != PROTOCOL_VERSION ||
+        load_u16(&p[2..4]) as usize != p.len() || load_u32(&p[4..8]) as usize != FEC_SEGMENT_BYTES ||
+        load_u32(&p[8..12]) as usize != crate::fec::GROUP_MAX_BLOCKS || load_u16(&p[12..14]) != 1136 ||
+        load_u16(&p[14..16]) != 65535 || load_u32(&p[16..20]) != crate::ship::ACK.max_delay_us ||
+        load_u32(&p[24..28]) != (PREVIOUS_KEY_NS / 1000) as u32 || load_u32(&p[28..32]) != 262144 { return None; }
+    let max = load_u32(&p[20..24]) as usize;
+    (max > 0 && max <= MAX_JUMBOGRAM_LEN).then_some(max)
+}
+fn build_server_hello(magic2: u64, max_message_size: usize) -> [u8; SERVER_HELLO_PAYLOAD_LEN] {
+    let mut payload = [0; SERVER_HELLO_PAYLOAD_LEN];
+    store_u64(&mut payload[..8], magic2);
+    payload[8..].copy_from_slice(&transport_parameters(max_message_size));
+    payload
+}
 pub const MAGIC2_APP_CROSSLINK: u64 = 0x5d747212563144d9;
 const SERVER_SUPPORTED_MAGIC2: &[u64] = &[MAGIC2_APP_CROSSLINK];
 
-pub fn build_magic2_client_block() -> [u8; MAGIC2_BLOCK_SIZE] {
+pub fn build_magic2_client_block() -> [u8; MAGIC2_BLOCK_SIZE] { build_magic2_client_block_for_limit(MAX_JUMBOGRAM_LEN) }
+pub fn build_magic2_client_block_for_limit(max_message_size: usize) -> [u8; MAGIC2_BLOCK_SIZE] {
     let mut block = [0u8; MAGIC2_BLOCK_SIZE];
+    block[MAGIC2_LIST_SIZE..].copy_from_slice(&transport_parameters(max_message_size));
     block[0] = 1;
     store_u64(&mut block[1..9], MAGIC2_APP_CROSSLINK);
     block
@@ -187,6 +223,7 @@ pub fn build_magic2_client_block() -> [u8; MAGIC2_BLOCK_SIZE] {
 /// Also validates that all slots beyond `count` are zeroed.
 pub fn negotiate_magic2(client_block: &[u8]) -> Option<u64> {
     if client_block.len() != MAGIC2_BLOCK_SIZE { return None; }
+    validate_transport_parameters(&client_block[MAGIC2_LIST_SIZE..])?;
     let count = client_block[0] as usize;
     if count == 0 || count > 32 { return None; }
     // Validate that padding beyond the count is all zeros.
@@ -217,24 +254,67 @@ pub fn validate_magic2(magic2: u64) -> bool {
 
 pub const fn total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(magic: u64) -> Option<usize> {
     match magic {
-        CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s => Some(6+16),
-        CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b => Some(6+16),
-        CONNECT_MAGIC1_PLAIN_TEXT => Some(6+0),
+        CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s => Some(CONNECTED_HEADER_SIZE+16),
+        CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b => Some(CONNECTED_HEADER_SIZE+16),
+        CONNECT_MAGIC1_PLAIN_TEXT => Some(CONNECTED_HEADER_SIZE),
         _ => None,
     }
 }
 
-pub const STP_FRAGMENT_HEADER_SIZE: usize = 8;
-const STP_WHOLE_HEADER_SIZE: usize = 4;
+/// Prefix (2), full nonce (8), explicit directional key epoch (4).
+pub const CONNECTED_HEADER_SIZE: usize = 14;
+const REKEY_PACKETS: u64 = 1 << 24;
+const REKEY_BYTES: u64 = 1 << 40;
+const REKEY_AGE_NS: u64 = 600_000_000_000;
+const PREVIOUS_KEY_NS: u64 = 10_000_000_000;
 
-/// Low bits 11 denote a whole plain message (fin, offset=0); 01 denotes FEC,
-/// 00/10 denote ordinary plain fragments. Length is 14 bits, package id 16 bits.
-/// 0xffffffff is reserved for padding and cannot collide with a TU-sized message.
-pub(crate) fn read_fragment_header(payload: &[u8]) -> Option<(u64, usize)> {
-    let word = u32::from_le_bytes(payload.get(..4)?.try_into().ok()?);
-    if word == u32::MAX { return None; }
-    if word & 3 == 3 { return Some(((word & !1) as u64, STP_WHOLE_HEADER_SIZE)); }
-    Some((u64::from_le_bytes(payload.get(..8)?.try_into().ok()?), STP_FRAGMENT_HEADER_SIZE))
+pub const STP_FRAGMENT_HEADER_SIZE: usize = 15;
+const STP_WHOLE_HEADER_SIZE: usize = 3;
+
+/// Self-delimiting frames. Padding is kind 255 and consumes the remaining tail.
+/// Every other kind has a u16 body length, including all kind-specific metadata.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum WireFrame<'a> {
+    Whole(&'a [u8]),
+    Plain { fin: bool, id: u64, offset: u32, data: &'a [u8] },
+    Fec { kind: u64, id: u64, block_id: u32, message_len: usize, block_bytes: usize,
+        segment: Option<FecSegment>, data: &'a [u8] },
+    Unknown,
+}
+pub(crate) fn read_frame(payload: &[u8]) -> Option<(WireFrame<'_>, usize)> {
+    let kind = *payload.first()?;
+    if kind == 255 { return None; }
+    let len = u16::from_le_bytes(payload.get(1..3)?.try_into().ok()?) as usize;
+    let end = 3usize.checked_add(len)?;
+    let body = payload.get(3..end)?;
+    let frame = match kind {
+        1 => WireFrame::Whole(body),
+        2 | 3 => WireFrame::Plain { fin: kind == 3, id: load_u64(body.get(..8)?),
+            offset: load_u32(body.get(8..12)?), data: body.get(12..)? },
+        4 | 5 | 6 => {
+            let segment = if kind == 6 { Some(FecSegment { root: load_u64(body.get(18..26)?),
+                total: load_u32(body.get(26..30)?), offset: load_u32(body.get(30..34)?) }) } else { None };
+            WireFrame::Fec { kind: match kind { 4 => STP_EXT_KIND_FEC, 5 => STP_EXT_KIND_GROUPED_FEC, _ => STP_EXT_KIND_SEGMENT_FEC },
+                id: load_u64(body.get(..8)?), block_id: load_u32(body.get(8..12)?),
+                message_len: load_u32(body.get(12..16)?) as usize, block_bytes: load_u16(body.get(16..18)?) as usize,
+                segment, data: body.get(if kind == 6 { 34 } else { 18 }..)? }
+        }
+        _ => WireFrame::Unknown,
+    };
+    Some((frame, end))
+}
+
+// Legacy test accessors synthesize the old bit fields from the NEW parser; these
+// are not used by transport receive and carry no on-wire compatibility behavior.
+#[cfg(test)]
+fn read_fragment_header(payload: &[u8]) -> Option<(u64, usize)> {
+    let (f, _) = read_frame(payload)?;
+    match f {
+        WireFrame::Whole(data) => Some((2 | ((data.len() as u64) << 18), STP_WHOLE_HEADER_SIZE)),
+        WireFrame::Plain { fin, id, offset, data } => Some(((fin as u64)*2 | (id << 2) | ((data.len() as u64)<<18) | ((offset as u64)<<32), STP_FRAGMENT_HEADER_SIZE)),
+        WireFrame::Fec { id, block_id, data, segment, .. } => Some((1 | (id<<2) | ((data.len() as u64)<<18) | ((block_id as u64)<<32), if segment.is_some() { STP_SEGMENT_FEC_HEADER_SIZE } else { STP_FEC_FRAGMENT_HEADER_SIZE })),
+        WireFrame::Unknown => None,
+    }
 }
 
 /// Largest app message STP sends in one datagram at the guaranteed TU; bigger ones are split across datagrams.
@@ -423,39 +503,55 @@ impl SliceRead for ConnectionKey {
     }
 }
 
-// Lease receiver ring positions while a package can still send or rescue. IDs remain
-// sender-only; no receiver change or per-queue wire namespace is needed.
+// Connection-scoped, never-recycled identities. Leases bound sender retention,
+// not wire identity lifetimes or receiver table positions.
 #[derive(Debug)]
 struct PackageAllocator {
-    next: std::sync::atomic::AtomicU16,
-    live: std::sync::Mutex<[u16; 1024]>,
+    next: std::sync::atomic::AtomicU64,
+    live: std::sync::Mutex<usize>,
 }
 impl PackageAllocator {
-    fn new() -> Self { Self { next: std::sync::atomic::AtomicU16::new(0), live: std::sync::Mutex::new([0; 1024]) } }
-    fn load(&self, order: std::sync::atomic::Ordering) -> u16 { self.next.load(order) }
-    fn store(&self, id: u16, order: std::sync::atomic::Ordering) { self.next.store(id, order); }
+    fn new() -> Self { Self { next: std::sync::atomic::AtomicU64::new(0), live: std::sync::Mutex::new(0) } }
+    fn load(&self, order: std::sync::atomic::Ordering) -> u64 { self.next.load(order) }
+    #[cfg(test)]
+    fn store(&self, id: u64, order: std::sync::atomic::Ordering) { self.next.store(id, order); }
     fn allocate(self: &std::sync::Arc<Self>) -> Option<std::sync::Arc<PackageLease>> {
         let mut live = self.live.lock().unwrap();
-        let next = self.next.load(std::sync::atomic::Ordering::Relaxed);
-        for offset in 0..1024u16 {
-            let id = next.wrapping_add(offset);
-            let index = id as usize % 1024;
-            if live[index] == 0 {
-                live[index] = 1;
-                // Failed probes must not burn an entire ID generation. Ring pressure
-                // can retry thousands of times within one RTT; advancing on failure
-                // makes new IDs look older under the receiver's 16-bit half-range rule.
-                self.next.store(id.wrapping_add(1), std::sync::atomic::Ordering::Relaxed);
-                return Some(std::sync::Arc::new(PackageLease { allocator: self.clone(), id }));
-            }
-        }
-        None
+        if *live >= 1024 { return None; }
+        let id = self.next.fetch_update(std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed, |n| n.checked_add(1)).ok()?;
+        *live += 1;
+        Some(std::sync::Arc::new(PackageLease { allocator: self.clone(), id }))
     }
 }
 #[derive(Debug)]
-struct PackageLease { allocator: std::sync::Arc<PackageAllocator>, id: u16 }
+struct PackageLease { allocator: std::sync::Arc<PackageAllocator>, id: u64 }
 impl Drop for PackageLease {
-    fn drop(&mut self) { self.allocator.live.lock().unwrap()[self.id as usize % 1024] -= 1; }
+    fn drop(&mut self) { *self.allocator.live.lock().unwrap() -= 1; }
+}
+
+/// Full-ID lookup into bounded storage, never `id % capacity`. On pressure the
+/// oldest identity is retired permanently; late packets are erased, not aliased.
+#[derive(Debug, Default)]
+struct ReceiveIndex { slots: std::collections::BTreeMap<u64, usize>, floor: u64 }
+impl ReceiveIndex {
+    fn get(&self, id: u64) -> Option<usize> { self.slots.get(&id).copied() }
+    fn admit(&mut self, id: u64, plain: &mut [ReassemblySlot], fec: &mut [FecRecvSlot]) -> Option<usize> {
+        if id < self.floor || id == u64::MAX { return None; }
+        if let Some(index) = self.get(id) { return Some(index); }
+        let index = if self.slots.len() < plain.len() { self.slots.len() }
+            else {
+                if id <= *self.slots.first_key_value()?.0 { return None; }
+                let (retired, index) = self.slots.pop_first()?;
+                self.floor = retired.checked_add(1)?;
+                if id < self.floor { return None; }
+                plain[index] = ReassemblySlot::new();
+                fec[index] = FecRecvSlot::default();
+                index
+            };
+        self.slots.insert(id, index);
+        Some(index)
+    }
 }
 
 // Strict fair reservations. Leases survive moves into active rescue/suspended slots;
@@ -491,7 +587,7 @@ pub struct UnreliableSendBuffer {
     current_dscp: Dscp,
     packet_dscp: Option<Dscp>,
     pub partial_send_slot: Option<(Vec<u8>, u32)>,
-    pub send_package_id: u16,
+    pub send_package_id: u64,
     package_allocator: Option<std::sync::Arc<PackageAllocator>>,
     package_lease: Option<std::sync::Arc<PackageLease>>,
     pub current_bytes_per_second: u64,
@@ -508,19 +604,19 @@ pub struct UnreliableSendBuffer {
     /// Sequence number of the packet the next fragment goes into (set by the network thread), so
     /// an FEC message knows which packets are its own when they are declared lost.
     pub next_packet_seq: u64,
-    /// Lazy fixed 2 MiB nonce ring: package id (16), symbol count (16), first ordinal (32).
+    /// Lazy fixed 4 MiB nonce ring: package id (64), symbol count (32), first ordinal (32).
     /// One ring per connection, reused across messages; ACK/probe/keepalive slots are empty.
-    fec_packet_tags: Option<Box<[u64]>>,
+    fec_packet_tags: Option<Box<[u128]>>,
     // Encoders awaiting packet outcome feedback, outside the application send queue.
-    fec_retained: HashMap<u16, RetainedFecSlot>,
+    fec_retained: HashMap<u64, RetainedFecSlot>,
     retention_quota: std::sync::Arc<RetentionQuota>,
     retained_bytes: usize,
-    rescue_ready: VecDeque<u16>,
+    rescue_ready: VecDeque<u64>,
     rescue_ready_count: usize,
     retained_next_prune_ns: u64,
     retained_last_prune_ns: u64,
-    fec_extra_packet_tags: HashMap<u64, Vec<u64>>,
-    fec_rescue_package: Option<u16>,
+    fec_extra_packet_tags: HashMap<u64, Vec<u128>>,
+    fec_rescue_package: Option<u64>,
     fec_suspended: Option<FecSendSlot>,
     fec_now_ns: u64,
     fec_rtt_ns: u64,
@@ -568,7 +664,7 @@ pub struct FecSendSlot {
 const FEC_RETAIN_SOURCE_BYTES: usize = 64 * 1024 * 1024;
 const FEC_RETAIN_SLOTS: usize = 4096;
 #[derive(Debug)]
-struct RetainedFecSlot { slot: FecSendSlot, package: u16, expires_ns: u64 }
+struct RetainedFecSlot { slot: FecSendSlot, package: u64, expires_ns: u64 }
 
 impl FecSendSlot {
     fn rescue_plan(&mut self) {
@@ -672,19 +768,16 @@ fn segment_source_horizon(total: usize, block_bytes: usize,
         else { (total - group * group_len).min(group_len).div_ceil(block_bytes) as u64 }).sum()
 }
 
-/// Header of an FEC fragment: two little-endian u64 words.
-///   word0: bit 0 = 1 (extended fragment; plain fragments have 0 here), bit 1 = 0,
-///          bits 2..18 package id, bits 18..32 block data length, bits 32..64 block id
-///   word1: bits 0..32 message length, bits 32..48 block bytes, bits 48..56 kind (1 = FEC), rest 0
-pub const STP_FEC_FRAGMENT_HEADER_SIZE: usize = 16;
+/// TLV prefix (3), identity (8), symbol (4), unit length (4), symbol bytes (2).
+pub const STP_FEC_FRAGMENT_HEADER_SIZE: usize = 21;
 pub const STP_EXT_KIND_FEC: u64 = 1;
 const STP_EXT_KIND_SEGMENT_FEC: u64 = 3;
-const STP_SEGMENT_FEC_HEADER_SIZE: usize = 26;
+const STP_SEGMENT_FEC_HEADER_SIZE: usize = 37;
 const FEC_SEGMENT_BYTES: usize = 2 << 20;
 /// Minimum honest symbol width: guaranteed UDP TU minus the largest supported
-/// crypto overhead (6-byte prefix + 16-byte AEAD tag) and the segment header.
-/// Ordinary FEC uses 10 more bytes; even the smallest coded message has K >= 2.
-pub const FEC_MIN_BLOCK_BYTES: usize = ASSUMED_UDP_PAYLOAD_SIZE_WITH_GUARANTEED_DELIVERY - (6 + 16) - STP_SEGMENT_FEC_HEADER_SIZE;
+/// crypto overhead (14-byte header + 16-byte AEAD tag) and segment framing.
+/// Keep the declared 1136-byte symbol floor, with one byte spare at TU 1204.
+pub const FEC_MIN_BLOCK_BYTES: usize = 1136;
 pub const FEC_MAX_SOURCE_BLOCKS: usize = FEC_SEGMENT_BYTES.div_ceil(FEC_MIN_BLOCK_BYTES);
 
 // Current senders segment every message above 2 MiB. Refuse legacy jumbo codecs
@@ -697,14 +790,14 @@ fn wire_fec_layout(len: usize, block_bytes: usize) -> Option<crate::fec::Message
 
 /// Independently coded, fixed byte-range group of one application message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FecSegment { root: u16, total: u32, offset: u32 }
+pub struct FecSegment { root: u64, total: u32, offset: u32 }
 
 #[derive(Debug)]
 struct SegmentedSend {
     plan_ks: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
     message: std::sync::Arc<Vec<u8>>,
     offset: usize,
-    root: u16,
+    root: u64,
     root_lease: Option<std::sync::Arc<PackageLease>>,
 }
 
@@ -719,7 +812,7 @@ impl FecSegment {
             }
     }
 }
-/// Balanced groups of <=32000 blocks, inferred from length/block size; same 16-byte header.
+/// Balanced groups of <=32000 blocks, inferred from length/block size; same 21-byte header.
 pub const STP_EXT_KIND_GROUPED_FEC: u64 = 2;
 /// Redundancy is capped at 100% (n = 2k).
 /// Messages with at most this many blocks have their Wirehair encoder/decoder run inline on
@@ -765,8 +858,8 @@ fn send_pacing_grant(elapsed_ns: u64, interval_ns: u64, credit_ns: u64) -> SendP
 }
 
 pub enum UnreliableFragment<'a> {
-    Plain { is_fin: bool, package_id: u16, data: &'a [u8], offset: u32 },
-    Fec { segment: Option<FecSegment>, package_id: u16, message_len: u32, block_bytes: u16, block_id: u32, data: &'a [u8] },
+    Plain { is_fin: bool, package_id: u64, data: &'a [u8], offset: u32 },
+    Fec { segment: Option<FecSegment>, package_id: u64, message_len: u32, block_bytes: u16, block_id: u32, data: &'a [u8] },
 }
 
 impl UnreliableSendBuffer {
@@ -839,16 +932,16 @@ impl UnreliableSendBuffer {
         self.fec_extra_packet_tags.remove(&(seq % PACKETS_WAITING_ACK_CAPACITY));
     }
 
-    fn tag_symbol(&mut self, package: u16, ordinal: u32) {
+    fn tag_symbol(&mut self, package: u64, ordinal: u32) {
         let index = self.next_packet_seq % PACKETS_WAITING_ACK_CAPACITY;
-        let tags = self.fec_packet_tags.get_or_insert_with(|| vec![0u64; PACKETS_WAITING_ACK_CAPACITY as usize].into_boxed_slice());
+        let tags = self.fec_packet_tags.get_or_insert_with(|| vec![0u128; PACKETS_WAITING_ACK_CAPACITY as usize].into_boxed_slice());
         let tag = &mut tags[index as usize];
-        let count = ((*tag >> 32) & 0xffff) as u32;
-        if count > 0 && *tag >> 48 == package as u64 && (*tag as u32).saturating_add(count) == ordinal {
-            *tag += 1u64 << 32;
+        let count = ((*tag >> 32) & 0xffff_ffff) as u32;
+        if count > 0 && *tag >> 64 == package as u128 && (*tag as u32).saturating_add(count) == ordinal {
+            *tag += 1u128 << 32;
         } else {
             if count > 0 { self.fec_extra_packet_tags.entry(index).or_default().push(*tag); }
-            *tag = ((package as u64) << 48) | (1u64 << 32) | ordinal as u64;
+            *tag = ((package as u128) << 64) | (1u128 << 32) | ordinal as u128;
         }
     }
 
@@ -865,11 +958,11 @@ impl UnreliableSendBuffer {
         if tag != 0 { self.fec_finalize_tags(seq, lost, &[tag]); }
     }
 
-    fn fec_finalize_tags(&mut self, seq: u64, lost: bool, tags: &[u64]) {
+    fn fec_finalize_tags(&mut self, seq: u64, lost: bool, tags: &[u128]) {
         for &tag in tags {
-            let count = ((tag >> 32) & 0xffff) as u32;
+            let count = ((tag >> 32) & 0xffff_ffff) as u32;
             if count == 0 { continue; }
-            let package = (tag >> 48) as u16;
+            let package = (tag >> 64) as u64;
             let active = self.fec_send_slot.is_some() && package == self.fec_rescue_package.unwrap_or(self.send_package_id);
             let suspended = self.fec_suspended.is_some() && package == self.send_package_id;
             let retained = self.fec_retained.contains_key(&package);
@@ -905,7 +998,7 @@ impl UnreliableSendBuffer {
         }
     }
 
-    fn remove_retained(&mut self, package: u16) -> Option<RetainedFecSlot> {
+    fn remove_retained(&mut self, package: u64) -> Option<RetainedFecSlot> {
         let r = self.fec_retained.remove(&package)?;
         self.retained_bytes -= r.slot.message.len();
         if r.slot.next_id > 0 && r.slot.next_id < r.slot.n { self.rescue_ready_count -= 1; }
@@ -915,7 +1008,7 @@ impl UnreliableSendBuffer {
         let package = *self.fec_retained.iter().min_by_key(|(_, r)| r.expires_ns)?.0;
         self.remove_retained(package)
     }
-    fn ready_rescue_package(&mut self) -> Option<u16> {
+    fn ready_rescue_package(&mut self) -> Option<u64> {
         while let Some(&package) = self.rescue_ready.front() {
             if self.fec_retained.get(&package).is_some_and(|r| r.expires_ns <= self.fec_now_ns) {
                 self.remove_retained(package);
@@ -927,7 +1020,7 @@ impl UnreliableSendBuffer {
     }
     fn fec_prune_retained(&mut self) {
         if self.fec_now_ns < self.retained_next_prune_ns { return; }
-        let expired: Vec<u16> = self.fec_retained.iter().filter(|(_, r)| r.expires_ns <= self.fec_now_ns).map(|(&p, _)| p).collect();
+        let expired: Vec<u64> = self.fec_retained.iter().filter(|(_, r)| r.expires_ns <= self.fec_now_ns).map(|(&p, _)| p).collect();
         for package in expired { self.remove_retained(package); }
         // Full-map scans stay at least 1 ms apart. Nonready expired sources may
         // linger by that quantum; active/ready repairs have exact O(1) expiry guards.
@@ -937,7 +1030,7 @@ impl UnreliableSendBuffer {
             .max(self.fec_now_ns.saturating_add(1_000_000));
     }
 
-    fn retain_fec(&mut self, mut slot: FecSendSlot, package: u16) {
+    fn retain_fec(&mut self, mut slot: FecSendSlot, package: u64) {
         if !slot.repair_policy.feedback() || slot.message.len() > self.retention_quota.byte_limit || matches!(slot.encoder, FecEncoderState::Failed) { return; }
         slot.original_symbols.get_or_insert(slot.next_id);
         self.fec_prune_retained();
@@ -1046,7 +1139,7 @@ impl UnreliableSendBuffer {
                 self.queue_bytes_filled -= msg_len;
                 self.partial_send_slot = None;
                 self.package_lease = None;
-                self.send_package_id = self.send_package_id.wrapping_add(1);
+                self.send_package_id = self.send_package_id.checked_add(1).expect("message identity exhausted");
             }
         }
         if let Some(f) = &self.fec_send_slot {
@@ -1058,7 +1151,7 @@ impl UnreliableSendBuffer {
                 if rescue.is_none() {
                     self.queue_bytes_filled -= message_len;
                     self.package_lease = None;
-                    self.send_package_id = self.send_package_id.wrapping_add(1);
+                    self.send_package_id = self.send_package_id.checked_add(1).expect("message identity exhausted");
                 }
                 finished.rescue_plan();
                 // Giant codec arenas can take seconds to free under allocator contention.
@@ -1111,7 +1204,7 @@ impl UnreliableSendBuffer {
                 Err(_) => match crate::fec::encode_message(message.clone(), block_bytes) { Some(e) => FecEncoderState::Ready(e), None => FecEncoderState::Failed },
             }
         };
-        self.fec_packet_tags.get_or_insert_with(|| vec![0u64; PACKETS_WAITING_ACK_CAPACITY as usize].into_boxed_slice());
+        self.fec_packet_tags.get_or_insert_with(|| vec![0u128; PACKETS_WAITING_ACK_CAPACITY as usize].into_boxed_slice());
         self.fec_send_slot = Some(FecSendSlot { segment, root_lease, plan_ks, retention_lease: None, retain_limit: self.retention_quota.byte_limit, package_lease: self.package_lease.clone(), dscp: self.current_dscp, finalized_symbols: 0, send_started_ns: self.fec_now_ns, original_send_duration_ns: None, repair_policy: a.policy, rescue_rounds: 0, retained_until_ns: None, original_symbols: None, group_lost: vec![0; layout.groups], message, block_bytes, k, n, next_id: 0, encoder, block_buf: vec![0u8; block_bytes], first_seq: self.next_packet_seq, lost: 0, n_planned: n, loss_estimate });
     }
 
@@ -1159,7 +1252,7 @@ impl UnreliableSendBuffer {
             Some(ids) => { let Some(lease) = ids.allocate() else { return false; }; Some(lease) },
             None => None,
         };
-        self.send_package_id = lease.as_ref().map_or(self.send_package_id.wrapping_add(1), |l| l.id);
+        self.send_package_id = lease.as_ref().map_or(self.send_package_id.checked_add(1).expect("message identity exhausted"), |l| l.id);
         self.package_lease = lease;
         let segment = FecSegment { root: source.root, total: source.message.len() as u32, offset: start as u32 };
         let root_lease = source.root_lease.clone();
@@ -1194,8 +1287,8 @@ impl UnreliableSendBuffer {
             // A continuation is indivisible as a filler: never make a third part.
             return (len - offset <= prefix).then_some(3);
         }
-        // Whole framing saves four bytes. A near-TU-sized message needs a
-        // sufficient prefix so its eight-byte continuation fits a fresh packet.
+        // Whole framing saves twelve bytes. A near-TU-sized message needs a
+        // sufficient prefix so its fifteen-byte continuation fits a fresh packet.
         (len - prefix.min(len) <= payload_len.saturating_sub(STP_FRAGMENT_HEADER_SIZE)).then_some(3)
     }
 
@@ -1262,7 +1355,7 @@ impl UnreliableSendBuffer {
                         None => None,
                     };
                     let f = self.fec_send_slot.take().unwrap();
-                    self.send_package_id = lease.as_ref().map_or(self.send_package_id.wrapping_add(1), |l| l.id);
+                    self.send_package_id = lease.as_ref().map_or(self.send_package_id.checked_add(1).expect("message identity exhausted"), |l| l.id);
                     self.package_lease = lease;
                     self.start_fec_group(f.message, payload_len - STP_SEGMENT_FEC_HEADER_SIZE, f.segment, f.root_lease, f.plan_ks);
                     return self.next_fragment(payload_len, space);
@@ -1273,7 +1366,7 @@ impl UnreliableSendBuffer {
                     self.resume_suspended();
                     return self.next_fragment(payload_len, space); // cannot change a retained package's layout
                 }
-                self.send_package_id = self.send_package_id.wrapping_add(1);
+                self.send_package_id = self.send_package_id.checked_add(1).expect("message identity exhausted");
                 let msg = std::sync::Arc::try_unwrap(f.message).unwrap_or_else(|a| (*a).clone());
                 if !self.start_message(msg, payload_len) { return None; }
                 return self.next_fragment(payload_len, space);
@@ -1348,12 +1441,12 @@ pub struct SendQueues {
     scheduled_bytes: Vec<u64>,
     queue_active: Vec<bool>,
     service_clock: u64,
-    fec_owner_tags: HashMap<u64, Vec<(u8, u64)>>,
+    fec_owner_tags: HashMap<u64, Vec<(u8, u128)>>,
     last_queue: usize,
     last_dscp: Dscp,
     fec_adaptive: Option<crate::fec_adapt::FecAdaptiveState>,
-    fec_packet_tags: Option<Box<[u64]>>,
-    fec_extra_packet_tags: HashMap<u64, Vec<u64>>,
+    fec_packet_tags: Option<Box<[u128]>>,
+    fec_extra_packet_tags: HashMap<u64, Vec<u128>>,
     next_packet_seq: u64,
     fec_record: Option<Vec<crate::fec_adapt::FecMessageInfo>>,
 }
@@ -1583,39 +1676,42 @@ impl ReceiveQueue {
 
 /// Fill a full transmission unit, or return 0 if nothing was queued.
 /// Padding is an authenticated terminator, never a variable-size tail.
-pub(crate) fn fec_fragment_header_size(payload: &[u8]) -> Option<usize> {
-    if payload.len() < STP_FEC_FRAGMENT_HEADER_SIZE { return None; }
-    Some(if (load_u64(&payload[8..16]) >> 48) & 0xff == STP_EXT_KIND_SEGMENT_FEC {
-        STP_SEGMENT_FEC_HEADER_SIZE
-    } else { STP_FEC_FRAGMENT_HEADER_SIZE })
+#[cfg(test)]
+fn fec_fragment_header_size(payload: &[u8]) -> Option<usize> {
+    match read_frame(payload)?.0 {
+        WireFrame::Fec { segment, .. } => Some(if segment.is_some() { STP_SEGMENT_FEC_HEADER_SIZE } else { STP_FEC_FRAGMENT_HEADER_SIZE }),
+        _ => None,
+    }
 }
-
 fn write_fragment(payload: &mut [u8], frag: UnreliableFragment<'_>) -> usize {
-    match frag {
+    let (kind, size, data) = match frag {
         UnreliableFragment::Plain { is_fin, package_id, data, offset } => {
-            let header = ((is_fin as u64) << 1) | ((package_id as u64) << 2) | ((data.len() as u64) << 18) | ((offset as u64) << 32);
-            let size = if is_fin && offset == 0 { STP_WHOLE_HEADER_SIZE } else { STP_FRAGMENT_HEADER_SIZE };
-            if size == STP_WHOLE_HEADER_SIZE { store_u32(&mut payload[..4], header as u32 | 1); }
-            else { store_u64(&mut payload[..8], header); }
-            data.write_to(&mut payload[size..]);
-            size + data.len()
+            let whole = is_fin && offset == 0;
+            let size = if whole { STP_WHOLE_HEADER_SIZE } else { STP_FRAGMENT_HEADER_SIZE };
+            if !whole {
+                store_u64(&mut payload[3..11], package_id);
+                store_u32(&mut payload[11..15], offset);
+            }
+            (if whole { 1 } else if is_fin { 3 } else { 2 }, size, data)
         }
         UnreliableFragment::Fec { segment, package_id, message_len, block_bytes, block_id, data } => {
-            let word0 = 1 | ((package_id as u64) << 2) | ((data.len() as u64) << 18) | ((block_id as u64) << 32);
-            let kind = if segment.is_some() { STP_EXT_KIND_SEGMENT_FEC } else if message_len as usize > crate::fec::MAX_BLOCKS * block_bytes as usize { STP_EXT_KIND_GROUPED_FEC } else { STP_EXT_KIND_FEC };
-            let word1 = message_len as u64 | ((block_bytes as u64) << 32) | (kind << 48);
-            store_u64(&mut payload[..8], word0);
-            store_u64(&mut payload[8..16], word1);
-            let size = if let Some(segment) = segment {
-                store_u16(&mut payload[16..18], segment.root);
-                store_u32(&mut payload[18..22], segment.total);
-                store_u32(&mut payload[22..26], segment.offset);
-                STP_SEGMENT_FEC_HEADER_SIZE
-            } else { STP_FEC_FRAGMENT_HEADER_SIZE };
-            data.write_to(&mut payload[size..]);
-            size + data.len()
+            store_u64(&mut payload[3..11], package_id);
+            store_u32(&mut payload[11..15], block_id);
+            store_u32(&mut payload[15..19], message_len);
+            store_u16(&mut payload[19..21], block_bytes);
+            let (kind, size) = if let Some(segment) = segment {
+                store_u64(&mut payload[21..29], segment.root);
+                store_u32(&mut payload[29..33], segment.total);
+                store_u32(&mut payload[33..37], segment.offset);
+                (6, STP_SEGMENT_FEC_HEADER_SIZE)
+            } else { (if message_len as usize > crate::fec::MAX_BLOCKS * block_bytes as usize { 5 } else { 4 }, STP_FEC_FRAGMENT_HEADER_SIZE) };
+            (kind, size, data)
         }
-    }
+    };
+    payload[0] = kind;
+    store_u16(&mut payload[1..3], u16::try_from(size - 3 + data.len()).expect("ordinary UDP frame length"));
+    payload[size..size + data.len()].copy_from_slice(data);
+    size + data.len()
 }
 
 fn fill_packet_payload_with_unreliable_fragments(payload: &mut [u8], buf: &mut UnreliableSendBuffer) -> usize {
@@ -1648,6 +1744,8 @@ pub struct ConnectionTrackingData {
     // pub reliable_streams: ReliableStreams,
     
     pub unreliable_send_buffer: SendQueues,
+    peer_max_message_size: usize,
+    receive_index: ReceiveIndex,
     pub unreliable_reassembly: Vec<ReassemblySlot>,
     pub unreliable_fec: Vec<FecRecvSlot>,
 }
@@ -1669,26 +1767,77 @@ pub struct ConnectionCipherTriplet {
     pub old: snow::StatelessTransportState,
     pub current: snow::StatelessTransportState,
     pub new: snow::StatelessTransportState,
+    outgoing_epoch: u32,
+    incoming_epoch: u32,
+    outgoing_packets: u64,
+    outgoing_bytes: u64,
+    outgoing_started_ns: Option<u64>,
+    previous_until_ns: u64,
 }
 impl ConnectionCipherTriplet {
     pub fn new_from_old_init_only(mut old: snow::StatelessTransportState) -> Self {
-        old.rekey_outgoing(); // target the other side's current
+        old.rekey_outgoing();
         let mut current = old.clone();
         current.rekey_incoming();
         let mut new = current.clone();
         new.rekey_incoming();
-        Self { old, current, new }
+        Self { old, current, new, outgoing_epoch: 0, incoming_epoch: 0,
+            outgoing_packets: 0, outgoing_bytes: 0, outgoing_started_ns: None,
+            previous_until_ns: 0 }
     }
     pub fn ratchet_forward_incoming(&mut self) {
         self.old.rekey_incoming();
         self.current.rekey_incoming();
         self.new.rekey_incoming();
+        self.incoming_epoch = self.incoming_epoch.checked_add(1).expect("key epoch exhausted");
     }
     pub fn advance_outgoing(&mut self) {
-        self.old.rekey_outgoing(); // This is a bit redundant since they are all the same.
+        self.old.rekey_outgoing();
         self.current.rekey_outgoing();
         self.new.rekey_outgoing();
+        self.outgoing_epoch = self.outgoing_epoch.checked_add(1).expect("key epoch exhausted");
+        self.outgoing_packets = 0;
+        self.outgoing_bytes = 0;
+        self.outgoing_started_ns = None;
     }
+    fn prepare_outgoing(&mut self, now: u64, bytes: usize) -> u32 {
+        if self.outgoing_packets >= REKEY_PACKETS || self.outgoing_bytes.saturating_add(bytes as u64) > REKEY_BYTES ||
+            self.outgoing_started_ns.is_some_and(|t| now.saturating_sub(t) >= REKEY_AGE_NS) {
+            self.advance_outgoing();
+        }
+        self.outgoing_started_ns.get_or_insert(now);
+        self.outgoing_packets += 1;
+        self.outgoing_bytes += bytes as u64;
+        self.outgoing_epoch
+    }
+    fn open(&mut self, nonce: u64, epoch: u32, header: &[u8], ciphertext: &[u8], out: &mut [u8], now: u64) -> Result<usize, snow::Error> {
+        if epoch == self.incoming_epoch {
+            self.current.read_message_with_additional_data(nonce, header, ciphertext, out)
+        } else if self.incoming_epoch.checked_sub(1) == Some(epoch) && now <= self.previous_until_ns {
+            self.old.read_message_with_additional_data(nonce, header, ciphertext, out)
+        } else if self.incoming_epoch.checked_add(1) == Some(epoch) {
+            // Untrusted epochs never trigger unbounded key derivation or change state.
+            let n = self.new.read_message_with_additional_data(nonce, header, ciphertext, out)?;
+            self.ratchet_forward_incoming();
+            self.previous_until_ns = now.saturating_add(PREVIOUS_KEY_NS);
+            Ok(n)
+        } else { Err(snow::Error::Decrypt) }
+    }
+}
+
+/// Encrypt once, then retain the exact result across local WouldBlock retries.
+fn seal_connected_packet(cipher: &mut Option<ConnectionCipherTriplet>, prefix: u16,
+    nonce: u64, payload: &[u8], out: &mut [u8], now: u64) -> usize {
+    assert_ne!(nonce, u64::MAX, "Noise reserved nonce exhausted");
+    let epoch = cipher.as_mut().map_or(0, |c| c.prepare_outgoing(now, payload.len() + 16));
+    store_u16(&mut out[..2], prefix);
+    store_u64(&mut out[2..10], nonce);
+    store_u32(&mut out[10..14], epoch);
+    let (header, body) = out.split_at_mut(CONNECTED_HEADER_SIZE);
+    let n = if let Some(c) = cipher {
+        c.current.write_message_with_additional_data(nonce, header, payload, body).unwrap()
+    } else { body[..payload.len()].copy_from_slice(payload); payload.len() };
+    CONNECTED_HEADER_SIZE + n
 }
 
 #[derive(Debug)]
@@ -1764,7 +1913,7 @@ pub struct ConnectionStateConnected {
     /// Highest positively acknowledged peer receipt; holes are NOT declarations of loss.
     pub highest_peer_acked: Option<u64>,
     pub peer_ack_delay_us: u32,
-    pub peer_ce_count: u32,
+    pub peer_ce_count: u64,
     loss_timer: LossTimer,
     ack_hole: AckHole,
 
@@ -2204,7 +2353,7 @@ pub fn connect_to_endpoint(
     assert!(my_connect_keypair.magic1 == endpoint.magic1);
 
     if my_connect_keypair.magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
-        let magic2_block = build_magic2_client_block();
+        let magic2_block = build_magic2_client_block_for_limit(max_message_size);
         let mut hello_packet_payload = vec![0u8; 6 + 32 + MAGIC2_BLOCK_SIZE];
         store_u48(&mut hello_packet_payload[0..6], my_connect_keypair.magic1);
         assert_eq!(my_connect_keypair.public.len(), 32);
@@ -2227,13 +2376,15 @@ pub fn connect_to_endpoint(
                 connection_state: ConnectionState::SendingClientHelloPlaintext { last_sent_time_ns: 0, hello_packet_payload },
                 handshake_hash: [0u8; 64],
                 unreliable_send_buffer: SendQueues::new(send_queue_count, send_buffer_params),
+                peer_max_message_size: 0,
+                receive_index: ReceiveIndex::default(),
                 unreliable_reassembly: ReassemblySlot::new_ring(1024),
                 unreliable_fec: FecRecvSlot::new_ring(1024),
             },
         );
     }
     else {
-        let magic2_block = build_magic2_client_block();
+        let magic2_block = build_magic2_client_block_for_limit(max_message_size);
         let mut hello_packet_payload = vec![0u8; 1024];
         store_u48(&mut hello_packet_payload[0..6], my_connect_keypair.magic1);
         let mut handshake = snow::Builder::new(crypto_string_from_connect_magic1(my_connect_keypair.magic1).unwrap().parse().unwrap())
@@ -2262,6 +2413,8 @@ pub fn connect_to_endpoint(
                 connection_state: ConnectionState::SendingClientHello { magic1: my_connect_keypair.magic1, last_sent_time_ns: 0, hello_packet_payload, handshake },
                 handshake_hash: [0u8; 64],
                 unreliable_send_buffer: SendQueues::new(send_queue_count, send_buffer_params),
+                peer_max_message_size: 0,
+                receive_index: ReceiveIndex::default(),
                 unreliable_reassembly: ReassemblySlot::new_ring(1024),
                 unreliable_fec: FecRecvSlot::new_ring(1024),
             },
@@ -2329,7 +2482,7 @@ pub struct ReassemblySlot {
     pub buf: Vec<u8>,
     pub total_len: Option<u32>,
     pub received: Vec<(u32, u32)>, // sorted non-overlapping non-adjacent ranges: [start, end)
-    pub package_id: u16,
+    pub package_id: u64,
     completed: bool,
     segment_parts: Option<Vec<(u32, Vec<u8>)>>,
     last_segment_ns: u64, // Last accepted plain fragment or segment symbol.
@@ -2387,7 +2540,7 @@ impl ReassemblySlot {
             !valid_fec_symbol(layout, block_id, data_len) { return false; }
         let in_use = self.completed || self.total_len.is_some() || !self.received.is_empty();
         if in_use && self.package_id != segment.root {
-            if (segment.root.wrapping_sub(self.package_id) as i16) < 0 { return false; }
+            if segment.root < self.package_id { return false; }
             *self = Self::new(); // eviction drops sparse parts and their charge
         }
         self.package_id = segment.root;
@@ -2534,7 +2687,7 @@ impl ReassemblySlot {
 /// and indexed the same way (package id % ring size).
 #[derive(Default)]
 pub struct FecRecvSlot {
-    pub package_id: u16,
+    pub package_id: u64,
     segment: Option<FecSegment>,
     state: FecRecvState,
     reservation: Option<crate::receive_memory::Reservation>,
@@ -2646,9 +2799,9 @@ impl Drop for FecWorkerGuard {
 /// Handles one received FEC fragment for the package in `slot` (the caller has already made
 /// the slot belong to `package_id`). Returns a message to deliver if decoding finished inline.
 fn fec_receive_block(
-    slot: &mut FecRecvSlot, connection_key: ConnectionKey, package_id: u16,
+    slot: &mut FecRecvSlot, connection_key: ConnectionKey, package_id: u64,
     message_len: usize, block_bytes: usize, block_id: u32, data: &[u8],
-    done_tx: &std::sync::mpsc::Sender<(ConnectionKey, u16, Vec<u8>, crate::receive_memory::Reservation)>,
+    done_tx: &std::sync::mpsc::Sender<(ConnectionKey, u64, Vec<u8>, crate::receive_memory::Reservation)>,
     workers: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
     budget: &std::sync::Arc<crate::receive_memory::ReceiveMemoryBudget>,
 ) -> Option<(Vec<u8>, crate::receive_memory::Reservation)> {
@@ -2944,7 +3097,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
         let mut packet_memory_send      = new_packet_memory(); // Outgoing Decrypted
 
         let mut receive_queue = ReceiveQueue::default();
-        let (fec_done_tx, fec_done_rx) = std::sync::mpsc::channel::<(ConnectionKey, u16, Vec<u8>, crate::receive_memory::Reservation)>();
+        let (fec_done_tx, fec_done_rx) = std::sync::mpsc::channel::<(ConnectionKey, u64, Vec<u8>, crate::receive_memory::Reservation)>();
         let fec_workers = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut fec_sweep_ns = 0;
 
@@ -3050,7 +3203,14 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             resp.send_unreliable_invalid_queue.extend(batch.into_iter().map(|(dscp, m)| (key, queue, dscp, m)));
                             continue;
                         }
-                        tracking_data.unreliable_send_buffer.submit_classified_messages(queue, batch)
+                        if !tracking_data.is_connected() { batch } else {
+                            let mut accepted = Vec::with_capacity(batch.len());
+                            for (dscp, message) in batch {
+                                if message.len() <= tracking_data.peer_max_message_size { accepted.push((dscp, message)); }
+                                else { resp.send_unreliable_oversized.push((key, queue, dscp, message)); }
+                            }
+                            tracking_data.unreliable_send_buffer.submit_classified_messages(queue, accepted)
+                        }
                     } else {
                         batch
                     };
@@ -3155,6 +3315,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                             break;
                                         };
         
+                                        let peer_max_message_size = validate_transport_parameters(&magic2_block[MAGIC2_LIST_SIZE..]).unwrap();
                                         let connection_key = ConnectionKey { ip: other_ip_addr, port: other_port, key_15_bits: load_u16(&client_key[0..2]) << 1 };
                                         if let Some(existing_connection) = connections_map.get_mut(&connection_key) {
                                             if &existing_connection.my_transport_identity_keypair == my_kp && existing_connection.other_transport_identity == client_key {
@@ -3162,9 +3323,10 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                                     if *client_key < *my_kp.public {
                                                         store_u48(&mut packet_memory_send[0..6], 0xffff_ffff_0000 | (load_u16(&my_kp.public[0..2]) << 1) as u64);
                                                         packet_memory_send[6..6+32].copy_from_slice(&my_kp.public[..]);
-                                                        store_u64(&mut packet_memory_send[6+32..6+32+8], chosen_magic2);
-                                                        let hello_packet_payload = Vec::from(&packet_memory_send[0..6+32+8]);
+                                                        packet_memory_send[6+32..6+32+SERVER_HELLO_PAYLOAD_LEN].copy_from_slice(&build_server_hello(chosen_magic2, max_message_size));
+                                                        let hello_packet_payload = Vec::from(&packet_memory_send[0..6+32+SERVER_HELLO_PAYLOAD_LEN]);
         
+                                                        existing_connection.peer_max_message_size = peer_max_message_size;
                                                         existing_connection.connection_state = ConnectionState::SendingServerHelloPlaintext { magic2: chosen_magic2, last_sent_time_ns: 0, hello_packet_payload };
                                                         if OVERLY_VERBOSE { println!("Transitioned connection {} to SendingServerHelloPlaintext.", connection_key.key_15_bits); }
                                                     } else {
@@ -3183,8 +3345,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                             let client_key = Vec::from(client_key);
                                             store_u48(&mut packet_memory_send[0..6], 0xffff_ffff_0000 | (load_u16(&my_kp.public[0..2]) << 1) as u64);
                                             packet_memory_send[6..6+32].copy_from_slice(&my_kp.public[..]);
-                                            store_u64(&mut packet_memory_send[6+32..6+32+8], chosen_magic2);
-                                            let hello_packet_payload = Vec::from(&packet_memory_send[0..6+32+8]);
+                                            packet_memory_send[6+32..6+32+SERVER_HELLO_PAYLOAD_LEN].copy_from_slice(&build_server_hello(chosen_magic2, max_message_size));
+                                            let hello_packet_payload = Vec::from(&packet_memory_send[0..6+32+SERVER_HELLO_PAYLOAD_LEN]);
         
                                             let my_ip = if other_ip_addr.to_ipv4_mapped().is_some() { Ipv6Addr::UNSPECIFIED } else { Ipv6Addr::UNSPECIFIED };
                                             connections_map.insert(
@@ -3202,7 +3364,9 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                                     connection_state: ConnectionState::SendingServerHelloPlaintext { magic2: chosen_magic2, last_sent_time_ns: 0, hello_packet_payload },
                                                     handshake_hash: [0u8; 64],
                                                     unreliable_send_buffer: SendQueues::new(send_queue_count, send_buffer_params),
-                                                    unreliable_reassembly: ReassemblySlot::new_ring(1024),
+                                                    peer_max_message_size,
+                                                    receive_index: ReceiveIndex::default(),
+                unreliable_reassembly: ReassemblySlot::new_ring(1024),
                                                     unreliable_fec: FecRecvSlot::new_ring(1024),
                                                 },
                                             );
@@ -3230,13 +3394,13 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                                 break;
                                             };
         
+                                            let peer_max_message_size = validate_transport_parameters(&packet_memory_recv[MAGIC2_LIST_SIZE..magic2_block_len]).unwrap();
                                             let connection_key = ConnectionKey { ip: other_ip_addr, port: other_port, key_15_bits: load_u16(&client_key[0..2]) << 1 };
                                             if let Some(existing_connection) = connections_map.get_mut(&connection_key) {
                                                 if &existing_connection.my_transport_identity_keypair == my_kp && existing_connection.other_transport_identity == client_key {
                                                     if let ConnectionState::SendingClientHello { magic1, last_sent_time_ns, hello_packet_payload, handshake } = &mut existing_connection.connection_state {
                                                         if *client_key < *my_kp.public {
-                                                            let mut chosen_magic2_bytes = [0u8; 8];
-                                                            store_u64(&mut chosen_magic2_bytes, chosen_magic2);
+                                                            let chosen_magic2_bytes = build_server_hello(chosen_magic2, max_message_size);
                                                             store_u48(&mut packet_memory_send[0..6], 0xffff_ffff_0000 | (load_u16(&my_kp.public[0..2]) << 1) as u64);
                                                             let handshake_size = new_handshake.write_message(&chosen_magic2_bytes, &mut packet_memory_send[6..]).unwrap();
                                                             let hello_packet_payload = Vec::from(&packet_memory_send[0..6+handshake_size]);
@@ -3245,7 +3409,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                                             existing_connection.handshake_hash = get_handshake_hash(&new_handshake);
                                                             let cipher = ConnectionCipherTriplet::new_from_old_init_only(new_handshake.into_stateless_transport_mode().expect("Cannot fail given assert above."));
         
-                                                            existing_connection.connection_state = ConnectionState::SendingServerHello { cipher, magic1: *magic1, magic2: chosen_magic2, last_sent_time_ns: 0, hello_packet_payload };
+                                                            existing_connection.peer_max_message_size = peer_max_message_size;
+                                                        existing_connection.connection_state = ConnectionState::SendingServerHello { cipher, magic1: *magic1, magic2: chosen_magic2, last_sent_time_ns: 0, hello_packet_payload };
                                                             if OVERLY_VERBOSE { println!("Transitioned connection {} to SendingServerHello.", connection_key.key_15_bits); }
                                                         } else {
                                                             if OVERLY_VERBOSE { println!("Did NOT transition {} to SendingServerHello: We \"lost\" the contended initiator comparison.", connection_key.key_15_bits); }
@@ -3260,8 +3425,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                             else {
                                                 let Some(receive_reservation) = receive_memory.reserve(RECEIVE_CONNECTION_BYTES) else { break; };
                                                 let client_key = Vec::from(client_key);
-                                                let mut chosen_magic2_bytes = [0u8; 8];
-                                                store_u64(&mut chosen_magic2_bytes, chosen_magic2);
+                                                let chosen_magic2_bytes = build_server_hello(chosen_magic2, max_message_size);
                                                 store_u48(&mut packet_memory_send[0..6], 0xffff_ffff_0000 | (load_u16(&my_kp.public[0..2]) << 1) as u64);
                                                 let handshake_size = new_handshake.write_message(&chosen_magic2_bytes, &mut packet_memory_send[6..]).unwrap();
                                                 let hello_packet_payload = Vec::from(&packet_memory_send[0..6+handshake_size]);
@@ -3286,7 +3450,9 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                                         connection_state: ConnectionState::SendingServerHello { cipher, magic1, magic2: chosen_magic2, last_sent_time_ns: 0, hello_packet_payload },
                                                         handshake_hash,
                                                         unreliable_send_buffer: SendQueues::new(send_queue_count, send_buffer_params),
-                                                        unreliable_reassembly: ReassemblySlot::new_ring(1024),
+                                                        peer_max_message_size,
+                                                    receive_index: ReceiveIndex::default(),
+                unreliable_reassembly: ReassemblySlot::new_ring(1024),
                                                         unreliable_fec: FecRecvSlot::new_ring(1024),
                                                     },
                                                 );
@@ -3315,9 +3481,11 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
     
                         match &mut existing_connection.connection_state {
                             ConnectionState::SendingClientHelloPlaintext { last_sent_time_ns, hello_packet_payload } => {
-                                if first_six_bytes >> 16 == 0xffff_ffff && buf_len >= 6 + 32 + 8 {
+                                if first_six_bytes >> 16 == 0xffff_ffff && buf_len == 6 + 32 + SERVER_HELLO_PAYLOAD_LEN {
                                     let server_key = &packet_memory_encrypted[6..6+32];
                                     if server_key == existing_connection.other_transport_identity {
+                                        let Some(peer_max_message_size) = validate_transport_parameters(&packet_memory_encrypted[6+32+8..6+32+SERVER_HELLO_PAYLOAD_LEN]) else { break 'conn; };
+                                        existing_connection.peer_max_message_size = peer_max_message_size;
                                         let server_magic2 = load_u64(&packet_memory_encrypted[6+32..6+32+8]);
                                         if !validate_magic2(server_magic2) {
                                             if OVERLY_VERBOSE { println!("Dropping from {connection_key:?}: server chose magic2 {server_magic2:#x} which we did not offer."); }
@@ -3338,10 +3506,11 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     if let Ok(payload_len) = handshake.read_message(&packet_memory_encrypted[6..buf_len], &mut packet_memory_recv[..]) {
                                         debug_assert!(handshake.is_handshake_finished());
                                         existing_connection.handshake_hash = get_handshake_hash(handshake);
-                                        if payload_len != 8 {
+                                        if payload_len != SERVER_HELLO_PAYLOAD_LEN || validate_transport_parameters(&packet_memory_recv[8..payload_len]).is_none() {
                                             if OVERLY_VERBOSE { println!("Dropping from {connection_key:?}: server hello payload was {payload_len} bytes, expected 8 (magic2)."); }
                                             break 'conn;
                                         }
+                                        existing_connection.peer_max_message_size = validate_transport_parameters(&packet_memory_recv[8..payload_len]).unwrap();
                                         let server_magic2 = load_u64(&packet_memory_recv[0..8]);
                                         if !validate_magic2(server_magic2) {
                                             if OVERLY_VERBOSE { println!("Dropping from {connection_key:?}: server chose magic2 {server_magic2:#x} which we did not offer."); }
@@ -3374,16 +3543,14 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 // FALLTHROUGH TO CONNECTED
                             }
                             ConnectionState::SendingServerHello { cipher, magic1, magic2, last_sent_time_ns, hello_packet_payload } => {
-                                let non_virtual_nonce = crate::sequence::ReceiveSequences::default().candidate((first_six_bytes >> 16) as u32);
-    
-                                let mut can_decrypt = false;
-                                // Optimization done here. It can never be cipher.old so we skip checking.
-                                can_decrypt = cipher.current.read_message(non_virtual_nonce, &packet_memory_encrypted[6..buf_len], &mut packet_memory_recv[..]).is_ok()
-                                    || cipher.new.read_message(non_virtual_nonce, &packet_memory_encrypted[6..buf_len], &mut packet_memory_recv[..]).is_ok();
-                                if can_decrypt == false {
+                                if buf_len < CONNECTED_HEADER_SIZE { break 'conn; }
+                                let nonce = load_u64(&packet_memory_encrypted[2..10]);
+                                let epoch = load_u32(&packet_memory_encrypted[10..14]);
+                                if cipher.open(nonce, epoch, &packet_memory_encrypted[..CONNECTED_HEADER_SIZE],
+                                    &packet_memory_encrypted[CONNECTED_HEADER_SIZE..buf_len], &mut packet_memory_recv[..], timestamp_ns).is_err() {
                                     break 'conn;
                                 }
-    
+
                                 if VERBOSE { println!("Connected to new client {:?}", existing_connection.other_transport_identity); }
                                 existing_connection.connection_state = new_connection_state_connected(Some(cipher.clone()), *magic1, *magic2, timestamp_ns);
                                 // FALLTHROUGH TO CONNECTED
@@ -3392,25 +3559,18 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                         }
 //////// BEGIN ORDINARY PACKET HANDLING  ////////////////////////////////////////////////////////////////////
                         if let ConnectionState::Connected(state) = &mut existing_connection.connection_state {
-                            let non_virtual_nonce = (first_six_bytes >> 16) as u32;
+                            if buf_len < CONNECTED_HEADER_SIZE { break 'conn; }
+                            let non_virtual_nonce = load_u64(&packet_memory_encrypted[2..10]);
                             let nonce = state.receive_sequences.candidate(non_virtual_nonce);
-    
+                            let epoch = load_u32(&packet_memory_encrypted[10..14]);
                             let payload;
                             if let Some(cipher) = &mut state.cipher {
-                                if let Ok(payload_len) = cipher.current.read_message(nonce as u64, &packet_memory_encrypted[6..buf_len], &mut packet_memory_recv[..]) {
-                                    payload = &packet_memory_recv[0..payload_len];
-                                }
-                                else if let Ok(payload_len) = cipher.old.read_message(nonce as u64, &packet_memory_encrypted[6..buf_len], &mut packet_memory_recv[..]) {
-                                    payload = &packet_memory_recv[0..payload_len];
-                                }
-                                else if let Ok(payload_len) = cipher.new.read_message(nonce as u64, &packet_memory_encrypted[6..buf_len], &mut packet_memory_recv[..]) {
-                                    payload = &packet_memory_recv[0..payload_len];
-                                    cipher.ratchet_forward_incoming();
-                                }
-                                else { break 'conn; }
-                            }
-                            else {
-                                payload = &packet_memory_encrypted[6..buf_len];
+                                let Ok(n) = cipher.open(nonce, epoch, &packet_memory_encrypted[..CONNECTED_HEADER_SIZE],
+                                    &packet_memory_encrypted[CONNECTED_HEADER_SIZE..buf_len], &mut packet_memory_recv[..], timestamp_ns) else { break 'conn; };
+                                payload = &packet_memory_recv[..n];
+                            } else {
+                                if epoch != 0 { break 'conn; }
+                                payload = &packet_memory_encrypted[CONNECTED_HEADER_SIZE..buf_len];
                             }
                             // Packet TYPE is still determined by authenticated payload SIZE.
                             let is_ack = payload.len() == crate::ack::ACK_PAYLOAD_LEN;
@@ -3591,30 +3751,18 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             // if OVERLY_VERBOSE { println!("Got data from {:?}  data: {:?}", existing_connection.other_transport_identity, payload); }
                             
                             let mut remaining_payload = payload;
-                            while let Some((header, plain_header_size)) = read_fragment_header(remaining_payload) {
+                            while let Some((frame, consumed)) = read_frame(remaining_payload) {
+                                remaining_payload = &remaining_payload[consumed..];
+                                if matches!(frame, WireFrame::Unknown) { continue; }
+                                if let WireFrame::Whole(data) = frame {
+                                    if data.len() > max_message_size { break 'conn; }
+                                    let Some(reservation) = existing_connection.receive_budget.reserve(data.len() + 256) else { memory_erased = true; continue; };
+                                    state.stats.rx_messages_completed += 1;
+                                    receive_queue.push_reserved(connection_key, data.to_vec(), MAX_RECV_QUEUE_BYTES, Some(reservation));
+                                    continue;
+                                }
 
-                                if header & 1 != 0 {
-                                    // Extended fragment (FEC); see STP_FEC_FRAGMENT_HEADER_SIZE.
-                                    let data_len = ((header >> 18) & 0x3fff) as usize;
-                                    let Some(fec_header_size) = fec_fragment_header_size(remaining_payload) else { break; };
-                                    if remaining_payload.len() < fec_header_size + data_len {
-                                        if OVERLY_VERBOSE { println!("Error, extended fragment extends beyond end of packet received from {connection_key:?}. Disconnecting..."); }
-                                        connections_map.remove(&connection_key);
-                                        break 'conn;
-                                    }
-                                    let word1 = load_u64(&remaining_payload[8..16]);
-                                    let kind = (word1 >> 48) & 0xff;
-                                    let segment = if kind == STP_EXT_KIND_SEGMENT_FEC {
-                                        Some(FecSegment { root: load_u16(&remaining_payload[16..18]),
-                                            total: load_u32(&remaining_payload[18..22]), offset: load_u32(&remaining_payload[22..26]) })
-                                    } else { None };
-                                    let data = &remaining_payload[fec_header_size..fec_header_size + data_len];
-                                    remaining_payload = &remaining_payload[fec_header_size + data_len..];
-                                    if kind != STP_EXT_KIND_FEC && kind != STP_EXT_KIND_GROUPED_FEC && kind != STP_EXT_KIND_SEGMENT_FEC { continue; } // unknown kind: skip it
-                                    let package_id = ((header >> 2) & 0xffff) as u16;
-                                    let block_id = (header >> 32) as u32;
-                                    let message_len = (word1 & 0xffff_ffff) as usize;
-                                    let block_bytes = ((word1 >> 32) & 0xffff) as usize;
+                                if let WireFrame::Fec { kind, id: package_id, block_id, message_len, block_bytes, segment, data } = frame {
                                     if message_len > max_message_size || segment.is_some_and(|s| s.total as usize > max_message_size) {
                                         if VERBOSE { println!("Error, FEC message exceeds local max_message_size ({max_message_size}) from {connection_key:?}. Disconnecting..."); }
                                         connections_map.remove(&connection_key);
@@ -3624,24 +3772,25 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     if !valid_fec_symbol(layout, block_id, data.len()) { continue; }
                                     if (kind == STP_EXT_KIND_GROUPED_FEC) != (layout.groups > 1) { continue; }
                                     if let Some(segment) = segment {
-                                        if !segment.valid(message_len) || segment.root == package_id ||
-                                            segment.root as usize % 1024 == package_id as usize % 1024 { continue; }
-                                        let root_idx = segment.root as usize % existing_connection.unreliable_reassembly.len();
+                                        if !segment.valid(message_len) || segment.root == package_id { continue; }
+                                        let Some(root_idx) = existing_connection.receive_index.admit(segment.root,
+                                            &mut existing_connection.unreliable_reassembly, &mut existing_connection.unreliable_fec) else { memory_erased = true; continue; };
                                         let fec_root = &mut existing_connection.unreliable_fec[root_idx];
                                         if fec_root.in_use() && fec_root.package_id != segment.root {
-                                            if (segment.root.wrapping_sub(fec_root.package_id) as i16) < 0 { continue; }
+                                            if segment.root < fec_root.package_id { continue; }
                                             *fec_root = FecRecvSlot::default();
                                         }
                                         if !existing_connection.unreliable_reassembly[root_idx].admit_segment(segment, layout, block_id, data.len(), timestamp_ns, &existing_connection.receive_budget) {
                                             memory_erased = true; continue;
                                         }
                                     }
-                                    let slot_idx = package_id as usize % existing_connection.unreliable_fec.len();
+                                    let Some(slot_idx) = existing_connection.receive_index.admit(package_id,
+                                        &mut existing_connection.unreliable_reassembly, &mut existing_connection.unreliable_fec) else { memory_erased = true; continue; };
                                     {
                                         // Same eviction rule as plain packages below, across both rings.
                                         let slot = &mut existing_connection.unreliable_fec[slot_idx];
                                         if slot.in_use() && slot.package_id != package_id {
-                                            if (package_id.wrapping_sub(slot.package_id) as i16) < 0 { state.stats.rx_stale_fragments += 1; continue; }
+                                            if package_id < slot.package_id { state.stats.rx_stale_fragments += 1; continue; }
                                             if !matches!(slot.state, FecRecvState::Done) {
                                                 state.stats.rx_partial_evicted += 1;
                                                 state.stats.rx_partial_evicted_bytes += slot.bytes_received();
@@ -3652,7 +3801,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                         slot.segment = segment;
                                         slot.package_id = package_id;
                                         let plain = &mut existing_connection.unreliable_reassembly[slot_idx];
-                                        if (plain.completed || plain.total_len.is_some() || !plain.received.is_empty()) && plain.package_id != package_id && (package_id.wrapping_sub(plain.package_id) as i16) > 0 {
+                                        if (plain.completed || plain.total_len.is_some() || !plain.received.is_empty()) && plain.package_id != package_id && package_id > plain.package_id {
                                             if !plain.completed { state.stats.rx_partial_evicted += 1; }
                                             state.stats.rx_partial_evicted_bytes += plain.bytes_received();
                                             *plain = ReassemblySlot::new();
@@ -3670,7 +3819,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     let dropped_before = existing_connection.unreliable_fec[slot_idx].ingress_dropped;
                                     if let Some((message, mut _reservation)) = fec_receive_block(&mut existing_connection.unreliable_fec[slot_idx], connection_key, package_id, message_len, block_bytes, block_id, data, &fec_done_tx, &fec_workers, &existing_connection.receive_budget) {
                                         let completed = if let Some(segment) = segment {
-                                            let root_idx = segment.root as usize % existing_connection.unreliable_reassembly.len();
+                                            let Some(root_idx) = existing_connection.receive_index.admit(segment.root,
+                                            &mut existing_connection.unreliable_reassembly, &mut existing_connection.unreliable_fec) else { memory_erased = true; continue; };
                                             _reservation.shrink(message.capacity());
                                             existing_connection.unreliable_reassembly[root_idx].finish_segment(segment, &message)
                                         } else { Some((message, _reservation)) };
@@ -3690,20 +3840,9 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     continue;
                                 }
                                 
-                                let is_reliable = header & 1 != 0;
-                                let is_fin = header & 2 != 0;
-                                let package_id = (header >> 2) & 0xffff;
-                                let frag_len = (header >> 18) & 0x3fff;
-                                let frag_offset = header >> 32;
-                                
-                                if (remaining_payload.len() as u64) < plain_header_size as u64 + frag_len {
-                                    if OVERLY_VERBOSE { println!("Error, frag_len ({frag_len:?}) extends beyond end of packet received from {connection_key:?}. Disconnecting..."); }
-                                    connections_map.remove(&connection_key);
-                                    break 'conn;
-                                }
-                                let frag_data = &remaining_payload[plain_header_size..(plain_header_size+frag_len as usize)];
-                                remaining_payload = &remaining_payload[(plain_header_size+frag_len as usize)..];
-
+                                let WireFrame::Plain { fin: is_fin, id: package_id, offset, data: frag_data } = frame else { continue; };
+                                let frag_offset = offset as u64;
+                                let frag_len = frag_data.len() as u64;
                                 if frag_offset + frag_len > u32::MAX as u64 {
                                     if OVERLY_VERBOSE { println!("Error, frag_offset + frag_len overflows u32 from {connection_key:?}. Disconnecting..."); }
                                     connections_map.remove(&connection_key);
@@ -3717,24 +3856,14 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
 
                                 //if OVERLY_VERBOSE { println!("Fragment from {:?}: R:{} F:{} ID:{} L:{} O:{}", connection_key, is_reliable, is_fin, package_id, frag_len, frag_offset); }
                                 
-                                let package_id = package_id as u16;
-                                let slot_idx = package_id as usize % existing_connection.unreliable_reassembly.len();
+                                let Some(slot_idx) = existing_connection.receive_index.admit(package_id,
+                                    &mut existing_connection.unreliable_reassembly, &mut existing_connection.unreliable_fec) else { memory_erased = true; continue; };
 
-                                // A slot is reused every 1024 packages, and insert() happily merges fragments
-                                // that are adjacent without overlapping, so a partial package left behind by
-                                // packet loss would be completed by a later package's fragments into one
-                                // spliced message. The slot remembers whose fragments it holds: a newer package
-                                // evicts it, and a late fragment of an older package is dropped.
-                                // @Todo: Make the package ID virtual. The receiver keeps the high bits of the
-                                // newest ID it has seen and widens each 16-bit ID to the 64-bit value nearest
-                                // it, and the slot stores that. Until then, a partial package that sits in its
-                                // slot for a full 65536-package wrap can still be spliced with the package that
-                                // wraps around onto its ID. The nonce above has the same @Todo.
                                 {
                                     let slot = &mut existing_connection.unreliable_reassembly[slot_idx];
                                     let slot_in_use = slot.completed || slot.total_len.is_some() || !slot.received.is_empty();
                                     if slot_in_use && slot.package_id != package_id {
-                                        if (package_id.wrapping_sub(slot.package_id) as i16) < 0 { state.stats.rx_stale_fragments += 1; continue; }
+                                        if package_id < slot.package_id { state.stats.rx_stale_fragments += 1; continue; }
                                         if !slot.completed { state.stats.rx_partial_evicted += 1; }
                                         state.stats.rx_partial_evicted_bytes += slot.bytes_received();
                                         *slot = ReassemblySlot::new();
@@ -3742,7 +3871,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     slot.package_id = package_id;
                                     // A newer package also evicts an FEC package in the same slot index.
                                     let fec = &mut existing_connection.unreliable_fec[slot_idx];
-                                    if fec.in_use() && fec.package_id != package_id && (package_id.wrapping_sub(fec.package_id) as i16) > 0 {
+                                    if fec.in_use() && fec.package_id != package_id && package_id > fec.package_id {
                                         if !matches!(fec.state, FecRecvState::Done) {
                                             state.stats.rx_partial_evicted += 1;
                                             state.stats.rx_partial_evicted_bytes += fec.bytes_received();
@@ -3783,13 +3912,13 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                 // Messages finished by FEC decoder threads.
                 while let Ok((key, package_id, message, mut _reservation)) = fec_done_rx.try_recv() {
                     if let Some(conn) = connections_map.get_mut(&key) {
-                        let idx = package_id as usize % conn.unreliable_fec.len();
+                        let Some(idx) = conn.receive_index.get(package_id) else { continue; };
                         let slot = &mut conn.unreliable_fec[idx];
                         if slot.package_id != package_id || !slot.in_use() { continue; } // evicted worker completion
                         let tail = monotonic_clock_ns().saturating_sub(slot.last_block_ns);
                         slot.state = FecRecvState::Done;
                         let completed = if let Some(segment) = slot.segment {
-                            let root_idx = segment.root as usize % conn.unreliable_reassembly.len();
+                            let Some(root_idx) = conn.receive_index.get(segment.root) else { continue; };
                             _reservation.shrink(message.capacity());
                             conn.unreliable_reassembly[root_idx].finish_segment(segment, &message)
                         } else { Some((message, _reservation)) };
@@ -3890,27 +4019,20 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
 
                         if current_time_now_ns > state.ack_timer {
                             { // send ack
-                                let mut o = 0;
                                 let virtual_nonce = state.send_ack_sequence_number;
-                                // ACK delay is time-sensitive: a refused snapshot is discarded.
-                                // Burn its ACK-only nonce, never encrypt a fresh snapshot with it.
                                 state.send_ack_sequence_number = state.send_ack_sequence_number.checked_add(1).expect("ACK nonce space exhausted");
-                                o += connection_tracking_data.two_byte_send_prefix.write_to(&mut packet_memory_send[o..]);
-                                o += crate::sequence::to_wire(virtual_nonce).write_to(&mut packet_memory_send[o..]);
-                                
                                 let a = state.ack_receiver.ack(current_time_now_ns);
                                 state.stats.ack_delay_us_max = state.stats.ack_delay_us_max.max(a.delay_us);
                                 let encoded = a.encode();
-                                let ack_payload = &encoded[..];
-                                if let Some(cipher) = &mut state.cipher { o += cipher.current.write_message(virtual_nonce, ack_payload, &mut packet_memory_send[o..]).unwrap(); }
-                                else { o += ack_payload.write_to(&mut packet_memory_send[o..]); }
+                                let o = seal_connected_packet(&mut state.cipher, connection_tracking_data.two_byte_send_prefix,
+                                    virtual_nonce, &encoded, &mut packet_memory_send[..], current_time_now_ns);
                                 #[cfg(test)]
                                 datagram_expectation.set(("ack", Some(crate::ack::ACK_PAYLOAD_LEN + total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(state.magic1).unwrap())));
                                 let sent = udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_send[..o], Dscp::Af21, false);
                                 if !finish_connected_send(state, &mut connection_tracking_data.unreliable_send_buffer,
                                     PendingSendKind::Ack, sent, current_time_now_ns, &packet_memory_send[..o], &[], Dscp::Af21,
                                     connection_tracking_data.two_byte_send_prefix, loss_trace.as_mut()) { return true; }
-                                state.ack_timer = u64::MAX;
+                                state.ack_timer = state.ack_receiver.feedback_deadline(current_time_now_ns);
                             }
                         }
                         
@@ -3923,26 +4045,18 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                         if state.outage.since_ns.is_some() {
                             if state.outage.probe_due(current_time_now_ns) {
                                 let seq = state.send_sequence_number;
-                                store_u16(&mut packet_memory_encrypted[0..2], connection_tracking_data.two_byte_send_prefix);
-                                store_u32(&mut packet_memory_encrypted[2..6], crate::sequence::to_wire(seq));
-                                // Authenticated null fragment: elicits a bitmap ACK but creates no message.
                                 let probe_payload_len = state.current_tu as usize - total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(state.magic1).unwrap();
                                 packet_memory_send[..probe_payload_len].fill(0xff);
-                                let data = &packet_memory_send[..probe_payload_len];
-                                let packet_len = if let Some(cipher) = &mut state.cipher {
-                                    cipher.current.write_message(seq, &data, &mut packet_memory_encrypted[6..]).unwrap()
-                                } else {
-                                    packet_memory_encrypted[6..6+data.len()].copy_from_slice(&data);
-                                    data.len()
-                                };
+                                let packet_len = seal_connected_packet(&mut state.cipher, connection_tracking_data.two_byte_send_prefix,
+                                    seq, &packet_memory_send[..probe_payload_len], &mut packet_memory_encrypted[..], current_time_now_ns);
                                 #[cfg(test)]
                                 datagram_expectation.set(("outage", Some(state.current_tu as usize)));
                                 let send_time = udp_send_with_congestion_and_dscp(socket,
                                     connection_tracking_data.other_ip, connection_tracking_data.other_port,
-                                    &packet_memory_encrypted[..6+packet_len], Dscp::Af21, false);
+                                    &packet_memory_encrypted[..packet_len], Dscp::Af21, false);
                                 finish_connected_send(state, &mut connection_tracking_data.unreliable_send_buffer,
-                                    PendingSendKind::Outage, send_time, current_time_now_ns, &packet_memory_encrypted[..6+packet_len],
-                                    data, Dscp::Af21, connection_tracking_data.two_byte_send_prefix, loss_trace.as_mut());
+                                    PendingSendKind::Outage, send_time, current_time_now_ns, &packet_memory_encrypted[..packet_len],
+                                    &packet_memory_send[..probe_payload_len], Dscp::Af21, connection_tracking_data.two_byte_send_prefix, loss_trace.as_mut());
                             }
                             return true;
                         }
@@ -4152,23 +4266,14 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             
                         
                             let virtual_nonce = state.send_sequence_number;
-                            store_u16(&mut packet_memory_encrypted[0..2], connection_tracking_data.two_byte_send_prefix);
-                            store_u32(&mut packet_memory_encrypted[2..6], crate::sequence::to_wire(virtual_nonce));
-
-                            let packet_len;
-                            if let Some(cipher) = &mut state.cipher {
-                                packet_len = cipher.current.write_message(virtual_nonce, &null_bytes[0..payload_size], &mut packet_memory_encrypted[6..]).unwrap();
-                            }
-                            else {
-                                (&null_bytes[0..payload_size]).write_to(&mut packet_memory_encrypted[6..]);
-                                packet_len = payload_size;
-                            }
+                            let packet_len = seal_connected_packet(&mut state.cipher, connection_tracking_data.two_byte_send_prefix,
+                                virtual_nonce, &null_bytes[..payload_size], &mut packet_memory_encrypted[..], current_time_now_ns);
 
                             #[cfg(test)]
                             datagram_expectation.set(("mtu_probe", Some(state.tu_probe_size as usize)));
-                            let send_time_ns = udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::Af21, false);
+                            let send_time_ns = udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..packet_len], Dscp::Af21, false);
                             if !finish_connected_send(state, &mut connection_tracking_data.unreliable_send_buffer,
-                                PendingSendKind::MtuProbe, send_time_ns, current_time_now_ns, &packet_memory_encrypted[..6+packet_len],
+                                PendingSendKind::MtuProbe, send_time_ns, current_time_now_ns, &packet_memory_encrypted[..packet_len],
                                 &[], Dscp::Af21, connection_tracking_data.two_byte_send_prefix, loss_trace.as_mut()) { return true; }
                         }
                         
@@ -4178,23 +4283,14 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             let null_bytes = [0xffu8; ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE];
                         
                             let virtual_nonce = state.send_sequence_number;
-                            store_u16(&mut packet_memory_encrypted[0..2], connection_tracking_data.two_byte_send_prefix);
-                            store_u32(&mut packet_memory_encrypted[2..6], crate::sequence::to_wire(virtual_nonce));
-
-                            let packet_len;
-                            if let Some(cipher) = &mut state.cipher {
-                                packet_len = cipher.current.write_message(virtual_nonce, &null_bytes[0..payload_size], &mut packet_memory_encrypted[6..]).unwrap();
-                            }
-                            else {
-                                (&null_bytes[0..payload_size]).write_to(&mut packet_memory_encrypted[6..]);
-                                packet_len = payload_size;
-                            }
+                            let packet_len = seal_connected_packet(&mut state.cipher, connection_tracking_data.two_byte_send_prefix,
+                                virtual_nonce, &null_bytes[..payload_size], &mut packet_memory_encrypted[..], current_time_now_ns);
 
                             #[cfg(test)]
                             datagram_expectation.set(("keepalive", Some(state.current_tu as usize)));
-                            let send_time_ns = udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::Af21, false);
+                            let send_time_ns = udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..packet_len], Dscp::Af21, false);
                             if !finish_connected_send(state, &mut connection_tracking_data.unreliable_send_buffer,
-                                PendingSendKind::Keepalive, send_time_ns, current_time_now_ns, &packet_memory_encrypted[..6+packet_len],
+                                PendingSendKind::Keepalive, send_time_ns, current_time_now_ns, &packet_memory_encrypted[..packet_len],
                                 &[], Dscp::Af21, connection_tracking_data.two_byte_send_prefix, loss_trace.as_mut()) { return true; }
                             packet_send_allowance_now = packet_send_allowance_now.saturating_sub(1);
                         }
@@ -4216,17 +4312,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                         } {
                         
                             let virtual_nonce = state.send_sequence_number;
-                            store_u16(&mut packet_memory_encrypted[0..2], connection_tracking_data.two_byte_send_prefix);
-                            store_u32(&mut packet_memory_encrypted[2..6], crate::sequence::to_wire(virtual_nonce));
-
-                            let packet_len;
-                            if let Some(cipher) = &mut state.cipher {
-                                packet_len = cipher.current.write_message(virtual_nonce, &packet_memory_send[0..unreliable_payload_size], &mut packet_memory_encrypted[6..]).unwrap();
-                            }
-                            else {
-                                (&packet_memory_send[0..unreliable_payload_size]).write_to(&mut packet_memory_encrypted[6..]);
-                                packet_len = unreliable_payload_size;
-                            }
+                            let packet_len = seal_connected_packet(&mut state.cipher, connection_tracking_data.two_byte_send_prefix,
+                                virtual_nonce, &packet_memory_send[..unreliable_payload_size], &mut packet_memory_encrypted[..], current_time_now_ns);
 
                             should_sleep = false;
                             let test_drop = if test_drop_burst_left > 0 { test_drop_burst_left -= 1; true } else {
@@ -4239,10 +4326,10 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             #[cfg(test)]
                             datagram_expectation.set(("data", Some(state.current_tu as usize)));
                             let send_time_ns = if test_drop { Some(monotonic_clock_ns()) }
-                            else { udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], connection_tracking_data.unreliable_send_buffer.last_dscp, false) };
+                            else { udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..packet_len], connection_tracking_data.unreliable_send_buffer.last_dscp, false) };
                             let dscp = connection_tracking_data.unreliable_send_buffer.last_dscp;
                             if !finish_connected_send(state, &mut connection_tracking_data.unreliable_send_buffer,
-                                PendingSendKind::Data, send_time_ns, current_time_now_ns, &packet_memory_encrypted[..6+packet_len],
+                                PendingSendKind::Data, send_time_ns, current_time_now_ns, &packet_memory_encrypted[..packet_len],
                                 &packet_memory_send[..payload_size], dscp, connection_tracking_data.two_byte_send_prefix,
                                 loss_trace.as_mut()) { return true; }
                             packet_send_allowance_now = packet_send_allowance_now.saturating_sub(1);
@@ -5472,22 +5559,18 @@ mod fec_send_tests {
     use rand::{Rng, RngCore};
 
     /// Parsed fragment: (package_id, Some((message_len, block_bytes, block_id)) for FEC or None for plain, is_fin, offset, data)
-    type Frag = (u16, Option<(usize, usize, u32)>, bool, u32, Vec<u8>);
+    type Frag = (u64, Option<(usize, usize, u32)>, bool, u32, Vec<u8>);
 
     fn parse_packet(mut p: &[u8]) -> Vec<Frag> {
         let mut out = Vec::new();
-        while let Some((h, plain_header_size)) = read_fragment_header(p) {
-            let len = ((h >> 18) & 0x3fff) as usize;
-            let pkg = ((h >> 2) & 0xffff) as u16;
-            if h & 1 != 0 {
-                let w1 = load_u64(&p[8..16]);
-                assert!(matches!(w1 >> 48, STP_EXT_KIND_FEC | STP_EXT_KIND_GROUPED_FEC));
-                out.push((pkg, Some(((w1 & 0xffff_ffff) as usize, ((w1 >> 32) & 0xffff) as usize, (h >> 32) as u32)), false, 0, p[16..16 + len].to_vec()));
-                p = &p[16 + len..];
-            } else {
-                out.push((pkg, None, h & 2 != 0, (h >> 32) as u32, p[plain_header_size..plain_header_size + len].to_vec()));
-                p = &p[plain_header_size + len..];
+        while let Some((frame, consumed)) = read_frame(p) {
+            match frame {
+                WireFrame::Whole(data) => out.push((u64::MAX, None, true, 0, data.to_vec())),
+                WireFrame::Plain { fin, id, offset, data } => out.push((id, None, fin, offset, data.to_vec())),
+                WireFrame::Fec { id, message_len, block_bytes, block_id, data, .. } => out.push((id, Some((message_len, block_bytes, block_id)), false, 0, data.to_vec())),
+                WireFrame::Unknown => (),
             }
+            p = &p[consumed..];
         }
         out
     }
@@ -5533,6 +5616,8 @@ mod fec_send_tests {
             assert!(b.submit_messages(messages.clone()).is_empty());
             let packets = drain(&mut b, payload_len, 300);
             for id in 1..=200 {
+                let wholes = packets.iter().flatten().filter(|f| f.0 == u64::MAX && f.4 == messages[id as usize]).count();
+                if wholes > 0 { assert_eq!(wholes, 1); continue; }
                 let physical: Vec<_> = packets.iter().filter(|p| p.iter().any(|f| f.0 == id)).collect();
                 assert!((1..=2).contains(&physical.len()), "payload={payload_len}, package={id}");
                 let fragments: Vec<_> = physical.iter().flat_map(|p| p.iter()).filter(|f| f.0 == id).collect();
@@ -5558,21 +5643,21 @@ mod fec_send_tests {
         assert!(b.submit_messages(vec![msg(1000)]).is_empty());
         match b.next_fragment(1450, 500).unwrap() {
             UnreliableFragment::Plain { is_fin, offset, data, .. } => {
-                assert!(!is_fin); assert_eq!((offset, data.len()), (0, 492));
+                assert!(!is_fin); assert_eq!((offset, data.len()), (0, 485));
             }
             _ => panic!("chopped small message must remain plain"),
         }
-        assert_eq!(b.partial_send_slot.as_ref().unwrap().1, 492);
+        assert_eq!(b.partial_send_slot.as_ref().unwrap().1, 485);
         match b.next_fragment(1162, 1162).unwrap() {
             UnreliableFragment::Plain { is_fin, offset, data, .. } => {
                 assert!(is_fin);
-                assert_eq!((offset, data.len()), (492, 508));
+                assert_eq!((offset, data.len()), (485, 515));
             }
             _ => panic!("one-packet message must remain plain"),
         }
     }
 
-    fn check_fec(frags: &[Frag], package_id: u16, m: &[u8], drop_every: usize) {
+    fn check_fec(frags: &[Frag], package_id: u64, m: &[u8], drop_every: usize) {
         let mine: Vec<&Frag> = frags.iter().filter(|f| f.0 == package_id).collect();
         let (len, bb, _) = mine[0].1.unwrap();
         assert_eq!(len, m.len());
@@ -5605,7 +5690,7 @@ mod fec_send_tests {
         // K = 88 source blocks; the real floor supplies at least 12 repairs.
         check_fec(&frags, 0, &m1, 25);
         // One block: plain.
-        assert!(frags.iter().any(|f| f.0 == 1 && f.1.is_none() && f.4 == m2));
+        assert!(frags.iter().any(|f| f.0 == u64::MAX && f.1.is_none() && f.4 == m2));
         // Exactly two blocks: the repair cap is two more blocks.
         check_fec(&frags, 2, &m3, 0);
         assert_eq!(b.queue_bytes_filled, 0);
@@ -5627,9 +5712,9 @@ mod fec_send_tests {
         let m = msg(200_000);
         b.submit_messages(vec![m.clone()]);
         let mut first = drain(&mut b, 9194, 5);
-        assert!(first.iter().flatten().all(|f| f.0 == 0 && f.1.unwrap().1 == 9178));
+        assert!(first.iter().flatten().all(|f| f.0 == 0 && f.1.unwrap().1 == 9173));
         let rest: Vec<Frag> = drain(&mut b, 1162, 10_000).into_iter().flatten().collect();
-        assert!(rest.iter().all(|f| f.0 == 1 && f.1.unwrap().1 == 1146));
+        assert!(rest.iter().all(|f| f.0 == 1 && f.1.unwrap().1 == 1141));
         check_fec(&rest, 1, &m, 0);
         first.clear();
         assert_eq!(b.queue_bytes_filled, 0);
@@ -5658,7 +5743,7 @@ mod fec_send_tests {
 
     #[test]
     fn grouped_wire_round_trip_and_overload_admission() {
-        let payload_len = 48;
+        let payload_len = STP_FEC_FRAGMENT_HEADER_SIZE + 32;
         let m = msg(64001 * (payload_len - STP_FEC_FRAGMENT_HEADER_SIZE) - 1);
         let layout = crate::fec::MessageLayout::new(m.len(), 32).unwrap();
         let mut b = new_buf();
@@ -5673,7 +5758,7 @@ mod fec_send_tests {
                 std::thread::sleep(std::time::Duration::from_millis(1));
                 continue;
             }
-            assert_eq!(load_u64(&packet[8..16]) >> 48, STP_EXT_KIND_GROUPED_FEC);
+            assert!(matches!(read_frame(&packet).unwrap().0, WireFrame::Fec { kind: STP_EXT_KIND_GROUPED_FEC, .. }));
             let f = parse_packet(&packet).remove(0);
             let id = f.1.unwrap().2;
             assert_eq!(id, layout.wire_id(sent));
@@ -5704,8 +5789,8 @@ mod fec_send_tests {
         let message = std::sync::Arc::new(msg(300 * 32));
         let base = 1_000_000_000;
         for (i, slot) in slots.iter_mut().enumerate() {
-            slot.package_id = i as u16;
-            fec_receive_block(slot, key, i as u16, message.len(), 32, 0, &message[..32], &done, &workers, &budget);
+            slot.package_id = i as u64;
+            fec_receive_block(slot, key, i as u64, message.len(), 32, 0, &message[..32], &done, &workers, &budget);
             assert!(matches!(slot.state, FecRecvState::Worker { .. }));
             slot.last_block_ns = base + i as u64 * 1000;
         }
@@ -5754,14 +5839,14 @@ mod fec_send_tests {
         assert!(b.fec_packet_tags.is_none());
         b.start_fec(std::sync::Arc::new(msg(64001 * 32)), 32);
         let allocation = b.fec_packet_tags.as_ref().unwrap().as_ptr();
-        assert_eq!(b.fec_packet_tags.as_ref().unwrap().len() * std::mem::size_of::<u64>(), 2 * 1024 * 1024);
+        assert_eq!(b.fec_packet_tags.as_ref().unwrap().len() * std::mem::size_of::<u128>(), 4 * 1024 * 1024);
         b.fec_prepare_packet(5);
         // TU growth packs three sequential transmission ordinals (three groups) in one packet.
-        for _ in 0..3 { assert!(b.next_fragment(144, 48).is_some()); }
+        for _ in 0..3 { assert!(b.next_fragment(159, 53).is_some()); }
         b.fec_on_packet_lost(5);
         assert_eq!(b.fec_send_slot.as_ref().unwrap().group_lost, vec![1, 1, 1]);
         b.fec_prepare_packet(6);
-        assert!(b.next_fragment(48, 48).is_some());
+        assert!(b.next_fragment(53, 53).is_some());
         // A non-FEC nonce reuses the same ring position: its loss cannot inherit old symbols.
         b.fec_prepare_packet(6 + PACKETS_WAITING_ACK_CAPACITY);
         b.fec_on_packet_lost(6 + PACKETS_WAITING_ACK_CAPACITY);
@@ -6037,7 +6122,7 @@ mod fec_closed_loop_tests {
         let initial = seq;
         for s in 0..initial { b.fec_on_packet_finalized(s, true); }
         let r = b.fec_retained.values().next().unwrap();
-        assert_eq!(r.slot.n - r.slot.next_id, 14); // all originals lost: K+2 new symbols
+        assert_eq!(r.slot.n - r.slot.next_id, r.slot.k + 2); // all originals lost: K+2 new symbols
         loop {
             b.fec_prepare_packet(seq);
             assert!(matches!(b.next_fragment(1449, 1449), Some(UnreliableFragment::Fec { package_id: 0, .. })));
@@ -6086,7 +6171,7 @@ mod fec_closed_loop_tests {
         let mut b = UnreliableSendBuffer::new(100000, 1000000, 1000000);
         b.fec_capacity_overhead_ppm = 10000;
         b.fec_adaptive = Some(FecAdaptiveState::new(cfg, 0, 0, 0));
-        b.start_fec(std::sync::Arc::new(vec![0u8; 1433 * 64]), 1433);
+        b.start_fec(std::sync::Arc::new(vec![0u8; 1428 * 64]), 1428);
         let initial_n = b.fec_send_slot.as_ref().unwrap().n;
         for seq in 0..64 {
             b.fec_prepare_packet(seq as u64);
@@ -6170,8 +6255,8 @@ mod send_queue_tests {
         assert!(s.submit_messages(7, vec![vec![3; 1000]]).is_empty());
         let (_, mixed) = packet(&mut s, 1);
         // The new FIFO goes first; the old queue can use its remaining tail.
-        assert_eq!(read_fragment_header(&mixed).unwrap().1, 4);
-        assert_eq!(&mixed[4..1004], &[3;1000]);
+        assert_eq!(read_fragment_header(&mixed).unwrap().1, STP_WHOLE_HEADER_SIZE);
+        assert_eq!(&mixed[3..1003], &[3;1000]);
         assert_eq!(packet(&mut s, 2).0, 0);
         assert_eq!(s.submit_messages(8, vec![vec![4; 100]]).len(), 1);
     }
@@ -6337,10 +6422,10 @@ mod review_tests {
         let mut p = vec![0; len];
         s.fill_packet(&mut p)
     }
-    fn plain_ids(p: &[u8]) -> Vec<u16> {
+    fn plain_ids(p: &[u8]) -> Vec<u64> {
         let mut v = Vec::new(); let mut c = 0;
         while let Some((h, header)) = read_fragment_header(&p[c..]) {
-            v.push(((h >> 2) & 0xffff) as u16); c += header + ((h >> 18) & 0x3fff) as usize; }
+            v.push(((h >> 2) & 0xffff) as u64); c += header + ((h >> 18) & 0x3fff) as usize; }
         v
     }
     // A long FEC train on one magazine keeps its package id while a small-message magazine burns ids.
@@ -6375,7 +6460,7 @@ mod review_tests {
             finalized_symbols: 0, send_started_ns: 0, original_send_duration_ns: None, repair_policy: crate::fec_adapt::RepairPolicy::Reliability, rescue_rounds: 0, retained_until_ns: None, original_symbols: None };
         for (retained, QQ) in [(0usize, 1usize), (4000, 1), (4000, 0)] {
             let mut s = SendQueues::new(2, (1000000, 1<<30, 1<<30));
-            for i in 0..retained { s.queues[QQ].retain_fec(slot(100), i as u16); }
+            for i in 0..retained { s.queues[QQ].retain_fec(slot(100), i as u64); }
             s.submit_messages(0, (0..20000).map(|_| vec![3; 1400]).collect());
             let mut p = vec![0; 1449];
             let t = std::time::Instant::now();
@@ -6470,7 +6555,7 @@ mod sender_lifetime_tests {
         let q1_id = *s.queues[1].fec_retained.keys().next().unwrap();
         s.submit_messages(0, vec![vec![8; 1000]]);
         s.fec_prepare_packet(seq); s.fill_packet(&mut p);
-        s.fec_packet_tags.as_mut().unwrap()[seq as usize] = ((q1_id as u64)<<48)|(1u64<<32);
+        s.fec_packet_tags.as_mut().unwrap()[seq as usize] = ((q1_id as u128)<<64)|(1u128<<32);
         s.fec_on_packet_finalized(seq, false);
         assert_eq!(s.queues[1].fec_retained[&q1_id].slot.finalized_symbols, 0);
         for old in 0..seq { s.fec_on_packet_finalized(old, true); }
@@ -6492,7 +6577,7 @@ mod package_pressure_tests {
         let old = leases.remove(0).id;
         let fresh = allocator.allocate().unwrap();
         assert_eq!(fresh.id % 1024, old % 1024);
-        assert!((fresh.id.wrapping_sub(old) as i16) > 0);
+        assert!(fresh.id > old);
         assert_eq!(fresh.id, 1024);
     }
 }
@@ -6594,7 +6679,7 @@ mod outage_review_repros {
         s.outage.enter(3_000_000_000, 100_000_000);
         s.account_send(3_000_000_000);
         s.outage.probes[0] = (0, 3_000_000_000);
-        let a = crate::ack::BitmapAck { highest: 0, sample_seq: 0, delay_us: 0, ce_count: 0, bitmap: [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0] };
+        let a = crate::ack::BitmapAck { receipt_base: 0, highest: 0, sample_seq: 0, delay_us: 0, ce_count: 0, bitmap: [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0] };
         assert!(recent_outage_probe_acked(&s, &a, 3_100_000_000));
         assert!(!recent_outage_probe_acked(&s, &a, 120_000_000_000));
         assert_eq!(s.last_ack_received_time, 1_000_000_000);
@@ -6633,7 +6718,7 @@ mod outage_review_repros {
 mod compact_frame_tests {
     use super::*;
     #[test]
-    fn whole_messages_pack_at_four_bytes_each_and_padding_stops_in_constant_time() {
+    fn whole_messages_pack_at_three_bytes_each_and_padding_stops_in_constant_time() {
         let mut b = UnreliableSendBuffer::new(1_000_000, 10000, 10000);
         b.submit_messages((0..13).map(|i| vec![i; 80]).collect());
         let mut p = [0; 1162];
@@ -6641,31 +6726,31 @@ mod compact_frame_tests {
         let mut cursor = 0;
         for i in 0..13 {
             let (h, size) = read_fragment_header(&p[cursor..]).unwrap();
-            assert_eq!(size, 4); assert_eq!(h & 3, 2); assert_eq!(h >> 32, 0);
+            assert_eq!(size, STP_WHOLE_HEADER_SIZE); assert_eq!(h & 3, 2); assert_eq!(h >> 32, 0);
             assert_eq!((h >> 18) & 0x3fff, 80);
             assert_eq!(&p[cursor+size..cursor+size+80], &[i; 80]);
             cursor += size+80;
         }
-        assert_eq!(cursor, 1092);
+        assert_eq!(cursor, 1079);
         assert!(read_fragment_header(&p[cursor..]).is_none());
         assert!(p[cursor..].iter().all(|&b| b == 255));
         for n in 0..4 { assert!(read_fragment_header(&p[cursor..cursor+n]).is_none()); }
         // Largest package id remains distinguishable from the all-ones padding marker.
         let mut q = [0; 84];
-        write_fragment(&mut q, UnreliableFragment::Plain { is_fin: true, package_id: u16::MAX, data: &[7;80], offset: 0 });
-        assert_eq!((read_fragment_header(&q).unwrap().0 >> 2) & 0xffff, u16::MAX as u64);
+        write_fragment(&mut q, UnreliableFragment::Plain { is_fin: true, package_id: u64::MAX, data: &[7;80], offset: 0 });
+        assert!(matches!(read_frame(&q).unwrap().0, WireFrame::Whole(data) if data == [7; 80]));
     }
 }
 
 #[cfg(test)]
 mod byte_fair_packing_tests {
     use super::*;
-    fn frames(p: &[u8]) -> Vec<(u16, usize, Vec<u8>)> {
+    fn frames(p: &[u8]) -> Vec<(u64, usize, Vec<u8>)> {
         let mut out = Vec::new(); let mut cursor = 0;
         while let Some((h, size)) = read_fragment_header(&p[cursor..]) {
-            let size = if h & 1 != 0 { 16 } else { size };
+
             let len = ((h >> 18) & 0x3fff) as usize;
-            out.push((((h >> 2) & 0xffff) as u16, size, p[cursor+size..cursor+size+len].to_vec()));
+            out.push((((h >> 2) & 0xffff) as u64, size, p[cursor+size..cursor+size+len].to_vec()));
             cursor += size+len;
         }
         out
@@ -6681,7 +6766,7 @@ mod byte_fair_packing_tests {
                 }).collect());
             }
             let mut seen = vec![0u32; n];
-            let mut slots = HashMap::<u16, ReassemblySlot>::new();
+            let mut slots = HashMap::<u64, ReassemblySlot>::new();
             let mut wire = 0u64;
             for seq in 0..1000 {
                 s.fec_prepare_packet(seq); let mut p = [0;1162];
@@ -6689,7 +6774,7 @@ mod byte_fair_packing_tests {
                 let mut cursor = 0;
                 while let Some((h, header)) = read_fragment_header(&p[cursor..]) {
                     let len = ((h >> 18) & 0x3fff) as usize;
-                    let id = ((h >> 2) & 0xffff) as u16;
+                    let id = ((h >> 2) & 0xffff) as u64;
                     let slot = slots.entry(id).or_insert_with(ReassemblySlot::new);
                     let (ok, complete) = slot.insert((h >> 32) as usize, &p[cursor+header..cursor+header+len], h & 2 != 0);
                     assert!(ok);
@@ -6716,7 +6801,7 @@ mod byte_fair_packing_tests {
         for q in 0..2 { s.submit_messages(q, vec![vec![q as u8;80];7]); }
         let mut p = [0;1162]; s.fec_prepare_packet(0); s.fill_packet(&mut p);
         let f = frames(&p); assert_eq!(f.len(),14);
-        assert_eq!(f.last().unwrap().1, STP_FRAGMENT_HEADER_SIZE);
+        assert_eq!(f.last().unwrap().1, STP_WHOLE_HEADER_SIZE);
         assert!(f.iter().any(|f| f.2[0] == 0) && f.iter().any(|f| f.2[0] == 1));
         for q in &mut s.queues { q.reclaim_finished_partial(); }
         s.fec_on_packet_finalized(0,true);
@@ -6728,15 +6813,15 @@ mod byte_fair_packing_tests {
         s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC,0,0,0));
         s.submit_messages(0,vec![vec![9;65536]]);
         s.fec_prepare_packet(0); s.fill_packet(&mut [0;1162]);
-        assert_eq!(s.queues[0].fec_send_slot.as_ref().unwrap().block_bytes,1146);
+        assert_eq!(s.queues[0].fec_send_slot.as_ref().unwrap().block_bytes,1141);
         s.submit_messages(1,vec![vec![7;80];3]);
         s.scheduled_bytes[1] = s.scheduled_bytes[0] + 1;
         s.queue_active[1] = true;
         let mut p = [0;1449]; s.fec_prepare_packet(1); s.fill_packet(&mut p);
         let f = frames(&p);
-        assert!(f.iter().any(|f| f.1 == 16 && f.2.len()==1146));
-        assert_eq!(f.iter().filter(|f| f.1 == 4 && f.2.len()==80).count(),3);
-        assert_eq!(s.queues[0].fec_send_slot.as_ref().unwrap().block_bytes,1146);
+        assert!(f.iter().any(|f| f.1 == STP_FEC_FRAGMENT_HEADER_SIZE && f.2.len()==1141));
+        assert_eq!(f.iter().filter(|f| f.1 == STP_WHOLE_HEADER_SIZE && f.2.len()==80).count(),3);
+        assert_eq!(s.queues[0].fec_send_slot.as_ref().unwrap().block_bytes,1141);
     }
 }
 
@@ -6747,7 +6832,7 @@ mod uniform_udp_capture_tests {
     use std::time::{Duration, Instant};
 
     /// A real UDP relay records every encrypted datagram from BOTH peers. It holds
-    /// MTU discovery at 1184, then admits up to 1472, and later blackholes both
+    /// MTU discovery at 1204, then admits up to 1472, and later blackholes both
     /// directions. Send-site expectations are cross-checked against actual bytes,
     /// not just against payload construction or packet counters.
     #[test]
@@ -6760,7 +6845,7 @@ mod uniform_udp_capture_tests {
         let actual = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let blackout = Arc::new(AtomicBool::new(false));
-        let mtu = Arc::new(AtomicUsize::new(1184));
+        let mtu = Arc::new(AtomicUsize::new(1204));
         let (observed, stopping, blackholing, allowed) = (actual.clone(), stop.clone(), blackout.clone(), mtu.clone());
         let forwarder = std::thread::spawn(move || {
             let mut buf = [0; 10000]; let mut client_addr = None;
@@ -6828,7 +6913,7 @@ mod uniform_udp_capture_tests {
         // Explicitly wait for authenticated TU growth, then send a whole message so
         // the size-transition assertion does not depend on thread scheduling.
         let grown_deadline = Instant::now()+Duration::from_secs(15);
-        while poll(&mut cw,&mut sw,&mut received) <= 1184 {
+        while poll(&mut cw,&mut sw,&mut received) <= 1204 {
             assert!(Instant::now()<grown_deadline,"TU did not grow after relay admission changed");
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -6863,10 +6948,10 @@ mod uniform_udp_capture_tests {
         let mut actual_packets = std::collections::BTreeMap::new();
         for packet in actual.lock().unwrap().iter() { *actual_packets.entry(packet.clone()).or_insert(0usize) += 1; }
         assert!(sent_packets==actual_packets,"native-send recording and actual UDP capture disagree");
-        assert!(histogram.contains_key(&("data",1184)));
-        assert!(histogram.iter().any(|((kind,size),_)| *kind=="data" && *size>1184));
+        assert!(histogram.contains_key(&("data",1204)));
+        assert!(histogram.iter().any(|((kind,size),_)| *kind=="data" && *size>1204));
         for kind in ["ack","mtu_probe","keepalive","outage"] { assert!(histogram.keys().any(|&(k,_)| k==kind),"missing {kind} coverage"); }
-        assert!(histogram.iter().filter(|((k,_),_)| *k=="ack").all(|((_,size),_)| *size==174));
+        assert!(histogram.iter().filter(|((k,_),_)| *k=="ack").all(|((_,size),_)| *size==182));
         println!("UDP_SIZE_HISTOGRAM kind,udp_payload_bytes,count");
         for ((kind,size),count) in histogram { println!("UDP_SIZE_HISTOGRAM {kind},{size},{count}"); }
         let refused = refused.lock().unwrap();
@@ -6874,7 +6959,7 @@ mod uniform_udp_capture_tests {
         assert_eq!(refused.attempts.len(), 8);
         assert!(refused.attempts.iter().all(|b| b == &refused.attempts[0]), "retry must preserve exact Noise ciphertext/nonce");
         assert!(sent.iter().any(|d| d.kind == "data" && d.bytes == refused.attempts[0]));
-        println!("UDP_SIZE_PROOF encrypted mixed=1x0B+20x80B+10x1000B+2x65536B+1x4MiB MTU=1184->1472 outage=3s idle=8s; every actual datagram matched send-site TU/ACK/probe expectation");
+        println!("UDP_SIZE_PROOF encrypted mixed=1x0B+20x80B+10x1000B+2x65536B+1x4MiB MTU=1204->1472 outage=3s idle=8s; every actual datagram matched send-site TU/ACK/probe expectation");
     }
 }
 
@@ -7033,8 +7118,8 @@ mod lazy_fec_segment_tests {
                 let total = (4usize<<20)+123;
                 let group_len = total.div_ceil(3);
                 let expected_whole_k = if group == 0 { 3 * layout.k as u64 }
-                    else { first_k.unwrap() as u64 + group_len.div_ceil(1424) as u64
-                        + (total - 2 * group_len).div_ceil(1424) as u64 };
+                    else { first_k.unwrap() as u64 + group_len.div_ceil(1413) as u64
+                        + (total - 2 * group_len).div_ceil(1413) as u64 };
                 assert_eq!(whole_k, expected_whole_k);
                 let repairs = a.repair_blocks_for_group_at_tail(layout.k as u64, expected_whole_k, groups, tail);
                 assert_eq!(f.k, layout.k as u32);
@@ -7059,7 +7144,7 @@ mod lazy_fec_segment_tests {
         s.submit_messages(0,vec![original.clone()]);
         let mut root = ReassemblySlot::new();
         let budget = crate::receive_memory::ReceiveMemoryBudget::new(16<<20);
-        let mut decoders = HashMap::<u16,(FecSegment,crate::fec::MessageDecoder)>::new();
+        let mut decoders = HashMap::<u64,(FecSegment,crate::fec::MessageDecoder)>::new();
         let mut widths = HashMap::new();
         let mut finished = None;
         let mut first_package = None;
@@ -7067,7 +7152,7 @@ mod lazy_fec_segment_tests {
         let mut delivered = 0;
         while s.has_unsent_data() && seq < 20000 {
             // Growth occurs during the FIRST group; later groups start at new TU.
-            let payload_len = if seq < 3 {1162} else {1450};
+            let payload_len = if seq < 3 {1174} else {1450};
             let mut p = vec![0;payload_len];
             s.fec_prepare_packet(seq);
             if s.fill_packet(&mut p) == 0 {
@@ -7076,27 +7161,20 @@ mod lazy_fec_segment_tests {
             assert_eq!(p.len(),payload_len);
             let mut cursor = 0;
             let mut packet_lost = false;
-            while let Some((h,_)) = read_fragment_header(&p[cursor..]) {
-                let size = fec_fragment_header_size(&p[cursor..]).unwrap();
-                assert_eq!(size,STP_SEGMENT_FEC_HEADER_SIZE);
-                let word = load_u64(&p[cursor+8..cursor+16]);
-                let package = ((h>>2)&0xffff) as u16;
-                let id = (h>>32) as u32;
-                let len = ((h>>18)&0x3fff) as usize;
-                let message_len = (word & 0xffff_ffff) as usize;
-                let width = ((word>>32)&0xffff) as usize;
-                let segment = FecSegment {root:load_u16(&p[cursor+16..cursor+18]),
-                    total:load_u32(&p[cursor+18..cursor+22]),offset:load_u32(&p[cursor+22..cursor+26])};
+            while let Some((frame, consumed)) = read_frame(&p[cursor..]) {
+                let WireFrame::Fec { id: package, block_id: id, message_len,
+                    block_bytes: width, segment: Some(segment), data, .. } = frame else { panic!("expected segment"); };
+                let len = data.len();
                 assert!(segment.valid(message_len));
                 assert!(root.admit_segment(segment, crate::fec::MessageLayout::new(message_len, width).unwrap(), id, len, seq, &budget));
                 let first = *first_package.get_or_insert(package);
-                assert_eq!(width,if package==first {1136} else {1424});
+                assert_eq!(width,if package==first {1137} else {1413});
                 widths.insert(segment.offset,width);
                 // Deterministic contiguous loss burst in EACH independent group.
                 if (10..20).contains(&id) { packet_lost=true; }
                 else {
                     let (_,decoder) = decoders.entry(package).or_insert_with(|| (segment,crate::fec::MessageDecoder::new(message_len,width).unwrap()));
-                    if decoder.add(id,&p[cursor+size..cursor+size+len]).unwrap()==crate::fec::DecodeStatus::Done {
+                    if decoder.add(id,data).unwrap()==crate::fec::DecodeStatus::Done {
                         if let Some(message) = decoder.recover() {
                             if let Some((message,reservation))=root.finish_segment(segment,&message) {
                                 delivered+=1; finished=Some((message,reservation));
@@ -7104,7 +7182,7 @@ mod lazy_fec_segment_tests {
                         }
                     }
                 }
-                cursor+=size+len;
+                cursor+=consumed;
             }
             s.fec_on_packet_finalized(seq,packet_lost);
             seq+=1;
@@ -7283,7 +7361,7 @@ mod lazy_fec_segment_tests {
     }
 
     #[test]
-    fn configured_receive_limit_rejects_plain_fec_and_segment_roots_before_admission() {
+    fn declared_receive_limit_rejects_plain_fec_and_segment_roots_at_sender() {
         use std::time::{Duration, Instant};
         for (size, limit) in [(512, 256), (4096, 2048), (4 << 20, 3 << 20)] {
             let port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
@@ -7305,17 +7383,16 @@ mod lazy_fec_segment_tests {
                 assert!(Instant::now() < deadline, "handshake stalled");
                 std::thread::sleep(Duration::from_millis(1));
             }
+            let baseline = process.used(); // established-connection metadata remains admitted
             let response = service_connections(&client, NetworkThreadPush { wanted_connections: cw,
                 send_unreliable: vec![(address.to_connection_key(), 0, Dscp::BestEffort, vec![7; size])], ..Default::default() }).unwrap();
-            assert!(response.send_unreliable_oversized.is_empty() && response.send_unreliable_rejected.is_empty());
-            loop {
-                let response = service_connections(&server, NetworkThreadPush { wanted_connections: sw.clone(), ..Default::default() }).unwrap(); sw = response.current_connections;
-                assert!(response.received_unreliable_messages.is_empty());
-                if sw.is_empty() { break; }
-                assert!(Instant::now() < deadline, "oversized wire message was not refused");
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            assert_eq!(process.used(), 0, "oversized message reached receive admission");
+            assert!(response.send_unreliable_rejected.is_empty());
+            assert_eq!(response.send_unreliable_oversized.len(),1);
+            assert_eq!(response.send_unreliable_oversized[0].3.len(),size);
+            let response = service_connections(&server, NetworkThreadPush { wanted_connections: sw, ..Default::default() }).unwrap();
+            assert!(response.received_unreliable_messages.is_empty());
+            assert!(!response.current_connections.is_empty());
+            assert_eq!(process.used(), baseline, "oversized message reached receive admission");
         }
     }
 
@@ -7355,19 +7432,21 @@ mod lazy_fec_segment_tests {
         let ids=s.queues[1].package_allocator.as_ref().unwrap().clone();
         let mut leases=Vec::new();
         while let Some(lease)=ids.allocate() {
-            assert_ne!(lease.id as usize%1024,root_id as usize%1024);
+            assert_ne!(lease.id,root_id);
             leases.push(lease);
         }
         assert_eq!(leases.len(),1022); // one root, one active segment
         assert!(ids.allocate().is_none());
         let released=leases.pop().unwrap().id;
-        let lease=ids.allocate().unwrap(); assert_eq!(lease.id as usize%1024,released as usize%1024);
-        assert_ne!(lease.id as usize%1024,root_id as usize%1024);
-        assert!(ids.live.lock().unwrap().iter().all(|&n|n<=1));
+        let lease=ids.allocate().unwrap(); assert!(lease.id > released);
+        assert_ne!(lease.id,root_id);
+        assert!(*ids.live.lock().unwrap() <= 1024);
         // Root survives even after the original cursor no longer owns it.
         let root_clone=s.queues[0].fec_send_slot.as_ref().unwrap().root_lease.clone();
         s.queues[0].segmented_send=None; drop(root);
-        assert_eq!(ids.live.lock().unwrap()[root_id as usize%1024],1);
+        leases.clear(); drop(lease); s.queues[0].fec_send_slot=None; s.queues[0].package_lease=None;
+        let live = *ids.live.lock().unwrap();
+        assert_eq!(live,1);
         drop(root_clone);
     }
 
@@ -7379,8 +7458,8 @@ mod lazy_fec_segment_tests {
         let key=ConnectionKey::default();
         let mut slots:Vec<_>=(0..9).map(|_|FecRecvSlot::default()).collect();
         for (id,slot) in slots.iter_mut().enumerate() {
-            slot.package_id=id as u16;
-            assert!(fec_receive_block(slot,key,id as u16,2<<20,1424,0,&vec![0;1424],&done,&workers,&budget).is_none());
+            slot.package_id=id as u64;
+            assert!(fec_receive_block(slot,key,id as u64,2<<20,1424,0,&vec![0;1424],&done,&workers,&budget).is_none());
             assert!(workers.load(std::sync::atomic::Ordering::Acquire)<=MAX_FEC_DECODE_WORKERS);
         }
         assert_eq!(workers.load(std::sync::atomic::Ordering::Acquire),8);
@@ -7481,7 +7560,7 @@ mod lazy_fec_segment_tests {
     }
 
     #[test]
-    fn near_tu_whole_messages_use_four_byte_frame_not_fec() {
+    fn near_tu_whole_messages_use_three_byte_frame_not_fec() {
         for len in 1146..=1158 {
             let mut s=SendQueues::new(1,(1_000_000,1<<20,1<<20));
             s.fec_adaptive=Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC,0,0,0));
@@ -7489,7 +7568,7 @@ mod lazy_fec_segment_tests {
             let mut p=vec![0;1162]; s.fec_prepare_packet(0);
             assert_eq!(s.fill_packet(&mut p),1162);
             let (header,size)=read_fragment_header(&p).unwrap();
-            assert_eq!(size,4); assert_eq!(header&1,0); assert_eq!((header>>18)&0x3fff,len as u64);
+            assert_eq!(size,STP_WHOLE_HEADER_SIZE); assert_eq!(header&1,0); assert_eq!((header>>18)&0x3fff,len as u64);
         }
     }
 }
@@ -7714,11 +7793,11 @@ mod review2_tests {
     #[test]
     fn review2_bitmap_ack_decode_bounds() {
         use crate::ack::BitmapAck;
-        let mut a = BitmapAck { highest: 100, sample_seq: 101, delay_us: 0, ce_count: 0, bitmap: [0; 16] };
+        let mut a = BitmapAck { receipt_base: 0, highest: 100, sample_seq: 101, delay_us: 0, ce_count: 0, bitmap: [0; 15] };
         a.bitmap[((100 - a.base()) / 64) as usize] |= 1u64 << ((100 - a.base()) % 64);
-        assert!(BitmapAck::decode(&a.encode()).is_none());
-        let mut b = BitmapAck { highest: 100, sample_seq: 100, delay_us: 0, ce_count: 0, bitmap: [0; 16] };
-        assert!(BitmapAck::decode(&b.encode()).is_none());
+        assert_eq!(BitmapAck::decode(&a.encode()).unwrap().highest, 101);
+        let mut b = BitmapAck { receipt_base: 0, highest: 100, sample_seq: 100, delay_us: 0, ce_count: 0, bitmap: [0; 15] };
+        assert_eq!(BitmapAck::decode(&b.encode()).unwrap().acknowledged().collect::<Vec<_>>(), vec![100]);
         b.bitmap[((100 - b.base()) / 64) as usize] |= 1u64 << ((100 - b.base()) % 64);
         let d = BitmapAck::decode(&b.encode()).unwrap();
         assert!(d.acknowledged().all(|s| s <= d.highest));
@@ -8208,20 +8287,20 @@ mod fill_rule_tests {
         let mut s = sender(2);
         s.submit_messages(0,vec![vec![0;1000],vec![7;1000]]);
         let first = heads(&emit(&mut s,0)).pop().unwrap();
-        assert_eq!(first.1.len(),437);
+        assert_eq!(first.1.len(),431);
         // Idle join ties the current clock and wins the next head by rotation.
         s.submit_messages(1,vec![vec![9;1000]]);
         let middle = emit(&mut s,1);
         assert_eq!(heads(&middle).len(),1);
         assert!(middle[1004..].iter().all(|&b| b==255));
-        assert_eq!(s.queues[0].partial_send_slot.as_ref().unwrap().1,437);
+        assert_eq!(s.queues[0].partial_send_slot.as_ref().unwrap().1,431);
         let last = heads(&emit(&mut s,2)).remove(0);
-        assert_eq!(last.0 >> 32,437);
-        assert_eq!(last.1.len(),563);
+        assert_eq!(last.0 >> 32,431);
+        assert_eq!(last.1.len(),569);
         assert_eq!((first.0>>2)&0xffff,(last.0>>2)&0xffff);
         let mut slot = ReassemblySlot::new();
         assert_eq!(slot.insert(0,&first.1,false),(true,false));
-        assert_eq!(slot.insert(437,&last.1,true),(true,true));
+        assert_eq!(slot.insert(431,&last.1,true),(true,true));
         assert_eq!(slot.take_complete(),vec![7;1000]);
         assert!(!s.has_unsent_data(), "continuation must progress at the next head opportunity");
     }
@@ -8249,8 +8328,8 @@ mod fill_rule_tests {
         s.queue_active.fill(true);
         let p = emit(&mut s,0); let f = heads(&p);
         assert_eq!(f.iter().map(|(_,d)| d[0]).collect::<Vec<_>>(),vec![0,2]);
-        assert_eq!(f[1].1.len(),437);
-        assert_eq!(s.scheduled_bytes,vec![1004,10000,446]);
+        assert_eq!(f[1].1.len(),431);
+        assert_eq!(s.scheduled_bytes,vec![1003,10000,447]);
         assert_eq!(s.queues[1].message_queue.len(),1);
     }
     #[test]
@@ -8265,7 +8344,7 @@ mod fill_rule_tests {
         let p = emit(&mut s,1); let f = heads(&p);
         assert_eq!(f.len(),5); // one fixed 1162 B symbol + 3 wholes + 27 B chop
         assert_eq!(f[0].0 & 3,1);
-        assert_eq!(f.last().unwrap().1.len(),27);
+        assert_eq!(f.last().unwrap().1.len(),23);
         assert_eq!(s.scheduled_bytes[1],100287);
         assert_eq!(s.queues[0].fec_send_slot.as_ref().unwrap().next_id,2);
     }
@@ -8278,8 +8357,8 @@ mod fill_rule_tests {
         let p = emit(&mut s,0); let frames = heads(&p);
         assert_eq!(frames.iter().map(|(_,d)| d[0]).collect::<Vec<_>>(), vec![0,3,4]);
         assert_eq!(frames[2].0 & 2, 0);
-        assert_eq!(frames[2].1.len(), 333);
-        assert_eq!(s.queues[2].partial_send_slot.as_ref().unwrap().1,333);
+        assert_eq!(frames[2].1.len(), 328);
+        assert_eq!(s.queues[2].partial_send_slot.as_ref().unwrap().1,328);
         assert_eq!(s.queues[2].message_queue.front().unwrap().1[0],5, "100 B follower remains behind partially sent 900 B head");
         assert_eq!(s.queues[0].message_queue.len(),2);
         assert_eq!(s.scheduled_bytes.iter().sum::<u64>(),1449);
@@ -8321,7 +8400,7 @@ mod fill_rule_tests {
         let p0=emit(&mut s,0); let p1=emit(&mut s,1);
         let a=heads(&p0).pop().unwrap(); let b=heads(&p1).remove(0);
         assert_eq!((a.0>>2)&0xffff,(b.0>>2)&0xffff);
-        assert_eq!(a.1.len(),437); assert_eq!(b.1.len(),563);
+        assert_eq!(a.1.len(),431); assert_eq!(b.1.len(),569);
         for lost in [None,Some(0),Some(1)] {
             let mut slot=ReassemblySlot::new(); let mut complete=false;
             for (i,(h,data)) in [&a,&b].into_iter().enumerate() {
@@ -8336,5 +8415,149 @@ mod fill_rule_tests {
         assert!(!s.has_unsent_data());
         assert!(s.queues[0].fec_retained.is_empty());
         s.fec_prepare_packet(2); assert_eq!(s.fill_packet(&mut [0;1449]),0);
+    }
+}
+
+#[cfg(test)]
+mod wire_v2_tests {
+    use super::*;
+
+    fn ciphers() -> (ConnectionCipherTriplet, ConnectionCipherTriplet) {
+        let params: snow::params::NoiseParams = "Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
+        let ka = snow::Builder::new(params.clone()).generate_keypair().unwrap();
+        let kb = snow::Builder::new(params.clone()).generate_keypair().unwrap();
+        let mut a = snow::Builder::new(params.clone()).local_private_key(&ka.private).unwrap().remote_public_key(&kb.public).unwrap().build_initiator().unwrap();
+        let mut b = snow::Builder::new(params).local_private_key(&kb.private).unwrap().build_responder().unwrap();
+        let mut enc = [0; 1024]; let mut dec = [0; 1024];
+        let n = a.write_message(&[], &mut enc).unwrap(); b.read_message(&enc[..n], &mut dec).unwrap();
+        let n = b.write_message(&[], &mut enc).unwrap(); a.read_message(&enc[..n], &mut dec).unwrap();
+        (ConnectionCipherTriplet::new_from_old_init_only(a.into_stateless_transport_mode().unwrap()),
+         ConnectionCipherTriplet::new_from_old_init_only(b.into_stateless_transport_mode().unwrap()))
+    }
+    fn open(c: &mut ConnectionCipherTriplet, p: &[u8], now: u64) -> Result<Vec<u8>, snow::Error> {
+        let mut out = vec![0; p.len()];
+        let n = c.open(load_u64(&p[2..10]), load_u32(&p[10..14]), &p[..14], &p[14..], &mut out, now)?;
+        out.truncate(n); Ok(out)
+    }
+    fn packet(c: &mut Option<ConnectionCipherTriplet>, seq: u64, now: u64) -> Vec<u8> {
+        let mut p = vec![0; 128];
+        let n = seal_connected_packet(c, 42, seq, b"wire epoch test", &mut p, now);
+        p.truncate(n); p
+    }
+    #[test]
+    fn every_frame_kind_round_trip_with_full_width_identities() {
+        let data = [7; 1136]; let id = (1u64 << 60) + 65535;
+        let segment = FecSegment { root: (1u64 << 59) + 1024, total: 4 << 20, offset: 2 << 20 };
+        let mut p = [0; 2000];
+        for (fin, offset, expected) in [(true, 0, 1), (false, 0, 2), (true, 2000, 3)] {
+            let n = write_fragment(&mut p, UnreliableFragment::Plain { is_fin: fin, package_id: id, data: &data, offset });
+            assert_eq!(p[0], expected);
+            let (f, consumed) = read_frame(&p[..n]).unwrap(); assert_eq!(consumed, n);
+            if expected == 1 { assert_eq!(f, WireFrame::Whole(&data)); }
+            else { assert_eq!(f, WireFrame::Plain { fin, id, offset, data: &data }); }
+        }
+        for (segment, message_len, block_bytes, kind) in [
+            (None, 2 << 20, 1136, STP_EXT_KIND_FEC),
+            (None, 64001 * 32, 32, STP_EXT_KIND_GROUPED_FEC),
+            (Some(segment), 2 << 20, 1136, STP_EXT_KIND_SEGMENT_FEC),
+        ] {
+            let n = write_fragment(&mut p, UnreliableFragment::Fec { segment, package_id: id,
+                message_len, block_bytes, block_id: u32::MAX - 1, data: &data });
+            assert_eq!(read_frame(&p[..n]), Some((WireFrame::Fec { kind, id, block_id: u32::MAX - 1,
+                message_len: message_len as usize, block_bytes: block_bytes as usize, segment, data: &data }, n)));
+        }
+        assert!(read_frame(&[255; 2000]).is_none());
+    }
+    #[test]
+    fn unknown_frame_skips_its_entire_body_before_next_known_frame() {
+        let mut p = vec![191, 8, 0, 255, 1, 2, 3, 4, 5, 6, 7];
+        p.extend_from_slice(&[1, 2, 0, 9, 8, 255]);
+        let (f, used) = read_frame(&p).unwrap(); assert_eq!(f, WireFrame::Unknown); assert_eq!(used, 11);
+        let (f, used2) = read_frame(&p[used..]).unwrap(); assert_eq!(f, WireFrame::Whole(&[9, 8]));
+        assert_eq!(used2, 5); assert!(read_frame(&p[used+used2..]).is_none());
+        assert_eq!(read_frame(&[192, 0, 0]), Some((WireFrame::Unknown, 3)));
+    }
+    #[test]
+    fn old_padding_collision_is_an_ordinary_whole_frame() {
+        let data = vec![255; 16383]; let mut p = vec![0; data.len()+3];
+        let n = write_fragment(&mut p, UnreliableFragment::Plain { is_fin: true, package_id: 65535, data: &data, offset: 0 });
+        assert_eq!(n, 16386); assert_eq!(read_frame(&p), Some((WireFrame::Whole(&data), n)));
+        assert_ne!(&p[..4], &[255; 4]);
+    }
+    #[test]
+    fn receive_lookup_has_no_modulo_alias_and_never_recycles_retired_ids() {
+        let mut index = ReceiveIndex::default(); let mut plain = ReassemblySlot::new_ring(3); let mut fec = FecRecvSlot::new_ring(3);
+        let a = index.admit(7, &mut plain, &mut fec).unwrap();
+        let b = index.admit(7+1024, &mut plain, &mut fec).unwrap(); assert_ne!(a,b);
+        assert_eq!(index.admit(7, &mut plain, &mut fec), Some(a));
+        index.admit(1u64<<48, &mut plain, &mut fec).unwrap();
+        index.admit((1u64<<48)+1, &mut plain, &mut fec).unwrap();
+        assert!(index.admit(7, &mut plain, &mut fec).is_none());
+        assert_eq!(index.get(7+1024), Some(b));
+        let ids = std::sync::Arc::new(PackageAllocator::new());
+        ids.store(u64::MAX-1, std::sync::atomic::Ordering::Relaxed);
+        let last = ids.allocate().unwrap(); assert_eq!(last.id, u64::MAX-1);
+        drop(last); assert!(ids.allocate().is_none());
+    }
+    #[test]
+    fn declared_version_layout_and_limits_are_checked() {
+        let p = transport_parameters(65536); assert_eq!(validate_transport_parameters(&p), Some(65536));
+        for i in [0,2,4,8,12,14,16,24,28] {
+            let mut bad = p; bad[i] ^= 1;
+            assert!(validate_transport_parameters(&bad).is_none(), "field at {i}");
+        }
+        for n in 0..32 { assert!(validate_transport_parameters(&p[..n]).is_none()); }
+        let mut bad = p; store_u32(&mut bad[20..24], u32::MAX); assert!(validate_transport_parameters(&bad).is_none());
+        let mut hello = build_magic2_client_block_for_limit(65536);
+        hello[MAGIC2_LIST_SIZE+4] ^= 1; assert!(negotiate_magic2(&hello).is_none());
+    }
+    #[test]
+    fn rekey_at_packet_budget_preserves_previous_epoch_reordering_and_replay() {
+        let (mut sender, mut receiver) = ciphers(); sender.outgoing_packets = REKEY_PACKETS-1;
+        let mut sender = Some(sender);
+        let old = packet(&mut sender, 1u64<<48, 10);
+        let new = packet(&mut sender, (1u64<<48)+1, 11);
+        assert_eq!(load_u32(&old[10..14]),0); assert_eq!(load_u32(&new[10..14]),1);
+        assert_eq!(sender.as_ref().unwrap().outgoing_packets,1);
+        assert_eq!(open(&mut receiver,&new,12).unwrap(),b"wire epoch test");
+        assert_eq!(open(&mut receiver,&old,13).unwrap(),b"wire epoch test");
+        let mut replay = crate::sequence::ReceiveSequences::default();
+        assert!(replay.commit((1u64<<48)+1)); assert!(replay.commit(1u64<<48)); assert!(!replay.commit(1u64<<48));
+        assert!(open(&mut receiver,&old,12+PREVIOUS_KEY_NS+1).is_err());
+        let mut forged = new.clone(); store_u32(&mut forged[10..14],u32::MAX);
+        assert!(open(&mut receiver,&forged,14).is_err()); assert_eq!(receiver.incoming_epoch,1);
+        let mut altered = new.clone(); altered[0] ^= 2;
+        assert!(open(&mut receiver,&altered,14).is_err());
+    }
+    #[test]
+    fn rekey_at_age_and_byte_budget_counts_both_nonce_spaces() {
+        let (sender, mut receiver) = ciphers(); let mut sender = Some(sender);
+        let a = packet(&mut sender, 0, 100); open(&mut receiver,&a,100).unwrap();
+        let b = packet(&mut sender, crate::sequence::ACK_SPACE, 100+REKEY_AGE_NS);
+        assert_eq!(load_u32(&b[10..14]),1); open(&mut receiver,&b,101+REKEY_AGE_NS).unwrap();
+        sender.as_mut().unwrap().outgoing_bytes=REKEY_BYTES;
+        let c = packet(&mut sender,1,102+REKEY_AGE_NS);
+        assert_eq!(load_u32(&c[10..14]),2); open(&mut receiver,&c,103+REKEY_AGE_NS).unwrap();
+        // More than one complete missing epoch is bounded recovery, not a derivation loop.
+        let (_, mut fresh_receiver)=ciphers(); assert!(open(&mut fresh_receiver,&c,104+REKEY_AGE_NS).is_err());
+        assert_eq!(fresh_receiver.incoming_epoch,0);
+    }
+    #[test]
+    fn malformed_frames_and_acks_are_bounded_and_do_not_panic() {
+        let mut rng=0x123456789abcdef0u64;
+        for n in 0..10000usize {
+            let mut p=vec![0; n%512];
+            for b in &mut p { rng^=rng<<13; rng^=rng>>7; rng^=rng<<17; *b=rng as u8; }
+            let mut cursor=0; let mut frames=0;
+            while let Some((_,used))=read_frame(&p[cursor..]) { assert!(used>=3); cursor+=used; frames+=1; }
+            assert!(cursor<=p.len()); assert!(frames<=p.len()/3);
+            let _=crate::ack::BitmapAck::decode(&p);
+            let _=validate_transport_parameters(&p);
+        }
+        for kind in 1..=6 {
+            let p=[kind,255,255,0,0,0]; assert!(read_frame(&p).is_none());
+        }
+        let minimum=ASSUMED_UDP_PAYLOAD_SIZE_WITH_GUARANTEED_DELIVERY;
+        assert!(minimum >= CONNECTED_HEADER_SIZE+16+STP_SEGMENT_FEC_HEADER_SIZE+FEC_MIN_BLOCK_BYTES);
     }
 }

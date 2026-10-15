@@ -214,8 +214,8 @@ pub struct FecMessageInfo {
     /// Own packets declared lost while the message was being sent.
     pub lost_during_send: u32,
     /// Research group identity and feedback repair counters (opt-in recording only).
-    pub package_id: u16,
-    pub root_id: u16,
+    pub package_id: u64,
+    pub root_id: u64,
     pub segment_offset: u32,
     pub block_bytes: u32,
     pub rescue_rounds: u8,

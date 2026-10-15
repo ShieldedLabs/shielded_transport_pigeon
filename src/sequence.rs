@@ -1,37 +1,17 @@
 //! Connected packet nonces: dense data [0,2^63), independent ACK [2^63,2^64).
-//! Bit 31 of the wire sequence selects the space; low 31 bits are extended relative
-//! to that space's highest authenticated nonce. No unauthenticated input moves it.
-//! Peers must start at zero, and gaps/reordering must be less than half a wire cycle.
+//! The complete nonce is transmitted verbatim; there is no half-cycle inference.
 pub const ACK_SPACE: u64 = 1 << 63;
-const CYCLE: u64 = 1 << 31;
-const MASK: u64 = CYCLE - 1;
-const REPLAY_BITS: u64 = 4096;
-
-pub fn to_wire(nonce: u64) -> u32 {
-    (nonce & MASK) as u32 | if nonce & ACK_SPACE != 0 { 1 << 31 } else { 0 }
-}
-pub fn is_ack_space(wire: u32) -> bool { wire & (1 << 31) != 0 }
-
-/// Extend truncated sequence numbers using nearest-cycle serial arithmetic.
-/// `reference` is a full per-space counter (without the space bit).
-pub fn extend(wire: u64, reference: u64, bits: u32) -> u64 {
-    let cycle = 1u64 << bits;
-    let mask = cycle - 1;
-    let candidate = (reference & !mask) | (wire & mask);
-    if candidate < reference && reference - candidate > cycle / 2 {
-        candidate.saturating_add(cycle)
-    } else if candidate > reference && candidate - reference > cycle / 2 && candidate >= cycle {
-        candidate - cycle
-    } else { candidate }
-}
+const REPLAY_BITS: u64 = 262144;
+pub fn to_wire(nonce: u64) -> u64 { nonce }
+pub fn is_ack_space(wire: u64) -> bool { wire & ACK_SPACE != 0 }
 
 #[derive(Debug, Clone)]
 struct Space {
     highest: Option<u64>,
-    history: [u64; (REPLAY_BITS / 64) as usize],
+    history: Box<[u64]>,
 }
 impl Default for Space {
-    fn default() -> Self { Self { highest: None, history: [0; (REPLAY_BITS / 64) as usize] } }
+    fn default() -> Self { Self { highest: None, history: vec![0; (REPLAY_BITS / 64) as usize].into_boxed_slice() } }
 }
 impl Space {
     fn commit(&mut self, seq: u64) -> bool {
@@ -58,11 +38,7 @@ pub struct ReceiveSequences { data: Space, ack: Space }
 impl ReceiveSequences {
     /// Non-mutating: call before AEAD decryption, commit only after authentication
     /// and validating that the decrypted size agrees with the nonce space.
-    pub fn candidate(&self, wire: u32) -> u64 {
-        let ack = is_ack_space(wire);
-        let space = if ack { &self.ack } else { &self.data };
-        extend(wire as u64 & MASK, space.highest.unwrap_or(0), 31) | if ack { ACK_SPACE } else { 0 }
-    }
+    pub fn candidate(&self, wire: u64) -> u64 { wire }
     pub fn commit(&mut self, nonce: u64) -> bool {
         if nonce & ACK_SPACE != 0 { self.ack.commit(nonce & !ACK_SPACE) } else { self.data.commit(nonce) }
     }
@@ -108,7 +84,7 @@ mod tests {
         let mut r = ReceiveSequences::default();
         assert!(r.commit((1 << 31)-3));
         let original = r.candidate(to_wire((1 << 31)-2));
-        for w in [u32::MAX, 0, 123456789] { let _ = r.candidate(w); }
+        for w in [u64::MAX, 0, 123456789] { let _ = r.candidate(w); }
         assert_eq!(r.candidate(to_wire((1 << 31)-2)), original);
     }
     fn cipher_pair() -> (crate::stp::ConnectionCipherTriplet, crate::stp::ConnectionCipherTriplet) {
@@ -153,8 +129,13 @@ mod tests {
         }
     }
     #[test]
-    fn legacy_ack_base_extends_at_32_bit_wrap() {
-        assert_eq!(extend(4, (1 << 32)+8, 32), (1 << 32)+4);
-        assert_eq!(extend(u32::MAX as u64-4, (1 << 32)+8, 32), (1 << 32)-5);
+    fn full_nonce_survives_arbitrary_forward_gaps() {
+        let mut r = ReceiveSequences::default();
+        for s in [0, 1 << 32, 1 << 48, (1 << 63) - 2] {
+            for n in [s, ACK_SPACE | s] {
+                assert_eq!(r.candidate(to_wire(n)), n);
+                assert!(r.commit(n));
+            }
+        }
     }
 }

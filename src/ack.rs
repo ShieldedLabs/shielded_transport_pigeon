@@ -1,7 +1,7 @@
-//! Size-identified low-delay acknowledgements. No allocation or bandwidth-sized history.
+//! Size-identified acknowledgements with explicit receipt windows and bounded history.
 pub const ACK_PAYLOAD_LEN: usize = 152;
-pub const ACK_BITMAP_BITS: u64 = 1024;
-const HISTORY_BITS: u64 = 4096;
+pub const ACK_BITMAP_BITS: u64 = 960;
+const HISTORY_BITS: u64 = 262144;
 
 /// Internal adaptive batching limits; chosen once in ship.rs.
 #[derive(Debug, Clone, Copy)]
@@ -13,39 +13,49 @@ pub(crate) struct AckPolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BitmapAck {
     pub highest: u64,
+    pub receipt_base: u64,
     /// Most recently received unique packet, also acknowledged even outside the bitmap.
     pub sample_seq: u64,
     pub delay_us: u32,
-    /// Cumulative number of unique CE-marked data/probe/keepalive packets, modulo 2^32.
-    pub ce_count: u32,
-    pub bitmap: [u64; 16],
+    /// Cumulative number of unique CE-marked data/probe/keepalive packets, saturating at u64::MAX (close before exhaustion).
+    pub ce_count: u64,
+    pub bitmap: [u64; 15],
 }
 impl BitmapAck {
-    pub fn base(&self) -> u64 { self.highest.saturating_sub(ACK_BITMAP_BITS - 1) }
+    pub fn base(&self) -> u64 { self.receipt_base }
     pub fn encode(&self) -> [u8; ACK_PAYLOAD_LEN] {
         let mut b = [0; ACK_PAYLOAD_LEN];
-        b[..8].copy_from_slice(&self.highest.to_le_bytes());
+        b[..8].copy_from_slice(&self.receipt_base.to_le_bytes());
         b[8..16].copy_from_slice(&self.sample_seq.to_le_bytes());
-        b[16..20].copy_from_slice(&self.delay_us.to_le_bytes());
-        b[20..24].copy_from_slice(&self.ce_count.to_le_bytes());
-        for (i, w) in self.bitmap.iter().enumerate() { b[24+i*8..32+i*8].copy_from_slice(&w.to_le_bytes()); }
+        b[16..24].copy_from_slice(&self.ce_count.to_le_bytes());
+        b[24..28].copy_from_slice(&self.delay_us.to_le_bytes());
+        // bytes 28..32: encoding 0 (bitmap), reserved zero.
+        for (i, w) in self.bitmap.iter().enumerate() { b[32+i*8..40+i*8].copy_from_slice(&w.to_le_bytes()); }
         b
     }
     pub fn decode(b: &[u8]) -> Option<Self> {
-        if b.len() != ACK_PAYLOAD_LEN { return None; }
+        if b.len() != ACK_PAYLOAD_LEN || b[28..32] != [0; 4] { return None; }
         let mut a = Self {
-            highest: u64::from_le_bytes(b[..8].try_into().ok()?),
+            highest: 0,
+            receipt_base: u64::from_le_bytes(b[..8].try_into().ok()?),
             sample_seq: u64::from_le_bytes(b[8..16].try_into().ok()?),
-            delay_us: u32::from_le_bytes(b[16..20].try_into().ok()?),
-            ce_count: u32::from_le_bytes(b[20..24].try_into().ok()?), bitmap: [0; 16],
+            ce_count: u64::from_le_bytes(b[16..24].try_into().ok()?),
+            delay_us: u32::from_le_bytes(b[24..28].try_into().ok()?), bitmap: [0; 15],
         };
-        for (i, w) in a.bitmap.iter_mut().enumerate() { *w = u64::from_le_bytes(b[24+i*8..32+i*8].try_into().ok()?); }
-        if a.sample_seq > a.highest || !a.contains(a.highest) { return None; }
+        if a.receipt_base >= crate::sequence::ACK_SPACE || a.sample_seq >= crate::sequence::ACK_SPACE { return None; }
+        for (i, w) in a.bitmap.iter_mut().enumerate() { *w = u64::from_le_bytes(b[32+i*8..40+i*8].try_into().ok()?); }
+        a.highest = a.sample_seq;
+        for (i, &word) in a.bitmap.iter().enumerate() {
+            if word != 0 {
+                let seq = a.receipt_base.checked_add(i as u64 * 64 + 63 - word.leading_zeros() as u64)?;
+                if seq >= crate::sequence::ACK_SPACE { return None; }
+                a.highest = a.highest.max(seq);
+            }
+        }
         Some(a)
     }
     pub fn contains(&self, seq: u64) -> bool {
-        if seq < self.base() || seq > self.highest { return false; }
-        let bit = seq - self.base();
+        let Some(bit) = seq.checked_sub(self.base()).filter(|&n| n < ACK_BITMAP_BITS) else { return false; };
         self.bitmap[(bit / 64) as usize] & (1 << (bit % 64)) != 0
     }
     /// Intersect receipt words with sender pending/lost rings before set-bit iteration.
@@ -76,34 +86,36 @@ impl BitmapAck {
                 let bit = w.trailing_zeros(); w &= w - 1;
                 Some(self.base() + i as u64 * 64 + bit as u64)
             })
-        }).filter(|&s| s <= self.highest).chain(
+        }).chain(
             (!self.contains(self.sample_seq)).then_some(self.sample_seq))
     }
 }
 
 #[derive(Debug)]
 pub struct AckReceiver {
-    history: [u64; 64],
+    history: Box<[u64]>,
     highest: Option<u64>,
     sample_seq: u64,
     sample_time_ns: u64,
-    ce_count: u32,
+    ce_count: u64,
     pending: u16,
     last_arrival_ns: Option<u64>,
     mean_gap_ns: u64,
     gap_seq: Option<u64>,
     gap_since_ns: u64,
     last_ack_ns: Option<u64>,
+    feedback_pages: std::collections::VecDeque<(u64, u8)>,
 }
 impl Default for AckReceiver {
-    fn default() -> Self { Self { history: [0; 64], highest: None, sample_seq: 0, sample_time_ns: 0, ce_count: 0, pending: 0, last_arrival_ns: None, mean_gap_ns: 1_000_000, gap_seq: None, gap_since_ns: 0, last_ack_ns: None } }
+    fn default() -> Self { Self { history: vec![0; (HISTORY_BITS/64) as usize].into_boxed_slice(), highest: None, sample_seq: 0, sample_time_ns: 0, ce_count: 0, pending: 0, last_arrival_ns: None, mean_gap_ns: 1_000_000, gap_seq: None, gap_since_ns: 0, last_ack_ns: None, feedback_pages: std::collections::VecDeque::new() } }
 }
 impl AckReceiver {
     /// Returns false for duplicate/too-old data; duplicates still refresh ACK feedback.
     pub fn receive(&mut self, seq: u64, now: u64, ce: bool, timer: &mut u64) -> bool {
-        self.receive_with_rtt(seq, now, ce, timer, 0, 1184)
+        self.receive_with_rtt(seq, now, ce, timer, 0, 1204)
     }
     pub fn receive_with_rtt(&mut self, seq: u64, now: u64, ce: bool, timer: &mut u64, rtt_us: u64, wire_bytes: usize) -> bool {
+        if seq >= crate::sequence::ACK_SPACE { return false; }
         let old_highest = self.highest;
         if old_highest.is_some_and(|h| seq < h.saturating_sub(HISTORY_BITS - 1)) { return false; }
         if let Some(h) = old_highest {
@@ -124,7 +136,12 @@ impl AckReceiver {
         self.highest = Some(old_highest.unwrap_or(seq).max(seq));
         self.sample_seq = seq;
         self.sample_time_ns = now;
-        if ce { self.ce_count = self.ce_count.wrapping_add(1); }
+        if ce { self.ce_count = self.ce_count.saturating_add(1); }
+        let floor = self.highest.unwrap().saturating_sub(HISTORY_BITS - 1);
+        self.feedback_pages.retain(|&(base, _)| base.saturating_add(ACK_BITMAP_BITS) > floor);
+        let page = seq / ACK_BITMAP_BITS * ACK_BITMAP_BITS;
+        if let Some((_, repeats)) = self.feedback_pages.iter_mut().find(|(base, _)| *base == page) { *repeats = 3; }
+        else { self.feedback_pages.push_back((page, 3)); }
         if let Some(last) = self.last_arrival_ns {
             let gap = now.saturating_sub(last).clamp(1000, 100_000_000);
             self.mean_gap_ns = (self.mean_gap_ns * 7 + gap) / 8;
@@ -163,9 +180,9 @@ impl AckReceiver {
     fn policy(&self, rtt_us: u64, wire_bytes: usize) -> (u16, u32) {
         let AckPolicy { every_packets, max_delay_us } = crate::ship::ACK;
         let pps = 1_000_000_000 / self.mean_gap_ns.max(1);
-        // 174 bytes is the encrypted UDP ACK size. At least this packet group
+        // 182 bytes is the encrypted UDP ACK size. At least this packet group
         // is needed for <=2% overhead, except when the delay cap forces a flush.
-        let budget_packets = (174u64 * 50).div_ceil(wire_bytes.max(1) as u64);
+        let budget_packets = (182u64 * 50).div_ceil(wire_bytes.max(1) as u64);
         let minimum = (every_packets as u64).max(budget_packets).clamp(1, 64);
         let n = pps.div_ceil(1000).clamp(minimum, 64);
         let budget_us = n * self.mean_gap_ns / 1000;
@@ -174,31 +191,38 @@ impl AckReceiver {
     }
     pub fn ack(&self, now: u64) -> BitmapAck {
         let highest = self.highest.unwrap_or(0);
-        let base = highest.saturating_sub(ACK_BITMAP_BITS - 1);
-        let mut bitmap = [0; 16];
-        let shift = base % 64;
-        for (i, w) in bitmap.iter_mut().enumerate() {
-            let slot = (base / 64 + i as u64) as usize % 64;
-            *w = self.history[slot] >> shift;
-            if shift != 0 { *w |= self.history[(slot+1)%64] << (64-shift); }
+        let base = self.feedback_pages.front().map_or(highest.saturating_sub(ACK_BITMAP_BITS - 1), |&(base, _)| base);
+        let mut bitmap = [0; 15];
+        let floor = highest.saturating_sub(HISTORY_BITS - 1);
+        // Bounded by the fixed ACK size, independent of the sequence gap.
+        for bit in 0..ACK_BITMAP_BITS {
+            let seq = base + bit;
+            if seq >= floor && seq <= highest && self.history[(seq%HISTORY_BITS/64) as usize] & (1 << (seq%64)) != 0 {
+                bitmap[(bit/64) as usize] |= 1 << (bit%64);
+            }
         }
-        // During connection start, positions beyond highest wrap around to old history.
-        let used = (highest-base+1) as usize;
-        if used < 1024 {
-            if used % 64 != 0 { bitmap[used/64] &= (1 << (used%64))-1; }
-            for w in &mut bitmap[(used+63)/64..] { *w = 0; }
-        }
-        BitmapAck { highest, sample_seq: self.sample_seq,
+        let mut a = BitmapAck { highest: self.sample_seq, receipt_base: base, sample_seq: self.sample_seq,
             delay_us: (now.saturating_sub(self.sample_time_ns)/1000).min(u32::MAX as u64) as u32,
-            ce_count: self.ce_count, bitmap }
+            ce_count: self.ce_count, bitmap };
+        a.highest = a.acknowledged().max().unwrap_or(a.sample_seq);
+        a
     }
-    pub fn sent(&mut self, now: u64) { self.pending = 0; self.last_ack_ns = Some(now); }
+    pub fn sent(&mut self, now: u64) {
+        self.pending = 0; self.last_ack_ns = Some(now);
+        if let Some((page, repeats)) = self.feedback_pages.pop_front() {
+            if repeats > 1 { self.feedback_pages.push_back((page, repeats-1)); }
+        }
+    }
+    pub fn feedback_deadline(&self, now: u64) -> u64 {
+        if self.feedback_pages.is_empty() { u64::MAX }
+        else { now.saturating_add(crate::ship::ACK.max_delay_us as u64 * 1000) }
+    }
+
 }
 
 /// Cumulative feedback is idempotent under ACK loss, duplication and reordering.
-pub fn update_ce_count(previous: &mut u32, incoming: u32) -> bool {
-    let delta = incoming.wrapping_sub(*previous);
-    if delta == 0 || delta >= 1 << 31 { return false; }
+pub fn update_ce_count(previous: &mut u64, incoming: u64) -> bool {
+    if incoming <= *previous { return false; }
     *previous = incoming;
     true
 }
@@ -237,15 +261,15 @@ mod tests {
     fn rolling_history_and_explicit_late_sample() {
         let mut r = AckReceiver::default();
         for s in 0..5000 { recv(&mut r, s, s*1000, false); }
-        assert_eq!(r.ack(5_000_000).acknowledged().count(), 1024);
+        assert_eq!(r.ack(5_000_000).acknowledged().count(), 961);
         assert_eq!(recv(&mut r, 4096, 6_000_000, true).0, false); // duplicate after ring wrap
-        assert_eq!(recv(&mut r, 0, 6_000_000, true).0, false); // outside history
+        assert_eq!(recv(&mut r, 0, 6_000_000, true).0, false); // duplicate already received
         let mut r = AckReceiver::default();
         recv(&mut r, 0, 0, false); recv(&mut r, 3000, 1000, false);
         recv(&mut r, 1, 2000, true);
         let a = r.ack(3000);
-        assert!(!a.contains(1));
-        assert_eq!(a.acknowledged().collect::<Vec<_>>(), vec![3000, 1]);
+        assert!(a.contains(1));
+        assert_eq!(a.acknowledged().collect::<Vec<_>>(), vec![0, 1]);
         assert_eq!(a.ce_count, 1);
     }
     #[test]
@@ -262,14 +286,14 @@ mod tests {
         let mut ce = 0;
         assert!(update_ce_count(&mut ce, 2));
         assert!(!update_ce_count(&mut ce, 2)); assert!(!update_ce_count(&mut ce, 1));
-        ce = u32::MAX; assert!(update_ce_count(&mut ce, 0));
+        ce = u32::MAX as u64; assert!(update_ce_count(&mut ce, 1u64 << 40));
     }
     #[test]
     fn bitmap_alignment_and_gaps() {
         let mut r = AckReceiver::default();
         for s in 0..10000 { if s%7 != 0 { recv(&mut r, s, s, false); } }
         let a = r.ack(10001);
-        for s in a.base()..=a.highest { assert_eq!(a.contains(s), s%7 != 0, "seq {s}"); }
+        for s in a.base()..a.base()+ACK_BITMAP_BITS { assert_eq!(a.contains(s), s%7 != 0, "seq {s}"); }
     }
     #[test]
     fn lost_and_reordered_acks_repeat_positive_receipts() {
@@ -292,21 +316,22 @@ mod tests {
     #[test]
     fn malformed_and_future_bitmap_positions() {
         let mut r = AckReceiver::default(); recv(&mut r, 1, 0, false);
-        let mut a = r.ack(0); a.sample_seq = 2;
-        assert!(BitmapAck::decode(&a.encode()).is_none());
-        a.sample_seq = 1; a.bitmap[0] = 0;
-        assert!(BitmapAck::decode(&a.encode()).is_none());
-        a.bitmap[0] = u64::MAX;
-        assert_eq!(BitmapAck::decode(&a.encode()).unwrap().acknowledged().collect::<Vec<_>>(), vec![0, 1]);
+        let a = r.ack(0);
+        let mut bytes = a.encode(); bytes[28] = 1;
+        assert!(BitmapAck::decode(&bytes).is_none());
+        bytes = a.encode(); bytes[..8].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(BitmapAck::decode(&bytes).is_none());
     }
     #[test]
     fn relevant_masks_align_across_ring_wrap_and_keep_late_losses() {
         for highest in [1030, 4000, 262150] {
             let mut r = AckReceiver::default();
             for s in highest-1023..=highest { recv(&mut r, s, s, false); }
-            let a = r.ack(highest+1);
+            let mut a = r.ack(highest+1);
+            a.receipt_base = highest - 959;
+            a.bitmap = [u64::MAX; 15];
             let mut waiting = [0u64; 4096]; let mut lost = [0u64; 4096];
-            let keep = [highest-1000, highest-800, highest-63, highest];
+            let keep = [highest-900, highest-800, highest-63, highest];
             for (i, &s) in keep.iter().enumerate() {
                 let ring = if i%2 == 0 { &mut waiting } else { &mut lost };
                 ring[(s%262144/64) as usize] |= 1 << (s%64);
@@ -349,7 +374,7 @@ mod tests {
     #[test]
     fn hello_sizes_are_not_ack_sizes() {
         use crate::stp::*;
-        assert_eq!(6+32+MAGIC2_BLOCK_SIZE, 295);
+        assert_eq!(6+32+MAGIC2_BLOCK_SIZE, 327);
         for magic in [CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b] {
             let client = new_keypair_from_connect_magic1(magic).unwrap();
             let server = new_keypair_from_connect_magic1(magic).unwrap();
@@ -359,13 +384,13 @@ mod tests {
             let mut s = snow::Builder::new(params.parse().unwrap()).prologue(&prologue[..6]).unwrap().local_private_key(&server.private).unwrap().build_responder().unwrap();
             let mut packet = [0; 1024]; let mut payload = [0; 1024];
             let n = c.write_message(&build_magic2_client_block(), &mut packet).unwrap();
-            assert_eq!(n+6, 359);
+            assert_eq!(n+6, 391);
             s.read_message(&packet[..n], &mut payload).unwrap();
-            let n = s.write_message(&1u64.to_le_bytes(), &mut packet).unwrap();
-            assert_eq!(n+6, 62);
-            for hello_udp_len in [295, 46, 359, 62] {
-                assert_ne!(hello_udp_len, ACK_PAYLOAD_LEN+22);
-                assert_ne!(hello_udp_len, ACK_PAYLOAD_LEN+6);
+            let n = s.write_message(&[0; 40], &mut packet).unwrap();
+            assert_eq!(n+6, 94);
+            for hello_udp_len in [327, 78, 391, 94] {
+                assert_ne!(hello_udp_len, ACK_PAYLOAD_LEN+30);
+                assert_ne!(hello_udp_len, ACK_PAYLOAD_LEN+14);
             }
         }
     }
@@ -374,12 +399,12 @@ mod tests {
         use crate::stp::*;
         // (crypto, bitmap ACK, minimum trimmed data, initial keepalive/probe).
         for (magic, expected) in [
-            (CONNECT_MAGIC1_PLAIN_TEXT, [158, 523, 1184]),
-            (CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, [174, 539, 1184]),
-            (CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b, [174, 539, 1184]),
+            (CONNECT_MAGIC1_PLAIN_TEXT, [166, 531, 1204]),
+            (CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, [182, 547, 1204]),
+            (CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b, [182, 547, 1204]),
         ] {
             let overhead = total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(magic).unwrap();
-            let sizes = [ACK_PAYLOAD_LEN + overhead, 517 + overhead, 1184];
+            let sizes = [ACK_PAYLOAD_LEN + overhead, 517 + overhead, 1204];
             assert_eq!(sizes, expected);
             for udp_len in [sizes[1], sizes[2]] {
                 assert!(udp_len - overhead >= 517);
@@ -387,7 +412,32 @@ mod tests {
             }
         }
         // Outer dispatch handles these before authenticated ordinary-traffic classification.
-        assert_eq!([6 + 32 + 257, 6 + 32 + 48 + 257 + 16, 6 + 32 + 8, 6 + 32 + 8 + 16], [295, 359, 46, 62]);
+        assert_eq!([6 + 32 + MAGIC2_BLOCK_SIZE, 6 + 32 + 48 + MAGIC2_BLOCK_SIZE + 16, 6 + 32 + 40, 6 + 32 + 40 + 16], [327, 391, 78, 94]);
+    }
+
+    #[test]
+    fn repeated_arbitrary_windows_cover_deep_reordering_and_idle_feedback() {
+        let mut r = AckReceiver::default();
+        let seqs = [200000, 1, 1921, 40000, 100000, 120000, 12345];
+        let mut expected = std::collections::BTreeSet::from(seqs);
+        for (t, seq) in seqs.into_iter().enumerate() { assert!(recv(&mut r, seq, t as u64, false).0); }
+        let pages = r.feedback_pages.len();
+        let mut counts = std::collections::BTreeMap::<u64,usize>::new();
+        for t in 0..pages*3 {
+            assert_ne!(r.feedback_deadline(t as u64),u64::MAX);
+            let a = r.ack(t as u64);
+            assert_eq!(BitmapAck::decode(&a.encode()),Some(a.clone()));
+            *counts.entry(a.receipt_base).or_default() += 1;
+            for seq in a.acknowledged() { expected.remove(&seq); }
+            r.sent(t as u64);
+        }
+        assert!(expected.is_empty()); assert!(counts.values().all(|&n| n==3));
+        assert_eq!(r.feedback_deadline(100),u64::MAX);
+        // A late arrival starts a fresh older window without resetting sample timing.
+        assert!(recv(&mut r, 20, 100, true).0);
+        let a=r.ack(1100); assert!(a.contains(20)); assert_eq!((a.sample_seq,a.delay_us,a.ce_count),(20,1,1));
+        let mut arbitrary=a.clone(); arbitrary.receipt_base=19; arbitrary.bitmap=[0;15]; arbitrary.bitmap[0]=2;
+        assert_eq!(BitmapAck::decode(&arbitrary.encode()).unwrap().acknowledged().collect::<Vec<_>>(),vec![20]);
     }
 
     #[test]

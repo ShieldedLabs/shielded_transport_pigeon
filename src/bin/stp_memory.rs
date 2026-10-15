@@ -26,25 +26,36 @@ impl Peer {
             prefix: u16::from_le_bytes(key.public[..2].try_into().unwrap()) << 1, seq: 0 })
     }
     fn send(&mut self, header: u64, word: Option<u64>, bytes: &[u8]) {
-        let mut payload = vec![255u8; (8 + word.map_or(0, |_| 8) + bytes.len() + 8).max(517)];
-        payload[..8].copy_from_slice(&header.to_le_bytes());
-        let o = if let Some(w) = word { payload[8..16].copy_from_slice(&w.to_le_bytes()); 16 } else { 8 };
+        // This adversarial helper accepts its original compact arguments but emits
+        // the same version-2 TLV framing as the real sender.
+        let o = if word.is_some() { 21 } else { 15 };
+        let mut payload = vec![255u8; (o + bytes.len() + 1).max(517)];
+        payload[0] = if let Some(w) = word { if w >> 48 == STP_EXT_KIND_GROUPED_FEC { 5 } else { 4 } }
+            else if header & 2 != 0 { 3 } else { 2 };
+        payload[1..3].copy_from_slice(&((o - 3 + bytes.len()) as u16).to_le_bytes());
+        payload[3..11].copy_from_slice(&((header >> 2) & 0xffff).to_le_bytes());
+        payload[11..15].copy_from_slice(&((header >> 32) as u32).to_le_bytes());
+        if let Some(w) = word {
+            payload[15..19].copy_from_slice(&(w as u32).to_le_bytes());
+            payload[19..21].copy_from_slice(&((w >> 32) as u16).to_le_bytes());
+        }
         payload[o..o+bytes.len()].copy_from_slice(bytes);
-        let mut b = vec![0; payload.len()+22];
+        let mut b = vec![0; payload.len()+30];
         b[..2].copy_from_slice(&self.prefix.to_le_bytes());
-        b[2..6].copy_from_slice(&shielded_transport_pigeon::sequence::to_wire(self.seq).to_le_bytes());
-        let n = self.cipher.current.write_message(self.seq, &payload, &mut b[6..]).unwrap();
-        self.socket.send(&b[..n+6]).unwrap(); self.seq += 1;
+        b[2..10].copy_from_slice(&shielded_transport_pigeon::sequence::to_wire(self.seq).to_le_bytes());
+        let (ad, body) = b.split_at_mut(14);
+        let n = self.cipher.current.write_message_with_additional_data(self.seq, ad, &payload, body).unwrap();
+        self.socket.send(&b[..n+14]).unwrap(); self.seq += 1;
     }
     fn acked(&self) -> usize {
         self.socket.set_read_timeout(Some(Duration::from_millis(30))).unwrap();
         let mut b = [0;2048]; let mut out = [0;2048]; let mut count = 0;
         while let Ok(n) = self.socket.recv(&mut b) {
-            if n < 6 { continue; }
-            let wire = u32::from_le_bytes(b[2..6].try_into().unwrap());
+            if n < 14 { continue; }
+            let wire = u64::from_le_bytes(b[2..10].try_into().unwrap());
             if !shielded_transport_pigeon::sequence::is_ack_space(wire) { continue; }
-            let nonce = shielded_transport_pigeon::sequence::ACK_SPACE | (wire & 0x7fffffff) as u64;
-            if let Ok(n) = self.cipher.current.read_message(nonce, &b[6..n], &mut out) {
+            let nonce = wire;
+            if let Ok(n) = self.cipher.current.read_message_with_additional_data(nonce, &b[..14], &b[14..n], &mut out) {
                 if let Some(a) = shielded_transport_pigeon::ack::BitmapAck::decode(&out[..n]) {
                     count = count.max((0..self.seq).filter(|&s| a.contains(s) || a.sample_seq == s).count());
                 }
