@@ -36,10 +36,11 @@ pub struct Config {
     /// Core's existing queue target (microseconds), minimum bytes, maximum bytes.
     pub core_send_buffer: (u32, u32, u32),
     pub max_pps: Option<u64>,
-    /// Temporary core-service cadence, centralized in one driver. Not a wire policy.
+    /// Legacy service-cadence setting, retained for source compatibility.
+    /// The driver now waits for core/command notifications, not this interval.
     pub service_interval: Duration,
-    /// Idle receive-discovery latency/CPU trade-off. Commands wake immediately;
-    /// idle service waits double up to this cap, then reset on observed activity.
+    /// Legacy idle cap, retained for source compatibility (still validated).
+    /// Notifications replace periodic idle discovery; this no longer adds latency.
     pub idle_service_interval: Duration,
 }
 impl Config {

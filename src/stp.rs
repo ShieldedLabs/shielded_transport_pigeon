@@ -4747,12 +4747,61 @@ pub struct NetworkThreadPull {
     pub thread_stats: NetworkThreadStats,
 }
 
+/// A coalescing edge between the core and its application driver. This never
+/// runs user code: only the adapter wakes application Wakers/handlers.
+#[derive(Debug)]
+pub(crate) struct CoreReady {
+    generation: std::sync::Mutex<u64>,
+    changed: std::sync::Condvar,
+    enabled: std::sync::atomic::AtomicBool,
+    pub(crate) send_space: std::sync::atomic::AtomicBool,
+}
+impl Default for CoreReady {
+    fn default() -> Self {
+        Self { generation: std::sync::Mutex::new(1), changed: std::sync::Condvar::new(),
+            enabled: std::sync::atomic::AtomicBool::new(false), send_space: std::sync::atomic::AtomicBool::new(false) }
+    }
+}
+impl CoreReady {
+    pub(crate) fn notify(&self) {
+        let mut generation = self.generation.lock().unwrap();
+        *generation = generation.wrapping_add(1);
+        self.changed.notify_one();
+    }
+    pub(crate) fn wait(&self, observed: &mut u64) {
+        let generation = self.generation.lock().unwrap();
+        let generation = self.changed.wait_while(generation, |g| *g == *observed).unwrap();
+        *observed = *generation;
+    }
+}
+
+#[cfg(test)]
+mod readiness_notification_tests {
+    use super::CoreReady;
+    #[test]
+    fn generation_retains_edges_before_wait_and_during_service() {
+        let ready = std::sync::Arc::new(CoreReady::default());
+        let mut seen = 0;
+        ready.wait(&mut seen); // Initial snapshot, without a command.
+        ready.notify();
+        ready.notify(); // Coalesced before the driver starts waiting.
+        ready.wait(&mut seen);
+        assert_eq!(seen, 3);
+        let other = ready.clone();
+        let worker = std::thread::spawn(move || { other.notify(); });
+        ready.wait(&mut seen); // Either side of condvar registration is safe.
+        worker.join().unwrap();
+        assert_eq!(seen, 4);
+    }
+}
+
 struct NetworkThreadInner {
     state: std::sync::atomic::AtomicUsize, // 0 empty, 1 full
     stop: std::sync::atomic::AtomicBool,
     wake: NetworkWake,
     exchange: std::sync::Mutex<()>,
     completed: std::sync::Condvar,
+    ready: std::sync::Arc<CoreReady>,
     push: std::cell::UnsafeCell<NetworkThreadPush>,
     pull: std::cell::UnsafeCell<NetworkThreadPull>,
 }
@@ -4768,6 +4817,12 @@ pub struct NetworkThreadHandle {
 }
 
 impl NetworkThreadHandle {
+    pub(crate) fn readiness(&self) -> std::sync::Arc<CoreReady> {
+        self.inner.ready.enabled.store(true, std::sync::atomic::Ordering::Release);
+        self.inner.wake.notify();
+        self.inner.ready.clone()
+    }
+
     /// Stop and join the socket-owning thread. Like Drop, this sends no close
     /// packet and does not drain queued sends; peers observe the existing timeout.
     /// Application API adapters use this to make endpoint shutdown deterministic.
@@ -4907,6 +4962,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
         wake: NetworkWake::new().expect("create network command wakeup"),
         exchange: std::sync::Mutex::new(()),
         completed: std::sync::Condvar::new(),
+        ready: std::sync::Arc::new(CoreReady::default()),
         push: std::cell::UnsafeCell::new(NetworkThreadPush::default()),
         pull: std::cell::UnsafeCell::new(NetworkThreadPull::default()),
     });
@@ -4993,6 +5049,9 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
         let mut network_cpu = (0u64, 0u64);
 
         let mut connections_map = HashMap::<ConnectionKey, ConnectionTrackingData>::new();
+        let mut ready_peers = HashMap::new();
+        let mut receive_notified = false;
+        let mut ready_used = 0usize;
 
         loop {
             if thread_inner.stop.load(std::sync::atomic::Ordering::Acquire) {
@@ -5157,6 +5216,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                     }
                 }).collect();
                 resp.received_unreliable_messages = receive_queue.take();
+                receive_notified = false;
+                ready_used = connections_map.values().flat_map(|c| &c.unreliable_send_buffer.queues).map(|q| q.queue_bytes_filled as usize).sum();
 
                 #[allow(unsafe_code)]
                 unsafe {
@@ -6369,6 +6430,29 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                 } true});
 
 //////// END SEND ////////////////////////////////////////////////////////////////////////
+
+                if thread_inner.ready.enabled.load(std::sync::atomic::Ordering::Acquire) {
+                    let mut connected = 0;
+                    let mut changed = false;
+                    let mut used = 0usize;
+                    for (key, conn) in &connections_map {
+                        used = used.saturating_add(conn.unreliable_send_buffer.queues.iter().map(|q| q.queue_bytes_filled as usize).sum::<usize>());
+                        if conn.is_connected() {
+                            connected += 1;
+                            changed |= ready_peers.get(key) != Some(&conn.handshake_hash);
+                        }
+                    }
+                    changed |= connected != ready_peers.len();
+                    if changed {
+                        ready_peers.clear();
+                        ready_peers.extend(connections_map.iter().filter(|(_, c)| c.is_connected()).map(|(k, c)| (*k, c.handshake_hash)));
+                    }
+                    let receive_ready = !receive_notified && !receive_queue.messages.is_empty();
+                    receive_notified |= receive_ready;
+                    let space_ready = used < ready_used && thread_inner.ready.send_space.load(std::sync::atomic::Ordering::Acquire);
+                    ready_used = used;
+                    if changed || receive_ready || space_ready { thread_inner.ready.notify(); }
+                }
 
                 if should_sleep {
                     let now = monotonic_clock_ns();

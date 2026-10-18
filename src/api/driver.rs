@@ -29,6 +29,7 @@ pub(super) struct State {
 pub(super) struct Shared {
     pub state: Mutex<State>,
     pub changed: Condvar,
+    core_ready: std::sync::OnceLock<Arc<stp::CoreReady>>,
     max_message_size: usize,
     send_slots: usize,
     send_bytes: usize,
@@ -74,6 +75,7 @@ impl Owner {
                 next_waiter: 0,
             }),
             changed: Condvar::new(),
+            core_ready: std::sync::OnceLock::new(),
             max_message_size: c.max_message_size,
             send_slots: c.send_slots,
             send_bytes: c.send_bytes,
@@ -82,8 +84,6 @@ impl Owner {
         });
         // The core binds synchronously. Keep startup on the caller's thread so
         // failures cannot strand a live-looking facade with a dead worker.
-        let interval = c.service_interval;
-        let idle_cap = c.idle_service_interval;
         let core = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut options = NetworkThreadOptions::default();
             options.bind_ip = Some(c.bind.ip());
@@ -99,10 +99,11 @@ impl Owner {
         .map_err(|_| {
             io::Error::other("STP core initialization failed (see core panic diagnostic)")
         })?;
+        shared.core_ready.set(core.readiness()).unwrap();
         let worker = shared.clone();
         let thread = thread::Builder::new()
             .name("stp-api".into())
-            .spawn(move || run(worker, core, interval, idle_cap))?;
+            .spawn(move || run(worker, core))?;
         Ok(Self {
             shared,
             thread: Some(thread),
@@ -131,6 +132,10 @@ impl Shared {
     }
     /// Wake arbitrary application code only AFTER releasing the state lock.
     pub fn signal(&self) {
+        if let Some(ready) = self.core_ready.get() { ready.notify(); }
+        self.publish();
+    }
+    fn publish(&self) {
         let waiters = { std::mem::take(&mut self.lock().waiters) };
         self.changed.notify_all();
         for (_, w) in waiters {
@@ -311,45 +316,18 @@ fn event_bytes(e: &Event) -> usize {
     }
 }
 
-/// The ONLY adapter polling fallback. A future core notification can call
-/// `shared.changed.notify_all()` and replace this timed wait with a deadline wait.
-/// Commands already wake it immediately; Futures never use timer polling.
-fn wait_for_core_or_command<'a>(
-    shared: &'a Shared,
-    s: MutexGuard<'a, State>,
-    interval: Duration,
-) -> MutexGuard<'a, State> {
-    if s.stopping || !s.pending.is_empty() || !s.connects.is_empty() {
-        return s;
-    }
-    shared
-        .changed
-        .wait_timeout(s, interval)
-        .unwrap_or_else(|e| e.into_inner())
-        .0
-}
-fn run(
-    shared: Arc<Shared>,
-    core: stp::NetworkThreadHandle,
-    interval: Duration,
-    idle_cap: Duration,
-) {
+/// Generation and command admission share one coalescing event. The generation
+/// is consumed BEFORE each exchange, so an edge during the exchange is retained.
+fn run(shared: Arc<Shared>, core: stp::NetworkThreadHandle) {
+    let ready = shared.core_ready.get().unwrap();
+    let mut observed = 0;
     let mut wanted = Vec::new();
     let mut retry = Vec::new();
     let mut current = HashMap::new();
-    let mut wait_interval = interval;
     loop {
+        ready.wait(&mut observed);
         let (connects, mut pending) = {
-            let s = shared.lock();
-            let mut s = wait_for_core_or_command(
-                &shared,
-                s,
-                if retry.is_empty() {
-                    wait_interval
-                } else {
-                    interval
-                },
-            );
+            let mut s = shared.lock();
             if s.stopping {
                 break;
             }
@@ -358,8 +336,10 @@ fn run(
                 std::mem::take(&mut s.pending),
             )
         };
-        let had_commands = !connects.is_empty() || !pending.is_empty() || !retry.is_empty();
         retry.append(&mut pending);
+        // Arm before submitting, never after the rejection: capacity may be
+        // reclaimed as soon as the core completes the exchange.
+        ready.send_space.store(!retry.is_empty(), std::sync::atomic::Ordering::Release);
         let submitted_slots = retry.len();
         let submitted_bytes: usize = retry.iter().map(|p| p.3.capacity()).sum();
         let Some(pull) = stp::service_connections(
@@ -443,14 +423,10 @@ fn run(
         s.stats.queued_send_bytes -=
             submitted_bytes - retry.iter().map(|p| p.3.capacity()).sum::<usize>();
         activity |= submitted_slots != retry.len();
-        wait_interval = if activity || had_commands {
-            interval
-        } else {
-            wait_interval.saturating_mul(2).min(idle_cap)
-        };
+        ready.send_space.store(!retry.is_empty(), std::sync::atomic::Ordering::Release);
         drop(s);
         if activity {
-            shared.signal();
+            shared.publish();
         }
     }
     // Joins the actual socket owner, not just this adapter worker.
@@ -495,6 +471,7 @@ mod tests {
                 next_waiter: 0,
             }),
             changed: Condvar::new(),
+            core_ready: std::sync::OnceLock::new(),
             max_message_size: 100,
             send_slots: 1,
             send_bytes: 100,
