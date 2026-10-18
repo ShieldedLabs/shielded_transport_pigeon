@@ -106,6 +106,7 @@ impl Direct {
                 wanted_connections: std::mem::take(&mut self.wanted),
                 initiate_connections,
                 send_unreliable,
+                ..Default::default()
             },
         )
         .unwrap();
