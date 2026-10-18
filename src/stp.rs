@@ -849,9 +849,9 @@ pub struct UnreliableSendBuffer {
     /// Sequence number of the packet the next fragment goes into (set by the network thread), so
     /// an FEC message knows which packets are its own when they are declared lost.
     pub next_packet_seq: u64,
-    /// Lazy fixed 4 MiB nonce ring: package id (64), symbol count (32), first ordinal (32).
-    /// One ring per connection, reused across messages; ACK/probe/keepalive slots are empty.
-    fec_packet_tags: Option<Box<[u128]>>,
+    /// Sparse-paged nonce ring: package id (64), symbol count (32), first ordinal (32).
+    /// Same fixed horizon; ACK/probe/keepalive slots are empty and do not allocate.
+    fec_packet_tags: Option<PacketTags>,
     // Encoders awaiting packet outcome feedback, outside the application send queue.
     fec_retained: HashMap<u64, RetainedFecSlot>,
     retention_quota: std::sync::Arc<RetentionQuota>,
@@ -1941,21 +1941,22 @@ impl UnreliableSendBuffer {
     /// Start ANY connected nonce (including control). Clear a reused ring entry before fill.
     pub fn fec_prepare_packet(&mut self, seq: u64) {
         self.next_packet_seq = seq;
-        if let Some(tags) = &mut self.fec_packet_tags { tags[(seq % PACKETS_WAITING_ACK_CAPACITY) as usize] = 0; }
+        if let Some(tags) = &mut self.fec_packet_tags { tags.take((seq % PACKETS_WAITING_ACK_CAPACITY) as usize); }
         self.fec_extra_packet_tags.remove(&(seq % PACKETS_WAITING_ACK_CAPACITY));
     }
 
     fn tag_symbol(&mut self, package: u64, ordinal: u32) {
         let index = self.next_packet_seq % PACKETS_WAITING_ACK_CAPACITY;
-        let tags = self.fec_packet_tags.get_or_insert_with(|| vec![0u128; PACKETS_WAITING_ACK_CAPACITY as usize].into_boxed_slice());
-        let tag = &mut tags[index as usize];
-        let count = ((*tag >> 32) & 0xffff_ffff) as u32;
-        if count > 0 && *tag >> 64 == package as u128 && (*tag as u32).saturating_add(count) == ordinal {
-            *tag += 1u128 << 32;
+        let tags = self.fec_packet_tags.get_or_insert_with(PacketTags::default);
+        let tag = tags.get(index as usize);
+        let count = ((tag >> 32) & 0xffff_ffff) as u32;
+        let tag = if count > 0 && tag >> 64 == package as u128 && (tag as u32).saturating_add(count) == ordinal {
+            tag + (1u128 << 32)
         } else {
-            if count > 0 { self.fec_extra_packet_tags.entry(index).or_default().push(*tag); }
-            *tag = ((package as u128) << 64) | (1u128 << 32) | ordinal as u128;
-        }
+            if count > 0 { self.fec_extra_packet_tags.entry(index).or_default().push(tag); }
+            ((package as u128) << 64) | (1u128 << 32) | ordinal as u128
+        };
+        tags.set(index as usize, tag);
     }
 
     #[cfg(test)]
@@ -1965,7 +1966,7 @@ impl UnreliableSendBuffer {
         if seq > self.next_packet_seq || self.next_packet_seq - seq >= PACKETS_WAITING_ACK_CAPACITY { return; }
         let Some(tags) = &mut self.fec_packet_tags else { return };
         let index = seq % PACKETS_WAITING_ACK_CAPACITY;
-        let tag = std::mem::take(&mut tags[index as usize]);
+        let tag = tags.take(index as usize);
         let extra = self.fec_extra_packet_tags.remove(&index);
         self.fec_finalize_tags(seq, lost, extra.as_deref().unwrap_or(&[]));
         if tag != 0 { self.fec_finalize_tags(seq, lost, &[tag]); }
@@ -2479,7 +2480,7 @@ impl UnreliableSendBuffer {
         } else { None };
         #[cfg(any(test,feature="research_target_validation"))]
         if let Some(b)=&budget {let b=b.lock().unwrap();if let Some(owner)=&b.target_owner {let mut row=owner.lock().unwrap();if row.current_k!=k || row.package_id!=self.send_package_id {row.current_k=k;row.restarts+=1;}}}
-        self.fec_packet_tags.get_or_insert_with(|| vec![0u128; PACKETS_WAITING_ACK_CAPACITY as usize].into_boxed_slice());
+        self.fec_packet_tags.get_or_insert_with(PacketTags::default);
         self.fec_send_slot = Some(FecSendSlot { #[cfg(feature = "research_budget_diagnostic")] diagnostic: None, segment, root_lease, plan_ks, retention_lease: None, retain_limit: self.retention_quota.byte_limit, package_lease: self.package_lease.clone(), dscp: self.current_dscp, finalized_symbols: 0, send_started_ns: self.fec_now_ns, original_send_duration_ns: None, repair_policy: a.policy, rescue_rounds: 0, retained_until_ns: None, original_symbols: None, repair_accounting: RepairAccounting { unbonused_n: n_base, category_bonus, base_b, base_r, base_cap_bound, budget, data_anchor: anchor, ..Default::default() }, group_lost: vec![0; layout.groups], message, block_bytes, k, n, next_id: 0, encoder, block_buf: vec![0u8; block_bytes], first_seq: self.next_packet_seq, lost: 0, n_planned: n, loss_estimate });
         if let Some(f) = &mut self.fec_send_slot {
             if f.repair_accounting.budget.is_some() {
@@ -2860,7 +2861,7 @@ pub struct SendQueues {
     last_queue: usize,
     last_dscp: Dscp,
     fec_adaptive: Option<crate::fec_adapt::FecAdaptiveState>,
-    fec_packet_tags: Option<Box<[u128]>>,
+    fec_packet_tags: Option<PacketTags>,
     fec_extra_packet_tags: HashMap<u64, Vec<u128>>,
     next_packet_seq: u64,
     fec_record: Option<Vec<crate::fec_adapt::FecMessageInfo>>,
@@ -2948,7 +2949,7 @@ impl SendQueues {
         }
         self.next_packet_seq = seq;
         if let Some(owners) = &mut self.packet_owner { owners[(seq % PACKETS_WAITING_ACK_CAPACITY) as usize] = u8::MAX; }
-        if let Some(tags) = &mut self.fec_packet_tags { tags[(seq % PACKETS_WAITING_ACK_CAPACITY) as usize] = 0; }
+        if let Some(tags) = &mut self.fec_packet_tags { tags.take((seq % PACKETS_WAITING_ACK_CAPACITY) as usize); }
         self.fec_extra_packet_tags.remove(&(seq % PACKETS_WAITING_ACK_CAPACITY));
         self.fec_owner_tags.remove(&(seq % PACKETS_WAITING_ACK_CAPACITY));
     }
@@ -2972,7 +2973,7 @@ impl SendQueues {
         if seq > self.next_packet_seq || self.next_packet_seq - seq >= PACKETS_WAITING_ACK_CAPACITY { return; }
         let Some(tags) = &mut self.fec_packet_tags else { return; };
         let index = seq % PACKETS_WAITING_ACK_CAPACITY;
-        let tag = std::mem::take(&mut tags[index as usize]);
+        let tag = tags.take(index as usize);
         let extra = self.fec_extra_packet_tags.remove(&index);
         let Some(owners) = &mut self.packet_owner else { return; };
         let owner = std::mem::replace(&mut owners[index as usize], u8::MAX);
@@ -2996,7 +2997,7 @@ impl SendQueues {
         if old == owner as u8 { return; }
         owners[index] = owner as u8;
         if let Some(tags) = &mut self.fec_packet_tags {
-            let tag = std::mem::take(&mut tags[index]);
+            let tag = tags.take(index);
             if tag != 0 { self.fec_owner_tags.entry(index as u64).or_default().push((old, tag)); }
         }
         if let Some(tags) = self.fec_extra_packet_tags.remove(&(index as u64)) {
@@ -4013,6 +4014,40 @@ impl ConnectionStateConnected {
 // ring of in-flight sequence numbers; head-tail span must stay under capacity or bits alias
 pub const PACKETS_WAITING_ACK_WORDS: usize = 4096;
 pub const PACKETS_WAITING_ACK_CAPACITY: u64 = PACKETS_WAITING_ACK_WORDS as u64 * 64;
+
+/// Same full nonce horizon as the old 4 MiB dense tag ring. Pages exist only
+/// while they contain unresolved FEC symbols, and are freed at finalization.
+#[derive(Debug)]
+struct PacketTags {
+    pages: Box<[Option<Box<TagPage>>]>,
+}
+#[derive(Debug)]
+struct TagPage { tags: [u128; 256], live: usize }
+impl Default for PacketTags {
+    fn default() -> Self {
+        Self { pages: (0..PACKETS_WAITING_ACK_CAPACITY as usize / 256).map(|_| None).collect() }
+    }
+}
+impl PacketTags {
+    fn get(&self, index: usize) -> u128 {
+        self.pages[index / 256].as_ref().map_or(0, |p| p.tags[index % 256])
+    }
+    fn set(&mut self, index: usize, tag: u128) {
+        let page = &mut self.pages[index / 256];
+        if tag == 0 && page.is_none() { return; }
+        let p = page.get_or_insert_with(|| Box::new(TagPage { tags: [0; 256], live: 0 }));
+        let old = std::mem::replace(&mut p.tags[index % 256], tag);
+        p.live = p.live + usize::from(tag != 0) - usize::from(old != 0);
+        if p.live == 0 { *page = None; }
+    }
+    fn take(&mut self, index: usize) -> u128 {
+        let tag = self.get(index);
+        if tag != 0 { self.set(index, 0); }
+        tag
+    }
+    #[cfg(test)]
+    fn allocated_pages(&self) -> usize { self.pages.iter().filter(|p| p.is_some()).count() }
+}
 
 pub fn increment_sequence_number_and_account(send_time_ns: u64, send_sequence_number: &mut u64, send_time_band: &mut [u64; 1024], send_time_band_head_index: &mut u64, packets_waiting_ack_field: &mut [u64; PACKETS_WAITING_ACK_WORDS]) {
     {
@@ -10178,16 +10213,39 @@ mod fec_send_tests {
     }
 
     #[test]
+    fn fec_paged_tags_match_dense_ring_and_release_empty_pages() {
+        let mut tags = PacketTags::default();
+        let mut dense = vec![0u128; PACKETS_WAITING_ACK_CAPACITY as usize];
+        let mut state = 0x91824ab57u64;
+        for step in 0..1_000_000u128 {
+            state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+            let index = state as usize % dense.len();
+            assert_eq!(tags.get(index), dense[index]);
+            if state & 3 == 0 {
+                assert_eq!(tags.take(index), std::mem::take(&mut dense[index]));
+            } else {
+                let tag = (step << 64) | state as u128;
+                tags.set(index, tag); dense[index] = tag;
+            }
+        }
+        for (index, tag) in dense.into_iter().enumerate() {
+            assert_eq!(tags.take(index), tag);
+        }
+        assert_eq!(tags.allocated_pages(), 0);
+    }
+
+    #[test]
     fn fec_nonce_ring_tracks_multi_group_packets_wrap_and_slot_generation() {
         let mut b = new_buf();
         assert!(b.fec_packet_tags.is_none());
         b.start_fec(std::sync::Arc::new(msg(64001 * 32)), 32);
-        let allocation = b.fec_packet_tags.as_ref().unwrap().as_ptr();
-        assert_eq!(b.fec_packet_tags.as_ref().unwrap().len() * std::mem::size_of::<u128>(), 4 * 1024 * 1024);
+        assert_eq!(b.fec_packet_tags.as_ref().unwrap().allocated_pages(), 0);
         b.fec_prepare_packet(5);
         // TU growth packs three sequential transmission ordinals (three groups) in one packet.
         for _ in 0..3 { assert!(b.next_fragment(159, 53).is_some()); }
+        assert_eq!(b.fec_packet_tags.as_ref().unwrap().allocated_pages(), 1);
         b.fec_on_packet_lost(5);
+        assert_eq!(b.fec_packet_tags.as_ref().unwrap().allocated_pages(), 0);
         assert_eq!(b.fec_send_slot.as_ref().unwrap().group_lost, vec![1, 1, 1]);
         b.fec_prepare_packet(6);
         assert!(b.next_fragment(53, 53).is_some());
@@ -10198,7 +10256,7 @@ mod fec_send_tests {
         assert_eq!(b.fec_send_slot.as_ref().unwrap().lost, 3);
         b.send_package_id = b.send_package_id.wrapping_add(1);
         b.start_fec(std::sync::Arc::new(msg(64001 * 32)), 32);
-        assert_eq!(b.fec_packet_tags.as_ref().unwrap().as_ptr(), allocation);
+        assert_eq!(b.fec_packet_tags.as_ref().unwrap().allocated_pages(), 0);
         b.fec_on_packet_lost(5); // former message never contributes to this slot
         assert_eq!(b.fec_send_slot.as_ref().unwrap().group_lost, vec![0, 0, 0]);
     }
@@ -10910,7 +10968,7 @@ mod sender_lifetime_tests {
         let q1_id = *s.queues[1].fec_retained.keys().next().unwrap();
         s.submit_messages(0, vec![vec![8; 1000]]);
         s.fec_prepare_packet(seq); s.fill_packet(&mut p);
-        s.fec_packet_tags.as_mut().unwrap()[seq as usize] = ((q1_id as u128)<<64)|(1u128<<32);
+        s.fec_packet_tags.as_mut().unwrap().set(seq as usize, ((q1_id as u128)<<64)|(1u128<<32));
         s.fec_on_packet_finalized(seq, false);
         assert_eq!(s.queues[1].fec_retained[&q1_id].slot.finalized_symbols, 0);
         for old in 0..seq { s.fec_on_packet_finalized(old, true); }
@@ -12775,19 +12833,19 @@ mod local_backpressure_tests {
             assert!(std::time::Instant::now() < deadline);
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        let tag = b.fec_packet_tags.as_ref().unwrap()[0];
+        let tag = b.fec_packet_tags.as_ref().unwrap().get(0);
         assert_ne!(tag, 0);
         assert!(!finish_connected_send(&mut s, &mut b, PendingSendKind::Data, None, 2_000_000_000,
             &[9; 1184], &plain, Dscp::BestEffort, 0, None));
         freeze_local_send(&mut s, 3_000_000_000);
         let p = s.pending_send.take().unwrap();
         assert_eq!(p.plaintext, plain);
-        assert_eq!(b.fec_packet_tags.as_ref().unwrap()[0], tag);
+        assert_eq!(b.fec_packet_tags.as_ref().unwrap().get(0), tag);
         commit_connected_send(&mut s, &mut b, p.kind, 3_000_000_001, p.bytes.len(), &p.plaintext, 0, None);
-        assert_eq!(b.fec_packet_tags.as_ref().unwrap()[0], tag, "success must not prepare/clear consumed data tags");
+        assert_eq!(b.fec_packet_tags.as_ref().unwrap().get(0), tag, "success must not prepare/clear consumed data tags");
         assert_eq!(s.send_sequence_number, 1);
         b.fec_on_packet_finalized(0, false);
-        assert_eq!(b.fec_packet_tags.as_ref().unwrap()[0], 0);
+        assert_eq!(b.fec_packet_tags.as_ref().unwrap().get(0), 0);
     }
 }
 
