@@ -1580,6 +1580,15 @@ fn next_service_deadline(now: u64, due: u64) -> u64 {
     if due <= now { now.saturating_add(150_000) } else { due }
 }
 
+// Readability must not shorten the legacy active retry sleep: doing so changes
+// RTT/ACK-pace sampling and can strand startup at a one-packet flight allowance.
+// Pending ACK feedback is active work even on a receive-only connection.
+fn needs_active_retry(state: &ConnectionStateConnected, has_unsent_data: bool) -> bool {
+    has_unsent_data || state.pending_send.is_some()
+        || state.send_sequence_number != state.packets_waiting_ack_tail
+        || state.outage.since_ns.is_some() || state.ack_timer != u64::MAX
+}
+
 fn send_pacing_grant(elapsed_ns: u64, interval_ns: u64, credit_ns: u64) -> SendPacingGrant {
     let interval_ns = interval_ns.max(1);
     let budget = elapsed_ns.saturating_add(credit_ns);
@@ -6585,6 +6594,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                     let mut deadline = now.saturating_add(100_000_000);
                     let mut include = |due| { deadline = deadline.min(next_service_deadline(now, due)); };
                     include(fec_sweep_ns.saturating_add(100_000_000));
+                    let mut active_retry = false;
                     for conn in connections_map.values() {
                         let cipher = match &conn.connection_state {
                             ConnectionState::Connected(c) => c.cipher.as_ref(),
@@ -6596,8 +6606,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                         }
                         match &conn.connection_state {
                             ConnectionState::Connected(c) => {
-                                if conn.unreliable_send_buffer.has_unsent_data() || c.pending_send.is_some()
-                                    || c.send_sequence_number != c.packets_waiting_ack_tail || c.outage.since_ns.is_some() {
+                                if needs_active_retry(c, conn.unreliable_send_buffer.has_unsent_data()) {
+                                    active_retry = true;
                                     include(now.saturating_add(150_000));
                                 }
                                 include(c.ack_timer.saturating_add(1));
@@ -6626,7 +6636,9 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             }
                         }
                     }
-                    if thread_inner.state.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                    if active_retry {
+                        std::thread::sleep(std::time::Duration::from_nanos(150_000));
+                    } else if thread_inner.state.load(std::sync::atomic::Ordering::Acquire) == 0 {
                         thread_inner.wake.wait(socket, std::time::Duration::from_nanos(deadline.saturating_sub(now)));
                         let resumed = monotonic_clock_ns();
                         if waited_across_idle_quantum(now, deadline, resumed) { idle_resume_ns = resumed; }
@@ -9885,6 +9897,37 @@ mod congestion_tests {
         }
         // A future key/peer/handshake expiry still wins over blocked ACK/probe work.
         assert_eq!(next_service_deadline(now, now - 1).min(next_service_deadline(now, now + 1)), now + 1);
+    }
+
+    #[test]
+    fn post_idle_burst_and_receive_feedback_keep_legacy_active_retry() {
+        let origin = 1_000_000_000;
+        let ConnectionState::Connected(mut state) = new_connection_state_connected(None, 0, 1, origin) else { unreachable!() };
+        update_app_limit(&mut state, origin, false);
+        assert!(!needs_active_retry(&state, false)); // May park on readiness while quiet.
+        let resume = origin + 3_000_000_000;
+        assert!(needs_active_retry(&state, true)); // Command wakes a parked sender.
+        update_app_limit(&mut state, resume, true);
+        state.account_send(resume + 0x400000);
+        assert!(needs_active_retry(&state, false)); // Queue drained, but packet still in flight.
+        assert!(state.delivery_growth.receipt_latency(resume + 10_000_000, state.send_time(0)).is_some());
+        state.packets_waiting_ack_tail = state.send_sequence_number;
+        assert!(!needs_active_retry(&state, false));
+
+        // A receive-only peer must use the same non-readiness-interruptible
+        // retry as the sender, including all repeated receipt-window feedback.
+        state.ack_receiver.receive(0, resume, false, &mut state.ack_timer);
+        assert!(needs_active_retry(&state, false));
+        for tick in 1..=3 {
+            let now = resume + tick * 10_000_000;
+            state.ack_receiver.sent(now);
+            state.ack_timer = state.ack_receiver.feedback_deadline(now);
+            assert_eq!(needs_active_retry(&state, false), tick < 3);
+        }
+        state.outage.since_ns = Some(resume);
+        assert!(needs_active_retry(&state, false));
+        state.outage.since_ns = None;
+        assert!(!needs_active_retry(&state, false));
     }
 
     #[test]
