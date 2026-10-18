@@ -4576,22 +4576,38 @@ impl FecCompletion {
     }
 }
 
-struct FecWorkerGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>, std::sync::Arc<crate::receive_memory::ReceiveMemoryBudget>);
+struct FecWorkerGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>, std::sync::Arc<crate::receive_memory::ReceiveMemoryBudget>, Option<std::sync::Arc<NetworkWake>>);
 impl Drop for FecWorkerGuard {
     fn drop(&mut self) {
         self.1.release_worker();
         self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        // Completion is already queued before the guard drops. Retain a durable
+        // event even if the socket owner observed an empty channel just before us.
+        if let Some(wake) = &self.2 { wake.notify(); }
     }
 }
 
 /// Handles one received FEC fragment for the package in `slot` (the caller has already made
 /// the slot belong to `package_id`). Returns a message to deliver if decoding finished inline.
+#[cfg(test)]
 fn fec_receive_block(
     slot: &mut FecRecvSlot, connection_key: ConnectionKey, package_id: u64,
     message_len: usize, block_bytes: usize, block_id: u32, data: &[u8],
     done_tx: &std::sync::mpsc::Sender<FecCompletion>,
     workers: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
     budget: &std::sync::Arc<crate::receive_memory::ReceiveMemoryBudget>,
+) -> Option<(Vec<u8>, crate::receive_memory::Reservation)> {
+    fec_receive_block_waking(slot, connection_key, package_id, message_len, block_bytes,
+        block_id, data, done_tx, workers, budget, None)
+}
+
+fn fec_receive_block_waking(
+    slot: &mut FecRecvSlot, connection_key: ConnectionKey, package_id: u64,
+    message_len: usize, block_bytes: usize, block_id: u32, data: &[u8],
+    done_tx: &std::sync::mpsc::Sender<FecCompletion>,
+    workers: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    budget: &std::sync::Arc<crate::receive_memory::ReceiveMemoryBudget>,
+    wake: Option<std::sync::Arc<NetworkWake>>,
 ) -> Option<(Vec<u8>, crate::receive_memory::Reservation)> {
     use crate::fec::*;
     if matches!(slot.state, FecRecvState::Done) { #[cfg(feature = "research_budget_diagnostic")] diag::rx_status(3); return None; }
@@ -4621,7 +4637,7 @@ fn fec_receive_block(
             let (tx, rx) = std::sync::mpsc::sync_channel::<(u32, Vec<u8>)>(ingress_slots(ingress_bytes, block_bytes));
             let done_tx = done_tx.clone();
             workers.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-            let guard = FecWorkerGuard(workers.clone(), budget.clone());
+            let guard = FecWorkerGuard(workers.clone(), budget.clone(), wake);
             let generation = std::sync::Arc::new(());
             let decoder_generation = generation.clone();
             // Each connection owns a freshly allocated budget. Retaining its Arc
@@ -4819,7 +4835,7 @@ mod readiness_notification_tests {
             state: std::sync::atomic::AtomicUsize::new(1),
             stop: std::sync::atomic::AtomicBool::new(false),
             exited: std::sync::atomic::AtomicBool::new(false),
-            wake: NetworkWake::new().unwrap(),
+            wake: std::sync::Arc::new(NetworkWake::new().unwrap()),
             exchange: std::sync::Mutex::new(()), completed: std::sync::Condvar::new(),
             ready: std::sync::Arc::new(CoreReady::default()),
             push: std::cell::UnsafeCell::new(NetworkThreadPush::default()),
@@ -4862,7 +4878,7 @@ struct NetworkThreadInner {
     state: std::sync::atomic::AtomicUsize, // 0 empty, 1 full
     stop: std::sync::atomic::AtomicBool,
     exited: std::sync::atomic::AtomicBool,
-    wake: NetworkWake,
+    wake: std::sync::Arc<NetworkWake>,
     exchange: std::sync::Mutex<()>,
     completed: std::sync::Condvar,
     ready: std::sync::Arc<CoreReady>,
@@ -5039,7 +5055,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
         state: std::sync::atomic::AtomicUsize::new(0),
         stop: std::sync::atomic::AtomicBool::new(false),
         exited: std::sync::atomic::AtomicBool::new(false),
-        wake: NetworkWake::new().expect("create network command wakeup"),
+        wake: std::sync::Arc::new(NetworkWake::new().expect("create network command wakeup")),
         exchange: std::sync::Mutex::new(()),
         completed: std::sync::Condvar::new(),
         ready: std::sync::Arc::new(CoreReady::default()),
@@ -5911,7 +5927,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     let worker_refused_before = existing_connection.unreliable_fec[slot_idx].worker_limit_refused;
                                     let refused_before = existing_connection.unreliable_fec[slot_idx].admission_refused;
                                     let dropped_before = existing_connection.unreliable_fec[slot_idx].ingress_dropped;
-                                    if let Some((message, mut _reservation)) = fec_receive_block(&mut existing_connection.unreliable_fec[slot_idx], connection_key, package_id, message_len, block_bytes, block_id, data, &fec_done_tx, &fec_workers, &existing_connection.receive_budget) {
+                                    if let Some((message, mut _reservation)) = fec_receive_block_waking(&mut existing_connection.unreliable_fec[slot_idx], connection_key, package_id, message_len, block_bytes, block_id, data, &fec_done_tx, &fec_workers, &existing_connection.receive_budget, Some(thread_inner.wake.clone())) {
                                         let completed = if let Some(segment) = segment {
                                             let Some(root_idx) = existing_connection.receive_index.admit_at(segment.root,
                                             &mut existing_connection.unreliable_reassembly, &mut existing_connection.unreliable_fec, timestamp_ns, fec_inactive_grace_ns(state.RTT_mean, true)) else { memory_erased = true; continue; };
