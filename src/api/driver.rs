@@ -22,6 +22,8 @@ pub(super) struct State {
     pub closed: bool,
     pub stopping: bool,
     pub stats: Stats,
+    stats_requested: u64,
+    stats_completed: u64,
     receive_bytes: usize,
     pub waiters: BTreeMap<u64, Waker>,
     next_waiter: u64,
@@ -70,6 +72,8 @@ impl Owner {
                 closed: false,
                 stopping: false,
                 stats: Stats::default(),
+                stats_requested: 0,
+                stats_completed: 0,
                 receive_bytes: 0,
                 waiters: BTreeMap::new(),
                 next_waiter: 0,
@@ -306,7 +310,15 @@ impl Shared {
         s.events.push_back(e);
     }
     pub fn stats(&self) -> Stats {
-        self.lock().stats.clone()
+        let mut s = self.lock();
+        if let Some(ready) = self.core_ready.get().filter(|_| !s.closed && !s.stopping) {
+            s.stats_requested += 1;
+            let requested = s.stats_requested;
+            ready.notify();
+            s = self.changed.wait_while(s, |s| s.stats_completed < requested && !s.closed && !s.stopping)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+        s.stats.clone()
     }
 }
 fn event_bytes(e: &Event) -> usize {
@@ -327,7 +339,7 @@ fn run(shared: Arc<Shared>, core: stp::NetworkThreadHandle) {
     loop {
         ready.wait(&mut observed);
         if core.is_finished() { break; }
-        let (connects, mut pending) = {
+        let (connects, mut pending, stats_request) = {
             let mut s = shared.lock();
             if s.stopping {
                 break;
@@ -335,6 +347,7 @@ fn run(shared: Arc<Shared>, core: stp::NetworkThreadHandle) {
             (
                 std::mem::take(&mut s.connects),
                 std::mem::take(&mut s.pending),
+                s.stats_requested,
             )
         };
         retry.append(&mut pending);
@@ -426,7 +439,9 @@ fn run(shared: Arc<Shared>, core: stp::NetworkThreadHandle) {
             submitted_bytes - retry.iter().map(|p| p.3.capacity()).sum::<usize>();
         activity |= submitted_slots != retry.len();
         ready.send_space.store(!retry.is_empty(), std::sync::atomic::Ordering::Release);
+        s.stats_completed = stats_request;
         drop(s);
+        shared.changed.notify_all();
         if activity {
             shared.publish();
         }
@@ -468,6 +483,8 @@ mod tests {
                 closed: false,
                 stopping: false,
                 stats: Stats::default(),
+                stats_requested: 0,
+                stats_completed: 0,
                 receive_bytes: 0,
                 waiters: BTreeMap::new(),
                 next_waiter: 0,
@@ -481,6 +498,27 @@ mod tests {
             receive_limit: 100,
         }
     }
+    #[test]
+    fn stats_requests_and_waits_for_a_fresh_idle_exchange() {
+        let shared = Arc::new(shared());
+        let ready = Arc::new(stp::CoreReady::default());
+        let mut observed = 0;
+        ready.wait(&mut observed);
+        shared.core_ready.set(ready.clone()).unwrap();
+        let worker = shared.clone();
+        let thread = thread::spawn(move || {
+            ready.wait(&mut observed);
+            let mut s = worker.lock();
+            assert_eq!(s.stats_requested, 1);
+            s.stats.received_messages = 42;
+            s.stats_completed = s.stats_requested;
+            drop(s);
+            worker.changed.notify_all();
+        });
+        assert_eq!(shared.stats().received_messages, 42);
+        thread.join().unwrap();
+    }
+
     #[test]
     fn admission_moves_payload_without_copying_and_counts_capacity() {
         let shared = shared();
