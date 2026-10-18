@@ -4433,9 +4433,9 @@ enum FecRecvState {
     #[default]
     Empty,
     /// Inline systematic symbols, without a native codec until a repair arrives.
-    SourceOnly(crate::fec::SourceOnly),
+    SourceOnly(Box<crate::fec::SourceOnly>),
     /// Small message with repair: decoded on the network thread.
-    Inline(crate::fec::MessageDecoder),
+    Inline(Box<crate::fec::MessageDecoder>),
     /// Big message: a byte-bounded, nonblocking ingress queue feeds a decoder thread.
     /// Dropping the sender (eviction, disconnect) ends it and frees the decoder.
     Worker { tx: std::sync::mpsc::SyncSender<(u32, Vec<u8>)>, message_len: usize, block_bytes: usize, generation: std::sync::Arc<()> },
@@ -4607,10 +4607,10 @@ fn fec_receive_block(
             else { #[cfg(feature = "research_budget_diagnostic")] diag::rx_status(5); slot.ingress_dropped += 1; return None; }
         } else if source_only {
             slot.reservation = Some(reservation);
-            slot.state = FecRecvState::SourceOnly(SourceOnly::new(layout));
+            slot.state = FecRecvState::SourceOnly(Box::new(SourceOnly::new(layout)));
         } else {
             slot.state = match MessageDecoder::new(message_len, block_bytes) {
-                Some(d) => { slot.reservation = Some(reservation); FecRecvState::Inline(d) },
+                Some(d) => { slot.reservation = Some(reservation); FecRecvState::Inline(Box::new(d)) },
                 None => { #[cfg(feature = "research_budget_diagnostic")] diag::rx_status(8); FecRecvState::Done },
             };
         }
@@ -4650,7 +4650,7 @@ fn fec_receive_block(
                 #[cfg(feature = "research_budget_diagnostic")] diag::rx_status(if message.is_some(){7}else{6});
                 // Free staged bytes before releasing their lease; move the new
                 // full lease into the slot/completion with no accounting gap.
-                slot.state = if message.is_some() { FecRecvState::Done } else { FecRecvState::Inline(dec) };
+                slot.state = if message.is_some() { FecRecvState::Done } else { FecRecvState::Inline(Box::new(dec)) };
                 slot.reservation = Some(native_reservation);
                 slot.last_block_ns = monotonic_clock_ns();
                 return message.map(|m| (m, slot.reservation.take().unwrap()));
