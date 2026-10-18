@@ -5049,8 +5049,13 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
             if let Some(until) = active_wait {
                 std::thread::sleep(until.saturating_duration_since(std::time::Instant::now())
                     .min(caller_deadline.saturating_duration_since(std::time::Instant::now())));
-                if std::time::Instant::now() >= caller_deadline { return Some(until); }
-                active_wait = None;
+                let now = std::time::Instant::now();
+                if now >= caller_deadline {
+                    // Owed progress runs past the deadline, but the active quantum is never
+                    // shortened: inside it only the owed command exchange may be admitted.
+                    if now >= until && budget.unit_owed() { active_wait = None; }
+                    else if !(budget.command_owed() && thread_inner.has_request()) { return Some(until); }
+                } else { active_wait = None; }
             }
             if budget.expired() { return wake_hint; }
             if thread_inner.stop.load(std::sync::atomic::Ordering::Acquire) {
@@ -5071,8 +5076,10 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
             }
             let test_drop_ppm = match &test_drop_schedule { Some(sch) => sch.ppm_at(monotonic_clock_ns().saturating_sub(test_drop_t0)), None => test_drop_ppm };
             // Do not remove a request after its admission deadline.
-            if thread_inner.has_request() && std::time::Instant::now() >= caller_deadline { return wake_hint; }
+            // The first take of each call is exempt (forward progress).
+            if !budget.command_owed() && thread_inner.has_request() && std::time::Instant::now() >= caller_deadline { return wake_hint; }
             if let Some((mut req, disconnect)) = thread_inner.take_request() {
+                budget.admitted();
                 if let Some(peer) = disconnect { connections_map.remove(&peer); }
                 let exchange_started = std::time::Instant::now();
                 let current_time_now_ns = monotonic_clock_ns();
@@ -5257,6 +5264,7 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
                         }
                     };
                     receive_round += 1;
+                    budget.progressed();
                     let (buf_len, other_ip_addr, other_port, ecn_marked, ecn_enabled, service_class, timestamp_ns) = packet;
                     if buf_len < 6 { continue; }
 
@@ -5943,6 +5951,7 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
                 // Messages finished by persistent decoder slices.
                 while !budget.checkpoint() {
                     let Ok(completion) = fec_done_rx.try_recv() else { break; };
+                    budget.progressed();
                     let key = completion.connection_key;
                     if let Some(conn) = connections_map.get_mut(&key) {
                         let Some(idx) = conn.receive_index.get(completion.package_id) else { continue; };
@@ -5979,6 +5988,7 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
                 while let Some(key) = fec_sweep_keys.front().copied() {
                     if budget.checkpoint() { return Some(std::time::Instant::now()); }
                     fec_sweep_keys.pop_front();
+                    budget.progressed();
                     if let Some(conn) = connections_map.get_mut(&key) {
                         if let ConnectionState::Connected(c) = &mut conn.connection_state {
                             let grace = if c.outage.since_ns.is_some() || current_time_now_ns.saturating_sub(c.last_ack_received_time) >= OUTAGE_ACK_SILENCE_NS {
@@ -6417,6 +6427,7 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
                             let send_time_ns = if test_drop { Some(monotonic_clock_ns()) }
                             else { udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..packet_len], connection_tracking_data.unreliable_send_buffer.last_dscp, false) };
                             if let Some(now) = send_time_ns { budget.sampled(now); }
+                            budget.progressed();
                             let dscp = connection_tracking_data.unreliable_send_buffer.last_dscp;
                             if !finish_connected_send(state, &mut connection_tracking_data.unreliable_send_buffer,
                                 PendingSendKind::Data, send_time_ns, current_time_now_ns, &packet_memory_encrypted[..packet_len],
@@ -6466,9 +6477,12 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
                         }
                     }
                 } true})();
+                    budget.progressed();
                     if !keep { connections_map.remove(connection_key); }
                 }
                 receiving = true;
+                // A pass with no unit (idle) still completes the owed unit.
+                budget.progressed();
 
 //////// END SEND ////////////////////////////////////////////////////////////////////////
 
