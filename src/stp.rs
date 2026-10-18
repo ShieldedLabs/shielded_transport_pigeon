@@ -1427,6 +1427,9 @@ impl FecSendSlot {
 }
 
 enum FecEncoderState {
+    /// Systematic sources need no encoder; build it at first repair demand.
+    Deferred,
+    #[cfg(test)]
     Pending(std::sync::mpsc::Receiver<Option<crate::fec::MessageEncoder>>),
     Ready(crate::fec::MessageEncoder),
     Failed,
@@ -1901,6 +1904,17 @@ impl UnreliableSendBuffer {
         Self::encoder_initialized(f)
     }
     fn encoder_initialized(f: &mut FecSendSlot) -> bool {
+        if matches!(f.encoder, FecEncoderState::Deferred) {
+            f.encoder = match crate::fec::encode_message(f.message.clone(), f.block_bytes) {
+                Some(encoder) => FecEncoderState::Ready(encoder),
+                None => {
+                    #[cfg(feature = "research_cohort_observer")]
+                    crate::cohort_observe::fec_encoder_failed();
+                    FecEncoderState::Failed
+                }
+            };
+        }
+        #[cfg(test)]
         if let FecEncoderState::Pending(rx) = &f.encoder {
             f.encoder = match rx.try_recv() {
                 Ok(Some(e)) => FecEncoderState::Ready(e),
@@ -2313,10 +2327,10 @@ impl UnreliableSendBuffer {
                     self.send_package_id = self.send_package_id.checked_add(1).expect("message identity exhausted");
                 }
                 finished.rescue_plan();
-                // Giant codec arenas can take seconds to free under allocator contention.
-                if message_len > FEC_RETAIN_SOURCE_BYTES {
-                    let _ = std::thread::Builder::new().name("stp-fec-release".into()).spawn(move || drop(finished));
-                } else { self.retain_fec(finished, package); }
+                // Production codecs are bounded by the <=2 MiB segment size.
+                // No release helper: allocation/destruction belongs to Pump too.
+                if message_len > FEC_RETAIN_SOURCE_BYTES { drop(finished); }
+                else { self.retain_fec(finished, package); }
                 if rescue.is_some() { self.resume_suspended(); }
             }
         }
@@ -2422,14 +2436,7 @@ impl UnreliableSendBuffer {
         self.category_bonus_repairs += n.saturating_sub(n_base) as u64;
         let encoder = if k as usize <= FEC_INLINE_MAX_BLOCKS {
             match crate::fec::encode_message(message.clone(), block_bytes) { Some(e) => FecEncoderState::Ready(e), None => { #[cfg(feature = "research_cohort_observer")] crate::cohort_observe::fec_encoder_failed(); FecEncoderState::Failed } }
-        } else {
-            let (tx, rx) = std::sync::mpsc::sync_channel(1);
-            let m = message.clone();
-            match std::thread::Builder::new().name("stp-fec-encode".into()).spawn(move || { let _ = tx.send(crate::fec::encode_message(m, block_bytes)); }) {
-                Ok(_) => FecEncoderState::Pending(rx),
-                Err(_) => match crate::fec::encode_message(message.clone(), block_bytes) { Some(e) => FecEncoderState::Ready(e), None => { #[cfg(feature = "research_cohort_observer")] crate::cohort_observe::fec_encoder_failed(); FecEncoderState::Failed } },
-            }
-        };
+        } else { FecEncoderState::Deferred };
         let anchor = a.budget_base_active().then(|| a.data_anchor());
         let budget = if a.budget_base_active() {
             Some(restart_budget.unwrap_or_else(|| {
@@ -2736,15 +2743,7 @@ impl UnreliableSendBuffer {
             {
                 let f = self.fec_send_slot.as_mut().unwrap();
                 if f.next_id >= f.k {
-                    if let FecEncoderState::Pending(rx) = &f.encoder {
-                        f.encoder = match rx.try_recv() {
-                            Ok(Some(e)) => FecEncoderState::Ready(e),
-                            Ok(None) | Err(std::sync::mpsc::TryRecvError::Disconnected) => FecEncoderState::Failed,
-                            Err(std::sync::mpsc::TryRecvError::Empty) => return None,
-                        };
-                        #[cfg(feature = "research_cohort_observer")]
-                        if matches!(f.encoder, FecEncoderState::Failed) { crate::cohort_observe::fec_encoder_failed(); }
-                    }
+                    if !Self::encoder_initialized(f) { return None; }
                     repair_len = match &mut f.encoder {
                         FecEncoderState::Ready(e) => e.block_into(f.next_id, &mut f.block_buf),
                         _ => None,
@@ -4496,8 +4495,8 @@ impl FecRecvSlot {
     }
 }
 
-/// Decoder threads per network thread; overload erases a fragment and retries
-/// admission later, never solves inline. Small (<=256-block) messages stay inline.
+/// Large decoder admissions per pump; overload erases a fragment and retries
+/// admission later. Small (<=256-block) messages retain the source-only fast path.
 pub const MAX_FEC_DECODE_WORKERS: usize = 8;
 /// Byte cap for each ingress level, including channel slots (not just block payload).
 pub const MAX_FEC_INGRESS_BYTES: usize = 32 << 20;
@@ -4525,8 +4524,7 @@ fn valid_fec_symbol(layout: crate::fec::MessageLayout, block_id: u32, data_len: 
     data_len == expect
 }
 
-/// Closing ingress lets the worker finish queued work and release its admission
-/// guard. Never decrement its counters here: it may still be inside Wirehair.
+/// Retirement drops the persistent decoder and its admission guard synchronously.
 /// Explicit retirement makes queued completion ineligible, even before ID eviction.
 fn retire_inactive_fec_workers(slots: &mut [FecRecvSlot], now_ns: u64, grace_ns: u64, oldest_only: bool) -> u64 {
     // Worker-admission pressure only needs to free a worker. The periodic sweep
@@ -4582,8 +4580,8 @@ impl Drop for FecWorkerGuard {
     fn drop(&mut self) {
         self.1.release_worker();
         self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-        // Completion is already queued before the guard drops. Retain a durable
-        // event even if the socket owner observed an empty channel just before us.
+        // Kept as an optional coalescing hook for alternative port implementations.
+        // The reference pump finishes slices locally and needs no decoder wake.
         if let Some(wake) = &self.2 { wake.notify(); }
     }
 }
@@ -4773,6 +4771,9 @@ pub struct NetworkThreadPush {
 
 #[derive(Default)]
 pub struct NetworkThreadPull {
+    /// Measured core time processing this reference exchange, excluding the
+    /// application's poll wait. Batch/snapshot cost scales with caller work.
+    pub exchange_processing_ns: u64,
     #[cfg(feature = "research_budget_diagnostic")]
     pub diagnostic: Option<diag::Capture>,
     pub current_connections: Vec<(STPAddress, [u8; 64])>,
@@ -5006,6 +5007,14 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
         let mut receive_notified = false;
         let mut ready_used = 0usize;
 
+        // Resume packet batches and connection traversal rather than restarting
+        // the receive-first phase at every short caller budget.
+        let mut receive_round = 0usize;
+        let mut receiving = true;
+        let mut send_keys = VecDeque::<ConnectionKey>::new();
+        let mut fec_sweep_keys = VecDeque::<ConnectionKey>::new();
+        let mut active_wait = None::<std::time::Instant>;
+        let mut wake_hint = Some(std::time::Instant::now());
         let run = move |caller_deadline: std::time::Instant| {
         // Capture owners explicitly: resources live even before the first call.
         let _owners = (&exit, &socket_owner);
@@ -5035,7 +5044,14 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
         #[cfg(feature = "research_budget_diagnostic")]
         diag::enable(diagnostic_enabled);
         loop {
-            if std::time::Instant::now() >= caller_deadline { return Some(std::time::Instant::now()); }
+            if let Some(until) = active_wait {
+                std::thread::sleep(until.saturating_duration_since(std::time::Instant::now())
+                    .min(caller_deadline.saturating_duration_since(std::time::Instant::now())));
+                if std::time::Instant::now() >= caller_deadline { return Some(until); }
+                active_wait = None;
+            }
+            if std::time::Instant::now() >= caller_deadline { return wake_hint; }
+            wake_hint = Some(std::time::Instant::now());
             if thread_inner.stop.load(std::sync::atomic::Ordering::Acquire) {
                 return None;
             }
@@ -5053,6 +5069,7 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
             }
             let test_drop_ppm = match &test_drop_schedule { Some(sch) => sch.ppm_at(monotonic_clock_ns().saturating_sub(test_drop_t0)), None => test_drop_ppm };
             if let Some(mut req) = thread_inner.take_request() {
+                let exchange_started = std::time::Instant::now();
                 let current_time_now_ns = monotonic_clock_ns();
                 connections_map.retain(|key, value| {
                     let stp_address = value.address();
@@ -5194,6 +5211,7 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
                 receive_notified = false;
                 ready_used = connections_map.values().flat_map(|c| &c.unreliable_send_buffer.queues).map(|q| q.queue_bytes_filled as usize).sum();
 
+                resp.exchange_processing_ns = exchange_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
                 thread_inner.publish(resp);
             } else {
 
@@ -5209,8 +5227,9 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
 //////// BEGIN RECEIVE ////////////////////////////////////////////////////////////////////////
                 // Drain ACKs before sending again. Bound the batch so a busy peer cannot
                 // monopolize the thread; the socket is nonblocking, so stop as soon as empty.
-                for _recv_round in 0..MAX_RECV_PACKETS_PER_TICK { // `continue` skips this packet
+                while receiving && receive_round < MAX_RECV_PACKETS_PER_TICK { // `continue` skips this packet
                     if std::time::Instant::now() >= caller_deadline { return Some(std::time::Instant::now()); }
+                    receive_round += 1;
                     let (buf_len, other_ip_addr, other_port, ecn_marked, ecn_enabled, service_class, timestamp_ns) =
                         match udp_recv_with_congestion_and_dscp(socket, &mut packet_memory_encrypted[..]) {
                             Ok(r) => r,
@@ -5891,9 +5910,16 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
                     } } // <- break 'conn lands here
                 }
 //////// END RECEIVE ////////////////////////////////////////////////////////////////////////
+                if receiving {
+                    receiving = false;
+                    receive_round = 0;
+                    send_keys.extend(connections_map.keys().copied());
+                }
 
-                // Messages finished by FEC decoder threads.
-                while let Ok(completion) = fec_done_rx.try_recv() {
+                if std::time::Instant::now() >= caller_deadline { return Some(std::time::Instant::now()); }
+                // Messages finished by persistent decoder slices.
+                while std::time::Instant::now() < caller_deadline {
+                    let Ok(completion) = fec_done_rx.try_recv() else { break; };
                     let key = completion.connection_key;
                     if let Some(conn) = connections_map.get_mut(&key) {
                         let Some(idx) = conn.receive_index.get(completion.package_id) else { continue; };
@@ -5922,8 +5948,14 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
                 let current_time_now_ns = monotonic_clock_ns();
                 // Missing unreliable tails must not hold decoder admission forever.
                 // Scan at most ten times/second, not once per incoming packet.
-                if current_time_now_ns.saturating_sub(fec_sweep_ns) >= 100_000_000 {
-                    for conn in connections_map.values_mut() {
+                if fec_sweep_keys.is_empty() && current_time_now_ns.saturating_sub(fec_sweep_ns) >= 100_000_000 {
+                    fec_sweep_keys.extend(connections_map.keys().copied());
+                    fec_sweep_ns = current_time_now_ns;
+                }
+                while let Some(key) = fec_sweep_keys.front().copied() {
+                    if std::time::Instant::now() >= caller_deadline { return Some(std::time::Instant::now()); }
+                    fec_sweep_keys.pop_front();
+                    if let Some(conn) = connections_map.get_mut(&key) {
                         if let ConnectionState::Connected(c) = &mut conn.connection_state {
                             let grace = if c.outage.since_ns.is_some() || current_time_now_ns.saturating_sub(c.last_ack_received_time) >= OUTAGE_ACK_SILENCE_NS {
                                 OUTAGE_TIMEOUT_NS
@@ -5932,7 +5964,6 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
                             retire_inactive_segment_roots(&mut conn.unreliable_reassembly, current_time_now_ns, grace);
                         }
                     }
-                    fec_sweep_ns = current_time_now_ns;
                 }
 
                 if receive_queue_report_time_ns + 10_000_000_000 <= current_time_now_ns {
@@ -5946,9 +5977,12 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
                     receive_queue.dropped_bytes = 0;
                     receive_queue_report_time_ns = current_time_now_ns;
                 }
-                connections_map.retain(|connection_key, connection_tracking_data| {
-                    if std::time::Instant::now() >= caller_deadline { return true; }
-                    match &mut connection_tracking_data.connection_state {
+                while let Some(connection_key) = send_keys.front().copied() {
+                    if std::time::Instant::now() >= caller_deadline { return Some(std::time::Instant::now()); }
+                    send_keys.pop_front();
+                    let Some(connection_tracking_data) = connections_map.get_mut(&connection_key) else { continue; };
+                    let connection_key = &connection_key;
+                    let keep = (|| { match &mut connection_tracking_data.connection_state {
                     ConnectionState::SendingClientHelloPlaintext { last_sent_time_ns, hello_packet_payload } => {
                         return retry_handshake(connection_tracking_data.creation_time_ns, last_sent_time_ns,
                             current_time_now_ns, 30_000_000_000, || udp_send_with_congestion_and_dscp(socket,
@@ -6144,6 +6178,7 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
                         // every send site (data loop, tu probe, keepalive, both ack paths) gates on ring space, so head never laps tail
                         assert!(state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY);
                         while state.packets_waiting_ack_tail < state.send_sequence_number {
+                            if std::time::Instant::now() >= caller_deadline { return true; }
                             let bit_index = state.packets_waiting_ack_tail % PACKETS_WAITING_ACK_CAPACITY;
                             // This slot now describes the tail packet (set below if declared lost).
                             state.declared_lost_field[(bit_index / 64) as usize] &= !(1u64 << (bit_index % 64));
@@ -6320,7 +6355,7 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
                         }
                         let mut unreliable_payload_size = 0;
                         drain_accepted_cc_events(state, &mut connection_tracking_data.unreliable_send_buffer);
-                        while state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY - 1 && packet_send_allowance_now > 0 && state.packets_in_flight < allowed_packets_in_flight && {
+                        while std::time::Instant::now() < caller_deadline && state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY - 1 && packet_send_allowance_now > 0 && state.packets_in_flight < allowed_packets_in_flight && {
                             connection_tracking_data.unreliable_send_buffer.fec_prepare_packet(state.send_sequence_number);
                             unreliable_payload_size = connection_tracking_data.unreliable_send_buffer.fill_packet(&mut packet_memory_send[0..payload_size]);
                             #[cfg(test)]
@@ -6405,7 +6440,10 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
                             state.max_in_flight_since_last_print = state.packets_in_flight;
                         }
                     }
-                } true});
+                } true})();
+                    if !keep { connections_map.remove(connection_key); }
+                }
+                receiving = true;
 
 //////// END SEND ////////////////////////////////////////////////////////////////////////
 
@@ -6481,8 +6519,12 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
                             }
                         }
                     }
+                    wake_hint = Some(std::time::Instant::now() + std::time::Duration::from_nanos(deadline.saturating_sub(now)));
                     if active_retry {
-                        std::thread::sleep(std::time::Duration::from_nanos(150_000).min(caller_deadline.saturating_duration_since(std::time::Instant::now())));
+                        // Unconditional active quantum, including across consecutive
+                        // run_for calls; commands must not shorten this sleep.
+                        active_wait = Some(std::time::Instant::now() + std::time::Duration::from_nanos(150_000));
+                        wake_hint = active_wait;
                     } else if !thread_inner.has_request() {
                         thread_inner.wake.wait(socket, std::time::Duration::from_nanos(deadline.saturating_sub(now))
                             .min(caller_deadline.saturating_duration_since(std::time::Instant::now())));

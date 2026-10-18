@@ -6,9 +6,12 @@ use std::time::{Duration, Instant};
 /// Exclusive socket/protocol owner. Move this value to a thread, or call it in
 /// frame slack. Application operations live on Endpoint, never on Pump.
 ///
-/// The core checks its deadline at packet boundaries. A native Wirehair
-/// encode/decode/recovery call cannot be preempted and is one indivisible work
-/// unit; OS scheduling and allocator latency are not hard real-time bounded.
+/// The core checks its deadline at packet boundaries. The cooperative bound is
+/// one packet/FEC unit, plus processing of at most one submitted reference
+/// exchange (cost proportional to its command and connection-snapshot size).
+/// A native Wirehair encode/decode/recovery call cannot be preempted. OS
+/// scheduling and allocator latency are not hard real-time bounded. Logical
+/// messages up to 1 GiB use native codec units no larger than 2 MiB.
 /// Dropping Pump closes the UDP socket and publishes endpoint termination.
 pub struct Pump {
     pub(crate) run: Box<dyn FnMut(Instant) -> Option<Instant> + Send>,

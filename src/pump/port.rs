@@ -1,11 +1,16 @@
 //! Replaceable application/core boundary for the API experiments.
 //!
-//! One bounded exchange slot carries a complete reference-API command batch and
-//! its result. `submit` only transfers ownership; `try_take` only observes results.
-//! Neither runs transport work. All protocol state belongs exclusively to Pump.
+//! One exchange slot carries a complete reference-API command batch and its
+//! result. Slot count is bounded; batch size is caller-selected (not byte-bounded).
+//! `submit` only transfers ownership; `try_take` only observes results. Neither
+//! runs transport work. All protocol state belongs exclusively to Pump.
 //! Commands signal the pump's eventfd, and publication increments Ready's durable
 //! generation. No user callback runs in the pump. Future endpoint designs replace
-//! this module without changing packet, pacing, or FEC policy.
+//! this module without changing packet, pacing, or FEC policy. In particular,
+//! `take_request` may yield one bounded command/sub-batch per core iteration;
+//! batch aggregation is a reference-endpoint choice, not a pump requirement.
+//! Variants can retain their connection intent in this port and attach it to
+//! small requests, avoiding the reference endpoint's proportional exchange cost.
 use crate::native_sockets::NetworkWake;
 use crate::stp::{NetworkThreadPull, NetworkThreadPush};
 use std::sync::{Arc, Condvar, Mutex};
