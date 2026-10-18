@@ -4750,6 +4750,9 @@ pub struct NetworkThreadPull {
 struct NetworkThreadInner {
     state: std::sync::atomic::AtomicUsize, // 0 empty, 1 full
     stop: std::sync::atomic::AtomicBool,
+    wake: NetworkWake,
+    exchange: std::sync::Mutex<()>,
+    completed: std::sync::Condvar,
     push: std::cell::UnsafeCell<NetworkThreadPush>,
     pull: std::cell::UnsafeCell<NetworkThreadPull>,
 }
@@ -4770,6 +4773,7 @@ impl NetworkThreadHandle {
     /// Application API adapters use this to make endpoint shutdown deterministic.
     pub fn shutdown(mut self) {
         self.inner.stop.store(true, std::sync::atomic::Ordering::Release);
+        self.inner.wake.notify();
         if let Some(t) = self.thread.take() { t.thread().unpark(); let _ = t.join(); }
     }
 }
@@ -4779,6 +4783,8 @@ impl NetworkThreadHandle {
 impl Drop for NetworkThreadHandle {
     fn drop(&mut self) {
         self.inner.stop.store(true, std::sync::atomic::Ordering::Release);
+        self.inner.wake.notify();
+        if let Some(t) = &self.thread { t.thread().unpark(); }
         // A traced run must flush the final buffered events before the process exits.
         if self.join_on_drop { if let Some(t) = self.thread.take() { let _ = t.join(); } }
     }
@@ -4898,6 +4904,9 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
     let inner = std::sync::Arc::new(NetworkThreadInner {
         state: std::sync::atomic::AtomicUsize::new(0),
         stop: std::sync::atomic::AtomicBool::new(false),
+        wake: NetworkWake::new().expect("create network command wakeup"),
+        exchange: std::sync::Mutex::new(()),
+        completed: std::sync::Condvar::new(),
         push: std::cell::UnsafeCell::new(NetworkThreadPush::default()),
         pull: std::cell::UnsafeCell::new(NetworkThreadPull::default()),
     });
@@ -5154,7 +5163,9 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                     std::mem::swap(&mut *thread_inner.pull.get(), &mut resp);
                 }
 
+                let _guard = thread_inner.exchange.lock().unwrap();
                 thread_inner.state.store(0, std::sync::atomic::Ordering::Release);
+                thread_inner.completed.notify_one();
             } else {
 
                 /*  Note(Sam): Scheduling is very important for fairness and good performance under load
@@ -6359,10 +6370,41 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
 
 //////// END SEND ////////////////////////////////////////////////////////////////////////
 
-                // Idle: sleep instead of spinning on a core. 150us is well below
-                // any packet-arrival timescale here and keeps the thread parked when quiet.
                 if should_sleep {
-                    std::thread::sleep(std::time::Duration::from_nanos(150_000));
+                    let now = monotonic_clock_ns();
+                    // Preserve the original active retry quantum. Quiet sockets
+                    // wait on readability/commands, bounded by existing timers.
+                    let mut deadline = now.saturating_add(100_000_000);
+                    if fec_workers.load(std::sync::atomic::Ordering::Acquire) != 0 {
+                        deadline = deadline.min(now.saturating_add(150_000));
+                    }
+                    for conn in connections_map.values() {
+                        match &conn.connection_state {
+                            ConnectionState::Connected(c) => {
+                                if conn.unreliable_send_buffer.has_unsent_data() || c.pending_send.is_some()
+                                    || c.send_sequence_number != c.packets_waiting_ack_tail || c.outage.since_ns.is_some() {
+                                    deadline = deadline.min(now.saturating_add(150_000));
+                                }
+                                deadline = deadline.min(c.ack_timer.saturating_add(1));
+                                deadline = deadline.min(c.last_sent_data_packet.saturating_add(5_000_000_001));
+                                if c.current_tu != ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE as u64
+                                    && c.tu_probe_sequence_number == u64::MAX {
+                                    let interval = send_interval_ns(c.stats.cc_rate_upps.max(cc.rate_floor_upps));
+                                    let probe_delay = (c.tu_probe_failed_count.min(50).pow(2) * 250_000_000).max(interval);
+                                    deadline = deadline.min(c.last_sent_tu_probe_time_ns.saturating_add(probe_delay).saturating_add(1));
+                                }
+                            }
+                            ConnectionState::SendingClientHelloPlaintext { last_sent_time_ns, .. }
+                            | ConnectionState::SendingClientHello { last_sent_time_ns, .. }
+                            | ConnectionState::SendingServerHelloPlaintext { last_sent_time_ns, .. }
+                            | ConnectionState::SendingServerHello { last_sent_time_ns, .. } => {
+                                deadline = deadline.min(last_sent_time_ns.saturating_add(2_500_000_001));
+                            }
+                        }
+                    }
+                    if thread_inner.state.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                        thread_inner.wake.wait(socket, std::time::Duration::from_nanos(deadline.saturating_sub(now)));
+                    }
                 }
             }
         }
@@ -6478,29 +6520,24 @@ pub fn service_connections(network_thread_handle: &NetworkThreadHandle, mut req:
     // is not answering.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
 
-    while network_thread_handle.inner.state.load(std::sync::atomic::Ordering::Acquire) != 0 {
-        if std::time::Instant::now() >= deadline {
-            return None;
-        }
-        // Sleep-poll: spinning here burned a core per caller for as long as the
-        // network thread took to answer.
-        std::thread::sleep(std::time::Duration::from_micros(25));
-    }
+    let inner = &network_thread_handle.inner;
+    let wait_idle = |guard| {
+        let (guard, result) = inner.completed.wait_timeout_while(guard,
+            deadline.saturating_duration_since(std::time::Instant::now()),
+            |_| inner.state.load(std::sync::atomic::Ordering::Acquire) != 0).unwrap();
+        if result.timed_out() && inner.state.load(std::sync::atomic::Ordering::Acquire) != 0 { None } else { Some(guard) }
+    };
+    let guard = wait_idle(inner.exchange.lock().unwrap())?;
 
     #[allow(unsafe_code)]
     unsafe {
         std::mem::swap(&mut *network_thread_handle.inner.push.get(), &mut req);
     }
 
-    network_thread_handle.inner.state.store(1, std::sync::atomic::Ordering::Release);
+    inner.state.store(1, std::sync::atomic::Ordering::Release);
+    inner.wake.notify();
     if let Some(thread) = &network_thread_handle.thread { thread.thread().unpark(); }
-
-    while network_thread_handle.inner.state.load(std::sync::atomic::Ordering::Acquire) != 0 {
-        if std::time::Instant::now() >= deadline {
-            return None;
-        }
-        std::thread::sleep(std::time::Duration::from_micros(25));
-    }
+    let _guard = wait_idle(guard)?;
 
     let mut resp = NetworkThreadPull::default();
 

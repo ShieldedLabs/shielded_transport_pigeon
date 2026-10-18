@@ -1,6 +1,46 @@
 #![allow(unused_unsafe)]
 pub use std::net::Ipv6Addr;
 
+/// Coalescing command wakeup, polled together with the UDP descriptor on Linux.
+/// Owned separately from SockHandle so shutdown cannot race descriptor reuse.
+#[derive(Debug)]
+pub(crate) struct NetworkWake {
+    #[cfg(target_os = "linux")]
+    fd: libc::c_int,
+}
+impl NetworkWake {
+    pub(crate) fn new() -> std::io::Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+            if fd < 0 { return Err(std::io::Error::last_os_error()); }
+            Ok(Self { fd })
+        }
+        #[cfg(not(target_os = "linux"))]
+        { Ok(Self {}) }
+    }
+    pub(crate) fn notify(&self) {
+        #[cfg(target_os = "linux")]
+        unsafe {
+            let one = 1u64;
+            // EAGAIN means an unread notification is already pending.
+            libc::write(self.fd, &one as *const u64 as *const libc::c_void, 8);
+        }
+    }
+    pub(crate) fn wait(&self, socket: SockHandle, timeout: std::time::Duration) {
+        #[cfg(target_os = "linux")]
+        socket.wait_readable(self.fd, timeout);
+        #[cfg(not(target_os = "linux"))]
+        { let _ = socket; std::thread::park_timeout(timeout.min(std::time::Duration::from_micros(150))); }
+    }
+}
+impl Drop for NetworkWake {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        unsafe { libc::close(self.fd); }
+    }
+}
+
 pub const ASSUMED_UDP_PAYLOAD_SIZE_WITH_GUARANTEED_DELIVERY: usize = 1204;
 pub const ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE: usize = 9216;
 
@@ -57,6 +97,21 @@ mod linux {
     #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
     pub struct SockHandle(libc::c_int, Option<Ipv6Addr>); // Linux
     impl SockHandle {
+        pub(crate) fn wait_readable(self, wake: libc::c_int, timeout: std::time::Duration) {
+            let mut fds = [
+                libc::pollfd { fd: self.0, events: libc::POLLIN, revents: 0 },
+                libc::pollfd { fd: wake, events: libc::POLLIN, revents: 0 },
+            ];
+            let ts = libc::timespec { tv_sec: timeout.as_secs() as _, tv_nsec: timeout.subsec_nanos() as _ };
+            unsafe {
+                // A signal interruption simply makes the owner recheck its predicates.
+                libc::ppoll(fds.as_mut_ptr(), 2, &ts, std::ptr::null());
+                if fds[1].revents & libc::POLLIN != 0 {
+                    let mut count = 0u64;
+                    libc::read(wake, &mut count as *mut u64 as *mut libc::c_void, 8);
+                }
+            }
+        }
         /// Caller must own the socket and never use any copy after this call.
         pub(crate) unsafe fn close(self) { unsafe { libc::close(self.0); } }
     }
