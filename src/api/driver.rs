@@ -326,6 +326,7 @@ fn run(shared: Arc<Shared>, core: stp::NetworkThreadHandle) {
     let mut current = HashMap::new();
     loop {
         ready.wait(&mut observed);
+        if core.is_finished() { break; }
         let (connects, mut pending) = {
             let mut s = shared.lock();
             if s.stopping {
@@ -348,6 +349,7 @@ fn run(shared: Arc<Shared>, core: stp::NetworkThreadHandle) {
                 wanted_connections: wanted,
                 initiate_connections: connects,
                 send_unreliable: std::mem::take(&mut retry),
+                ..Default::default()
             },
         ) else {
             break;

@@ -3,6 +3,8 @@
 //! Start with [`Config::new`] (the message-size limit is deliberately required),
 //! then choose [`blocking`], [`asynchronous`], [`callback`], [`readiness`] or
 //! [`channel`]. All transfer owned message buffers without copying their contents.
+//! Stats are cached snapshots refreshed on core/command activity; an idle
+//! connection's counters do not trigger periodic refreshes.
 //! See `docs/API_STYLES.md` for admission, shutdown and delivery semantics.
 
 pub mod asynchronous;

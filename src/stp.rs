@@ -4812,7 +4812,35 @@ impl CoreReady {
 
 #[cfg(test)]
 mod readiness_notification_tests {
-    use super::CoreReady;
+    use super::*;
+    #[test]
+    fn network_unwind_wakes_parked_driver_and_fails_exchange_immediately() {
+        let inner = std::sync::Arc::new(NetworkThreadInner {
+            state: std::sync::atomic::AtomicUsize::new(1),
+            stop: std::sync::atomic::AtomicBool::new(false),
+            exited: std::sync::atomic::AtomicBool::new(false),
+            wake: NetworkWake::new().unwrap(),
+            exchange: std::sync::Mutex::new(()), completed: std::sync::Condvar::new(),
+            ready: std::sync::Arc::new(CoreReady::default()),
+            push: std::cell::UnsafeCell::new(NetworkThreadPush::default()),
+            pull: std::cell::UnsafeCell::new(NetworkThreadPull::default()),
+        });
+        let ready = inner.ready.clone();
+        let mut observed = 0;
+        ready.wait(&mut observed);
+        let worker_inner = inner.clone();
+        let thread = std::thread::spawn(move || {
+            let _exit = NetworkExit(worker_inner);
+            panic!("test socket-owner unwind");
+        });
+        let core = NetworkThreadHandle { inner, thread: Some(thread), join_on_drop: false };
+        ready.wait(&mut observed);
+        assert!(core.is_finished());
+        let start = std::time::Instant::now();
+        assert!(service_connections(&core, NetworkThreadPush::default()).is_none());
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        core.shutdown();
+    }
     #[test]
     fn generation_retains_edges_before_wait_and_during_service() {
         let ready = std::sync::Arc::new(CoreReady::default());
@@ -4833,6 +4861,7 @@ mod readiness_notification_tests {
 struct NetworkThreadInner {
     state: std::sync::atomic::AtomicUsize, // 0 empty, 1 full
     stop: std::sync::atomic::AtomicBool,
+    exited: std::sync::atomic::AtomicBool,
     wake: NetworkWake,
     exchange: std::sync::Mutex<()>,
     completed: std::sync::Condvar,
@@ -4844,6 +4873,17 @@ struct NetworkThreadInner {
 #[allow(unsafe_code)]
 unsafe impl std::marker::Sync for NetworkThreadInner {}
 
+// Publish death before waking either waiter, including when the socket owner unwinds.
+struct NetworkExit(std::sync::Arc<NetworkThreadInner>);
+impl Drop for NetworkExit {
+    fn drop(&mut self) {
+        let _guard = self.0.exchange.lock().unwrap_or_else(|e| e.into_inner());
+        self.0.exited.store(true, std::sync::atomic::Ordering::Release);
+        self.0.completed.notify_all();
+        self.0.ready.notify();
+    }
+}
+
 // Note(Sam): Using this handle from two threads at once is UB. Only one thread may call service_connections at any given time.
 pub struct NetworkThreadHandle {
     inner: std::sync::Arc<NetworkThreadInner>,
@@ -4852,6 +4892,10 @@ pub struct NetworkThreadHandle {
 }
 
 impl NetworkThreadHandle {
+    pub(crate) fn is_finished(&self) -> bool {
+        self.inner.exited.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub(crate) fn readiness(&self) -> std::sync::Arc<CoreReady> {
         self.inner.ready.enabled.store(true, std::sync::atomic::Ordering::Release);
         self.inner.wake.notify();
@@ -4994,6 +5038,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
     let inner = std::sync::Arc::new(NetworkThreadInner {
         state: std::sync::atomic::AtomicUsize::new(0),
         stop: std::sync::atomic::AtomicBool::new(false),
+        exited: std::sync::atomic::AtomicBool::new(false),
         wake: NetworkWake::new().expect("create network command wakeup"),
         exchange: std::sync::Mutex::new(()),
         completed: std::sync::Condvar::new(),
@@ -5018,6 +5063,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
     #[cfg(feature="research_budget_diagnostic")]
     let diagnostic_enabled = options.budget_diagnostic;
     let thread = std::thread::spawn(move || {
+        let _exit = NetworkExit(thread_inner.clone());
         #[cfg(feature = "research_budget_diagnostic")]
         diag::enable(diagnostic_enabled);
         // SockHandle is Copy, not RAII. This thread is the sole socket owner;
@@ -6643,8 +6689,10 @@ pub fn service_connections(network_thread_handle: &NetworkThreadHandle, mut req:
     let wait_idle = |guard| {
         let (guard, result) = inner.completed.wait_timeout_while(guard,
             deadline.saturating_duration_since(std::time::Instant::now()),
-            |_| inner.state.load(std::sync::atomic::Ordering::Acquire) != 0).unwrap();
-        if result.timed_out() && inner.state.load(std::sync::atomic::Ordering::Acquire) != 0 { None } else { Some(guard) }
+            |_| !inner.exited.load(std::sync::atomic::Ordering::Acquire)
+                && inner.state.load(std::sync::atomic::Ordering::Acquire) != 0).unwrap();
+        if inner.exited.load(std::sync::atomic::Ordering::Acquire)
+            || (result.timed_out() && inner.state.load(std::sync::atomic::Ordering::Acquire) != 0) { None } else { Some(guard) }
     };
     let guard = wait_idle(inner.exchange.lock().unwrap())?;
 
