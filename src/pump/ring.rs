@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[repr(align(64))]
 struct Cursor(AtomicUsize);
-pub(super) struct Ring<T> {
+pub(crate) struct Ring<T> {
     head: Cursor,
     tail: Cursor,
     slots: Box<[UnsafeCell<MaybeUninit<T>>]>,
@@ -22,7 +22,7 @@ pub(super) struct Ring<T> {
 unsafe impl<T: Send> Send for Ring<T> {}
 unsafe impl<T: Send> Sync for Ring<T> {}
 impl<T> Ring<T> {
-    pub(super) fn new(capacity: usize) -> Self {
+    pub(crate) fn new(capacity: usize) -> Self {
         assert!(capacity.is_power_of_two() && capacity <= 65_536);
         Self {
             head: Cursor(AtomicUsize::new(0)),
@@ -33,18 +33,18 @@ impl<T> Ring<T> {
             mask: capacity - 1,
         }
     }
-    pub(super) fn has_space(&self) -> bool {
+    pub(crate) fn has_space(&self) -> bool {
         self.tail
             .0
             .load(Ordering::Acquire)
             .wrapping_sub(self.head.0.load(Ordering::Acquire))
             < self.slots.len()
     }
-    pub(super) fn has_value(&self) -> bool {
+    pub(crate) fn has_value(&self) -> bool {
         self.tail.0.load(Ordering::Acquire) != self.head.0.load(Ordering::Acquire)
     }
     /// SAFETY: only the unique producer may call push; calls may not overlap.
-    pub(super) unsafe fn push(&self, value: T) -> Result<(), T> {
+    pub(crate) unsafe fn push(&self, value: T) -> Result<(), T> {
         let tail = self.tail.0.load(Ordering::Relaxed);
         if tail.wrapping_sub(self.head.0.load(Ordering::Acquire)) == self.slots.len() {
             return Err(value);
@@ -55,8 +55,14 @@ impl<T> Ring<T> {
         self.tail.0.store(tail.wrapping_add(1), Ordering::Release);
         Ok(())
     }
+    /// SAFETY: only the unique consumer may peek, and must end the borrow before pop.
+    pub(crate) unsafe fn peek(&self) -> Option<&T> {
+        let head = self.head.0.load(Ordering::Relaxed);
+        if head == self.tail.0.load(Ordering::Acquire) { return None; }
+        Some(unsafe { (*self.slots[head & self.mask].get()).assume_init_ref() })
+    }
     /// SAFETY: only the unique consumer may call pop; calls may not overlap.
-    pub(super) unsafe fn pop(&self) -> Option<T> {
+    pub(crate) unsafe fn pop(&self) -> Option<T> {
         let head = self.head.0.load(Ordering::Relaxed);
         if head == self.tail.0.load(Ordering::Acquire) {
             return None;

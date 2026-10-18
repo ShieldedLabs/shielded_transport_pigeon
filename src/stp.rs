@@ -4813,6 +4813,50 @@ mod pump_thread;
 #[cfg(test)]
 use pump_thread::*;
 use crate::pump::port::{Port, Ready as CoreReady};
+use crate::pump::port::lockfree::{Control, Event as RingEvent, DisconnectReason, ConnectFailure};
+
+#[derive(Default)]
+struct RingState {
+    peers: HashMap<ConnectionKey, [u8; 64]>,
+    connects: HashMap<ConnectionKey, STPAddress>,
+    pending: VecDeque<RingEvent>,
+}
+impl RingState {
+    fn connected(&mut self, port: &Port, address: STPAddress, hash: [u8; 64]) -> bool {
+        let Some(n) = port.native.get() else { return true; };
+        let peer = address.connection_key();
+        if self.peers.get(&peer) == Some(&hash) { return true; }
+        if !self.pending.is_empty() || !n.events.has_space() {
+            n.counters.inbound_refused_full.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return false;
+        }
+        assert!(n.emit(&port.ready, RingEvent::Connected { peer, address, handshake_hash: hash }).is_ok());
+        self.peers.insert(peer, hash);
+        self.connects.remove(&peer);
+        true
+    }
+    fn disconnected(&mut self, peer: ConnectionKey, reason: DisconnectReason) {
+        if self.peers.remove(&peer).is_some() { self.pending.push_back(RingEvent::Disconnected { peer, reason }); }
+        if let Some(address) = self.connects.remove(&peer) {
+            self.pending.push_back(RingEvent::ConnectFailed { address, reason: if reason == DisconnectReason::Local { ConnectFailure::Cancelled } else { ConnectFailure::TimedOut } });
+        }
+    }
+    fn message(&self, port: &Port, peer: ConnectionKey, data: Vec<u8>) {
+        let n = port.native.get().unwrap();
+        if !self.peers.contains_key(&peer) { return; }
+        if n.emit(&port.ready, RingEvent::Message { peer, data }).is_err() {
+            n.counters.receive_dropped_full.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else { n.counters.received.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+    }
+    fn flush(&mut self, port: &Port) {
+        let n = port.native.get().unwrap();
+        for _ in 0..32 {
+            if !n.events.has_space() { break; }
+            let Some(event) = self.pending.pop_front() else { break; };
+            assert!(n.emit(&port.ready, event).is_ok());
+        }
+    }
+}
 
 // Publish death on normal drop AND unwind, even if Pump was never run.
 struct NetworkExit(std::sync::Arc<Port>);
@@ -5004,6 +5048,8 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
 
         let mut connections_map = HashMap::<ConnectionKey, ConnectionTrackingData>::new();
         let mut ready_peers = HashMap::new();
+        let mut ring_state = RingState::default();
+        let mut ring_burst = 0usize;
         let mut receive_notified = false;
         let mut ready_used = 0usize;
 
@@ -5078,6 +5124,68 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
             // Do not remove a request after its admission deadline.
             // The first take of each call is exempt (forward progress).
             if !budget.command_owed() && thread_inner.has_request() && std::time::Instant::now() >= caller_deadline { return wake_hint; }
+            // Native boundary: only the pump touches RingState and consumes inputs.
+            // At most 32 admissions precede a protocol pass; each respects the call
+            // deadline except the first owed admission (the forward-progress rule).
+            let mut ring_admitted = false;
+            if let Some(n) = thread_inner.native.get() {
+                ring_state.flush(&thread_inner);
+                if ring_burst < 32 {
+                    if ring_state.pending.is_empty() {
+                        if let Some(control) = unsafe { n.control.pop() } {
+                            n.input_drained(&thread_inner.ready, true);
+                            match control {
+                                Control::Connect(address) => {
+                                    let peer = address.connection_key();
+                                    if connections_map.contains_key(&peer) {
+                                        ring_state.pending.push_back(RingEvent::ConnectFailed { address, reason: ConnectFailure::AlreadyConnected });
+                                    } else if let Some(keypair) = my_keypairs.iter().find(|kp| kp.magic1 == address.magic1 && kp.public != address.key) {
+                                        connect_to_endpoint(&mut connections_map, keypair, &address, send_buffer_params, send_queue_count, &receive_memory, connection_receive_limit, max_message_size);
+                                        if connections_map.contains_key(&peer) { ring_state.connects.insert(peer, address); }
+                                        else { ring_state.pending.push_back(RingEvent::ConnectFailed { address, reason: ConnectFailure::InvalidAddress }); }
+                                    } else { ring_state.pending.push_back(RingEvent::ConnectFailed { address, reason: ConnectFailure::InvalidAddress }); }
+                                }
+                                Control::Disconnect(peer) => {
+                                    connections_map.remove(&peer);
+                                    ring_state.disconnected(peer, DisconnectReason::Local);
+                                }
+                            }
+                            ring_admitted = true;
+                        }
+                    }
+                    if !ring_admitted {
+                        if let Some(message) = unsafe { n.send.peek() } {
+                            let mut drop_kind = 0;
+                            let mut fits = true;
+                            if message.payload.len() > max_message_size { drop_kind = 2; }
+                            else if let Some(conn) = connections_map.get_mut(&message.peer).filter(|c| c.is_connected()) {
+                                if message.queue >= conn.unreliable_send_buffer.queues.len() { drop_kind = 3; }
+                                else if message.payload.len() > conn.peer_max_message_size { drop_kind = 2; }
+                                else { fits = message.payload.len() as u64 <= conn.unreliable_send_buffer.queues[message.queue].free_bytes(); }
+                            } else { drop_kind = 1; }
+                            if fits {
+                                let message = unsafe { n.send.pop() }.unwrap();
+                                n.input_drained(&thread_inner.ready, false);
+                                let counter = match drop_kind {
+                                    1 => &n.counters.send_dropped_unknown,
+                                    2 => &n.counters.send_dropped_oversized,
+                                    3 => &n.counters.send_dropped_invalid_queue,
+                                    _ => {
+                                        let rejected = connections_map.get_mut(&message.peer).unwrap().unreliable_send_buffer.submit_classified_messages(message.queue, vec![(message.class, message.payload)]);
+                                        assert!(rejected.is_empty(), "peeked credit must admit the FIFO head");
+                                        &n.counters.sent
+                                    }
+                                };
+                                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                ring_admitted = true;
+                            } else { n.counters.send_head_blocked.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+                        }
+                    }
+                }
+                if ring_admitted { ring_burst += 1; budget.admitted(); }
+                else { ring_burst = 0; }
+            }
+            if ring_admitted { continue; }
             if let Some((mut req, disconnect)) = thread_inner.take_request() {
                 budget.admitted();
                 if let Some(peer) = disconnect { connections_map.remove(&peer); }
@@ -5273,6 +5381,12 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
 
 
                     if first_six_bytes & 1 != 0 { // Client Hello
+                        if let Some(n) = thread_inner.native.get() {
+                            if !n.events.has_space() || !ring_state.pending.is_empty() {
+                                n.counters.inbound_refused_full.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                continue;
+                            }
+                        }
                         let magic1 = first_six_bytes;
                         if magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
                             for key_i in 0..my_keypairs.len() {
@@ -5450,6 +5564,10 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
                             break 'conn;
                         };
 
+                        if !existing_connection.is_connected() && thread_inner.native.get().is_some_and(|n| !n.events.has_space() || !ring_state.pending.is_empty()) {
+                            thread_inner.native.get().unwrap().counters.inbound_refused_full.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            break 'conn;
+                        }
                         match &mut existing_connection.connection_state {
                             ConnectionState::SendingClientHelloPlaintext { last_sent_time_ns, hello_packet_payload } => {
                                 if first_six_bytes >> 16 == 0xffff_ffff && buf_len == 6 + 32 + SERVER_HELLO_PAYLOAD_LEN {
@@ -5464,6 +5582,7 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
                                         }
                                         if VERBOSE { println!("Connected to new server {:?}", server_key); }
                                         existing_connection.connection_state = new_connection_state_connected(None, CONNECT_MAGIC1_PLAIN_TEXT, server_magic2, timestamp_ns);
+                                        assert!(ring_state.connected(&thread_inner, existing_connection.address(), existing_connection.handshake_hash));
                                     }
                                 } else {
                                     if OVERLY_VERBOSE {
@@ -5496,6 +5615,7 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
                                         let ConnectionState::SendingClientHello { handshake, .. } = old_state else { panic!(); };
                                         let ConnectionState::Connected(ref mut state) = existing_connection.connection_state else { panic!(); };
                                         state.cipher = Some(ConnectionCipherTriplet::new_from_old_init_only(handshake.into_stateless_transport_mode().expect("Cannot fail given assert above.")));
+                                        assert!(ring_state.connected(&thread_inner, existing_connection.address(), existing_connection.handshake_hash));
                                     } else {
                                         if OVERLY_VERBOSE {
                                             println!("Dropping from {connection_key:?} because this failed: let Ok(payload_len) = handshake.read_message(&packet_memory_encrypted[6..buf_len], &mut packet_memory_recv[..])");
@@ -5528,6 +5648,7 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
                             }
                             ConnectionState::Connected(_) => (),
                         }
+                        if !ring_state.connected(&thread_inner, existing_connection.address(), existing_connection.handshake_hash) { break 'conn; }
 //////// BEGIN ORDINARY PACKET HANDLING  ////////////////////////////////////////////////////////////////////
                         if let ConnectionState::Connected(state) = &mut existing_connection.connection_state {
                             if buf_len < CONNECTED_HEADER_SIZE { break 'conn; }
@@ -5775,7 +5896,7 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
 
                                     let Some(reservation) = preallocated.or_else(||existing_connection.receive_budget.reserve(data.len() + 256)) else { memory_erased = true; continue; };
                                     state.stats.rx_messages_completed += 1;
-                                    receive_queue.push_reserved(connection_key, data.to_vec(), MAX_RECV_QUEUE_BYTES, Some(reservation));
+                                    if thread_inner.is_reference() { receive_queue.push_reserved(connection_key, data.to_vec(), MAX_RECV_QUEUE_BYTES, Some(reservation)); } else { ring_state.message(&thread_inner, connection_key, data.to_vec()); }
                                     continue;
                                 }
 
@@ -5858,7 +5979,7 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
                                         } else { Some((message, _reservation)) };
                                         if let Some((message, reservation)) = completed {
                                             state.stats.rx_messages_completed += 1;
-                                            receive_queue.push_reserved(connection_key, message, MAX_RECV_QUEUE_BYTES, Some(reservation));
+                                            if thread_inner.is_reference() { receive_queue.push_reserved(connection_key, message, MAX_RECV_QUEUE_BYTES, Some(reservation)); } else { ring_state.message(&thread_inner, connection_key, message); }
                                         }
                                     }
                                     memory_erased |= existing_connection.unreliable_fec[slot_idx].ingress_dropped != dropped_before;
@@ -5928,7 +6049,7 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
                                     state.stats.rx_messages_completed += 1;
                                     let reservation = existing_connection.unreliable_reassembly[slot_idx].reservation.take();
                                     let completed = existing_connection.unreliable_reassembly[slot_idx].take_complete();
-                                    receive_queue.push_reserved(connection_key, completed, MAX_RECV_QUEUE_BYTES, reservation);
+                                    if thread_inner.is_reference() { receive_queue.push_reserved(connection_key, completed, MAX_RECV_QUEUE_BYTES, reservation); } else { ring_state.message(&thread_inner, connection_key, completed); }
                                 }
                             }
 
@@ -5971,7 +6092,7 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
                             c.stats.fec_decode_max_tail_ns = c.stats.fec_decode_max_tail_ns.max(tail);
                         }
                         if let Some((message, reservation)) = completed {
-                            receive_queue.push_reserved(key, message, MAX_RECV_QUEUE_BYTES, Some(reservation));
+                            if thread_inner.is_reference() { receive_queue.push_reserved(key, message, MAX_RECV_QUEUE_BYTES, Some(reservation)); } else { ring_state.message(&thread_inner, key, message); }
                         }
                     }
                 }
@@ -6486,6 +6607,11 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
 
 //////// END SEND ////////////////////////////////////////////////////////////////////////
 
+                if thread_inner.native.get().is_some() {
+                    let gone: Vec<_> = ring_state.peers.keys().chain(ring_state.connects.keys()).copied().filter(|k| !connections_map.contains_key(k)).collect();
+                    for peer in gone { ring_state.disconnected(peer, DisconnectReason::TimedOut); }
+                    ring_state.flush(&thread_inner);
+                }
                 if thread_inner.ready.enabled.load(std::sync::atomic::Ordering::Acquire) {
                     let mut connected = 0;
                     let mut changed = false;
