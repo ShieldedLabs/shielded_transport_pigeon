@@ -4940,7 +4940,7 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
 
     let socket = setup_and_bind_udp_socket_on(my_port, bind_ip).expect("Failed to bind socket, try again.");
 
-    let inner = Port::new();
+    let inner = Port::new(max_message_size);
     let record_fec_messages = options.record_fec_messages;
     let record_loss_episodes = options.record_loss_episodes;
     let mut loss_trace = options.loss_trace.as_deref().map(|p| crate::loss_trace::LossTrace::open(p).expect("open loss trace"));
@@ -5072,17 +5072,18 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
             let test_drop_ppm = match &test_drop_schedule { Some(sch) => sch.ppm_at(monotonic_clock_ns().saturating_sub(test_drop_t0)), None => test_drop_ppm };
             // Do not remove a request after its admission deadline.
             if thread_inner.has_request() && std::time::Instant::now() >= caller_deadline { return wake_hint; }
-            if let Some(mut req) = thread_inner.take_request() {
+            if let Some((mut req, disconnect)) = thread_inner.take_request() {
+                if let Some(peer) = disconnect { connections_map.remove(&peer); }
                 let exchange_started = std::time::Instant::now();
                 let current_time_now_ns = monotonic_clock_ns();
-                connections_map.retain(|key, value| {
+                if thread_inner.is_reference() { connections_map.retain(|key, value| {
                     let stp_address = value.address();
                     if value.creation_time_ns + 30_000_000_000 < current_time_now_ns && req.wanted_connections.iter().position(|(x, _)| x == &stp_address).is_none() && value.is_connected() {
                         println!("############################# KILLING CONNECTION {:?}", value);
                         return false;
                     }
                     true
-                });
+                }); }
                 for w in &req.initiate_connections {
                     if my_keypairs.iter().any(|kp| kp.public == w.key) {
                         continue;
@@ -5143,6 +5144,7 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
                 }
                 #[cfg(feature = "research_budget_diagnostic")]
                 if req.diagnostic_take { resp.diagnostic = diag::take(current_time_now_ns); }
+                if thread_inner.wants_stats() {
                 resp.unreliable_send_free_bytes = connections_map.iter_mut()
                     .flat_map(|(key, value)| value.unreliable_send_buffer.free_bytes().into_iter().enumerate().map(|(q, bytes)| (*key, q, bytes))).collect();
                 #[cfg(feature = "research_cohort_observer")]
@@ -5204,6 +5206,8 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
                     }
                 }
 
+                } // reference/explicit stats snapshot
+                if thread_inner.wants_snapshot() {
                 resp.current_connections = connections_map.iter().filter_map(|(key, value)| {
                     if value.is_connected() {
                         Some((value.address().clone(), value.handshake_hash))
@@ -5214,7 +5218,12 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
                 resp.received_unreliable_messages = receive_queue.take();
                 receive_notified = false;
                 ready_used = connections_map.values().flat_map(|c| &c.unreliable_send_buffer.queues).map(|q| q.queue_bytes_filled as usize).sum();
-
+                }
+                // Native Send responses omit snapshots. Anchor a rejected
+                // sender's one-shot space edge before the next protocol drain.
+                if !thread_inner.is_reference() && !resp.send_unreliable_rejected.is_empty() {
+                    ready_used = connections_map.values().flat_map(|c| &c.unreliable_send_buffer.queues).map(|q| q.queue_bytes_filled as usize).sum();
+                }
                 resp.exchange_processing_ns = exchange_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
                 thread_inner.publish(resp);
             } else {
@@ -6481,9 +6490,9 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
                     }
                     let receive_ready = !receive_notified && !receive_queue.messages.is_empty();
                     receive_notified |= receive_ready;
-                    let space_ready = used < ready_used && thread_inner.ready.send_space.load(std::sync::atomic::Ordering::Acquire);
+                    let space_ready = thread_inner.send_space_ready(used, ready_used);
                     ready_used = used;
-                    if changed || receive_ready || space_ready { thread_inner.ready.notify(); }
+                    if changed || receive_ready || space_ready { thread_inner.transport_ready(); }
                 }
 
                 if should_sleep {
