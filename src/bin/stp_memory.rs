@@ -1,5 +1,5 @@
 //! Authenticated adversarial receive-memory probes. Each invocation is a fresh process.
-//! stp_memory sparse|inline|workers|pending|complete COUNT SIZE [CONNECTIONS]
+//! `stp_memory sparse|inline|workers|pending|complete COUNT SIZE [CONNECTIONS]`
 //! SIZE is bytes (plain end offset / FEC message length). Never sends outside loopback.
 extern crate shielded_transport_pigeon as stp_core;
 #[path = "../../tests/support/pump_thread.rs"]

@@ -45,9 +45,9 @@ pub fn service_connections(handle: &NetworkThreadHandle, request: NetworkThreadP
         }
     }
     drain(&mut app, &mut response);
-    for (peer, queue, class, mut payload) in request.send_unreliable {
-        if !app.endpoint.try_send(peer, queue, class, &mut payload) { response.send_unreliable_rejected.push((peer, queue, class, payload)); }
-    }
+    response.send_unreliable_rejected = reject_suffix(request.send_unreliable, |peer, queue, class, payload| {
+        app.endpoint.try_send(peer, queue, class, payload)
+    });
     app.endpoint.request_protocol_stats();
     loop {
         drain(&mut app, &mut response);
@@ -60,4 +60,37 @@ pub fn service_connections(handle: &NetworkThreadHandle, request: NetworkThreadP
         if app.endpoint.is_finished() || Instant::now() >= deadline { return None; }
         std::thread::sleep(Duration::from_micros(25));
     }
+}
+
+// The legacy cohort ledger requires dense admission: after the first refusal,
+// return the entire remaining suffix, even if a concurrent pump frees space.
+fn reject_suffix(
+    messages: Vec<(ConnectionKey, usize, Dscp, Vec<u8>)>,
+    mut send: impl FnMut(ConnectionKey, usize, Dscp, &mut Vec<u8>) -> bool,
+) -> Vec<(ConnectionKey, usize, Dscp, Vec<u8>)> {
+    let mut rejected = Vec::new();
+    let mut blocked = false;
+    for (peer, queue, class, mut payload) in messages {
+        if blocked || !send(peer, queue, class, &mut payload) {
+            blocked = true;
+            rejected.push((peer, queue, class, payload));
+        }
+    }
+    rejected
+}
+
+#[test]
+fn legacy_batch_returns_suffix_even_if_send_space_reappears() {
+    let key = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).unwrap();
+    let peer = STPAddress::from(std::net::Ipv6Addr::LOCALHOST, 9000, &key).connection_key();
+    let messages = (0..4).map(|i| (peer, 0, Dscp::BestEffort, vec![i])).collect();
+    let mut calls = 0;
+    let rejected = reject_suffix(messages, |_, _, _, payload| {
+        calls += 1;
+        if calls == 2 { return false; }
+        payload.clear();
+        true
+    });
+    assert_eq!(calls, 2, "must not retry later messages after the first refusal");
+    assert_eq!(rejected.into_iter().map(|x| x.3).collect::<Vec<_>>(), vec![vec![1], vec![2], vec![3]]);
 }

@@ -1,10 +1,10 @@
 [package]
 name = "shielded_transport_pigeon"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/ShieldedLabs/shielded_transport_pigeon"
-description = "Shielded Transport Pigeon, STP, is an encrypted optionally reliable UDP transport layer that does not use TLS."
+description = "Encrypted, caller-driven UDP message transport with bounded lock-free rings and forward error correction."
 
 [dependencies]
 base64 = "0.22"

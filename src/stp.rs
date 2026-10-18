@@ -4769,6 +4769,15 @@ pub struct NetworkThreadPush {
     pub send_unreliable: Vec<(ConnectionKey, usize, Dscp, Vec<u8>)>,
 }
 
+/// Explicit protocol telemetry returned by `LockfreeEndpoint::try_protocol_stats`.
+///
+/// This type also supports the crate-private historical exchange used in tests.
+/// On the public rings telemetry path, `current_connections`,
+/// `received_unreliable_messages` and all `send_unreliable_*` result vectors are
+/// always empty. Read lifecycle/messages from `Event` instead; accepted sends
+/// never produce individual results. Queue-credit and CC/FEC/thread counters are
+/// snapshots, not atomic admission guarantees. Requesting this snapshot allocates
+/// and can take existing internal telemetry locks; ordinary ring operations do not.
 #[derive(Default)]
 pub struct NetworkThreadPull {
     /// Measured core time processing this reference exchange, excluding the

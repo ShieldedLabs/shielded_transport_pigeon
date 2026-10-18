@@ -1,0 +1,584 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>STP Application API: Pump and three rings</title>
+<style>
+:root {
+  --bg: #fbfaf7; --bg2: #f2f0ea; --fg: #1d1f24; --muted: #5d6370; --line: #dedad0;
+  --accent: #2f6fdf; --accent2: #0f8f72; --warn: #b8620b; --bad: #c0392b;
+  --code-bg: #f4f2ec; --code-fg: #22252b;
+  --k: #8a3fbf; --t: #0b7a8a; --s: #3b7d1f; --c: #8b8f98; --n: #b5530b; --f: #2f5fbf; --m: #b0306a;
+  --old: #a9b0bd; --new: #2f6fdf;
+  --ok-bg: #e9f6f1; --ok-line: #0f8f72; --warn-bg: #fdf3e6; --warn-line: #d9822b; --info-bg: #ebf2fd; --info-line: #2f6fdf;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14161a; --bg2: #1b1e24; --fg: #e4e6eb; --muted: #9aa1ad; --line: #2c313a;
+    --accent: #6ea2ff; --accent2: #3fd0a8; --warn: #f0a050; --bad: #ff7b6b;
+    --code-bg: #1c1f26; --code-fg: #dfe3ea;
+    --k: #c792ea; --t: #6fd3e0; --s: #a5d6a7; --c: #6f7787; --n: #f2a36b; --f: #82aaff; --m: #f07fb0;
+    --old: #4f5663; --new: #6ea2ff;
+    --ok-bg: #12261f; --ok-line: #3fd0a8; --warn-bg: #2a1f12; --warn-line: #f0a050; --info-bg: #142035; --info-line: #6ea2ff;
+  }
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0; background: var(--bg); color: var(--fg);
+  font: 16px/1.62 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+code, pre, .mono { font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, "Liberation Mono", monospace; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+.layout { display: grid; grid-template-columns: 260px minmax(0, 1fr); max-width: 1320px; margin: 0 auto; }
+nav.toc {
+  position: sticky; top: 0; align-self: start; height: 100vh; overflow-y: auto;
+  padding: 28px 18px 28px 24px; border-right: 1px solid var(--line); font-size: 14px;
+}
+nav.toc .brand { font-weight: 700; letter-spacing: .02em; margin-bottom: 4px; }
+nav.toc .brand span { color: var(--accent); }
+nav.toc .sub { color: var(--muted); font-size: 12.5px; margin-bottom: 18px; }
+nav.toc ol { list-style: none; padding: 0; margin: 0; counter-reset: toc; }
+nav.toc li { margin: 1px 0; }
+nav.toc li a { display: block; padding: 4px 10px; border-radius: 6px; color: var(--muted); }
+nav.toc li a:hover { background: var(--bg2); color: var(--fg); text-decoration: none; }
+nav.toc li.sub2 a { padding-left: 24px; font-size: 13px; }
+main { padding: 0 48px 80px; min-width: 0; }
+.hero { padding: 56px 0 30px; border-bottom: 1px solid var(--line); margin-bottom: 8px; }
+.hero .eyebrow { text-transform: uppercase; letter-spacing: .14em; font-size: 12px; color: var(--accent2); font-weight: 700; }
+.hero h1 { font-size: 42px; line-height: 1.12; margin: 10px 0 14px; letter-spacing: -.02em; }
+.hero h1 em { font-style: normal; color: var(--accent); }
+.hero p.lead { font-size: 18.5px; color: var(--muted); max-width: 820px; margin: 0; }
+.chips { margin-top: 18px; display: flex; flex-wrap: wrap; gap: 8px; }
+.chip { font-size: 12.5px; padding: 3px 10px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); background: var(--bg2); }
+h2 { font-size: 27px; margin: 56px 0 12px; letter-spacing: -.01em; padding-top: 8px; }
+h2 .num { color: var(--accent); font-weight: 600; margin-right: 8px; font-size: 22px; }
+h3 { font-size: 19px; margin: 30px 0 8px; }
+p, li { max-width: 860px; }
+:not(pre) > code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; font-size: .9em; }
+pre {
+  background: var(--code-bg); color: var(--code-fg); padding: 16px 18px; border-radius: 10px;
+  overflow-x: auto; font-size: 13.6px; line-height: 1.55; border: 1px solid var(--line); margin: 14px 0 18px;
+}
+pre .k { color: var(--k); } pre .t { color: var(--t); } pre .s { color: var(--s); }
+pre .c { color: var(--c); font-style: italic; } pre .n { color: var(--n); } pre .f { color: var(--f); } pre .m { color: var(--m); }
+.codehead { font-size: 12px; color: var(--muted); margin: 14px 0 -10px; font-family: ui-monospace, Menlo, Consolas, monospace; }
+table { border-collapse: collapse; width: 100%; margin: 14px 0 20px; font-size: 14.5px; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-size: 12.5px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); font-weight: 600; background: var(--bg2); }
+td code { white-space: nowrap; }
+td.sig code { white-space: pre-wrap; }
+.callout { border-left: 4px solid var(--info-line); background: var(--info-bg); padding: 12px 16px; border-radius: 0 8px 8px 0; margin: 16px 0; max-width: 900px; }
+.callout.ok { border-color: var(--ok-line); background: var(--ok-bg); }
+.callout.warn { border-color: var(--warn-line); background: var(--warn-bg); }
+.callout .title { font-weight: 700; font-size: 13px; text-transform: uppercase; letter-spacing: .07em; margin-bottom: 4px; }
+.callout.ok .title { color: var(--ok-line); } .callout.warn .title { color: var(--warn); } .callout .title { color: var(--info-line); }
+.callout p { margin: 4px 0; } .callout ul { margin: 4px 0; padding-left: 20px; }
+/* diagram */
+.diagram { display: grid; grid-template-columns: 1fr 1.25fr 1fr .25fr .8fr; align-items: center; gap: 0; margin: 26px 0 10px; max-width: 980px; }
+.box { border: 2px solid var(--line); border-radius: 12px; padding: 16px; background: var(--bg2); text-align: center; }
+.box .bt { font-weight: 700; font-size: 16px; }
+.box .bd { font-size: 12.5px; color: var(--muted); margin-top: 4px; }
+.box.app { border-color: var(--accent2); }
+.box.pump { border-color: var(--accent); }
+.rings { display: flex; flex-direction: column; gap: 14px; padding: 0 8px; }
+.ring { position: relative; display: flex; align-items: center; gap: 6px; font-size: 12.5px; }
+.ring .lane { flex: 1; height: 26px; border: 1.5px solid var(--line); border-radius: 13px; display: flex; gap: 3px; align-items: center; padding: 0 6px; background: var(--bg); }
+.ring .slot { width: 12px; height: 14px; border-radius: 3px; background: var(--line); }
+.ring .slot.f { background: var(--accent2); }
+.ring.recv .slot.f { background: var(--accent); }
+.ring .lbl { position: absolute; top: -17px; left: 10px; font-weight: 600; font-size: 11.5px; color: var(--muted); letter-spacing: .04em; }
+.ring .arrow { font-size: 16px; color: var(--muted); width: 16px; text-align: center; }
+.wire { height: 2px; background: repeating-linear-gradient(90deg, var(--muted) 0 6px, transparent 6px 10px); }
+.dcap { font-size: 13px; color: var(--muted); max-width: 900px; }
+/* bars */
+.chart { margin: 14px 0 26px; max-width: 900px; }
+.chart h4 { margin: 0 0 8px; font-size: 14.5px; }
+.bargroup { display: grid; grid-template-columns: 150px 1fr; gap: 4px 12px; align-items: center; margin-bottom: 10px; }
+.bargroup .name { font-size: 13.5px; color: var(--muted); text-align: right; grid-row: span 2; }
+.bar { height: 18px; border-radius: 4px; position: relative; display: flex; align-items: center; }
+.bar.old { background: var(--old); } .bar.new { background: var(--new); }
+.bar span { position: absolute; left: calc(100% + 8px); font-size: 12.5px; white-space: nowrap; color: var(--fg); }
+.bar span b { color: var(--accent2); font-weight: 600; margin-left: 6px; }
+.legend { font-size: 12.5px; color: var(--muted); display: flex; gap: 18px; margin: 6px 0 12px; }
+.legend i { display: inline-block; width: 12px; height: 12px; border-radius: 3px; vertical-align: -1px; margin-right: 5px; }
+.stack { display: flex; height: 30px; border-radius: 6px; overflow: hidden; max-width: 820px; margin: 10px 0 6px; font-size: 12px; color: #fff; }
+.stack div { display: flex; align-items: center; justify-content: center; white-space: nowrap; overflow: hidden; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; max-width: 920px; }
+.kpi { border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; background: var(--bg2); }
+.kpi .v { font-size: 26px; font-weight: 700; }
+.kpi .l { font-size: 13px; color: var(--muted); }
+.tag { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); vertical-align: 1px; }
+footer { margin-top: 60px; padding-top: 18px; border-top: 1px solid var(--line); color: var(--muted); font-size: 13px; }
+@media (max-width: 980px) {
+  .layout { grid-template-columns: 1fr; }
+  nav.toc { position: static; height: auto; border-right: 0; border-bottom: 1px solid var(--line); }
+  main { padding: 0 20px 60px; }
+  .diagram { grid-template-columns: 1fr; gap: 12px; }
+  .wire { display: none; }
+  .grid2 { grid-template-columns: 1fr; }
+  .bargroup { grid-template-columns: 90px 1fr; }
+}
+</style>
+</head>
+<body>
+<div class="layout">
+
+<nav class="toc">
+  <div class="brand">STP <span>rings</span> API</div>
+  <div class="sub">shielded_transport_pigeon &middot; caller-driven pump</div>
+  <ol>
+    <li><a href="#overview">Overview</a></li>
+    <li><a href="#quickstart">Quick start</a></li>
+    <li><a href="#driving">Driving the pump</a></li>
+    <li><a href="#send">Send ring</a></li>
+    <li><a href="#control">Control ring</a></li>
+    <li><a href="#receive">Receive ring</a></li>
+    <li class="sub2"><a href="#events">Event stream</a></li>
+    <li class="sub2"><a href="#ordering">Ordering guarantees</a></li>
+    <li><a href="#full">When a ring is full</a></li>
+    <li><a href="#parking">Parking &amp; readiness</a></li>
+    <li><a href="#stats">Statistics</a></li>
+    <li><a href="#config">Configuration</a></li>
+    <li><a href="#threading">Threading &amp; ownership</a></li>
+    <li><a href="#shutdown">Shutdown</a></li>
+    <li><a href="#tradeoffs">Trade-offs &amp; limits</a></li>
+    <li><a href="#perf">Performance</a></li>
+    <li><a href="#reference">API reference</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<header class="hero" id="overview">
+  <div class="eyebrow">Application API &middot; version <code>0.3.0</code></div>
+  <h1>One pump, <em>three rings</em>, no hidden threads.</h1>
+  <p class="lead">STP is an encrypted UDP message transport: Noise IK handshakes, ChaCha20-Poly1305 sealed datagrams, Wirehair fountain-code parity for large messages, and rate-based congestion control in packets per second. The library starts <strong>no threads</strong>. All protocol work happens inside a <code>Pump</code>, and only while you call it. Your application talks to the pump through exactly three bounded, lock-free single-producer/single-consumer rings whose capacities you choose at setup: <strong>send</strong> and <strong>control</strong> carry work in, and <strong>receive</strong> carries one ordered stream of events out.</p>
+  <div class="chips">
+    <span class="chip">no library threads</span><span class="chip">no locks on the ring path</span><span class="chip">no allocation in ring operations</span>
+    <span class="chip">ownership transfer of <code>Vec&lt;u8&gt;</code></span><span class="chip">futex parking (Linux)</span><span class="chip">~250 MB/s per connection</span>
+  </div>
+</header>
+
+<div class="diagram" aria-label="Architecture diagram">
+  <div class="box app"><div class="bt">Application</div><div class="bd"><code>LockfreeEndpoint</code><br>Send, not Sync<br>single owner</div></div>
+  <div class="rings">
+    <div class="ring"><span class="lbl">SEND &middot; RingConfig.send</span><div class="lane"><span class="slot f"></span><span class="slot f"></span><span class="slot f"></span><span class="slot"></span><span class="slot"></span><span class="slot"></span></div><span class="arrow">&rarr;</span></div>
+    <div class="ring"><span class="lbl">CONTROL &middot; RingConfig.control</span><div class="lane"><span class="slot f"></span><span class="slot"></span><span class="slot"></span></div><span class="arrow">&rarr;</span></div>
+    <div class="ring recv"><span class="arrow">&larr;</span><span class="lbl" style="left:30px">RECEIVE &middot; RingConfig.receive</span><div class="lane"><span class="slot f"></span><span class="slot f"></span><span class="slot"></span><span class="slot"></span><span class="slot"></span><span class="slot"></span></div></div>
+  </div>
+  <div class="box pump"><div class="bt">Pump</div><div class="bd">Noise &middot; AEAD &middot; FEC<br>congestion control<br>runs only in <code>run_until</code></div></div>
+  <div class="wire"></div>
+  <div class="box"><div class="bt">UDP socket</div><div class="bd">owned by the pump<br>closed on drop</div></div>
+</div>
+<p class="dcap">The application thread is the only producer of the send and control rings and the only consumer of the receive ring; the pump is the other end of each. Each ring operation is a constant-time ownership move with no retry loop, allocation or lock. Wakeups go through an eventfd (pump side) and a futex generation counter (application side).</p>
+
+<!-- ============================================================ -->
+<h2 id="quickstart"><span class="num">1</span>Quick start</h2>
+<p>This is the whole lifecycle: create an identity and address, construct the pump and endpoint, move the pump to a thread of your own that loops <code>run_for(100&nbsp;ms)</code> until <em>your</em> cancel flag is set, connect, send, and drain events. It is adapted from <code>examples/support/lockfree_common.rs</code> and <code>examples/lockfree_thread.rs</code>.</p>
+<div class="codehead">Cargo: shielded_transport_pigeon</div>
+<pre><code><span class="k">use</span> shielded_transport_pigeon::{pump::port::lockfree::*, stp::*};
+<span class="k">use</span> std::collections::<span class="t">VecDeque</span>;
+<span class="k">use</span> std::sync::{<span class="t">Arc</span>, atomic::{<span class="t">AtomicBool</span>, <span class="t">Ordering</span>}};
+<span class="k">use</span> std::time::<span class="t">Duration</span>;
+
+<span class="c">// 1. Identity + address. The address is what peers dial: [ip]:port:magic1:key</span>
+<span class="k">let</span> port: <span class="t">u16</span> = <span class="n">9000</span>;
+<span class="k">let</span> key = <span class="f">new_keypair_from_connect_magic1</span>(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).<span class="f">unwrap</span>();
+<span class="k">let</span> me = <span class="t">STPAddress</span>::<span class="f">from</span>(std::net::<span class="t">Ipv6Addr</span>::LOCALHOST, port, &amp;key);
+<span class="m">println!</span>(<span class="s">"my address: {me:?}"</span>); <span class="c">// Debug prints the parseable form</span>
+
+<span class="c">// 2. Construct. Synchronous; binds the UDP socket; starts no threads.</span>
+<span class="k">let</span> (<span class="k">mut</span> pump, <span class="k">mut</span> ep) = <span class="f">new_pump_with_options</span>(
+    <span class="m">vec!</span>[key], port, <span class="t">None</span>,                       <span class="c">// keys, UDP port, max_pps</span>
+    (<span class="n">1_000_000</span>, <span class="n">32</span> &lt;&lt; <span class="n">20</span>, <span class="n">32</span> &lt;&lt; <span class="n">20</span>),            <span class="c">// send-buffer (target_us, min_bytes, max_bytes)</span>
+    <span class="n">2_000_000</span>,                                   <span class="c">// max_message_size (required, &lt;= 1 GiB)</span>
+    <span class="t">NetworkThreadOptions</span> {
+        rings: <span class="t">RingConfig</span> { send: <span class="n">128</span>, control: <span class="n">32</span>, receive: <span class="n">128</span> },
+        ..<span class="t">Default</span>::<span class="f">default</span>()
+    });
+
+<span class="c">// 3. Your thread, your cancel flag. The library never spawns one.</span>
+<span class="k">let</span> cancel = <span class="t">Arc</span>::<span class="f">new</span>(<span class="t">AtomicBool</span>::<span class="f">new</span>(<span class="k">false</span>));
+<span class="k">let</span> stop = cancel.<span class="f">clone</span>();
+<span class="k">let</span> worker = std::thread::<span class="f">spawn</span>(<span class="k">move</span> || {
+    <span class="k">while</span> !stop.<span class="f">load</span>(<span class="t">Ordering</span>::Acquire) { pump.<span class="f">run_for</span>(<span class="t">Duration</span>::<span class="f">from_millis</span>(<span class="n">100</span>)); }
+});
+
+<span class="c">// 4. Connect. true = request queued; the outcome arrives as an Event.</span>
+<span class="c">// Supply the parseable address printed by your peer as argv[1].</span>
+<span class="k">let</span> remote_text = std::env::<span class="f">args</span>().<span class="f">nth</span>(<span class="n">1</span>).<span class="f">expect</span>(<span class="s">"usage: example '[ip]:port:magic1:key'"</span>);
+<span class="k">let</span> remote = <span class="t">STPAddress</span>::<span class="f">parse</span>(&amp;remote_text).<span class="f">expect</span>(<span class="s">"valid peer address"</span>);
+<span class="k">let</span> peer = remote.<span class="f">connection_key</span>();
+<span class="k">assert!</span>(ep.<span class="f">try_connect</span>(remote));
+
+<span class="c">// 5. One loop: drain events, flush the outbox, park when idle.</span>
+<span class="k">let mut</span> outbox: <span class="t">VecDeque</span>&lt;<span class="t">Vec</span>&lt;<span class="t">u8</span>&gt;&gt; = <span class="t">VecDeque</span>::<span class="f">new</span>();
+<span class="k">let mut</span> connected = <span class="k">false</span>;
+<span class="k">loop</span> {
+    <span class="k">while let</span> <span class="t">Some</span>(event) = ep.<span class="f">try_recv</span>() {
+        <span class="k">match</span> event {
+            <span class="t">Event</span>::Connected { peer: p, .. } <span class="k">if</span> p == peer =&gt; {
+                connected = <span class="k">true</span>;
+                outbox.<span class="f">push_back</span>(<span class="s">b"hello over three rings"</span>.<span class="f">to_vec</span>());
+            }
+            <span class="t">Event</span>::Message { peer, data } =&gt; <span class="m">println!</span>(<span class="s">"{peer:?}: {} bytes"</span>, data.<span class="f">len</span>()),
+            <span class="t">Event</span>::ConnectFailed { address, reason } =&gt; <span class="m">eprintln!</span>(<span class="s">"connect {address:?}: {reason:?}"</span>),
+            <span class="t">Event</span>::Disconnected { peer: p, reason } =&gt; { <span class="k">if</span> p == peer { connected = <span class="k">false</span>; } <span class="m">eprintln!</span>(<span class="s">"gone: {reason:?}"</span>) }
+            _ =&gt; {}
+        }
+    }
+    <span class="c">// Send only after Connected: sends to a still-handshaking peer are dropped as unknown.</span>
+    <span class="k">while</span> connected {
+        <span class="k">let</span> <span class="t">Some</span>(msg) = outbox.<span class="f">front_mut</span>() <span class="k">else</span> { <span class="k">break</span> };
+        <span class="k">if</span> !ep.<span class="f">try_send</span>(peer, <span class="n">0</span>, <span class="t">Dscp</span>::BestEffort, msg) { <span class="k">break</span>; } <span class="c">// full: msg stays in the Vec</span>
+        outbox.<span class="f">pop_front</span>();                                        <span class="c">// accepted: now an empty Vec</span>
+    }
+    <span class="k">if</span> !ep.<span class="f">park_until_ready</span>() { <span class="k">break</span>; } <span class="c">// false = closed and drained</span>
+}
+
+<span class="c">// Shutdown: cancel, not flush.</span>
+ep.<span class="f">close</span>();
+cancel.<span class="f">store</span>(<span class="k">true</span>, <span class="t">Ordering</span>::Release);
+worker.<span class="f">join</span>().<span class="f">unwrap</span>();</code></pre>
+<div class="callout">
+  <div class="title">Addresses and keys</div>
+  <p>An address is <code>[IPv6]:port:magic1:public_key</code> with both trailing parts URL-safe base64 without padding (IPv4 is written IPv4-mapped). <code>magic1</code> selects the handshake: <code>CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s</code>, <code>..._BLAKE2b</code>, or <code>CONNECT_MAGIC1_PLAIN_TEXT</code>, which is a mock scheme for development tests only. To dial an address the pump needs one of its own keypairs with the same <code>magic1</code>. A peer is named by <code>ConnectionKey</code>, which is <code>address.connection_key()</code>: IP, port and 15 bits of the key.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="driving"><span class="num">2</span>Driving the pump</h2>
+<p><code>Pump</code> owns the UDP socket and every bit of protocol state. Nothing runs between calls. The application API is entirely on <code>LockfreeEndpoint</code>, never on <code>Pump</code>.</p>
+<table>
+  <tr><th>Method</th><th>Behaviour</th></tr>
+  <tr><td><code>run_until(deadline: Instant)</code></td><td>Does protocol work until <code>deadline</code>. When idle it blocks on the socket and the command wakeup instead of spinning, so a call generally returns at (or just after) its deadline. If entered at or after the deadline it returns at once and does nothing.</td></tr>
+  <tr><td><code>run_for(duration: Duration)</code></td><td><code>run_until(Instant::now() + duration)</code>.</td></tr>
+  <tr><td><code>next_wakeup() -&gt; Option&lt;Instant&gt;</code></td><td>Earliest scheduled core work as of the last run. Commands or socket readiness can make work ready earlier. <code>None</code> means stopped, not &ldquo;no timer&rdquo;.</td></tr>
+</table>
+
+<h3>Style A: a dedicated thread</h3>
+<p>Loop <code>run_for(100&nbsp;ms)</code> and check a flag you own. The 100&nbsp;ms only bounds how quickly the loop notices your cancel flag; traffic wakes the pump immediately. A test checks that the worker exits well under 100&nbsp;ms after the flag is set.</p>
+<pre><code><span class="k">let</span> join = std::thread::<span class="f">spawn</span>(<span class="k">move</span> || {
+    <span class="k">while</span> !stop.<span class="f">load</span>(<span class="t">Ordering</span>::Acquire) { pump.<span class="f">run_for</span>(<span class="t">Duration</span>::<span class="f">from_millis</span>(<span class="n">100</span>)); }
+});  <span class="c">// examples/support/lockfree_common.rs: Worker::start</span></code></pre>
+
+<h3>Style B: a game frame loop</h3>
+<p>Give the pump a small budget in each frame and drain events between frames. No endpoint call ever does transport work, so the rest of the frame is yours. From <code>examples/lockfree_game.rs</code>:</p>
+<pre><code><span class="k">for</span> frame_number <span class="k">in</span> <span class="n">0</span>..<span class="n">400</span> {
+    <span class="k">let</span> frame = <span class="t">Instant</span>::<span class="f">now</span>();
+    pa.<span class="f">run_until</span>(frame + <span class="t">Duration</span>::<span class="f">from_millis</span>(<span class="n">1</span>)); pb.<span class="f">run_for</span>(<span class="t">Duration</span>::<span class="f">from_millis</span>(<span class="n">1</span>));
+    <span class="k">while let</span> <span class="t">Some</span>(event) = a.<span class="f">try_recv</span>() {
+        <span class="k">if</span> <span class="m">matches!</span>(event, <span class="t">Event</span>::Connected { .. }) &amp;&amp; !sent { <span class="f">send</span>(&amp;<span class="k">mut</span> a, peer, <span class="s">b"message between frames"</span>.<span class="f">to_vec</span>()); sent = <span class="k">true</span>; }
+    }
+    <span class="k">while let</span> <span class="t">Some</span>(event) = b.<span class="f">try_recv</span>() {
+        <span class="k">if let</span> <span class="t">Event</span>::Message { data, .. } = event { <span class="m">println!</span>(<span class="s">"frame {frame_number}: {}"</span>, <span class="t">String</span>::<span class="f">from_utf8_lossy</span>(&amp;data)); <span class="k">return</span>; }
+    }
+    std::thread::<span class="f">sleep</span>((frame + <span class="t">Duration</span>::<span class="f">from_millis</span>(<span class="n">16</span>)).<span class="f">saturating_duration_since</span>(<span class="t">Instant</span>::<span class="f">now</span>()));
+}</code></pre>
+<p>A game-loop pump only advances during its budget, so timers, ACKs and retransmissions run at frame granularity. Throughput is bounded by how much budget you give it. The measured numbers in <a href="#perf">Performance</a> are for a dedicated thread per pump.</p>
+
+<h3>Deadlines and forward progress</h3>
+<div class="callout ok">
+  <div class="title">Guarantee: every call entered before its deadline makes progress</div>
+  <p>A <code>run_until</code> call entered before its deadline admits one eligible pending command and completes one unit of work, even if the deadline passes during clock calibration or preemption. One <em>unit</em> is one received datagram, one data send, one FEC completion or sweep entry, one connection send step, or eight bookkeeping units. An idle pass also counts as a unit. The cooperative overshoot bound is <strong>one admission plus one such unit</strong>.</p>
+</div>
+<ul>
+  <li>Each protocol pass admits at most 32 commands. The deadline is checked before every admission except the first one, which is owed.</li>
+  <li>Protocol clock samples are taken at packet boundaries. Bookkeeping loops with no fresh sample re-check the clock every eight units.</li>
+  <li>A 150&nbsp;&micro;s active-retry quantum that is still running is never shortened. Only the owed command may be admitted inside it. The owed unit waits for a call made after the quantum ends.</li>
+  <li>Deadlines are converted to <code>CLOCK_MONOTONIC_RAW</code> once per call. At the maximum 500&nbsp;ppm NTP slew, a 100&nbsp;ms call has at most ~50&nbsp;&micro;s of drift.</li>
+</ul>
+<div class="callout warn">
+  <div class="title">Caveat: indivisible units</div>
+  <p>A native Wirehair encode, decode or recovery call cannot be preempted. Logical messages up to 1&nbsp;GiB are split into codec units of at most 2&nbsp;MiB, and one such unit can take a few milliseconds. OS scheduling and allocator latency are not hard real-time bounded. Explicit protocol telemetry also costs work proportional to the number of connections and queues. The test <code>deadlines_under_encrypted_fec_load_deliver_messages</code> drives 1&nbsp;MB and 2&nbsp;MB messages with 100&nbsp;&micro;s budgets and asserts a maximum overshoot below 50&nbsp;ms.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="send"><span class="num">3</span>Send ring <span class="tag">app &rarr; pump</span></h2>
+<pre><code><span class="k">pub fn</span> <span class="f">try_send</span>(&amp;<span class="k">mut</span> <span class="k">self</span>, peer: <span class="t">ConnectionKey</span>, queue: <span class="t">usize</span>, class: <span class="t">Dscp</span>, payload: &amp;<span class="k">mut</span> <span class="t">Vec</span>&lt;<span class="t">u8</span>&gt;) -&gt; <span class="t">bool</span></code></pre>
+<table>
+  <tr><th>Result</th><th>Meaning</th></tr>
+  <tr><td><code>true</code></td><td>Accepted. The allocation was moved into the ring with <code>std::mem::take</code>, so <code>payload</code> is now an empty <code>Vec</code>. You never hear about this message again: there is no admission or completion event.</td></tr>
+  <tr><td><code>false</code></td><td>The ring is full, <strong>or</strong> the endpoint is closed or finished. <code>payload</code> is untouched: same pointer, same bytes. Retry later, or park first.</td></tr>
+</table>
+<p>The pump takes messages from the head of the ring in FIFO order. It pops the head only when that peer&rsquo;s protocol send queue has room for it (byte credit for <code>queue</code>). Otherwise the head stays in the ring and <code>stats().send_head_blocked</code> is incremented. Nothing is lost inside the pump to backpressure.</p>
+<p>The head is popped and <strong>dropped and counted</strong> (no event) when:</p>
+<table>
+  <tr><th>Condition</th><th>Counter</th></tr>
+  <tr><td>Peer unknown, disconnected, or <em>still handshaking</em> (not yet <code>Connected</code>)</td><td><code>send_dropped_unknown</code></td></tr>
+  <tr><td>Payload larger than the local <code>max_message_size</code> or the peer&rsquo;s advertised maximum</td><td><code>send_dropped_oversized</code></td></tr>
+  <tr><td><code>queue &gt;= send_queue_count</code> for that connection</td><td><code>send_dropped_invalid_queue</code></td></tr>
+  <tr><td>Admitted to the protocol send queue</td><td><code>sent</code></td></tr>
+</table>
+<p><code>queue</code> picks one of the connection&rsquo;s <code>send_queue_count</code> FIFO queues (default 1), which share bandwidth by equal-weight byte service. <code>class</code> is a <code>Dscp</code> traffic class (<code>BestEffort</code>, <code>Af11</code>, <code>Af21</code>, <code>Ef</code>). It never changes FIFO or round-robin scheduling, or congestion control.</p>
+<div class="callout warn"><div class="title">Wait for Connected</div><p>A send to a peer whose handshake has not completed is dropped as unknown. Start sending to a peer after you see its <code>Event::Connected</code>.</p></div>
+
+<!-- ============================================================ -->
+<h2 id="control"><span class="num">4</span>Control ring <span class="tag">app &rarr; pump</span></h2>
+<pre><code><span class="k">pub enum</span> <span class="t">Control</span> { Connect(<span class="t">STPAddress</span>), Disconnect(<span class="t">ConnectionKey</span>) }
+
+<span class="k">pub fn</span> <span class="f">try_control</span>(&amp;<span class="k">mut</span> <span class="k">self</span>, control: <span class="t">Control</span>) -&gt; <span class="t">bool</span>
+<span class="k">pub fn</span> <span class="f">try_connect</span>(&amp;<span class="k">mut</span> <span class="k">self</span>, address: <span class="t">STPAddress</span>) -&gt; <span class="t">bool</span>     <span class="c">// = try_control(Control::Connect(address))</span>
+<span class="k">pub fn</span> <span class="f">try_disconnect</span>(&amp;<span class="k">mut</span> <span class="k">self</span>, peer: <span class="t">ConnectionKey</span>) -&gt; <span class="t">bool</span> <span class="c">// = try_control(Control::Disconnect(peer))</span></code></pre>
+<p><code>false</code> means the ring is full or the endpoint is closed. In both cases the value is dropped, because it was passed by value. <code>true</code> means queued. Control commands go before sends at each admission. While any lifecycle event is waiting for receive-ring space, the pump consumes no control commands.</p>
+<table>
+  <tr><th>Command</th><th>Outcome</th></tr>
+  <tr><td><code>Connect</code>, new peer</td><td>Handshake starts. Ends in exactly one <code>Connected</code> or <code>ConnectFailed { reason: TimedOut }</code>. The handshake timeout is fixed at 30&nbsp;s.</td></tr>
+  <tr><td><code>Connect</code>, peer already present or handshaking</td><td><code>ConnectFailed { reason: AlreadyConnected }</code></td></tr>
+  <tr><td><code>Connect</code>, no local keypair with that <code>magic1</code>, own key, or unusable</td><td><code>ConnectFailed { reason: InvalidAddress }</code></td></tr>
+  <tr><td><code>Disconnect</code>, connected peer</td><td>Local state is removed at once, with no flush and no wire close. Produces <code>Disconnected { reason: Local }</code>.</td></tr>
+  <tr><td><code>Disconnect</code>, pending connect</td><td><code>ConnectFailed { reason: Cancelled }</code></td></tr>
+  <tr><td><code>Disconnect</code>, unknown peer</td><td>No event.</td></tr>
+</table>
+<div class="callout warn"><div class="title">Disconnect is local cancellation</div><p>No close message is sent. The remote side finds out through its own liveness expiry (120&nbsp;s with no ACK progress and no fresh authenticated packet), and it may reconnect at any time. Queued unsent data for that peer is discarded. Later sends to it count as <code>send_dropped_unknown</code>.</p></div>
+
+<!-- ============================================================ -->
+<h2 id="receive"><span class="num">5</span>Receive ring <span class="tag">pump &rarr; app</span></h2>
+<pre><code><span class="k">pub fn</span> <span class="f">try_recv</span>(&amp;<span class="k">mut</span> <span class="k">self</span>) -&gt; <span class="t">Option</span>&lt;<span class="t">Event</span>&gt;</code></pre>
+<p>This is a single ordered stream of everything the application hears: lifecycle and data, for all peers. Popping an event also wakes the pump, because lifecycle events it holds back may now fit.</p>
+
+<h3 id="events">The event stream</h3>
+<pre><code><span class="k">pub enum</span> <span class="t">Event</span> {
+    Connected     { peer: <span class="t">ConnectionKey</span>, address: <span class="t">STPAddress</span>, handshake_hash: [<span class="t">u8</span>; <span class="n">64</span>] },
+    ConnectFailed { address: <span class="t">STPAddress</span>, reason: <span class="t">ConnectFailure</span> },
+    Disconnected  { peer: <span class="t">ConnectionKey</span>, reason: <span class="t">DisconnectReason</span> },
+    Message       { peer: <span class="t">ConnectionKey</span>, data: <span class="t">Vec</span>&lt;<span class="t">u8</span>&gt; },
+}
+<span class="k">pub enum</span> <span class="t">ConnectFailure</span>   { TimedOut, AlreadyConnected, InvalidAddress, Cancelled }
+<span class="k">pub enum</span> <span class="t">DisconnectReason</span> { Local, TimedOut }</code></pre>
+<p><code>Connected</code> is emitted for both outgoing and incoming associations. An incoming peer appears for the first time as <code>Connected</code>. <code>handshake_hash</code> is the Noise handshake hash, which you can use for channel binding.</p>
+
+<h3 id="ordering">Ordering guarantees</h3>
+<div class="callout ok">
+<div class="title">Guarantees (each covered by a test in <code>tests/lockfree.rs</code>)</div>
+<table>
+  <tr><th>#</th><th>Guarantee</th><th>Test</th></tr>
+  <tr><td>1</td><td>A peer&rsquo;s <code>Connected</code> comes before any <code>Message</code> from it.</td><td><code>lifecycle_order_and_exactly_once_disconnect</code></td></tr>
+  <tr><td>2</td><td>A connected association produces exactly one <code>Disconnected</code>, and nothing from that association after it. Messages for a removed peer are suppressed at once, even before its <code>Disconnected</code> fits in the ring.</td><td><code>lifecycle_order_and_exactly_once_disconnect</code></td></tr>
+  <tr><td>3</td><td>Every processed connect request ends in exactly one <code>Connected</code> or <code>ConnectFailed</code>, including duplicate, invalid, cancelled and timed-out requests. This holds <em>while both the endpoint and the pump are alive</em>. See the close caveat below.</td><td><code>every_connect_request_has_one_outcome_&shy;including_duplicates_and_invalid</code>, <code>cancelled_connect_produces_exactly_one_failure</code>, <code>unreachable_connect_times_out_once_&shy;under_frozen_handshake_timer</code></td></tr>
+  <tr><td>4</td><td>Lifecycle events (<code>Connected</code>, <code>ConnectFailed</code>, <code>Disconnected</code>) are never dropped for lack of space. The pump holds them in order, keeps that order relative to earlier events, and stops consuming control commands until they are delivered.</td><td><code>receive_full_drops_data_but_preserves_disconnect</code></td></tr>
+  <tr><td>5</td><td>A new association under the same peer key produces a new <code>Connected</code>.</td><td>&mdash;</td></tr>
+</table>
+</div>
+<div class="callout warn"><div class="title">Not guaranteed after close</div><p><code>close()</code> or dropping either owner <em>cancels</em>. Queued work can be discarded. Queued connect requests and live associations are <strong>not</strong> promised a final <code>Connected</code>, <code>ConnectFailed</code> or <code>Disconnected</code>. Guarantees 2&ndash;4 apply only while the endpoint and the pump are both alive.</p></div>
+
+<!-- ============================================================ -->
+<h2 id="full"><span class="num">6</span>When a ring is full</h2>
+<p>The pump never waits for the application. The table shows what happens when each ring fills up.</p>
+<table>
+  <tr><th>Ring</th><th>Full means</th><th>Effect</th><th>Recovery</th></tr>
+  <tr><td><strong>Send</strong></td><td>App produced faster than the pump admits, or the FIFO head is blocked on protocol send credit</td><td><code>try_send</code> returns <code>false</code> and your <code>Vec</code> is untouched. Nothing is lost.</td><td>Retry. <code>park_until_ready</code> wakes when space appears after a failed attempt.</td></tr>
+  <tr><td><strong>Control</strong></td><td>Pump has not admitted earlier commands yet (or is holding lifecycle events)</td><td><code>try_connect</code> / <code>try_disconnect</code> return <code>false</code></td><td>Retry. Parking wakes on control space.</td></tr>
+  <tr><td><strong>Receive</strong>, data</td><td>App is not draining</td><td>Incoming <code>Message</code> is <strong>dropped</strong> and counted in <code>receive_dropped_full</code>. This keeps ACK and socket servicing going, so a stalled app cannot stall the transport.</td><td>Drain faster or size <code>receive</code> larger. Lost messages are not re-delivered.</td></tr>
+  <tr><td><strong>Receive</strong>, inbound handshake</td><td>No slot for <code>Connected</code></td><td>The handshake is <strong>refused</strong>: neither new hello state nor completion is admitted. Counted in <code>inbound_refused_full</code>.</td><td>The remote peer&rsquo;s handshake retry succeeds once space returns (<code>inbound_handshake_waits_for_receive_space_then_retries</code>).</td></tr>
+  <tr><td><strong>Receive</strong>, lifecycle</td><td>No slot for <code>Connected</code>, <code>ConnectFailed</code> or <code>Disconnected</code> from a command or timeout</td><td>Held pump-side in order. The number held is bounded by live and pending associations. No control commands are consumed meanwhile.</td><td>Delivered as soon as you drain.</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="parking"><span class="num">7</span>Parking &amp; readiness</h2>
+<pre><code><span class="k">pub fn</span> <span class="f">park_until_ready</span>(&amp;<span class="k">mut</span> <span class="k">self</span>) -&gt; <span class="t">bool</span></code></pre>
+<p>This blocks the application thread on a futex generation counter. It returns immediately if there is already a receive event, a finished telemetry snapshot, or space in a ring whose last <code>try_*</code> failed because it was full. Otherwise it sleeps until one of those happens or the endpoint closes. It returns <code>false</code> only when the endpoint is closed or finished <em>and</em> no events remain to drain. Spurious wakes are allowed, so always re-check with <code>try_*</code> after it returns.</p>
+<pre><code><span class="c">// tests/lockfree.rs: park_for_receive_and_close</span>
+<span class="k">loop</span> {
+    <span class="k">if let</span> <span class="t">Some</span>(<span class="t">Event</span>::Message { data, .. }) = b.<span class="f">try_recv</span>() { <span class="m">assert_eq!</span>(data, <span class="s">b"park"</span>); <span class="k">break</span>; }
+    <span class="m">assert!</span>(b.<span class="f">park_until_ready</span>());
+}</code></pre>
+<p>For a custom wait you can get the raw notifier with <code>readiness() -&gt; Arc&lt;Ready&gt;</code> and call <code>Ready::wait(&amp;self, observed: &amp;mut u64)</code>. Start <code>observed</code> at 0. Spurious wakes and generation wrap at 2<sup>32</sup> apply. On non-Linux targets the wait falls back to 1&nbsp;ms sleeps.</p>
+
+<!-- ============================================================ -->
+<h2 id="stats"><span class="num">8</span>Statistics</h2>
+<h3>Cheap: <code>stats() -&gt; Stats</code></h3>
+<p>These are relaxed atomic loads of cumulative counters, with no lock and no allocation. Each counter is consistent on its own. The set is not an atomic snapshot taken together.</p>
+<table>
+  <tr><th>Field</th><th>Counts</th></tr>
+  <tr><td><code>sent</code></td><td>Messages admitted from the send ring into a protocol send queue</td></tr>
+  <tr><td><code>received</code></td><td>Messages placed in the receive ring</td></tr>
+  <tr><td><code>send_dropped_unknown</code></td><td>Sends to an unknown, disconnected or still-handshaking peer</td></tr>
+  <tr><td><code>send_dropped_oversized</code></td><td>Sends above the local or peer maximum message size</td></tr>
+  <tr><td><code>send_dropped_invalid_queue</code></td><td>Sends with <code>queue &gt;= send_queue_count</code></td></tr>
+  <tr><td><code>receive_dropped_full</code></td><td>Incoming messages dropped because the receive ring was full</td></tr>
+  <tr><td><code>inbound_refused_full</code></td><td>Handshake completions or hellos refused for lack of receive space</td></tr>
+  <tr><td><code>send_head_blocked</code></td><td>Admission attempts stopped by a FIFO head without send credit. This counts attempts, not distinct messages.</td></tr>
+</table>
+<h3>Expensive: protocol telemetry</h3>
+<pre><code>ep.<span class="f">request_protocol_stats</span>();                 <span class="c">// coalesces; never blocks the app</span>
+<span class="c">// ... later, in your loop (park_until_ready also wakes for it):</span>
+<span class="k">if let</span> <span class="t">Some</span>(u) = ep.<span class="f">try_protocol_stats</span>() {        <span class="c">// Option&lt;NetworkThreadPull&gt;</span>
+    <span class="k">for</span> (peer, s) <span class="k">in</span> &amp;u.connection_stats { <span class="m">println!</span>(<span class="s">"{peer:?} rate={} upps rtt={}us"</span>, s.cc_rate_upps, s.rtt_us); }
+    <span class="m">println!</span>(<span class="s">"kernel rx drops: {:?}"</span>, u.thread_stats.kernel_rx_drops);
+}</code></pre>
+<p>The pump collects the snapshot on its next pass and hands it over through a single atomic ownership slot, not another ring. Collecting it allocates, costs work proportional to connections and queues, and takes the core&rsquo;s per-queue <code>budget_sink</code> mutex. Ordinary ring operations do none of these things. The snapshot carries per-connection CC/FEC counters (<code>connection_stats</code>), queue credit (<code>unreliable_send_free_bytes</code>) and thread counters (<code>thread_stats</code>). It carries no messages and no lifecycle state: those come only through the receive ring.</p>
+<div class="callout warn"><div class="title">Legacy fields are always empty here</div><p><code>try_protocol_stats()</code> returns the older <code>NetworkThreadPull</code> type. On this explicit telemetry path its message, connection and rejection fields (<code>received_unreliable_messages</code>, <code>current_connections</code> and the rejection lists) are <strong>always empty</strong>. Read only the telemetry fields. Messages and peer lifecycle come only from <code>try_recv()</code>.</p></div>
+
+<!-- ============================================================ -->
+<h2 id="config"><span class="num">9</span>Configuration</h2>
+<h3>Constructors</h3>
+<pre><code><span class="k">pub fn</span> <span class="f">new_pump</span>(keys: <span class="t">Vec</span>&lt;<span class="t">IdentityKeyPair</span>&gt;, port: <span class="t">u16</span>, max_pps: <span class="t">Option</span>&lt;<span class="t">u64</span>&gt;,
+                bounds: (<span class="t">u32</span>, <span class="t">u32</span>, <span class="t">u32</span>), maximum: <span class="t">usize</span>) -&gt; (<span class="t">Pump</span>, <span class="t">LockfreeEndpoint</span>)
+<span class="k">pub fn</span> <span class="f">new_pump_with_options</span>(keys: <span class="t">Vec</span>&lt;<span class="t">IdentityKeyPair</span>&gt;, port: <span class="t">u16</span>, max_pps: <span class="t">Option</span>&lt;<span class="t">u64</span>&gt;,
+                bounds: (<span class="t">u32</span>, <span class="t">u32</span>, <span class="t">u32</span>), maximum: <span class="t">usize</span>, options: <span class="t">NetworkThreadOptions</span>) -&gt; (<span class="t">Pump</span>, <span class="t">LockfreeEndpoint</span>)
+<span class="k">pub fn</span> <span class="f">new</span>(config: <span class="t">PumpConfig</span>) -&gt; (<span class="t">Pump</span>, <span class="t">LockfreeEndpoint</span>)   <span class="c">// stp::new, same thing with named fields</span></code></pre>
+<p>Setup is synchronous and starts no threads. It <strong>panics</strong> if the socket cannot bind, if a ring capacity is invalid, if <code>send_queue_count</code> is outside 1..=64, or if the receive cap for <code>max_message_size</code> does not fit the receive memory budget.</p>
+<table>
+  <tr><th>Parameter / field</th><th>Type</th><th>Default</th><th>Meaning</th></tr>
+  <tr><td><code>keys</code> / <code>keypairs</code></td><td><code>Vec&lt;IdentityKeyPair&gt;</code></td><td>&mdash;</td><td>Local identities, one per <code>magic1</code> you accept or dial with</td></tr>
+  <tr><td><code>port</code></td><td><code>u16</code></td><td>&mdash;</td><td>UDP port to bind (0 = ephemeral)</td></tr>
+  <tr><td><code>max_pps</code></td><td><code>Option&lt;u64&gt;</code></td><td>&mdash;</td><td>Optional cap on the packet rate; <code>None</code> leaves congestion control alone</td></tr>
+  <tr><td><code>bounds</code> / <code>send_buffer_params</code></td><td><code>(u32, u32, u32)</code></td><td>&mdash;</td><td>Per-queue send buffer: (target queue time in &micro;s, min bytes, max bytes). This sets the protocol send credit that backpressures the send ring. Examples use <code>(1_000_000, 32 &lt;&lt; 20, 32 &lt;&lt; 20)</code>.</td></tr>
+  <tr><td><code>maximum</code> / <code>max_message_size</code></td><td><code>usize</code></td><td>required</td><td>Largest message in either direction, clamped to 1&nbsp;GiB. There is no negotiation, so both sides should configure compatible limits.</td></tr>
+  <tr><td><code>options.rings.send</code></td><td><code>usize</code></td><td><code>128</code></td><td>Send ring capacity: power of two, 1..=65,536</td></tr>
+  <tr><td><code>options.rings.control</code></td><td><code>usize</code></td><td><code>32</code></td><td>Control ring capacity: power of two, 1..=65,536</td></tr>
+  <tr><td><code>options.rings.receive</code></td><td><code>usize</code></td><td><code>128</code></td><td>Receive ring capacity: power of two, 1..=65,536</td></tr>
+  <tr><td><code>options.send_queue_count</code></td><td><code>usize</code></td><td><code>1</code></td><td>FIFO queues per connection (1..=64), also sizing the peer receive cap</td></tr>
+  <tr><td><code>options.receive_memory</code></td><td><code>Option&lt;Arc&lt;ReceiveMemoryBudget&gt;&gt;</code></td><td><code>None</code></td><td>Receive allocation budget. Share one <code>Arc</code> across pumps for a global limit. <code>None</code> uses one process-wide 4&nbsp;GiB budget. Messages already handed to the app are not counted.</td></tr>
+  <tr><td><code>options.bind_ip</code></td><td><code>Option&lt;IpAddr&gt;</code></td><td><code>None</code></td><td>Local IP to bind</td></tr>
+  <tr><td><code>options.record_fec_messages</code></td><td><code>bool</code></td><td><code>false</code></td><td>Include per-message FEC progress in protocol telemetry</td></tr>
+  <tr><td><code>options.record_loss_episodes</code></td><td><code>bool</code></td><td><code>false</code></td><td>Record loss-episode statistics (never changes CC)</td></tr>
+  <tr><td><code>options.loss_trace</code></td><td><code>Option&lt;PathBuf&gt;</code></td><td><code>None</code></td><td>Write a sender packet/fragment/outcome CSV trace</td></tr>
+</table>
+<p>The three capacities are independent. They count <em>slots</em>, not bytes: a send or message slot holds a moved <code>Vec&lt;u8&gt;</code> of any size up to the maximum message, so there are no fixed byte slabs and no copies. Choosing ring sizes: <code>send</code> sets how many messages you can have in flight before <code>try_send</code> pushes back. The pipelined benchmarks used 8192 to keep a deep pipeline. <code>receive</code> should hold a burst of what you expect between two drains, because overflowing <em>data</em> is dropped. <code>control</code> rarely needs to be large.</p>
+
+<!-- ============================================================ -->
+<h2 id="threading"><span class="num">10</span>Threading &amp; ownership</h2>
+<div class="grid2">
+  <div class="kpi"><div class="v">0</div><div class="l">threads started by the library. Setup, protocol work and shutdown all run on threads you own.</div></div>
+  <div class="kpi"><div class="v">1 + 1</div><div class="l">owners: one <code>Pump</code> (any thread, one at a time) and one <code>LockfreeEndpoint</code> (any thread, one at a time).</div></div>
+</div>
+<ul>
+  <li><code>Pump</code> is <code>Send</code>. Move it to a worker thread, or keep it on the game thread. It is the only consumer of the send and control rings and the only producer of the receive ring.</li>
+  <li><code>LockfreeEndpoint</code> is <code>Send</code> but deliberately <strong>not <code>Sync</code></strong> (a <code>PhantomData&lt;Cell&lt;()&gt;&gt;</code> marker), and its mutating methods take <code>&amp;mut self</code>. That is what makes the SPSC contract sound. You can hand it to another thread (tests move it into a parker thread and back), but you cannot share it. If several threads need to send, put your own queue or <code>Mutex</code> in front of it. Checked by <code>handle_is_send_but_not_sync</code>.</li>
+  <li>Each ring cursor has exactly one writer. Producers publish with Release, consumers observe with Acquire, and cursors are padded to their own 64-byte cache lines.</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="shutdown"><span class="num">11</span>Shutdown</h2>
+<ul>
+  <li><code>ep.close()</code> sets the stop flag and wakes both sides. After it, every <code>try_*</code> producer returns <code>false</code>.</li>
+  <li>Dropping <code>Pump</code> closes the UDP socket and publishes termination, even on unwind and even if the pump never ran. <code>ep.is_finished()</code> then reports <code>true</code>, and <code>park_until_ready()</code> returns <code>false</code> once events are drained.</li>
+  <li>Dropping the endpoint also closes.</li>
+  <li>Both of these <strong>cancel; they do not flush</strong>. Queued sends can be discarded, and lifecycle events are not promised for every queued request or association.</li>
+  <li>Stopping a dedicated thread: call <code>close()</code>, set your cancel flag, and join. The pump is dropped when its thread returns.</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="tradeoffs"><span class="num">12</span>Trade-offs &amp; limits</h2>
+<div class="callout warn">
+  <div class="title">Head-of-line blocking across peers</div>
+  <p>There is a single FIFO send ring. When the head message&rsquo;s peer has no protocol send credit, it stays at the head, and messages queued behind it for <em>other</em> peers wait until that peer drains or is disconnected. <code>stats().send_head_blocked</code> shows it happening. The test <code>fifo_credit_blocks_other_peer_until_head_disconnects</code> demonstrates it: peer B is rate-limited to 1&nbsp;pps with a 1-byte send buffer, a 1&nbsp;MB message to B blocks a message to C, and disconnecting B releases it. If you mix a slow bulk peer with latency-sensitive ones, gate sends to the slow peer in your app (for example, keep your own per-peer outbox and use protocol telemetry&rsquo;s <code>unreliable_send_free_bytes</code>), or run separate pumps.</p>
+</div>
+<ul>
+  <li><strong>No hard real-time bound.</strong> Overshoot is one admission plus one indivisible unit, and a native FEC unit (up to 2&nbsp;MiB) can take a few ms. OS scheduling and allocation are outside the bound.</li>
+  <li><strong>Data can be dropped on receive</strong> if the app does not drain. That is intentional, so the transport keeps ACKing. Size <code>receive</code> to fit.</li>
+  <li><strong>No per-message send feedback.</strong> An accepted message has no delivery or failure event. Drops are visible only as counters.</li>
+  <li><strong>Disconnect is local</strong>, with no wire close. The remote side times out after 120&nbsp;s of no liveness.</li>
+  <li><strong>Linux-specific pieces:</strong> futex parking and eventfd pump wakeups. Other targets fall back to 1&nbsp;ms sleep polling in <code>Ready::wait</code>. The clock is <code>CLOCK_MONOTONIC_RAW</code>. All measurements here are Linux.</li>
+  <li><strong>Congestion policy and handshake timer are fixed internally</strong>: not configurable through this API.</li>
+  <li><strong>Handshakes:</strong> Noise IK (X25519, ChaChaPoly, BLAKE2s or BLAKE2b) selected by <code>magic1</code>. Plaintext is for tests only.</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="perf"><span class="num">13</span>Performance</h2>
+<p>Loopback on a Ryzen 5 5500U with the HPET clocksource, each pump on its own thread, encrypted (Noise IK, BLAKE2s). These are the median of 3 interleaved runs, with [min..max] where shown. The previous lock-free design (<code>e8319f2</code>) is compared with this rings design (<code>45224d0</code>). Every cell had <strong>zero lost, corrupt, duplicate or dropped</strong> messages. Harness: <code>examples/throughput_matrix.rs</code>, ring capacity 8192.</p>
+<div class="legend"><span><i style="background:var(--old)"></i>previous (e8319f2)</span><span><i style="background:var(--new)"></i>rings (45224d0)</span></div>
+
+<div class="chart">
+  <h4>Messages/s, deep pipeline (8192 in flight)</h4>
+  <div class="bargroup"><div class="name">16 B</div><div class="bar old" style="width:37.2%"><span>119.0k</span></div><div class="bar new" style="width:96.0%"><span>307.3k [300.0..314.8k]<b>2.58&times;</b></span></div></div>
+  <div class="bargroup"><div class="name">100 B</div><div class="bar old" style="width:37.1%"><span>118.6k</span></div><div class="bar new" style="width:96.6%"><span>309.1k [301.6..317.2k]<b>2.61&times;</b></span></div></div>
+  <div class="bargroup"><div class="name">1 KB</div><div class="bar old" style="width:24.4%"><span>78.2k</span></div><div class="bar new" style="width:40.0%"><span>127.9k [126.0..160.9k]<b>1.64&times;</b></span></div></div>
+</div>
+
+<div class="chart">
+  <h4>Messages/s, 32 in flight</h4>
+  <div class="bargroup"><div class="name">16 B</div><div class="bar old" style="width:57.1%"><span>57.1k</span></div><div class="bar new" style="width:83.3%"><span>83.3k<b>1.46&times;</b></span></div></div>
+  <div class="bargroup"><div class="name">100 B</div><div class="bar old" style="width:59.9%"><span>59.9k</span></div><div class="bar new" style="width:91.5%"><span>91.5k<b>1.53&times;</b></span></div></div>
+  <div class="bargroup"><div class="name">1 KB</div><div class="bar old" style="width:63.9%"><span>63.9k</span></div><div class="bar new" style="width:87.0%"><span>87.0k<b>1.36&times;</b></span></div></div>
+</div>
+
+<div class="chart">
+  <h4>Bulk throughput, MB/s (decimal)</h4>
+  <div class="bargroup"><div class="name">64 KiB pipelined</div><div class="bar old" style="width:65.0%"><span>169</span></div><div class="bar new" style="width:66.9%"><span>174</span></div></div>
+  <div class="bargroup"><div class="name">64 KiB one-at-a-time</div><div class="bar old" style="width:41.9%"><span>109</span></div><div class="bar new" style="width:45.8%"><span>119</span></div></div>
+  <div class="bargroup"><div class="name">1 MiB pipelined</div><div class="bar old" style="width:91.9%"><span>239</span></div><div class="bar new" style="width:94.6%"><span>246</span></div></div>
+  <div class="bargroup"><div class="name">1 MiB one-at-a-time</div><div class="bar old" style="width:89.6%"><span>233</span></div><div class="bar new" style="width:96.5%"><span>251</span></div></div>
+  <div class="bargroup"><div class="name">16 MiB pipelined</div><div class="bar old" style="width:81.2%"><span>211</span></div><div class="bar new" style="width:82.7%"><span>215</span></div></div>
+  <div class="bargroup"><div class="name">16 MiB one-at-a-time</div><div class="bar old" style="width:82.7%"><span>215</span></div><div class="bar new" style="width:85.4%"><span>222</span></div></div>
+</div>
+
+<div class="chart">
+  <h4>Post-idle delivery delay, &micro;s (lower is better)</h4>
+  <div class="bargroup"><div class="name">p50</div><div class="bar old" style="width:48.3%"><span>338</span></div><div class="bar new" style="width:42.6%"><span>298</span></div></div>
+  <div class="bargroup"><div class="name">p99</div><div class="bar old" style="width:88.0%"><span>616</span></div><div class="bar new" style="width:80.0%"><span>560</span></div></div>
+</div>
+
+<div class="grid2">
+  <div class="kpi"><div class="v">0.5% &rarr; 0.6%</div><div class="l">idle CPU, of one core (connected, no traffic)</div></div>
+  <div class="kpi"><div class="v">98.8 &rarr; 93.4 MB</div><div class="l">peak RSS</div></div>
+</div>
+
+<h3>Where the ceiling is</h3>
+<p>One connection tops out around <strong>250&nbsp;MB/s (~2&nbsp;Gbit/s)</strong>. The limit is the <em>sender</em> pump thread running at ~100% of one core. Congestion control was not the limit: its target rate was 1.2&ndash;2.3&times; what was achieved. Sender pump profile:</p>
+<div class="stack">
+  <div style="width:28%;background:#2f6fdf">crypto 28%</div>
+  <div style="width:27%;background:#0f8f72">sendmsg/datagram 27%</div>
+  <div style="width:19%;background:#8a3fbf">FEC 19%</div>
+  <div style="width:12%;background:#b8620b">clock 12%</div>
+  <div style="width:14%;background:#6b7280">other</div>
+</div>
+<p class="dcap">There is one <code>sendmsg</code> per datagram, and clock reads are expensive under HPET. In the small-message pump about 50% of the time goes to clock reads (HPET). For scale, plain TCP loopback with a single stream measured 23.4&nbsp;Gbit/s on the same machine, but that has no crypto, no FEC and uses 64&nbsp;KB segments, so it is a reference point rather than a like-for-like comparison.</p>
+<div class="callout"><div class="title">Test status at 45224d0</div><p>475 passed / 2 ignored (default build), 509 passed / 16 ignored (research build). The golden plan hash is unchanged.</p></div>
+
+<!-- ============================================================ -->
+<h2 id="reference"><span class="num">14</span>API reference</h2>
+<p>Paths: <code>shielded_transport_pigeon::stp</code> re-exports <code>Pump</code>, <code>LockfreeEndpoint</code> and <code>RingConfig</code>. <code>shielded_transport_pigeon::pump</code> exports <code>Pump</code>, <code>LockfreeEndpoint</code>, <code>RingConfig</code>, <code>Control</code>, <code>Event</code>, <code>Stats</code>, <code>ConnectFailure</code> and <code>DisconnectReason</code>. <code>Ready</code> lives at <code>pump::port::Ready</code>. The examples use <code>use shielded_transport_pigeon::{pump::port::lockfree::*, stp::*};</code>.</p>
+<table>
+  <tr><th>Item</th><th>Signature</th><th>Notes</th></tr>
+  <tr><td colspan="3"><strong>Construction</strong> (<code>stp</code>)</td></tr>
+  <tr><td><code>new_pump</code></td><td class="sig"><code>fn(Vec&lt;IdentityKeyPair&gt;, u16, Option&lt;u64&gt;, (u32,u32,u32), usize) -&gt; (Pump, LockfreeEndpoint)</code></td><td>Default options</td></tr>
+  <tr><td><code>new_pump_with_options</code></td><td class="sig"><code>fn(..., NetworkThreadOptions) -&gt; (Pump, LockfreeEndpoint)</code></td><td>Ring sizes in <code>options.rings</code></td></tr>
+  <tr><td><code>new</code></td><td class="sig"><code>fn(PumpConfig) -&gt; (Pump, LockfreeEndpoint)</code></td><td>Named-field form</td></tr>
+  <tr><td><code>PumpConfig</code></td><td class="sig"><code>struct { keypairs, port, max_pps, send_buffer_params, max_message_size, options }</code></td><td></td></tr>
+  <tr><td><code>NetworkThreadOptions</code></td><td class="sig"><code>struct { rings, send_queue_count, receive_memory, bind_ip, record_fec_messages, record_loss_episodes, loss_trace }</code></td><td><code>Default</code></td></tr>
+  <tr><td><code>RingConfig</code></td><td class="sig"><code>struct { send: usize, control: usize, receive: usize }</code></td><td>Default 128 / 32 / 128</td></tr>
+  <tr><td><code>new_keypair_from_connect_magic1</code></td><td class="sig"><code>fn(u64) -&gt; Option&lt;IdentityKeyPair&gt;</code></td><td>Also <code>_with_seed(u64, [u8; 32])</code></td></tr>
+  <tr><td><code>CONNECT_MAGIC1_*</code></td><td class="sig"><code>Noise_IK_25519_ChaChaPoly_BLAKE2s</code>, <code>..._BLAKE2b</code>, <code>PLAIN_TEXT</code></td><td><code>u64</code> constants</td></tr>
+  <tr><td><code>IdentityKeyPair</code></td><td class="sig"><code>struct { magic1: u64, private: Vec&lt;u8&gt;, public: Vec&lt;u8&gt; }</code></td><td></td></tr>
+  <tr><td><code>STPAddress</code></td><td class="sig"><code>struct { ip: Ipv6Addr, port: u16, magic1: u64, key: Vec&lt;u8&gt; }</code></td><td><code>from(ip, port, &amp;kp)</code>, <code>parse(&amp;str) -&gt; Option&lt;Self&gt;</code>, <code>connection_key()</code>; <code>Debug</code> prints the parseable form</td></tr>
+  <tr><td><code>ConnectionKey</code></td><td class="sig"><code>struct { ip: Ipv6Addr, port: u16, key_15_bits: u16 }</code></td><td><code>Copy + Eq + Hash + Ord</code>; <code>From&lt;&amp;STPAddress&gt;</code></td></tr>
+  <tr><td><code>Dscp</code></td><td class="sig"><code>enum { BestEffort = 0, Af11 = 10, Af21 = 18, Ef = 46 }</code></td><td>Traffic class; does not affect scheduling or CC</td></tr>
+  <tr><td colspan="3"><strong><code>Pump</code></strong> (Send)</td></tr>
+  <tr><td><code>run_until</code></td><td class="sig"><code>fn(&amp;mut self, deadline: Instant)</code></td><td>No-op if already past the deadline</td></tr>
+  <tr><td><code>run_for</code></td><td class="sig"><code>fn(&amp;mut self, duration: Duration)</code></td><td></td></tr>
+  <tr><td><code>next_wakeup</code></td><td class="sig"><code>fn(&amp;self) -&gt; Option&lt;Instant&gt;</code></td><td><code>None</code> = stopped</td></tr>
+  <tr><td colspan="3"><strong><code>LockfreeEndpoint</code></strong> (Send, !Sync)</td></tr>
+  <tr><td><code>try_send</code></td><td class="sig"><code>fn(&amp;mut self, ConnectionKey, usize, Dscp, &amp;mut Vec&lt;u8&gt;) -&gt; bool</code></td><td>Moves the Vec only on <code>true</code></td></tr>
+  <tr><td><code>try_control</code></td><td class="sig"><code>fn(&amp;mut self, Control) -&gt; bool</code></td><td></td></tr>
+  <tr><td><code>try_connect</code></td><td class="sig"><code>fn(&amp;mut self, STPAddress) -&gt; bool</code></td><td></td></tr>
+  <tr><td><code>try_disconnect</code></td><td class="sig"><code>fn(&amp;mut self, ConnectionKey) -&gt; bool</code></td><td></td></tr>
+  <tr><td><code>try_recv</code></td><td class="sig"><code>fn(&amp;mut self) -&gt; Option&lt;Event&gt;</code></td><td></td></tr>
+  <tr><td><code>park_until_ready</code></td><td class="sig"><code>fn(&amp;mut self) -&gt; bool</code></td><td><code>false</code> = closed and drained</td></tr>
+  <tr><td><code>stats</code></td><td class="sig"><code>fn(&amp;self) -&gt; Stats</code></td><td>Relaxed atomics</td></tr>
+  <tr><td><code>request_protocol_stats</code></td><td class="sig"><code>fn(&amp;self)</code></td><td>Coalesces</td></tr>
+  <tr><td><code>try_protocol_stats</code></td><td class="sig"><code>fn(&amp;self) -&gt; Option&lt;NetworkThreadPull&gt;</code></td><td>Ownership transfer</td></tr>
+  <tr><td><code>readiness</code></td><td class="sig"><code>fn(&amp;self) -&gt; Arc&lt;Ready&gt;</code></td><td>Raw futex notifier</td></tr>
+  <tr><td><code>close</code></td><td class="sig"><code>fn(&amp;self)</code></td><td>Cancel, not flush</td></tr>
+  <tr><td><code>is_finished</code></td><td class="sig"><code>fn(&amp;self) -&gt; bool</code></td><td>Pump has exited or been dropped</td></tr>
+  <tr><td colspan="3"><strong>Ring types</strong> (<code>pump</code>)</td></tr>
+  <tr><td><code>Control</code></td><td class="sig"><code>enum { Connect(STPAddress), Disconnect(ConnectionKey) }</code></td><td></td></tr>
+  <tr><td><code>Event</code></td><td class="sig"><code>enum { Connected { peer, address, handshake_hash: [u8; 64] }, ConnectFailed { address, reason }, Disconnected { peer, reason }, Message { peer, data: Vec&lt;u8&gt; } }</code></td><td></td></tr>
+  <tr><td><code>ConnectFailure</code></td><td class="sig"><code>enum { TimedOut, AlreadyConnected, InvalidAddress, Cancelled }</code></td><td></td></tr>
+  <tr><td><code>DisconnectReason</code></td><td class="sig"><code>enum { Local, TimedOut }</code></td><td></td></tr>
+  <tr><td><code>Stats</code></td><td class="sig"><code>struct { sent, received, send_dropped_unknown, send_dropped_oversized, send_dropped_invalid_queue, receive_dropped_full, inbound_refused_full, send_head_blocked }</code></td><td>All <code>u64</code></td></tr>
+  <tr><td><code>Ready</code></td><td class="sig"><code>fn wait(&amp;self, observed: &amp;mut u64)</code></td><td>Futex on Linux</td></tr>
+</table>
+
+<footer>
+  Documents <code>shielded_transport_pigeon 0.3.0</code>; API/runtime baseline <code>45224d0</code>. The authoritative sources are <code>src/pump/</code> (<code>mod.rs</code>, <code>lockfree.rs</code>, <code>port.rs</code>, <code>ring.rs</code>), the constructors in <code>src/stp.rs</code>, <code>tests/lockfree.rs</code>, <code>tests/pump.rs</code> and <code>examples/</code>. Protocol details, constants and wire formats are in <code>PROTOCOL.md</code> in the repository.
+</footer>
+</main>
+</div>
+</body>
+</html>

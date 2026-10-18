@@ -36,7 +36,7 @@
 //! (seconds:percent from network thread start, optional @period repeat) varies it over time, and
 //! STP_TEST_DROP_BURST=n makes drops come in runs of n packets.
 //!
-//! Every message, data or control, is framed [id u32 LE][total len u32 LE][blake3(payload) 32B][payload].
+//! Every message, data or control, is framed `[id u32 LE][total len u32 LE][blake3(payload) 32B][payload]`.
 //! Data ids are 0..count; ids from CTRL_BASE up are control messages:
 //!   PING        sender -> server  payload [sender_ns u64]
 //!   PONG        server -> sender  payload [sender_ns u64][server_ns u64]

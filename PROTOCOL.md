@@ -2,8 +2,22 @@
 
 This document specifies the incompatible version-2 transport implemented by
 `shielded_transport_pigeon`. It does not change the crate's package version.
-All integers are unsigned little-endian; offsets below are byte offsets. One
-UDP payload is one STP packet. There is no compatibility with version 1.
+All STP framing integers are unsigned little-endian; offsets below are byte
+offsets. Public keys and Noise messages are byte strings with the encodings
+specified by Noise, not little-endian STP integers. One UDP payload is one STP
+packet. There is no compatibility with version 1.
+
+The words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** specify
+requirements for this interoperable wire profile. Statements explicitly labelled
+"this implementation", "local", or "sender policy" describe the shipped Rust
+implementation, not additional peer-negotiated requirements. Wire version 2 is
+independent of the crate version and the application API. This is the release
+candidate's version-2 profile, **including** the whole-duplication flags; an older
+version-2 implementation without those flags is not compatible.
+
+An independent implementation needs this document, the Noise specification for
+the selected suite, and the exact vendored Wirehair codec pinned below. No Rust
+object layout, thread model, queue index, or public API type is serialized.
 
 ## Scope and delivery
 
@@ -56,9 +70,42 @@ profile). A Noise server datagram is `reply_prefix[6] || Noise IK message 2`
 `sender_prefix = low_u16(static_public_key) << 1` (truncated to u16).
 Developer plaintext client packets are selector[6], public key[32], client
 payload[289], total 327 bytes; server packets are reply prefix[6], public
-key[32], server payload[40], total 78 bytes. Handshake packets are dispatched
-before ordinary size-based ACK classification. Retransmissions reuse the
-original handshake bytes, not a new Noise transcript.
+key[32], server payload[40], total 78 bytes. ClientHello dispatch uses bit zero of byte 0 (set); the selector is matched
+exactly. An even prefix selects an existing association by source IP address,
+source UDP port, and sender prefix. A pending initiator recognizes ServerHello
+by bytes 2..5 all being `ff`; a connected endpoint instead attempts ordinary
+AEAD admission. Handshake packets are dispatched before ordinary size-based ACK
+classification. Retransmissions reuse the original handshake bytes, not a new
+Noise transcript. An unknown selector, unknown association, failed handshake
+authentication, invalid application offer/choice, or incompatible declaration
+produces no wire error response.
+
+Complete encrypted-profile handshake layouts (ranges are half-open):
+
+| Datagram | Range | Contents |
+|---|---|---|
+| ClientHello (391 bytes) | 0..6 | little-endian six-byte selector / Noise prologue |
+| | 6..38 | Noise initiator ephemeral public key `e` (32 bytes) |
+| | 38..86 | Noise-encrypted initiator static key `s` (32 bytes + tag) |
+| | 86..391 | Noise-encrypted client payload (289 bytes + tag) |
+| ServerHello (94 bytes) | 0..6 | little-endian reply prefix, **not** a second prologue |
+| | 6..38 | Noise responder ephemeral public key `e` (32 bytes) |
+| | 38..94 | Noise-encrypted server payload (40 bytes + tag) |
+
+The client payload offsets are count at 0, 32 application-ID slots at 1..257,
+and declaration at 257..289. The server payload offsets are chosen application
+ID at 0..8 and declaration at 8..40. The Noise IK pre-message is the responder
+static key; the flights follow `-> e, es, s, ss` and `<- e, ee, se`. Handshake
+hashes, cipher state, DH order and handshake nonces follow Noise, not the STP
+connected-packet counters. After the second flight, Noise Split gives the
+initiator-to-responder and responder-to-initiator keys; apply the one REKEY per
+direction described under "Key epochs" before any connected packet.
+
+For developer plaintext the corresponding byte ranges are selector/prefix
+0..6, sender static key 6..38, then the unencrypted payload 38..327 (client)
+or 38..78 (server). The implementation accepts a plaintext ClientHello with
+trailing bytes but sends exactly 327 bytes; interoperable senders MUST use the
+specified lengths. This mode MUST NOT be treated as an authenticated profile.
 
 ### Handshake confirmation and simultaneous initiation
 
@@ -71,11 +118,35 @@ reply arrived: the initiator MUST send an ordinary, authenticated data-class
 packet within five seconds of accepting ServerHello, even if the application
 is idle. An all-padding current-TU keepalive suffices. It MUST keep sending
 ACK-eliciting keepalives as specified below until the responder is confirmed.
-The responder enters Connected on the first successfully authenticated
-ordinary packet under the split/rekeyed keys, then processes that packet
-normally, including positive receipt feedback. There is no third Noise flight.
-It does not send ordinary application traffic before confirmation. The
-plaintext developer variant follows the transitions without authentication.
+This implementation enters Connected on the first successfully authenticated
+ordinary packet under the split/rekeyed keys, **before** checking packet type,
+replay, minimum size or ACK semantics. It then processes that packet normally;
+positive receipt feedback is generated only if subsequent data admission allows
+it. Thus AEAD success confirms receipt of the responder's Noise flight, not
+validity or application delivery of the confirming packet. There is no third
+Noise flight. It does not send ordinary application traffic before this
+transition. In developer plaintext even this authentication gate is absent.
+
+| State | Input/action | Next state |
+|---|---|---|
+| Absent | local connect request: generate and save ClientHello | ClientHello-sending |
+| Absent | valid ClientHello and local admission succeeds: save ServerHello and split keys | ServerHello-sending |
+| ClientHello-sending | timer: resend saved ClientHello | unchanged |
+| ClientHello-sending | valid compatible ServerHello: split/rekey keys; schedule data/keepalive | Connected |
+| ClientHello-sending | simultaneous ClientHello from smaller public key: answer it | ServerHello-sending |
+| ServerHello-sending | timer: resend saved ServerHello | unchanged |
+| ServerHello-sending | ordinary packet with valid transport AEAD | Connected, then ordinary admission |
+| Connected | fresh admitted data or ACK | Connected; process as below |
+| Connected | ClientHello for the existing association | unchanged; do not reset |
+| Any live state | local disconnect, deadline, or safety exhaustion | Closed (remove local association) |
+
+Closed is conceptual: there is **no close frame, reset packet, reliable stream
+control, or wire disconnect reason**. Reconnection creates fresh handshake and
+transport state. Endpoint lookup is by source address/port plus the 15-bit
+prefix, not a cryptographic connection ID; this implementation does not support
+address migration or concurrent identities that collide in that lookup key.
+Admission may also refuse a handshake when lifecycle-event or memory capacity
+is unavailable; that refusal does not negotiate a different wire profile.
 
 If both peers initiate concurrently with the same identities and selector,
 compare the complete 32-byte static public keys lexicographically as byte
@@ -160,12 +231,13 @@ The length makes the declaration boundary explicit. Unknown versions or
 lengths are rejected, not guessed. Future compatible frame extensions do not
 require expanding this fixed handshake declaration.
 
-A sender obeys both its local maximum and the peer's declared maximum. An
-oversized submission is returned in `send_unreliable_oversized`; submissions
-before handshake completion remain retryable. The receiver independently
-checks whole lengths, fragment extents, coded-unit lengths and segmented totals
-before allocation. Local receive/worker quotas are allowed to be stricter than
-wire maxima. The declaration does not promise unlimited history or memory.
+A sender MUST obey the peer's declared maximum and may impose a smaller local
+maximum. The receiver independently checks whole lengths, fragment extents,
+coded-unit lengths and segmented totals. Local receive/decoder quotas may be
+stricter than wire maxima. The declaration does not promise unlimited history
+or memory. The public rings API's admission, dropping and counter behavior is
+local API policy (see README), not an on-wire error or delivery receipt; in
+particular accepting a send into a ring does not promise peer delivery.
 
 ## Ordinary connected packet
 
@@ -184,11 +256,15 @@ authentication. Developer plaintext uses this header with epoch zero and no tag.
 
 ### Nonces and replay
 
-Data/probe/keepalive nonces are `0 .. 2^63-1`; ACK nonces are
-`2^63 .. 2^64-2`. `2^64-1` is reserved by Noise and is never used. Each direction
-allocates its own monotonically increasing counter within each space. A fresh
-handshake is required before exhaustion; counters never wrap, reset at rekey,
-or reuse a nonce for different plaintext under a key.
+Data/probe/keepalive nonce space is `0 .. 2^63-1` inclusive; ACK nonce space is
+`2^63 .. 2^64-2` inclusive. `2^64-1` is reserved by Noise and MUST NOT be used.
+This implementation also reserves data nonce `2^63-1`, closing before sealing
+it, so its highest emitted data nonce is `2^63-2`. Initial outgoing nonces are
+zero for data and `2^63` for ACKs in each direction. Counters are independent,
+monotonically increase within each space, and MUST NOT wrap or reset at rekey.
+A fresh handshake is required before exhaustion. A `(direction, key, nonce)`
+MUST NOT seal different plaintext or associated data. Retrying an already
+sealed locally blocked datagram reuses its exact bytes, not an encryption.
 
 The two anti-replay histories are independent and persist across rekeys.
 The full transmitted nonce authenticates correctly after arbitrarily large
@@ -212,6 +288,49 @@ larger TU is recorded but promotion is deferred until that immutable datagram
 is accepted. Every retry is therefore still exactly the effective current TU.
 Promote before framing the next datagram; never reseal changed plaintext under
 the pending nonce. MTU probes retain their explicit probe-size exception.
+
+### Receive admission and rejection order
+
+The shipped receiver follows this order; malformed authenticated input is not
+an atomic transaction and state changes are not rolled back.
+
+1. Demultiplex by source address/port and prefix; require the 14-byte header.
+2. Select only the key for the supplied epoch and verify AEAD with the entire
+   header as associated data. A valid current+1 tag advances the incoming epoch
+   and starts previous-key retention **at this point**, even if later checks
+   reject the packet. An invalid tag cannot advance epochs or replay history.
+3. Classify ACK by plaintext length 152 and require agreement with nonce space.
+4. Commit packet replay admission. Duplicate/too-old packets stop here and do
+   not regenerate ACK feedback. This replay commit precedes minimum-size,
+   ACK semantic, frame and resource checks: a later rejected nonce stays spent.
+5. Reject data plaintext shorter than 517. For ACKs, decode the fixed format
+   and validate that the highest positive receipt is below the next **sent**
+   data nonce (locally pending data have not advanced that counter). Valid ACKs
+   refresh peer activity and may confirm outgoing keys; only new positive
+   receipts progress delivery/loss state. ACK packets never elicit ACKs.
+6. For data, refresh peer activity, apply whole-duplication admission and parse
+   frames in order. A frame can complete/deliver before a later frame fails.
+   Unknown frames are skipped. Truncated known frames stop parsing; this alone
+   does not withhold receipt feedback for the physical packet.
+7. If any receive-memory/table/decoder-ingress admission was refused, withhold
+   the entire packet's positive receipt; otherwise record its nonce and ECN CE
+   in the ACK receiver. This can acknowledge packets whose invalid/stale frames
+   were skipped, and can withhold an ACK after another frame already delivered.
+
+Further local distinctions: an oversized whole frame stops packet processing
+without an ACK but does not close the connection. An over-limit FEC unit/root,
+a plain extent exceeding the declared maximum, or plain u32 extent overflow
+removes the association (the current API labels this `TimedOut`; there is no
+wire reason). Other invalid FEC layouts, symbol lengths or role conflicts are
+skipped. A plain extent above 2 MiB but within the declared maximum fails
+reassembly admission and withholds the ACK. These choices are implementation
+error policy, not messages a peer must send. Compliant senders MUST respect
+all declared bounds and the consistency rules below.
+
+A positive STP ACK is therefore packet feedback, **not** a reliable application
+receipt. In particular the public receive ring may drop a completed message
+when full while normal ACK processing continues. Neither replay admission nor
+whole-duplication suppression is rolled back on such an application-side drop.
 
 ## Frame stream
 
@@ -243,6 +362,24 @@ cause an infinite parsing loop.
 | 5 | grouped Wirehair symbol | same as kind 4 | 21 |
 | 6 | segmented Wirehair symbol | kind-4 fields, root_id:u64, total:u32, unit_offset:u32 | 37 |
 
+Complete frame layouts (offsets relative to the frame's first kind byte;
+`L` is body_length, and each frame ends at `3+L`):
+
+| Kind | Byte ranges and contents | Minimum L |
+|---|---|---:|
+| 1 | kind[0], L[1..3], message[3..3+L] | 0 |
+| 2, 3 | kind[0], L[1..3], message_id[3..11], offset[11..15], data[15..3+L] | 12 |
+| 4, 5 | kind[0], L[1..3], unit_id[3..11], block_id[11..15], unit_len[15..19], block_bytes[19..21], symbol[21..3+L] | 18 |
+| 6 | kind[0], L[1..3], unit_id[3..11], block_id[11..15], unit_len[15..19], block_bytes[19..21], root_id[21..29], total[29..33], unit_offset[33..37], symbol[37..3+L] | 34 |
+| 255 | kind[0], ignored tail[1..end of plaintext]; **no L field** | n/a |
+
+A sender MUST NOT place duplication flags on later frame-kind bytes. For
+robustness the current parser strips a recognized flag nibble on any frame;
+only the **first** byte controls whole-message duplicate suppression. Unknown
+high-nibble combinations are ordinary unknown TLV kinds, not a reason to infer
+another flag format. Padding terminates parsing without inspecting the tail;
+conforming senders fill the complete padding tail with `ff`.
+
 All remaining body bytes are data. A whole frame, even a zero-byte message, is
 one complete application message; its identity is its containing packet nonce
 and frame position. Packet replay admission suffices for its duplicate
@@ -261,17 +398,22 @@ flag only appears on the first frame of the datagram; later frames are
 unflagged. The receiver parses the first frame as its base kind. Unflagged
 datagrams behave exactly as above and never touch the duplication history.
 
-Sender rules:
+Local duplication-selection policy (not required to match the peer): a sender
+may send no flagged pairs at all. The frozen sender does the following.
 
 - A datagram that carries at least one whole frame and is assembled while
   the sender's duplication decision is high (see "Release candidate sender
   policy") is sent twice. Every whole frame in it is protected; this is not
   a random fraction. Packed wholes share one duplicated datagram, and a
   high-risk small message is not split to fill the tail of a datagram.
-- The copy has the same plaintext apart from the flag nibble. It is sealed
-  under a fresh data-space nonce that MUST be exactly the original's nonce
-  + 1, and it uses the original's DSCP. It takes its own pacing, flight and
-  congestion-control slot. ACK-space nonces are unaffected.
+- A flagged copy MUST carry the same frames and application bytes as its
+  original, apart from the first-kind flag nibble. If the sender's TU grows
+  between pair members, the copy may append additional `ff` padding to fill
+  the new TU; exact plaintext length equality is not required. The copy MUST
+  use a fresh data-space nonce exactly the original's nonce + 1. This sender
+  also retains the original DSCP and takes a separate pacing, flight and
+  congestion-control slot. ACK-space nonces are unaffected. Copies need not
+  share the original's key epoch if a permitted rotation occurs between them.
 - A pending copy is sent before any other data-space packet (data, MTU probe,
   keepalive). If an outage begins before it is sent, the copy itself is the
   first outage probe. On local send refusal the exact ciphertext is retained.
@@ -289,11 +431,13 @@ Receiver rules:
   packet are skipped. Fragment and Wirehair frames in the packet are still
   processed with their own identity deduplication, so the second arrival can
   still supply a symbol.
-- Otherwise receive memory for all of the packet's whole frames is reserved
-  first. Only when all reservations succeed are the wholes delivered and the
-  canonical nonce committed. If memory is refused the packet counts as
-  memory-erased and the canonical nonce stays fresh, so the other copy can
-  still be delivered.
+- Otherwise this implementation scans parseable frames and reserves receive
+  memory for all whole frames first, then commits the canonical nonce before
+  processing/delivering individual frames. If reservation is refused the packet
+  counts as memory-erased and the canonical nonce stays fresh, so the other
+  copy can still be delivered. This is atomic memory admission, **not** atomic
+  validation/delivery of a malformed frame stream or guaranteed admission into
+  the public application receive ring.
 - Each physical packet keeps its own nonce and its own ACK/CE accounting.
   On the sender, a coded symbol carried in a duplicated pair counts as one
   lost FEC symbol only when both copies are lost. Congestion control still
@@ -315,7 +459,7 @@ or already-erased identity older than the arriving ID first, otherwise the
 least recently active older identity inactive for more than max(4*RTT, 2s).
 If all entries are live/recent it refuses the new ID and withholds that packet's
 ACK; it does not evict already-ACKed active state. Inline FEC decoders expire
-on the same inactivity grace as workers (the outage sweep retains its existing
+on the same inactivity grace as larger decoder jobs (the outage sweep uses a
 longer grace). The retirement watermark only erases unretained older arrivals:
 retained active roots/units/plain messages remain usable below it. A frame for
 an unretained ID (or segmented root) below the watermark is stale: ignore it
@@ -326,19 +470,34 @@ completed-message churn nor a flood of concurrent incomplete messages can
 evict a recently active assembly or grow the table.
 It does not use `id % 1024` as identity or infer a 16-bit generation.
 
-A message fitting one packet is not split simply because the current tail is
-too small. Whole FIFO-head fillers are preferred. The existing fill exception
-allows chopping a small message across at most **two packets** to use a tail,
-provided its remainder fits a fresh packet with the 15-byte fragment header.
-Both pieces then carry the same full message ID. A continuation cannot be
-chopped into a third piece as another tail filler. No small plain message is
-retransmitted/FEC-rescued by this rule.
+Local sender packing policy: a message fitting one packet is not split simply
+because the current tail is too small. Whole FIFO-head fillers are preferred.
+The fill exception allows chopping a small message across at most **two
+packets** to use a tail, provided its remainder fits a fresh packet with the
+15-byte fragment header. Both pieces carry the same full message ID. A
+continuation cannot be chopped into a third piece as another tail filler. No
+small plain message is retransmitted/FEC-rescued by this rule. These sender
+choices do not limit a receiver to two fragments per message.
 
-For plain fragments, checked `offset + data_len` must fit u32 and not exceed
-the local receiver application maximum. A final fragment declares the total
-extent. Completion requires conflict-free coverage from zero through that
-extent. The implementation bounds plain-message reassembly to 2 MiB, using
-coded segmentation for larger original messages.
+For plain fragments, `offset + data_len` MUST fit u32, the receiver's declared
+application maximum, and this profile's 2 MiB plain-reassembly bound. The final
+fragment declares that sum as the total extent. A compliant sender MUST keep
+that total fixed and MUST send identical bytes in any overlapping ranges for
+the same ID. Completion requires coverage of `[0,total)` and a final fragment;
+equal overlaps and duplicate fragments add no new bytes. Empty fragments are
+legal subject to the same extent checks. Coded segmentation is used for larger
+original messages.
+
+**Current receiver conflict policy:** conflicting overlap, a changed final
+extent, or bytes beyond a previously declared total fail insertion. Unlike
+FEC layout conflicts, the implementation then discards the incomplete plain
+assembly and retries the incoming fragment under the **same** ID; it does not
+freeze or permanently reject that ID's byte contents. Completed plain IDs do
+not redeliver. Thus immutable byte-content binding against an authenticated
+malicious/buggy plain sender is not guaranteed. Resetting does not join
+*different* IDs, and network loss/reordering of a compliant sender's consistent
+fragments cannot itself create these conflicts. An independent receiver MAY
+instead discard conflicting fragments or permanently erase that incomplete ID.
 
 ### Wirehair symbol and segmentation validation
 
@@ -371,14 +530,25 @@ The receiving ordinary profile requires `block_bytes >= 1136`, a unit at most
 2 MiB, and a bounded source-block count (at most ceil(2 MiB/1136)). Thus grouped
 kind 5 is structurally parseable and round-trip tested, but cannot be needed
 by a valid current-profile production unit; tiny-symbol or oversized-unit
-uses are rejected. Kind 6 requires the unit itself to have one codec.
-An admitted ID has one immutable role (plain fragmented message, FEC unit,
-or segmented root). A unit's length, width, and full segment tuple and a
-root's total cannot change under an ID. Conflicting frames are discarded,
-never used to reset/rebind an existing decoder or completed identity.
-Resource retirement may erase content, but not reopen the ID for another
-role/layout. Asynchronous completion is delivered only for its exact still-live
-decoder instance and connection generation, once; a Done slot is not live.
+uses are rejected. Kind 5 is therefore rejected by the current transport's
+layout/kind check, not an alternate way to encode an ordinary unit. Kind 6
+requires the unit itself to have one codec. For this profile K MUST be in
+2..1847 and `1136 <= block_bytes <= 65535`, additionally constrained by the
+frame's u16 body length and the actual packet extent. All u32 block IDs are
+source or repair equation IDs according to the mapping; no separate repair
+flag is transmitted. Decoding may require more than K distinct equations:
+Wirehair is a fountain code, not a guarantee that every K-symbol subset solves.
+
+A sender MUST NOT change an ID's role (plain fragmented message, FEC unit, or
+segmented root). A unit's length, width, and full segment tuple and a root's
+total MUST NOT change under an ID. The receiver binds these role/layout fields
+and discards conflicts rather than resetting a decoder or completed identity.
+This does not guarantee rejection of every inconsistent coded equation from
+an authenticated malicious sender, nor does it freeze plain byte contents
+(see the plain conflict policy above). Resource retirement may erase content,
+but cannot rebind a retained ID to another role/layout. Deferred completion is
+delivered only for its exact still-live decoder instance and connection
+generation, once; a Done slot is not live.
 
 Version 2 declares the current balanced segmentation layout explicitly. For
 `total > max_unit`, let `groups = ceil(total / max_unit)` and
@@ -410,8 +580,13 @@ size is 166 bytes. No other connected traffic uses that size.
 Bit i means positive receipt of `receipt_base + i`. The base is absolute and
 may address **any** old or new window; it is not inferred from a highest
 packet. `sample_seq` is independently acknowledged even outside the bitmap.
-All positive receipts and the sample must be in data nonce space and below
-the sender's next allocated data nonce. Additions are checked. Unknown ACK
+All positive receipts and the sample MUST be in data nonce space and below
+the sender's next emitted data nonce; an allocated/sealed but still locally
+pending datagram cannot yet be receipted. `receipt_base` itself must be in data
+space even if its bitmap is empty; zero-bit positions need not be below the
+next emitted nonce. There is no "no sample" sentinel: sample_seq always
+positively receipts a packet, even with an empty bitmap. Additions are checked.
+Unknown ACK
 encodings or nonzero reserved bytes are rejected safely. A highest receipt,
 when needed internally, is derived from set bits and the sample; it is not a
 separate wire field.
@@ -426,7 +601,12 @@ sample remains the latest unique admitted packet; duplicates do not change
 its origin. ACK losses do not erase the underlying receipt history.
 
 Delay uses microseconds, saturates at u32::MAX, and applies only to the timing
-sample, not every bitmap receipt. CE is a monotone u64 cumulative count of
+sample, not every bitmap receipt. It measures from that sample's receive time
+to generation of this ACK snapshot. The declared 10000 us is the maximum
+**scheduled** ACK delay, not a clamp on delay_us or a real-time execution
+guarantee: a caller that does not drive Pump, local socket refusal or retained
+feedback pages can make the actual sample age larger. CE is a monotone u64
+cumulative count of
 unique admitted data/probe/keepalive packets; old/repeated counts do not move
 the sender's remembered count backwards. Exhaustion requires a fresh
 handshake; it must never wrap. Counts decreasing or greater than the sender's
@@ -521,7 +701,7 @@ Before nonce, u32 epoch or u64 identity exhaustion, implementations MUST
 stop sealing and close or arrange a fresh handshake, never wrap or abort the
 process. This implementation closes cleanly and reports the association gone;
 the caller may request reconnection. It conservatively reserves the last
-data nonce rather than trying to allocate beyond it. No old worker completion
+data nonce rather than trying to allocate beyond it. No old decoder completion
 may deliver into a replacement connection with the same endpoint lookup key.
 Invalid tags elicit neither ACKs nor frame allocation.
 
@@ -533,6 +713,18 @@ minimum with one byte spare. Current-TU data, fixed-size ACK, and explicit MTU
 probe sizes remain the only encrypted connected UDP sizes emitted. Raising
 the minimum TU is an intentional interoperability change; paths that cannot
 carry it are not supported by this profile.
+
+TU is directional and measured in **UDP payload bytes**, excluding UDP/IP
+headers. It starts at 1204; there is no explicit MTU frame or negotiated common
+TU. A probe is simply an all-`ff` padding plaintext in a larger authenticated
+data-space packet, receipted by the ordinary ACK. The sender remembers the
+probe nonce and size and promotes its TU on a positive receipt of that probe;
+the receiver need not recognize a probe or echo its size. All data receivers
+MUST accept ordinary current-profile packets independently of their own send
+TU. The implementation accepts smaller data plaintexts down to 517 bytes even
+though its sender never emits trimmed data. Its local discovery searches up to
+9216 bytes, doubles the step after success and divides it by five after loss;
+this search and its pacing are local policy, not required for decoding.
 
 The table excludes IP/UDP headers, padding and coding redundancy; these are
 encoding overhead bytes, not a claim about measured wire/app ratio. The
@@ -569,11 +761,11 @@ hello, and matching-selector garbage still incurs responder DH attempts.
 Half-open state is memory-bounded and expires after 15 seconds, but CPU cost
 is not rate-limited. The initial 391-byte request/94-byte response is not
 large-response reflection; retransmitted responses before confirmation can
-exceed the original request cumulatively. A future **handshake version** will
-put a stateless return-routability retry cookie before expensive DH/allocation,
-with an aggregate pre-confirmation response budget. That cookie is not part
-of version 2 and no current anti-spoofing/strict anti-amplification guarantee
-is claimed.
+exceed the original request cumulatively. Stateless return-routability retry
+cookies and an aggregate pre-confirmation response budget are **not** part of
+version 2. No current anti-spoofing/strict anti-amplification guarantee is
+claimed; adding such a handshake exchange requires a separately specified
+compatible mechanism or a new profile/version.
 
 Uniform current-TU padding hides application message sizes, fragment shape
 and packing boundaries, not all metadata. The clear full nonce reveals packet
@@ -589,10 +781,15 @@ not removed by encrypting/padding message frames.
 
 ## Implementation and verification boundaries
 
-FEC worker counts, slot counts, sender retention, congestion/loss estimators,
+FEC job quotas, slot counts, sender retention, congestion/loss estimators,
 ACK batching cadence and native socket limits are implementation policies,
 not new identity widths or implicit wire generations. The declaration makes
-current support explicit and rejects incompatible interpretations.
+current support explicit and rejects incompatible interpretations. The library
+creates no worker threads: the caller drives a Pump; encoder construction and
+persistent decoder work run on that caller's thread. Historical internal
+"Worker" names and worker counters now denote admitted decoder jobs, not
+library-owned threads. Job generations prevent stale completions from reaching
+a different decoder or replacement association.
 
 ### Release candidate sender policy (frozen)
 
@@ -702,9 +899,13 @@ configuration but are not used for planning while EPS is set.)
 Selector 2 mixes adjacent integers: with hi = r, lo = r − 1,
 `w = clamp((1 − ε − delivery(K,lo,p)) / (delivery(K,hi,p) − delivery(K,lo,p)), 0, 1)`,
 `threshold = floor(w × 2^64)`; use hi if `w = 1` or `draw < threshold`,
-else lo. `draw` is SplitMix64 of `MIX_SEED + seq × 0x9e3779b97f4a7c15`
-(MIX_SEED = 0x5354505f544d0001, seq = admission sequence of the root). It
-does not depend on timing or outcomes.
+else lo. Define `D(x)` as the SplitMix64 finalizer applied to
+`MIX_SEED + x × 0x9e3779b97f4a7c15`, with wrapping u64 arithmetic and
+MIX_SEED = 0x5354505f544d0001. The finalizer successively applies
+`z = (z XOR (z >> 30)) × 0xbf58476d1ce4e5b9`,
+`z = (z XOR (z >> 27)) × 0x94d049bb133111eb`, and
+`z XOR (z >> 31)`. The admission draw is `D(seq)`, where seq is the root's
+admission sequence; it does not depend on timing or outcomes.
 
 The risk admission (p_eff, ε) is evaluated **once** at a logical root's first
 admission and frozen for all its groups, segments and replans.
@@ -750,7 +951,7 @@ final segment is emitted (before sealing):
     kt       = min(K, ceil(rate_pps × RTT_s × 3.0))
     reserve  = proactive count for kt from the rule above, using a fresh
                risk admission with phi' = max(PHI, root p_base) and draw
-               SplitMix64(root_draw XOR 0x5441494c5f525356)   ("TAIL_RSV")
+               D(root_draw XOR 0x5441494c5f525356)   ("TAIL_RSV")
     added    = max(0, reserve − repairs still planned but not yet sent)
 
 `added` repairs are added to the owner's plan (kt = 0 gives 0). The 1:1

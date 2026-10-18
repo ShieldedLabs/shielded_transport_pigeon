@@ -1,83 +1,56 @@
-# STP - WIP
+# Shielded Transport Pigeon (STP)
 
-**"Stop winging your connections"**
+**Encrypted UDP messages, with scheduling owned by your application.**
 
-STP is a fledgling🐦 transport layer built to support [Zebra](https://z.cash/ecosystem/zebrad/)'s and [Crosslink](https://github.com/ShieldedLabs/zebra-crosslink-staging)'s networking requirements with minimal code size and infrastructure dependencies.
+STP combines Noise IK authentication, ChaCha20-Poly1305 encryption, message
+packing and fragmentation, Wirehair forward error correction, and packet-rate
+congestion control. It needs no TLS, certificates, relay service or peer-discovery
+infrastructure. Applications supply peer addresses and keys.
 
-STP is intended to make "small-and-frequent" P2P gossip and "high-bandwidth serial beaming" both viable, even over high-RTT connections (satellite, radio, intercontinental fibre).
+STP provides **unordered, best-effort messages**, not reliable byte streams.
+Proactive repair symbols and loss top-up improve delivery, but a sender forgets a
+message once its planned send work is finished. Delivery is not guaranteed.
 
-## Overview
+## Documentation
 
-- **UDP only**.
-- Encrypted from the ground up. STP can only connect to STP addresses: `[IP]:port:crypto_specifier:public_key`. Plaintext connections to `[IP]:port:plaintext_mode:0` are explicitly unsupported except as a mock crypto scheme for dev testing.
-    - We use the [Noise Protocol](https://noiseprotocol.org/) for our secure and two way authenticated connections. The rust implementation of STP uses the [`snow`](https://github.com/mcginty/snow) crate.
-- If you want infrastructure, bring your own. We don't depend on TLS or any PKI, which helps keep the surface area small. We don't depend on or make use of any relay servers. If you want to relay, do it manually.
-- Upgrade-only crypto. No downgrade attacks possible.
-- STP is P2P ready, without forcing any particular P2P scheme. You bring your own peer discovery scheme or DHT. With STP, implementing a global P2P gossip network is made relatively easy. [TODO: link to example code]
-- Option for: Reliable streams [TODO: link to docs]
-- Option for: Large datagrams with fragmentation [TODO: link to docs]
-- Assumed minimum-maximum-transmissable-unit (mMTU) is slightly different from QUIC.
+- [Wire protocol specification](PROTOCOL.md): packet layouts, handshake,
+  authenticated fields, ACKs, nonce/key epochs, framing and FEC interoperability.
+- [Application API guide](docs/rings-api.html): self-contained HTML documentation
+  with examples, ownership rules, backpressure and configuration.
+- [Dedicated-thread example](examples/lockfree_thread.rs) and
+  [game-loop example](examples/lockfree_game.rs).
 
-## Users
-- Zebra without Crosslink
-    - Requires frequent, overlapping-lifetime, short-lived reliable streams.
-    - Optionally requires longer-lived high-bandwidth connections.
-- Zebra with Crosslink
-    - We have battle tested this with Tenderlink, our Tendermint BFT implementation.
-- Application developers who want fine-grained control over their infrastructure
+## Build and run
 
-## Benefits
+```sh
+cargo add shielded_transport_pigeon@0.3
+cargo run --release --example lockfree_thread
+cargo run --release --example lockfree_game
+```
 
-- Low dependency
-  - small code size
-  - fewer system components
+Building requires Rust with edition 2024 support, a C++11 compiler and a native
+C/C++ toolchain: the crate builds the vendored Wirehair codec. Wirehair's
+BSD-3-Clause license is included in `third_party/wirehair/LICENSE`; STP is MIT.
+Linux is the platform exercised by the release tests and benchmarks. Other
+platform branches exist but are not release-tested here.
 
-<!--
-- (Crypto-capability connection model (with object-capability))
-> no reliance on infrastructure
-> no reliance on relays
-> secure IP connections without intermediate relays/infrastructure
--->
+## Compatibility
 
-## Current non-goals
-- Multiple NICs/network interfaces
-- Multiple simultaneous physical locations for the same logical client (e.g. 2 connections with the same NOISE key)
-- Opening & closing the same connection frequently, with all the same keys/IP/port (not actively supported, can be handled by application anyway)
-- Punch through for Symmetric NATs and other difficult NAT traversal
-    - Discovering faster endpoints for peers on more local networks
-- Packet Relay for peers with no path
-
-### Why Not QUIC?
-- TLS
-- Certificates - *boo hiss boo*
-    - Centralized authorities
-    - Downgrade attacks
-    - Overall complexity and code volume / audit surface area
-- Made redundant with Noise
-
-### Why Not libp2p?
-- Misaligned goals
-- Peer discovery
-- NAT-poor, relay heavy
-- Broadcast-only
-- Too modular, can’t make effective use of any of its features
-- Large code volume/layers
-- Pub-sub is a terrible model for our use case - all our messages are globally relevant to all peers, so we always want to gossip everything
-- DHT is unneeded complexity - see point on pub-sub
-- Not a Zcash project, so a heavy dependency for a key component of the “supply chain”
-
-### Why not Iroh?
-- See "Why not QUIC"
-- Relies on peer discovery routing infrastructure
-
-## Medium-term improvements
-- "Packlet" framing for small datagrams & streams.
-
-## Long-term improvements
-- Opt-in RaptorQ (or similar) lost-packet recovery
-- Compression
+Version **0.3.0** replaces the 0.2 application API with a caller-driven pump and
+three SPSC rings. This is a breaking API release. The library does not start
+network or FEC threads. Move the pump to an application-owned thread if desired.
+The package version and the wire-profile version are separate: this release uses
+the version-2 profile, including the duplication flags specified in `PROTOCOL.md`.
+Do not assume interoperability with older implementations merely because they
+also call their wire profile version 2.
 
 ## Application API
+
+`NetworkThreadOptions` and `NetworkThreadStats` retain historical names; they do
+not imply library-owned threads. The supported application surface is the pump,
+ring endpoint, configuration, address/key types and the events described here.
+Low-level protocol modules are exposed for inspection but are not an additional
+application service interface.
 
 The library creates **no threads**. `stp::new_pump(...)` or
 `stp::new_pump_with_options(..., NetworkThreadOptions { rings: RingConfig {
@@ -97,7 +70,7 @@ handle are `Send`; the single-owner app handle is deliberately **not Sync**.
 - `try_connect(address) -> bool`, `try_disconnect(peer) -> bool`, and
   `try_control(Control) -> bool` use a separate control ring. Disconnect cancels
   local state without flushing or sending a wire close. Connecting an already
-  present/handshaking peer produces `ConnectFailed::AlreadyConnected`.
+  present/handshaking peer produces `ConnectFailure::AlreadyConnected`.
 - `try_recv() -> Option<Event>` drains one ordered receive stream:
   `Connected { peer, address, handshake_hash }`, `Message { peer, data }`,
   `ConnectFailed { address, reason }`, `Disconnected { peer, reason }`.
@@ -122,7 +95,8 @@ handle are `Send`; the single-owner app handle is deliberately **not Sync**.
   ownership slot, not another queue/ring.
 - `park_until_ready()` uses futex generation handshakes on Linux. It wakes for
   receive events, previously-full input-ring space, telemetry, or close. Always
-  retry after waking. `close()` and dropping either owner **cancel**, not flush:
+  retry after waking. Non-Linux parking falls back to 1 ms polling and has not
+  been release-tested here. `close()` and dropping either owner **cancel**, not flush:
   queued work can be discarded and cancellation does not promise lifecycle
   events for every queued request/association. Pump never waits for app space.
 
@@ -131,22 +105,30 @@ styles. The historical batch exchange is crate-private, kept solely for frozen
 protocol regression tests. Research binaries use an application-side adapter
 implemented on the same public rings; it is not another library API.
 
-## Design overview
-Normative details, constants and wire formats are in [PROTOCOL.md](PROTOCOL.md).
+## Transport and security boundaries
 
-- **Transport**: Noise-authenticated association, AEAD-sealed UDP datagrams, replay-checked 64-bit packet nonces, separate ACK space with ACK-delay reporting and ECN feedback.
-- **Messages**: a message that fits in one datagram is sent as a *whole* frame, and several can be packed into one datagram. Larger messages are fragmented, or coded with Wirehair fountain FEC (large ones in segments). The maximum message size is a required constructor argument with no default.
-- **Congestion control**: rate-based (packets per second). After each congestion event the rate follows a fixed recovery/probe curve: beta 0.8, 9-RTT recovery to 0.92 of the anchor rate, then probing toward 1.02 and 2.0 of it. Congestion events are loss, ECN CE, and a *delay* event (queueing delay above clamp(0.5 × min RTT, 5–50 ms) for a whole RTT window). A delay cut is gentle (beta 0.95). Delay cuts stop after 3 ineffective ones so STP is not starved by loss-based flows such as CUBIC. They stay off for 16–256 RTT and come back once the queue drains.
-- **Parity**: each coded message gets proactive repair symbols so its planned miss probability is 0.2% at a design loss rate. The base rate is 0.1%, raised by a measured background random-loss estimate (2× its EWMA, at most 5%). When the sender is at its anchor rate and the queue is building, the design loss rises toward 10%. Extra parity covers the last ~3 RTTs of a message. Each known loss is replaced 1:1 while the message is still sending. Nothing is repaired after a message finishes sending.
-- **Whole-message duplication**: in high-risk periods every datagram carrying whole messages is sent twice. A flag nibble in the first frame-kind byte marks it, and the receiver deduplicates by canonical nonce.
-- **Liveness**: a connection expires after 120 s with neither ACK progress nor any fresh authenticated packet from the peer.
+- The default production policy is fixed: rate-based congestion control in
+  packets/second and message-bound P4 repair. Research features are not ordinary
+  application configuration; leave them disabled in deployments.
+- Peer discovery, authorization and deciding which public keys to trust belong
+  to the application. The supported authenticated profiles use Noise IK and
+  require the responder's static public key. Developer plaintext is not secure.
+- IPv4/IPv6 UDP paths must support the profile's 1204-byte minimum UDP payload.
+- Receive resources are bounded. Incoming data may be dropped under local
+  memory or ring pressure, even when its network packet was acknowledged.
+- Cryptographic authentication is not a claim of a security audit, anonymity,
+  traffic-flow confidentiality, DoS resistance or reliable delivery. The wire
+  specification describes the implementation's security limits explicitly.
 
-## Release candidate design (frozen)
-The release candidate fixes the policy above (P4 message-bound repair, interleave width 1, no slipstream, no post-send repair). Legacy P0–P3 initialization is not supported by this candidate; those experiment arms remain in the research tree. Measured results:
+## Validation and performance
 
-- **Emulated 20 Mbit/s bottleneck, 20 ms and 200 ms RTT, ~1 BDP buffer** (clean link): 100% delivery at every message size from 100 B to 2 MB on both links. Goodput 16.79 / 15.27 Mbit/s.
-- **0.3% random loss, same links**: worst size 99.53% / 99.55%; all misses were single-datagram (100 B / 1 kB) messages. At 200 ms RTT goodput falls to 4.18 Mbit/s, because CC still cuts on random loss.
-- **Sharing with a long TCP CUBIC flow** (delay cut 0.95, give-up 3, hold 16–256 RTT): at 200 ms STP's share converges to ~53–56%. At 20 ms it is starved to 8–18% for the first ~140–180 s, then recovers to 33–47% (two runs).
-- **Real internet, Ethernet sender to three Fly hosts, one run each** (sizes 100 B–2 MB): London 155 Mbit/s, worst 98.78% (2 kB; 40 kB 99.40%). Virginia 70.6 Mbit/s, worst 87.50% at 1 MB (28 of 32 messages); all other sizes 100%. Singapore 33.4 Mbit/s, 100% at every size.
+The 0.3.0 release passed the default and research-feature test suites,
+including encrypted loopback, lifecycle/backpressure and pump-deadline tests.
+The deterministic FEC planning golden hash is unchanged. Tests are not an
+independent interoperability or security audit.
 
-Caveats: these are single research runs (sources: `p4-cc-calm/NIGHT-NOTES.md` and `wifi/eth-rand/*/summary.txt`), not a reliability guarantee. The runs used a per-profile exposure constant H (33.3 or 333.3) rather than the frozen 100/3. H has no effect on planning while the 0.2% target is set, but the frozen value itself was not re-run. The emulated runs predate the liveness change, and the TCP-sharing runs predate the random-loss estimator. The Virginia 1 MB shortfall is not analysed in the notes.
+On a Ryzen 5 5500U Linux host using HPET, three interleaved loopback runs measured
+about **309,000 100-byte messages/s** with 8192 in flight and **246 MB/s** for
+1 MiB messages with eight in flight. Each endpoint's pump ran on its own thread.
+These are machine-specific application-payload rates, not WAN guarantees; bulk
+throughput saturated one sender core. The API guide includes benchmark context.
