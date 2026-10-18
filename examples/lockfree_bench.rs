@@ -31,6 +31,12 @@ impl Drop for QuietStdout {
         }
     }
 }
+/// Process CPU time with ns resolution (the tick counter has 10 ms granularity).
+fn cpu_ns() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    assert_eq!(unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts) }, 0);
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
 fn cpu_ticks() -> u64 {
     let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
     let fields: Vec<_> = stat
@@ -86,9 +92,11 @@ fn main() {
     drain(&mut a);
     drain(&mut b);
     let ticks = cpu_ticks();
+    let ns = cpu_ns();
     let idle_start = Instant::now();
     std::thread::sleep(Duration::from_secs(10));
     let idle_seconds = idle_start.elapsed().as_secs_f64();
+    let idle_ns = cpu_ns() - ns;
     let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64;
     let idle_cpu = (cpu_ticks() - ticks) as f64 / hz;
     let mut latency_us = Vec::new();
@@ -121,7 +129,9 @@ fn main() {
         "idle_cpu_percent,{:.3},percent",
         idle_cpu / idle_seconds * 100.0
     );
-    println!("post_idle_p50,{:.3},us", latency_us[50]);
-    println!("post_idle_p99,{:.3},us", latency_us[99]);
+    println!("idle_cpu_percent_ns,{:.4},percent", idle_ns as f64 / 1e9 / idle_seconds * 100.0);
+    println!("post_idle_p50,{:.3},us", latency_us[49]);
+    println!("post_idle_p99,{:.3},us", latency_us[98]);
+    println!("post_idle_max,{:.3},us", latency_us[99]);
     println!("peak_rss,{rss_kib},KiB");
 }
