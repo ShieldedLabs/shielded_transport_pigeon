@@ -103,7 +103,7 @@ impl LockfreeEndpoint {
         let ready = &self.owner.inner.ready;
         let mut observed = ready.generation.load(Ordering::SeqCst) as u64;
         let n = self.owner.inner.native.get().unwrap();
-        if n.events.has_value() || (n.send_full.load(Ordering::SeqCst) && n.send.has_space())
+        if n.events.has_value() || !n.stats_result.load(Ordering::Acquire).is_null() || (n.send_full.load(Ordering::SeqCst) && n.send.has_space())
             || (n.control_full.load(Ordering::SeqCst) && n.control.has_space()) { return true; }
         if self.is_finished() || self.owner.inner.stop.load(Ordering::Acquire) { return false; }
         ready.wait(&mut observed);

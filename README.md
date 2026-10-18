@@ -77,6 +77,60 @@ STP is intended to make "small-and-frequent" P2P gossip and "high-bandwidth seri
 - Opt-in RaptorQ (or similar) lost-packet recovery
 - Compression
 
+## Application API
+
+The library creates **no threads**. `stp::new_pump(...)` or
+`stp::new_pump_with_options(..., NetworkThreadOptions { rings: RingConfig {
+    send: 128, control: 32, receive: 128
+}, ..Default::default() })` returns `(Pump, LockfreeEndpoint)`. Every capacity
+is independently configurable and must be a power of two from 1 to 65,536.
+Move the pump to your own thread and loop `run_for(Duration::from_millis(100))`,
+or drive it with `run_until(frame_deadline)` between frames. The pump and app
+handle are `Send`; the single-owner app handle is deliberately **not Sync**.
+
+- `try_send(peer, queue, class, &mut payload) -> bool` moves the Vec allocation
+  on true; false (full or closed) leaves the caller's Vec untouched. No send
+  admission/completion events exist. Core send-buffer pressure keeps the FIFO
+  head in the send ring: **one blocked peer head-of-line blocks other peers**.
+  Oversized messages, invalid queue indices and sends to unknown/disconnected
+  peers are dropped and counted in `stats()`, not reported individually.
+- `try_connect(address) -> bool`, `try_disconnect(peer) -> bool`, and
+  `try_control(Control) -> bool` use a separate control ring. Disconnect cancels
+  local state without flushing or sending a wire close. Connecting an already
+  present/handshaking peer produces `ConnectFailed::AlreadyConnected`.
+- `try_recv() -> Option<Event>` drains one ordered receive stream:
+  `Connected { peer, address, handshake_hash }`, `Message { peer, data }`,
+  `ConnectFailed { address, reason }`, `Disconnected { peer, reason }`.
+  `Connected` precedes a peer's messages; a disconnected association produces
+  one `Disconnected`, with no later messages from that association. A new
+  association can reconnect under the same peer key and produces a new
+  `Connected`. Every processed connect has one outcome, including duplicate,
+  invalid and cancelled requests. Frozen handshake timeout is 30 seconds.
+- A full receive ring drops/counts **data**, so a stalled app cannot prevent
+  ACK/socket servicing. It also refuses inbound handshakes: neither new hello
+  state nor handshake completion is admitted without a slot for `Connected`;
+  frozen peer retry logic can retry once space returns. Must-deliver lifecycle
+  events are held pump-side pending (bounded by live/pending associations),
+  blocking further control consumption while pending. Messages for a removed
+  peer are suppressed immediately, even before its disconnect event fits.
+- `stats() -> Stats` reads relaxed atomic boundary counters without locking.
+  `request_protocol_stats()` / `try_protocol_stats()` explicitly request expensive
+  frozen-core telemetry (including per-peer CC/FEC counters and queue credit).
+  Telemetry allocates and takes the core's existing per-queue `budget_sink`
+  mutex; ordinary ring operations do neither. It carries no messages or peer
+  lifecycle snapshots, and repeated requests coalesce. Results use an atomic
+  ownership slot, not another queue/ring.
+- `park_until_ready()` uses futex generation handshakes on Linux. It wakes for
+  receive events, previously-full input-ring space, telemetry, or close. Always
+  retry after waking. `close()` and dropping either owner **cancel**, not flush:
+  queued work can be discarded and cancellation does not promise lifecycle
+  events for every queued request/association. Pump never waits for app space.
+
+`examples/lockfree_thread.rs` and `examples/lockfree_game.rs` show both driving
+styles. The historical batch exchange is crate-private, kept solely for frozen
+protocol regression tests. Research binaries use an application-side adapter
+implemented on the same public rings; it is not another library API.
+
 ## Design overview
 Normative details, constants and wire formats are in [PROTOCOL.md](PROTOCOL.md).
 

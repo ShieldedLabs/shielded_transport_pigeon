@@ -7,6 +7,7 @@ pub use std::net::Ipv6Addr;
 pub(crate) struct NetworkWake {
     #[cfg(target_os = "linux")]
     fd: libc::c_int,
+    pending: std::sync::atomic::AtomicBool,
 }
 impl NetworkWake {
     pub(crate) fn new() -> std::io::Result<Self> {
@@ -14,12 +15,16 @@ impl NetworkWake {
         {
             let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
             if fd < 0 { return Err(std::io::Error::last_os_error()); }
-            Ok(Self { fd })
+            Ok(Self { fd, pending: std::sync::atomic::AtomicBool::new(false) })
         }
         #[cfg(not(target_os = "linux"))]
-        { Ok(Self {}) }
+        { Ok(Self { pending: std::sync::atomic::AtomicBool::new(false) }) }
     }
     pub(crate) fn notify(&self) {
+        // One unread eventfd edge is sufficient throughout an active protocol
+        // burst. The owner clears only AFTER wait/drain and before rechecking
+        // ring predicates; clearing before drain can lose a concurrent wake.
+        if self.pending.swap(true, std::sync::atomic::Ordering::SeqCst) { return; }
         #[cfg(target_os = "linux")]
         unsafe {
             let one = 1u64;
@@ -32,6 +37,7 @@ impl NetworkWake {
         socket.wait_readable(self.fd, timeout);
         #[cfg(not(target_os = "linux"))]
         { let _ = socket; std::thread::park_timeout(timeout.min(std::time::Duration::from_micros(150))); }
+        self.pending.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
 impl Drop for NetworkWake {

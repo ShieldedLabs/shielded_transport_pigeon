@@ -72,6 +72,7 @@ fn lifecycle_order_and_exactly_once_disconnect() {
     }
     // A local disconnect has no wire close. Do not let the remote initiate a new
     // connection while checking that the cancelled association stays silent.
+    send(&mut b, aa.connection_key(), b"late old-association data".to_vec());
     std::thread::sleep(Duration::from_millis(20));
     while let Some(event) = a.try_recv() { assert!(!matches!(event, Event::Disconnected { .. } | Event::Message { .. })); }
     assert_eq!(disconnected, 1); assert_eq!(outcomes, 1);
@@ -94,7 +95,7 @@ fn every_connect_request_has_one_outcome_including_duplicates_and_invalid() {
 #[test]
 fn receive_full_drops_data_but_preserves_disconnect() {
     let rings = RingConfig { send: 128, control: 8, receive: 1 };
-    let (pa, mut a, _) = setup_with(rings, 2000); let (pb, mut b, ab) = setup_with(rings, 2000);
+    let (pa, mut a, aa) = setup_with(rings, 2000); let (pb, mut b, ab) = setup_with(rings, 2000);
     let _wa = Worker::start(pa); let _wb = Worker::start(pb);
     let peer = connect(&mut a, &mut b, ab);
     send(&mut a, peer, b"one".to_vec()); send(&mut a, peer, b"two".to_vec());
@@ -104,16 +105,15 @@ fn receive_full_drops_data_but_preserves_disconnect() {
     let first = b.try_recv().unwrap(); assert!(matches!(first, Event::Message { .. }));
     // Fill output with one failure then request a disconnect. The latter must
     // wait rather than disappear, and must be ordered after the earlier event.
-    assert!(a.try_connect(STPAddress::from(std::net::Ipv6Addr::LOCALHOST, 0, &new_keypair_from_connect_magic1(CONNECT_MAGIC1_PLAIN_TEXT).unwrap())));
+    assert!(a.try_connect(aa));
     assert!(a.try_disconnect(peer));
+    std::thread::sleep(Duration::from_millis(20));
     let mut failures = 0; let mut disconnected = 0;
     while disconnected == 0 {
         if let Some(event) = a.try_recv() { match event { Event::Disconnected { .. } => disconnected += 1, Event::ConnectFailed { .. } => failures += 1, _ => {} } }
         assert!(Instant::now() < end); std::thread::yield_now();
     }
-    // The request may actually start a plaintext handshake: don't assert a
-    // timeout in a short test. Its cancellation is covered separately.
-    assert!(failures <= 1);
+    assert_eq!(failures, 1);
 }
 
 #[test]
@@ -126,7 +126,11 @@ fn inbound_handshake_waits_for_receive_space_then_retries() {
     assert!(a.try_connect(ab));
     let end = Instant::now() + Duration::from_secs(8);
     while b.stats().inbound_refused_full == 0 { assert!(Instant::now() < end); std::thread::yield_now(); }
-    assert!(matches!(b.try_recv(), Some(Event::ConnectFailed { .. })));
+    let refusal = loop {
+        if let Some(event) = b.try_recv() { break event; }
+        assert!(Instant::now() < end); std::thread::yield_now();
+    };
+    assert!(matches!(refusal, Event::ConnectFailed { .. }));
     let mut ca = false; let mut cb = false;
     while !ca || !cb {
         if let Some(event) = a.try_recv() { ca |= matches!(event, Event::Connected { .. }); }
@@ -171,4 +175,78 @@ fn game_loop_driving_delivers_and_orders_events() {
         std::thread::sleep((frame + Duration::from_millis(16)).saturating_duration_since(Instant::now()));
     }
     assert!(ca && cb && sent && got);
+}
+
+#[test]
+fn handle_is_send_but_not_sync() {
+    static_assertions::assert_impl_all!(LockfreeEndpoint: Send);
+    static_assertions::assert_not_impl_any!(LockfreeEndpoint: Sync);
+}
+
+#[test]
+fn park_wakes_for_control_space_without_an_event() {
+    let (mut pump, mut ep, _) = setup_with(RingConfig { send: 1, control: 1, receive: 1 }, 100);
+    assert!(ep.try_disconnect(ConnectionKey::default()));
+    assert!(!ep.try_disconnect(ConnectionKey::default()));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || { assert!(ep.park_until_ready()); tx.send(ep).unwrap(); });
+    pump.run_for(Duration::from_millis(5));
+    let mut ep = rx.recv_timeout(Duration::from_secs(2)).unwrap(); waiter.join().unwrap();
+    assert!(ep.try_recv().is_none()); assert!(ep.try_disconnect(ConnectionKey::default()));
+    drop(pump);
+}
+
+#[test]
+fn cancelled_connect_produces_exactly_one_failure() {
+    let (mut pump, mut ep, _) = setup();
+    let probe = std::net::UdpSocket::bind("[::1]:0").unwrap();
+    let addr = STPAddress::from(std::net::Ipv6Addr::LOCALHOST, probe.local_addr().unwrap().port(),
+        &new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).unwrap());
+    assert!(ep.try_connect(addr.clone())); assert!(ep.try_disconnect(addr.connection_key()));
+    pump.run_for(Duration::from_millis(5));
+    assert!(matches!(ep.try_recv(), Some(Event::ConnectFailed { address, reason: ConnectFailure::Cancelled }) if address == addr));
+    assert!(ep.try_recv().is_none());
+}
+
+#[test]
+fn fifo_credit_blocks_other_peer_until_head_disconnects() {
+    let (pa, mut a, _) = {
+        let probe = std::net::UdpSocket::bind("[::1]:0").unwrap(); let port = probe.local_addr().unwrap().port(); drop(probe);
+        let key = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).unwrap();
+        let addr = STPAddress::from(std::net::Ipv6Addr::LOCALHOST, port, &key);
+        let (pump, ep) = new_pump_with_options(vec![key], port, Some(1), (1, 1, 1), 2_000_000,
+            NetworkThreadOptions { rings: RingConfig { send: 8, control: 8, receive: 8 }, ..Default::default() });
+        (pump, ep, addr)
+    };
+    let (pb, mut b, ab) = setup(); let (pc, mut c, ac) = setup();
+    let _wa = Worker::start(pa); let _wb = Worker::start(pb); let _wc = Worker::start(pc);
+    let kb = connect(&mut a, &mut b, ab); let kc = connect(&mut a, &mut c, ac);
+    send(&mut a, kb, vec![7; 1_000_000]); send(&mut a, kb, vec![8; 100]); send(&mut a, kc, b"behind head".to_vec());
+    let end = Instant::now() + Duration::from_secs(5);
+    while a.stats().send_head_blocked == 0 { assert!(Instant::now() < end); std::thread::yield_now(); }
+    assert_eq!(a.stats().sent, 1); assert!(c.try_recv().is_none());
+    assert!(a.try_disconnect(kb));
+    assert_eq!(receive(&mut c, 1)[0].1, b"behind head");
+    assert!(a.stats().send_dropped_unknown >= 1);
+}
+
+#[test]
+fn unreachable_connect_times_out_once_under_frozen_handshake_timer() {
+    let (pump, mut ep, _) = setup(); let mut worker = Worker::start(pump);
+    let probe = std::net::UdpSocket::bind("[::1]:0").unwrap();
+    let address = STPAddress::from(std::net::Ipv6Addr::LOCALHOST, probe.local_addr().unwrap().port(),
+        &new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).unwrap());
+    assert!(ep.try_connect(address.clone()));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        loop {
+            if let Some(event) = ep.try_recv() { tx.send((event, ep)).ok(); break; }
+            if !ep.park_until_ready() { break; }
+        }
+    });
+    let outcome = rx.recv_timeout(Duration::from_secs(35));
+    worker.stop(); waiter.join().unwrap();
+    let (event, mut ep) = outcome.expect("frozen 30s handshake timer did not finish");
+    assert!(matches!(event, Event::ConnectFailed { address: a, reason: ConnectFailure::TimedOut } if a == address));
+    assert!(ep.try_recv().is_none());
 }

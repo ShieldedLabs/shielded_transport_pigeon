@@ -5,28 +5,27 @@ pub use port::lockfree::{LockfreeEndpoint, RingConfig, Control, Event, Stats, Co
 use std::time::{Duration, Instant};
 
 /// Exclusive socket/protocol owner. Move this value to a thread, or call it in
-/// frame slack. Application operations live on Endpoint, never on Pump.
+/// frame slack. Application operations live on LockfreeEndpoint, never on Pump.
 ///
-/// The core reuses protocol clock samples at packet boundaries. Traversals with
-/// no fresh sample check every eight bookkeeping units. The cooperative bound is
-/// one packet/FEC unit or eight bookkeeping units, plus at most one reference
-/// exchange (cost proportional to its command and connection-snapshot size).
+/// Protocol clock samples remain at packet boundaries. Traversals with no fresh
+/// sample check every eight bookkeeping units. Native admissions form bursts of
+/// at most 32 commands per protocol pass, checking the caller deadline before
+/// each command except the first owed admission. HOL-blocked sends stay queued.
 /// A native Wirehair encode/decode/recovery call cannot be preempted. OS
 /// scheduling and allocator latency are not hard real-time bounded. Logical
-/// messages up to 1 GiB use native codec units no larger than 2 MiB.
+/// messages up to 1 GiB use native codec units no larger than 2 MiB. Explicit
+/// protocol telemetry also incurs work proportional to connections/queues.
 /// Dropping Pump closes the UDP socket and publishes endpoint termination.
 ///
-/// Forward progress: a `run_until` call entered before its deadline always
-/// admits the pending command exchange (if one is pending when it is checked)
-/// and completes one unit (one received datagram, one data send, one FEC
-/// completion/sweep entry, one connection send step or eight bookkeeping units;
-/// an idle pass counts), even if the deadline passes meanwhile, e.g. during
-/// clock calibration or OS preemption. Overshoot past the deadline is therefore
-/// bounded by one command admission (measured ~30-70 us for small batches;
-/// proportional to batch/connection-snapshot size) plus one unit. An unfinished
-/// 150 us active retry quantum is never shortened: only the owed command may be
-/// admitted inside it, and the owed unit waits for a call after it ends. A call
-/// entered at or after its deadline returns immediately without work.
+/// Forward progress: a `run_until` call entered before its deadline admits one
+/// eligible pending command and completes one unit (one received datagram, one
+/// data send, one FEC completion/sweep entry, one connection send step or eight
+/// bookkeeping units; an idle pass counts), even if the deadline passes during
+/// calibration/preemption. The cooperative overshoot bound is one admission
+/// plus one such unit. An unfinished 150 us active retry quantum is never
+/// shortened: only the owed command may be admitted inside it, and the owed
+/// unit waits for a call after it ends. Calls entered at/after their deadline
+/// return immediately without work.
 pub struct Pump {
     pub(crate) run: Box<dyn FnMut(Deadline) -> Option<Instant> + Send>,
     pub(crate) wakeup: Option<Instant>,

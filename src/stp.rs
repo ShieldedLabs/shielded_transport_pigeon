@@ -5062,7 +5062,6 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
         let mut connections_map = HashMap::<ConnectionKey, ConnectionTrackingData>::new();
         let mut ready_peers = HashMap::new();
         let mut ring_state = RingState::default();
-        let mut ring_burst = 0usize;
         let mut receive_notified = false;
         let mut ready_used = 0usize;
 
@@ -5140,10 +5139,11 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
             // Native boundary: only the pump touches RingState and consumes inputs.
             // At most 32 admissions precede a protocol pass; each respects the call
             // deadline except the first owed admission (the forward-progress rule).
-            let mut ring_admitted = false;
             if let Some(n) = thread_inner.native.get() {
                 ring_state.flush(&thread_inner);
-                if ring_burst < 32 {
+                for _ in 0..32 {
+                    if !budget.command_owed() && std::time::Instant::now() >= caller_deadline { break; }
+                    let mut ring_admitted = false;
                     if ring_state.pending.is_empty() {
                         if let Some(control) = unsafe { n.control.pop() } {
                             n.input_drained(&thread_inner.ready, true);
@@ -5194,11 +5194,9 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                             } else { n.counters.send_head_blocked.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
                         }
                     }
+                    if ring_admitted { budget.admitted(); } else { break; }
                 }
-                if ring_admitted { ring_burst += 1; budget.admitted(); }
-                else { ring_burst = 0; }
             }
-            if ring_admitted { continue; }
             if let Some((mut req, disconnect)) = thread_inner.take_request() {
                 budget.admitted();
                 if let Some(peer) = disconnect { connections_map.remove(&peer); }
