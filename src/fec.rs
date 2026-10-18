@@ -332,6 +332,59 @@ impl MessageEncoder {
     }
 }
 
+/// Inline systematic staging: one exact-length output allocation, no native codec.
+/// The fixed bitmap cannot grow with peer-chosen IDs; repairs never index it.
+/// Only single-group layouts up to the existing inline boundary are eligible.
+pub(crate) struct SourceOnly {
+    pub(crate) layout: MessageLayout,
+    pub(crate) output: Vec<u8>,
+    seen: [u64; 4],
+    remaining: usize,
+    pub(crate) native_failed: bool,
+}
+impl SourceOnly {
+    pub(crate) fn charge(layout: MessageLayout) -> Option<usize> {
+        if layout.groups != 1 || layout.k > crate::stp::FEC_INLINE_MAX_BLOCKS || layout.k > 256 { return None; }
+        // Covers the fixed bitmap, Vec/layout metadata and allocator bookkeeping.
+        // No per-symbol allocation: the output Vec has capacity exactly len.
+        layout.len.checked_add(4096)
+    }
+    pub(crate) fn new(layout: MessageLayout) -> Self {
+        Self { layout, output: vec![0; layout.len], seen: [0; 4], remaining: layout.k, native_failed: false }
+    }
+    pub(crate) fn has(&self, id: usize) -> bool { self.seen[id / 64] & (1u64 << (id % 64)) != 0 }
+    pub(crate) fn insert(&mut self, id: u32, data: &[u8]) -> Result<(DecodeStatus, bool), DecodeError> {
+        let id = id as usize;
+        if id >= self.layout.k || data.len() != block_len(self.layout.len, self.layout.block_bytes, id as u32) {
+            return Err(DecodeError::BadBlock);
+        }
+        let start = id * self.layout.block_bytes;
+        let target = &mut self.output[start..start + data.len()];
+        let mask = 1u64 << (id % 64);
+        if self.seen[id / 64] & mask != 0 {
+            if target != data { return Err(DecodeError::BadBlock); }
+            return Ok((DecodeStatus::NeedMore, false));
+        }
+        target.copy_from_slice(data);
+        self.seen[id / 64] |= mask;
+        self.remaining -= 1;
+        Ok((if self.remaining == 0 { DecodeStatus::Done } else { DecodeStatus::NeedMore }, true))
+    }
+    /// Caller holds BOTH the source lease and a full native lease during this
+    /// allocation/feed. Failure leaves every staged source available unchanged.
+    pub(crate) fn decoder(&self) -> Result<MessageDecoder, DecodeError> {
+        let mut dec = MessageDecoder::with_layout(self.layout).ok_or(DecodeError::Failed(-1))?;
+        for id in 0..self.layout.k {
+            if self.has(id) {
+                let start = id * self.layout.block_bytes;
+                let end = (start + self.layout.block_bytes).min(self.layout.len);
+                dec.add(id as u32, &self.output[start..end])?;
+            }
+        }
+        Ok(dec)
+    }
+}
+
 pub struct MessageDecoder {
     layout: MessageLayout,
     decoders: Vec<Option<Decoder>>,

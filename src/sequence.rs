@@ -14,6 +14,11 @@ impl Default for Space {
     fn default() -> Self { Self { highest: None, history: vec![0; (REPLAY_BITS / 64) as usize].into_boxed_slice() } }
 }
 impl Space {
+    fn fresh(&self,seq:u64)->bool {
+        let Some(h)=self.highest else {return true};
+        if seq>h {return true;}
+        seq>=h.saturating_sub(REPLAY_BITS-1) && self.history[(seq%REPLAY_BITS/64) as usize] & (1<<(seq%64))==0
+    }
     fn commit(&mut self, seq: u64) -> bool {
         if let Some(h) = self.highest {
             if seq < h.saturating_sub(REPLAY_BITS - 1) { return false; }
@@ -39,6 +44,10 @@ impl ReceiveSequences {
     /// Non-mutating: call before AEAD decryption, commit only after authentication
     /// and validating that the decrypted size agrees with the nonce space.
     pub fn candidate(&self, wire: u64) -> u64 { wire }
+    /// Non-mutating replay admission, for atomic research whole-frame reservation.
+    pub(crate) fn fresh(&self,nonce:u64)->bool {
+        if nonce & ACK_SPACE != 0 {self.ack.fresh(nonce & !ACK_SPACE)}else{self.data.fresh(nonce)}
+    }
     pub fn commit(&mut self, nonce: u64) -> bool {
         if nonce & ACK_SPACE != 0 { self.ack.commit(nonce & !ACK_SPACE) } else { self.data.commit(nonce) }
     }

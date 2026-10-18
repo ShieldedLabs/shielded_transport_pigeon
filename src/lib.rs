@@ -14,6 +14,13 @@ pub mod fec_adapt;
 mod loss_trace;
 pub mod helpers;
 pub mod native_sockets;
+#[cfg(feature="research_cohort_observer")]
+pub mod cohort_observe;
 pub mod stp;
 pub mod receive_memory;
 pub mod sequence;
+
+#[cfg(feature = "research_budget_diagnostic")]
+pub mod budget_diagnostic;
+
+pub mod target_validation;

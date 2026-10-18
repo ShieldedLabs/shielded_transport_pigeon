@@ -474,6 +474,8 @@ mod linux {
             if n < 0 {
                 let err = std::io::Error::last_os_error();
                 if err.raw_os_error().is_some_and(|e| e == libc::EAGAIN || e == libc::EWOULDBLOCK || e == libc::ENOBUFS) {
+                    #[cfg(feature = "research_cohort_observer")]
+                    crate::cohort_observe::udp_send_backpressure(payload);
                     return None; // Local backpressure: the caller retains this datagram.
                 }
                 if err.raw_os_error() == Some(libc::EMSGSIZE)
@@ -482,6 +484,8 @@ mod linux {
                     || err.raw_os_error() == Some(libc::EHOSTDOWN) /* @todo(judah): ensure we actually want to tolerate this error  */
                     // A socket bound to an IPv4 address cannot send to an IPv6 peer: unreachable.
                     || err.raw_os_error() == Some(libc::EAFNOSUPPORT) {
+                    #[cfg(feature = "research_cohort_observer")]
+                    crate::cohort_observe::udp_send_tolerated(payload, err.raw_os_error().unwrap_or(0));
                     return Some(timestamp_ns);
                 }
                 panic!("UDP Socket error: {}", err);
@@ -490,6 +494,8 @@ mod linux {
             if sent != payload.len() {
                 panic!("partial UDP send: {sent} of {}", payload.len());
             }
+            #[cfg(feature = "research_cohort_observer")]
+            crate::cohort_observe::udp_send_full(payload);
             Some(timestamp_ns)
         }
     }

@@ -1,5 +1,7 @@
 #![allow(unsafe_code)]
 #![allow(unused_variables, unused_mut, unused_imports, unused_macros, unused_assignments)]
+#[cfg(feature = "research_budget_diagnostic")]
+use crate::budget_diagnostic as diag;
 use std::collections::{HashMap, VecDeque};
 use rand::SeedableRng;
 use static_assertions::const_assert;
@@ -127,15 +129,15 @@ pub fn do_the_test_program3(port: u16, my_keypair: IdentityKeyPair, beam_to: Opt
     monotonic_clock_setup();
 
     let network_thread_handle2 = new_network_thread(vec![my_keypair], port, max_pps, send_buffer_params, max_message_size);
-    
+
     if let Some(other) = beam_to {
         let initiate_connections = vec![other];
 
         let ret = service_connections(&network_thread_handle2, NetworkThreadPush { initiate_connections, ..Default::default() }).unwrap_or_default();
         let mut wanted_connections = ret.current_connections;
-    
+
         let mut i = 0;
-    
+
         loop {
             let mut send_unreliable = Vec::new();
             if wanted_connections.len() > 0 {
@@ -281,8 +283,66 @@ pub(crate) enum WireFrame<'a> {
         segment: Option<FecSegment>, data: &'a [u8] },
     Unknown,
 }
+// Frozen duplication policy: first-kind prefix flags. Canonical packet identity is the
+// original data nonce; a copy MUST use the immediately following data nonce.
+// Both retain full independent authenticated nonces/ACKs/CE/loss accounting.
+
+const TARGET_DUP_ORIGINAL:u8=0x10;
+
+const TARGET_DUP_COPY:u8=0x20;
+
+fn target_dup_kind(kind:u8)->Option<(u8,bool)> {
+    let base=kind & 0x0f;
+    ((1..=6).contains(&base) && matches!(kind & 0xf0,TARGET_DUP_ORIGINAL|TARGET_DUP_COPY))
+        .then_some((base,kind & 0xf0==TARGET_DUP_COPY))
+}
+
+fn target_dup_counts(payload:&[u8])->(u64,bool) {
+    let mut p=payload;let mut messages=0;let mut fec=false;
+    while let Some((frame,n))=read_frame(p) {
+        match frame {WireFrame::Whole(_)=>messages+=1,WireFrame::Fec{..}=>fec=true,_=>{}}
+        p=&p[n..];
+    }
+    (messages,fec)
+}
+fn target_is_copy(_payload:&[u8])->bool {
+    {return _payload.first().and_then(|&k|target_dup_kind(k)).is_some_and(|(_,copy)|copy);}
+
+}
+/// Lazy 64 KiB replay history, 262144 canonical data positions, same bound as
+/// physical replay. Below its watermark identities are permanently stale (not
+/// forgotten/reopened), so even arbitrarily skewed copies cannot redeliver.
+
+fn target_dup_receive(history:&mut Option<Box<crate::sequence::ReceiveSequences>>,nonce:u64,payload:&[u8])->bool {
+    let Some((_,copy))=payload.first().and_then(|&k|target_dup_kind(k)) else {return true};
+    let Some(canonical)=nonce.checked_sub(u64::from(copy)) else {return false};
+    history.get_or_insert_with(||Box::new(Default::default())).commit(canonical)
+}
+/// Atomically admit all packed wholes before committing their canonical nonce.
+/// A memory-erased original cannot poison the copy's later admission. Only whole
+/// delivery is suppressed: FEC/plain frames retain their existing identity dedup
+/// and may still use the second packet to recover a resource-erased first arrival.
+
+fn target_dup_prepare(history:&mut Option<Box<crate::sequence::ReceiveSequences>>,nonce:u64,payload:&[u8],
+    budget:&std::sync::Arc<crate::receive_memory::ReceiveMemoryBudget>)->(bool,VecDeque<crate::receive_memory::Reservation>,bool) {
+    let mut reservations=VecDeque::new();
+    let Some((_,copy))=payload.first().and_then(|&k|target_dup_kind(k)) else {return (false,reservations,false)};
+    let Some(canonical)=nonce.checked_sub(u64::from(copy)) else {return (true,reservations,false)};
+    if history.as_ref().is_some_and(|h|!h.fresh(canonical)) {return (true,reservations,false);}
+    let mut p=payload;
+    while let Some((frame,n))=read_frame(p) {
+        if let WireFrame::Whole(data)=frame {
+            let Some(r)=budget.reserve(data.len()+256) else {return (true,VecDeque::new(),true)};
+            reservations.push_back(r);
+        }
+        p=&p[n..];
+    }
+    (!target_dup_receive(history,nonce,payload),reservations,false)
+}
 pub(crate) fn read_frame(payload: &[u8]) -> Option<(WireFrame<'_>, usize)> {
     let kind = *payload.first()?;
+
+    let kind=target_dup_kind(kind).map_or(kind,|(base,_)|base);
     if kind == 255 { return None; }
     let len = u16::from_le_bytes(payload.get(1..3)?.try_into().ok()?) as usize;
     let end = 3usize.checked_add(len)?;
@@ -399,7 +459,7 @@ impl STPAddress {
         let     magic1         = u64::from_le_bytes(buf); if magic1 & 1 == 0 { return None; }
         Some(STPAddress { ip, port, magic1, key })
     }
-    
+
     pub fn to_connection_key(&self) -> ConnectionKey { self.into() }
 }
 impl Default for STPAddress {
@@ -578,7 +638,7 @@ impl ReceiveIndex {
                 let unused = |i: usize| plain[i].reservation.is_none() && plain[i].buf.is_empty()
                     && plain[i].received.is_empty() && plain[i].segment_parts.is_none()
                     && !fec[i].in_use();
-                let last_active = |i: usize| plain[i].last_segment_ns.max(fec[i].last_block_ns);
+                let last_active = |i: usize| plain[i].last_segment_ns.max(fec[i].last_active_ns());
                 let (&retired, &index) = candidates().find(|&(_, &i)|
                     plain[i].completed || matches!(fec[i].state, FecRecvState::Done) || unused(i))
                     .or_else(|| candidates().filter(|&(_, &i)| now_ns.saturating_sub(last_active(i)) > grace_ns)
@@ -624,10 +684,71 @@ impl Drop for RetentionLease {
     fn drop(&mut self) { let mut used = self.quota.used.lock().unwrap(); used.0 -= self.bytes; used.1 -= 1; self.quota.telemetry.current.fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed); }
 }
 
-// P4 duration category: the planned packet train spans [RTT/2, 2 RTT], inclusive,
-// at the queue's current fair-share payload rate. set_rate is full *payload* TU
-// bytes/s, so payload TU and rate scale identically. A zero rate or RTT has no
-// category; any nonzero current RTT model value is used as is.
+// Lightweight logical-message ownership. The selected owner is projected into
+// the legacy fields; FIFO, loss profile and connection tag rings are NEVER copied.
+// Segmented roots, completed segments and ready repairs move together.
+#[derive(Debug)]
+struct MessageSendContext {
+    current_dscp: Dscp,
+    partial_send_slot: Option<(Vec<u8>, u32)>,
+    send_package_id: u64,
+    package_lease: Option<std::sync::Arc<PackageLease>>,
+    fec_send_slot: Option<FecSendSlot>,
+    p4_open: bool,
+    p4_closing: bool,
+    p4_tail_refreshed: bool,
+    segmented_send: Option<SegmentedSend>,
+    fec_retained: HashMap<u64, RetainedFecSlot>,
+    retained_bytes: usize,
+    rescue_ready: VecDeque<u64>,
+    rescue_ready_count: usize,
+    retained_next_prune_ns: u64,
+    retained_last_prune_ns: u64,
+    fec_rescue_package: Option<u64>,
+    fec_suspended: Option<FecSendSlot>,
+    slipstream_head: bool,
+    slipstream_eligible: Option<bool>,
+    slipstream_started: bool,
+    logical_root: u64,
+    logical_tag: u64,
+    logical_len: usize,
+    category_eligible: Option<bool>,
+    budget_root: Option<std::sync::Arc<std::sync::Mutex<BudgetRoot>>>,
+}
+impl MessageSendContext {
+    fn empty() -> Self {
+        Self { current_dscp: Dscp::BestEffort, partial_send_slot: None,
+            send_package_id: 0, package_lease: None, fec_send_slot: None,
+            p4_open: false, p4_closing: false, p4_tail_refreshed: false,
+            segmented_send: None, fec_retained: HashMap::new(), retained_bytes: 0,
+            rescue_ready: VecDeque::new(), rescue_ready_count: 0,
+            retained_next_prune_ns: 0, retained_last_prune_ns: 0,
+            fec_rescue_package: None, fec_suspended: None,
+            slipstream_head: true, slipstream_eligible: None, slipstream_started: false,
+            logical_root: 0, logical_tag: 0, logical_len: 0, category_eligible: None, budget_root: None }
+    }
+    fn source_bytes(&self) -> usize {
+        source_owner_bytes(self.partial_send_slot.as_ref(), self.segmented_send.as_ref(),
+            self.fec_send_slot.as_ref(), self.fec_suspended.as_ref(), &self.fec_retained)
+    }
+    fn owns_package(&self, package: u64) -> bool {
+        self.send_package_id == package || self.fec_rescue_package == Some(package) ||
+            self.fec_retained.contains_key(&package)
+    }
+    fn swap(&mut self, q: &mut UnreliableSendBuffer) {
+        macro_rules! swap { ($($f:ident),*) => { $(std::mem::swap(&mut self.$f, &mut q.$f);)* }; }
+        swap!(current_dscp, partial_send_slot, send_package_id, package_lease,
+            fec_send_slot, p4_open, p4_closing, p4_tail_refreshed, segmented_send,
+            fec_retained, retained_bytes, rescue_ready, rescue_ready_count,
+            retained_next_prune_ns, retained_last_prune_ns, fec_rescue_package,
+            fec_suspended, slipstream_head, slipstream_eligible, slipstream_started,
+            logical_root, logical_tag, logical_len, category_eligible, budget_root);
+    }
+}
+
+// Shared research policy: [half RTT, two RTTs] of planned full-TU packets at
+// the queue's current fair-share pps. set_rate is full *payload* TU bytes/s;
+// wire TU/rate scale identically. Zero context has no special startup category.
 fn medium_duration_class(packets: u32, payload_len: usize, rate: u64, rtt: u64) -> &'static str {
     let duration = packets as u128 * payload_len as u128 * 1_000_000_000;
     let horizon = rtt as u128 * rate as u128;
@@ -638,7 +759,7 @@ fn medium_duration_class(packets: u32, payload_len: usize, rate: u64, rtt: u64) 
 
 // Metadata-only whole-logical P4 initial train. Balanced segmentation has at
 // most two distinct range lengths; no source copy, codec or worker for estimates.
-// Initial P4 really plans K + min(2,K) per range.
+// Initial P4 really plans K + min(2,K) per range. Later real plans stay on slots.
 fn p4_new_train(total: usize, offset: usize, payload: usize) -> (u32, u32) {
     if total <= payload.saturating_sub(STP_WHOLE_HEADER_SIZE) || offset >= total { return (0, 0); }
     let groups = total.div_ceil(FEC_SEGMENT_BYTES);
@@ -655,23 +776,61 @@ fn p4_new_train(total: usize, offset: usize, payload: usize) -> (u32, u32) {
     let (last_k, last_n) = unit(last_len);
     ((remaining as u32 - 1) * k + last_k, (remaining as u32 - 1) * n + last_n)
 }
-// Rounded-up percentage of source K. Segments add the cumulative difference, so a
-// logical message receives ceil(total K * percent / 100) once, not per segment.
 fn source_bonus(k: u64, percent: u32) -> u32 { (k * percent as u64).div_ceil(100) as u32 }
+fn owner_remaining_packets(active: Option<&FecSendSlot>, suspended: Option<&FecSendSlot>,
+    retained: &HashMap<u64, RetainedFecSlot>, giant: Option<&SegmentedSend>, payload: usize,
+    initial: bool, percent: u32, bonus_eligible: bool) -> u32 {
+    // fill_tier forbids active FEC as tail fillers: one symbol is one actual
+    // emitted packet even after TU growth. Never divide by hypothetical packing.
+    let mut packets = active.into_iter().chain(suspended).chain(retained.values().map(|r| &r.slot))
+        .map(|f| {
+            let n = if initial && f.repair_accounting.category_bonus > 0 { f.repair_accounting.unbonused_n } else { f.n };
+            n.saturating_sub(f.next_id)
+        }).sum::<u32>();
+    if let Some(g) = giant {
+        let (k, n) = p4_new_train(g.message.len(), g.offset, payload);
+        packets = packets.saturating_add(n);
+        if !initial && bonus_eligible {
+            let group_len = g.message.len().div_ceil(g.message.len().div_ceil(FEC_SEGMENT_BYTES));
+            let prefix_k: u64 = g.plan_ks.lock().unwrap()[..g.offset.div_ceil(group_len)].iter().sum();
+            packets = packets.saturating_add(source_bonus(prefix_k + k as u64, percent).saturating_sub(source_bonus(prefix_k, percent)));
+        }
+    }
+    packets
+}
+
+// Unique source allocations, including segment copies and the original giant.
+// Reserve future segment copies too: queue_bytes_filled alone falls as segments
+// finish while P4 may still own their codecs. Encoder Arc aliases count once.
+fn source_owner_bytes(plain: Option<&(Vec<u8>, u32)>, giant: Option<&SegmentedSend>,
+    active: Option<&FecSendSlot>, suspended: Option<&FecSendSlot>, retained: &HashMap<u64, RetainedFecSlot>) -> usize {
+    let mut seen = Vec::new();
+    let mut bytes = plain.map_or(0, |(m, _)| m.capacity());
+    let mut charge = |m: &std::sync::Arc<Vec<u8>>| {
+        let ptr = std::sync::Arc::as_ptr(m);
+        if !seen.contains(&ptr) { seen.push(ptr); bytes += m.capacity(); }
+    };
+    if let Some(g) = giant { charge(&g.message); }
+    for f in active.into_iter().chain(suspended).chain(retained.values().map(|r| &r.slot)) { charge(&f.message); }
+    bytes + giant.map_or(0, |g| g.message.len().saturating_sub(g.offset))
+}
 
 #[derive(Debug)]
 pub struct UnreliableSendBuffer {
+    #[cfg(feature = "research_budget_diagnostic")]
+    diagnostic_last: Option<diag::Layout>,
     // A time based capacity constrained by byte counts.
     // The queue should for example probably have a minimum byte size twice that of your largest message.
     pub target_queue_size_us: u32,
     pub min_queue_size_bytes: u32,
     pub max_queue_size_bytes: u32,
-    
+
     /// Message bytes (not wire bytes) of the queued messages plus the one being sent.
     pub queue_bytes_filled: usize,
     pub message_queue: VecDeque<(Dscp, Vec<u8>)>,
     current_dscp: Dscp,
     packet_dscp: Option<Dscp>,
+    target_dup_no_chop:bool,
     pub partial_send_slot: Option<(Vec<u8>, u32)>,
     pub send_package_id: u64,
     package_allocator: Option<std::sync::Arc<PackageAllocator>>,
@@ -713,12 +872,42 @@ pub struct UnreliableSendBuffer {
     fec_rtt_ns: u64,
     /// Cumulative source/repair progress snapshots, when recording is enabled (Some).
     pub fec_record: Option<Vec<crate::fec_adapt::FecMessageInfo>>,
-    // Fixed ship policy (0 except P4). The category is decided at the logical
-    // message's first FEC plan and frozen through segments and TU restarts.
+    // The fields above are the selected context's legacy projection. W1 never
+    // swaps it. Only small ordinary contexts are admitted to this rolling ring.
+    interleave_width: usize,
+    interleave_parked: VecDeque<MessageSendContext>,
+    interleave_last_packet: Option<u64>,
+    slipstream: bool,
+    slipstream_head: bool,
+    slipstream_eligible: Option<bool>,
+    slipstream_turn_head: bool,
+    slipstream_packet: Option<u64>,
+    // Research counters: decisions and real nonempty per-lane packet service.
+    slipstream_classified: u64,
+    slipstream_eligible_heads: u64,
+    slipstream_head_packets: u64,
+    slipstream_follow_packets: u64,
+    slipstream_started: bool,
+    logical_root: u64,
+    logical_tag: u64,
+    logical_len: usize,
+    slipstream_info: SlipstreamInfo,
+    slipstream_trace: Option<crate::loss_trace::SlipstreamWriter>,
+    slipstream_queue: usize,
+    slipstream_payload_len: usize,
     category_bonus_percent: u32,
     category_eligible: Option<bool>,
     category_bonus_messages: u64,
     category_bonus_repairs: u64,
+    event_repair_q: u32,
+    event_root_latched: bool,
+    event_repair: EventRepairInfo,
+    event_sink: std::sync::Arc<EventSink>,
+    commit_marks: std::collections::BTreeMap<u64, Vec<CommitMark>>,
+    budget_root: Option<std::sync::Arc<std::sync::Mutex<BudgetRoot>>>,
+    budget_sink: std::sync::Arc<std::sync::Mutex<BudgetBaseInfo>>,
+    target_root_sequence:u64,
+    target_state:crate::target_validation::RiskState,
 }
 
 /// Sender state of one FEC-coded message: blocks 0..k-1 are slices of the message itself and
@@ -726,6 +915,8 @@ pub struct UnreliableSendBuffer {
 /// a helper thread while the source blocks go out (creating one costs ~4 us per block, 155 ms
 /// for a 48 MB message, too long to stall the network thread).
 pub struct FecSendSlot {
+    #[cfg(feature = "research_budget_diagnostic")]
+    diagnostic: Option<diag::Layout>,
     segment: Option<FecSegment>,
     root_lease: Option<std::sync::Arc<PackageLease>>,
     plan_ks: Option<std::sync::Arc<std::sync::Mutex<Vec<u64>>>>,
@@ -764,7 +955,165 @@ struct RepairAccounting {
     sent_tail: u32,
     unbonused_n: u32,
     category_bonus: u32,
+    /// p4-event-repair: immutable per-group B_g = ceil(q*K_g/100), empty = no grant (baseline path unchanged).
+    event_bonus: Vec<u32>,
+    /// First successful DATA commit carrying one of this slot's source ordinals: (seq, exact sent_ns).
+    first_source_commit: Option<(u64, u64)>,
+    /// Event-attributable planned ordinal ranges [a, b), merged, bounded by EVENT_IDS_CAP.
+    event_ids: Vec<(u32, u32)>,
+    event_planned: u32,
+    /// Ranges not recorded because EVENT_IDS_CAP was reached.
+    event_ids_overflow: u32,
+    /// Shared with the owning queue once granted: every later refresh's attribution reaches the public counters.
+    event_sink: Option<std::sync::Arc<EventSink>>,
+    /// p4-burst-base B1: immutable initial base b_g per codec group (empty = baseline/B0 path).
+    base_b: Vec<u32>,
+    /// B1: planned total repairs per group (uniform rounds), monotone lower bound; never refunded.
+    base_r: u32,
+    /// B1, internal only (no public stat): some plan of this slot hit the cap Kg or the iteration budget.
+    base_cap_bound: bool,
+    // C1 only. Segment allowance is shared across TU restarts; reservations never refunded.
+    budget: Option<std::sync::Arc<std::sync::Mutex<BudgetSegment>>>,
+    data_anchor: Option<(u64, u64)>,
+    budget_demand: u64,
+    budget_shortfall: u64,
+    budget_known_shortfall: u64,
+    budget_limited: bool,
+    budget_invalid_anchor: bool,
+    #[cfg(feature="research_budget_diagnostic")]
+    diagnostic_last_demand: Option<u32>,
 }
+
+/// Counters written from inside FecSendSlot::refresh_plan (any refresh path: loss, source completion, tail, rescue).
+#[derive(Debug, Default)]
+struct EventSink { planned: std::sync::atomic::AtomicU64, ids_overflow: std::sync::atomic::AtomicU64, overflow: std::sync::atomic::AtomicU64 }
+
+/// RESEARCH-ONLY p4-event-repair evidence. Counters only; with q = 0 nothing is granted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EventRepairInfo {
+    /// Accepted (CC actually cut) events delivered to the sender, by kind.
+    pub accepted_early: u64,
+    pub accepted_timeout: u64,
+    pub accepted_ce: u64,
+    /// Accepted events lost to the bounded per-connection event queue (must be 0).
+    pub accepted_dropped: u64,
+    /// Accepted events while no P4 root was open / root closing (sealed) / root already granted.
+    pub skip_closed: u64,
+    pub skip_latched: u64,
+    /// Accepted events with an open root but no slot whose first source commit precedes the evidence.
+    pub skip_unexposed: u64,
+    pub roots_granted: u64,
+    pub slots_granted: u64,
+    /// Exposed slots of a granting event not qualifying (no prior source commit / failed encoder).
+    pub slots_unqualified: u64,
+    /// Sum of B_g over granted groups (immutable allowance).
+    pub grant_symbols: u64,
+    /// LOCAL attribution only (not a counterfactual network cost): ordinals that a refresh of a granted slot planned
+    /// above the same refresh computed with B_g = 0; all later refreshes included. `emitted` = such ordinals
+    /// committed as DATA.
+    pub planned: u64,
+    pub emitted: u64,
+    /// Every committed DATA FEC repair ordinal (>= k), all slots, regardless of attribution (any arm, incl. E0).
+    pub repairs_emitted: u64,
+    /// Accepted cuts whose ORIGINAL send history was unknown (0/MAX): CC cut kept, no repair notification.
+    pub missing_anchor: u64,
+    /// Prepared event-ordinal marks whose packet was never committed (abandoned before commit).
+    pub marks_abandoned: u64,
+    /// Ordinal-range overflow (attribution incomplete; measurement invalid if nonzero).
+    pub ids_overflow: u64,
+    /// Retained slots that became ready (rescue_ready) because of a grant.
+    pub ready_added: u64,
+    /// Nonzero iff any counter saturated while merging (measurement invalid, fail closed).
+    pub counter_overflow: u64,
+}
+impl EventRepairInfo {
+    pub fn merge(&mut self, o: EventRepairInfo) {
+        let mut of = self.counter_overflow.max(o.counter_overflow);
+        let mut add = |a: &mut u64, b: u64| { *a = a.checked_add(b).unwrap_or_else(|| { of = 1; u64::MAX }); };
+        add(&mut self.accepted_early, o.accepted_early); add(&mut self.accepted_timeout, o.accepted_timeout);
+        add(&mut self.accepted_ce, o.accepted_ce); add(&mut self.accepted_dropped, o.accepted_dropped);
+        add(&mut self.skip_closed, o.skip_closed); add(&mut self.skip_latched, o.skip_latched);
+        add(&mut self.skip_unexposed, o.skip_unexposed); add(&mut self.roots_granted, o.roots_granted);
+        add(&mut self.slots_granted, o.slots_granted); add(&mut self.slots_unqualified, o.slots_unqualified);
+        add(&mut self.grant_symbols, o.grant_symbols); add(&mut self.planned, o.planned); add(&mut self.emitted, o.emitted);
+        add(&mut self.marks_abandoned, o.marks_abandoned); add(&mut self.ids_overflow, o.ids_overflow);
+        add(&mut self.ready_added, o.ready_added); add(&mut self.repairs_emitted, o.repairs_emitted);
+        add(&mut self.missing_anchor, o.missing_anchor);
+        self.counter_overflow = of;
+    }
+}
+/// RESEARCH-ONLY C1 sender budget audit, cumulative; C0 is all zero. Coding credits are
+/// first-layout source K per distinct segment, never TU retries or padded/UDP byte counts.
+/// Demand/shortfalls sum per-slot HIGH-WATER increments, not repeated refresh requests.
+/// Reservations include abandoned TU plans, are never refunded, and bound actual repair commits.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BudgetBaseInfo {
+    pub roots: u64,
+    pub source_symbols: u64,
+    pub repair_limit: u64,
+    pub demand_repairs: u64,
+    pub planned_repairs: u64,
+    pub sources_emitted: u64,
+    pub repairs_emitted: u64,
+    #[cfg(feature="research_target_validation")] pub postseal_repairs_emitted:u64,
+    #[cfg(feature="research_target_validation")] pub postseal_owners_reopened:u64,
+    pub cap_limited_roots: u64,
+    pub cap_limited_slots: u64,
+    pub cap_shortfall: u64,
+    pub known_loss_shortfall: u64,
+    pub invalid_anchor_fallbacks: u64,
+    pub counter_overflow: u64,
+}
+impl BudgetBaseInfo {
+    pub fn merge(&mut self, other: Self) {
+        let mut overflow = self.counter_overflow.max(other.counter_overflow);
+        macro_rules! add { ($($f:ident),*) => { $(self.$f = self.$f.checked_add(other.$f).unwrap_or_else(|| { overflow = 1; u64::MAX });)* }; }
+        add!(roots, source_symbols, repair_limit, demand_repairs, planned_repairs, sources_emitted, repairs_emitted, cap_limited_roots, cap_limited_slots, cap_shortfall, known_loss_shortfall, invalid_anchor_fallbacks);
+        self.counter_overflow = overflow;
+    }
+}
+#[derive(Debug)]
+struct BudgetRoot {
+    sink: std::sync::Arc<std::sync::Mutex<BudgetBaseInfo>>,
+    limited: bool,
+    /// Ceiling frozen at the first layout of the logical root, including later segments/TU retries.
+    cap_percent: u32,
+    target_draw:u64,
+    target_tail_applied:bool,
+    target_risk:crate::target_validation::RiskAdmission,
+    target_ordinal:u64,
+    target_app_tag:[u8;8],
+    #[cfg(any(test,feature="research_target_validation"))] target_owners:Vec<crate::target_validation::Owner>,
+    target_state:crate::target_validation::RiskState,
+    target_source_symbols:u64,
+}
+#[derive(Debug)]
+struct BudgetSegment {
+    target_plans:Vec<crate::target_validation::Plan>,
+    #[cfg(any(test,feature="research_target_validation"))] target_owner:Option<crate::target_validation::Owner>,
+    target_prior_losses:u32,
+    target_tail_added:u32,
+    #[cfg(feature="research_budget_diagnostic")] diagnostic_owner_generation:u64,
+    #[cfg(feature="research_budget_diagnostic")] diagnostic_original_k:u32,
+    #[cfg(feature="research_budget_diagnostic")] diagnostic_sources_committed:u64,
+    #[cfg(feature="research_budget_diagnostic")] diagnostic_counter_overflow:bool,
+    root: std::sync::Arc<std::sync::Mutex<BudgetRoot>>,
+    limit: u32,
+    reserved: u32,
+    emitted: u64,
+}
+
+/// An ACCEPTED congestion cut (the CC state actually changed), with its exact evidence anchor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcceptedCcEvent { pub kind: u8, pub evidence_seq: u64, pub evidence_sent_ns: u64, pub feedback_ns: u64 }
+pub const CC_EVENT_EARLY: u8 = 0;
+pub const CC_EVENT_TIMEOUT: u8 = 1;
+pub const CC_EVENT_CE: u8 = 2;
+const CC_EVENT_QUEUE_CAP: usize = 64;
+const EVENT_IDS_CAP: usize = 64;
+#[derive(Debug, Default, Clone)]
+struct CommitMark { event: u32, repair: u32, first_source: bool, package: u64,
+    source: u32, budget: Option<std::sync::Arc<std::sync::Mutex<BudgetSegment>>> }
 
 // Fixed per-connection retained-source budget and slot bound. Codec arenas add their
 // implementation overhead; giant messages exceeding the budget keep the original policy.
@@ -796,6 +1145,29 @@ impl FecSendSlot {
         self.n = if self.repair_policy == crate::fec_adapt::RepairPolicy::Reliability { n }
             else { n.min(self.k.saturating_mul(2).saturating_add(2 * groups)) };
     }
+    fn event_attribute(&mut self, from: u32, to: u32) {
+        let acc = &mut self.repair_accounting;
+        use std::sync::atomic::Ordering::Relaxed;
+        let from = acc.event_ids.last().map_or(from, |&(_, b)| from.max(b));
+        if from >= to { return; }
+        acc.event_planned = acc.event_planned.saturating_add(to - from);
+        if let Some(sink) = &acc.event_sink {
+            let add = (to - from) as u64;
+            if sink.planned.fetch_update(Relaxed, Relaxed, |v| v.checked_add(add)).is_err() { sink.overflow.store(1, Relaxed); }
+        }
+        let len = acc.event_ids.len();
+        match acc.event_ids.last_mut() {
+            Some(last) if last.1 == from => last.1 = to,
+            _ if len >= EVENT_IDS_CAP => {
+                acc.event_ids_overflow = acc.event_ids_overflow.saturating_add(1);
+                if let Some(sink) = &acc.event_sink { sink.ids_overflow.fetch_add(1, Relaxed); }
+            }
+            _ => acc.event_ids.push((from, to)),
+        }
+    }
+    fn event_ordinal(&self, ordinal: u32) -> bool {
+        self.repair_accounting.event_ids.iter().any(|&(a, b)| (a..b).contains(&ordinal))
+    }
     fn progress_info(&self) -> crate::fec_adapt::FecMessageInfo {
         let mut tag = [0u8; 8];
         let l = self.message.len().min(8);
@@ -822,18 +1194,235 @@ impl FecSendSlot {
         (segment_source_horizon(total, self.block_bytes, self.plan_ks.as_ref()), groups, self.message.len() > self.retain_limit)
     }
 
+    /// p4-burst-base B1, the single core of every P4 refresh path (loss, source completion, open-tail
+    /// refresh, final repair). While sources are still sending: R_g = d_g + b_g (known own loss replaced
+    /// one-for-one above the immutable base). Once all sources are sent: the count-quantile fixed point
+    /// over own unresolved symbols and connection-wide unresolved DATA. Plans only grow.
+    fn refresh_base_plan(&mut self, a: &crate::fec_adapt::FecAdaptiveState) {
+        let layout = crate::fec::MessageLayout::new(self.message.len(), self.block_bytes).unwrap();
+        let groups = layout.groups as u32;
+        let eps = crate::fec_adapt::base_group_eps(self.base_codecs(&layout));
+        let repairs = self.next_id.saturating_sub(self.k);
+        let pending = self.next_id.saturating_sub(self.finalized_symbols) as u64;
+        let mut r = self.repair_accounting.base_r;
+        let mut cap_bound = false;
+        for g in 0..layout.groups {
+            let kg = layout.group(g).1 as u32;
+            let d = self.group_lost[g];
+            let rg = if self.next_id < self.k {
+                let want = d.saturating_add(self.repair_accounting.base_b[g]);
+                cap_bound |= want > kg;
+                want.min(kg)
+            } else {
+                let rs = repairs / groups + u32::from((g as u32) < repairs % groups);
+                let (rg, capped) = a.base_tail_repairs(kg as u64, r.min(kg) as u64, d as u64, rs as u64, pending, eps);
+                cap_bound |= capped;
+                rg as u32
+            };
+            r = r.max(rg);
+        }
+        self.repair_accounting.base_r = r;
+        self.repair_accounting.base_cap_bound |= cap_bound;
+        let old_n = self.n;
+        let base = layout.round_plan(self.k.saturating_add(r.saturating_mul(groups)));
+        self.repair_accounting.unbonused_n = self.repair_accounting.unbonused_n.max(self.n).max(base);
+        self.n = self.n.max(base);
+        // Same attribution as the baseline: known-loss deficit first, the rest is tail protection.
+        let known = self.group_lost.iter().copied().max().unwrap_or(0);
+        let known_n = self.k.saturating_add((known + 2).saturating_mul(groups));
+        self.repair_accounting.planned_topup += self.n.saturating_sub(old_n).min(known_n.saturating_sub(old_n));
+    }
+    /// Reserve only new ordinal positions. The segment's FIRST layout grants its sole allowance;
+    /// TU restart changes the codec, not the budget. Never refund even abandoned reservations.
+    fn budget_plan(&mut self,demand:u32) { self.budget_plan_inner(demand,None); }
+    fn budget_plan_inner(&mut self, demand:u32,capture:Option<(usize,u8)>) {
+        let acc = &mut self.repair_accounting;
+        let mut segment = acc.budget.as_ref().unwrap().lock().unwrap();
+        let old = self.n.saturating_sub(self.k);
+        let mut added = demand.saturating_sub(old).min(segment.limit.saturating_sub(segment.reserved));
+        if segment.root.lock().unwrap().cap_percent==0 {
+            let representable=u32::MAX-self.k-old;
+            if added>representable {
+                segment.root.lock().unwrap().sink.lock().unwrap().merge(BudgetBaseInfo {counter_overflow:1,..Default::default()});
+                added=0; // explicit failure, never a giant index-ceiling target
+            }
+        }
+        #[cfg(feature="research_budget_diagnostic")]
+        if let Some((checkpoint,reason))=capture {
+            diag::demand_finish(checkpoint,(reason&!4)|if added>0 {4}else{0},demand,old+added,segment.diagnostic_owner_generation,segment.diagnostic_original_k,segment.limit,segment.reserved,segment.emitted,segment.diagnostic_sources_committed,segment.diagnostic_counter_overflow);
+        }
+        segment.reserved += added;
+        #[cfg(any(test,feature="research_target_validation"))]
+        if let Some(owner)=&segment.target_owner {owner.lock().unwrap().planned_repairs=segment.reserved;}
+        let allowed = old + added;
+        self.n = self.k + allowed;
+        let mut root = segment.root.lock().unwrap();
+        let mut delta = BudgetBaseInfo { planned_repairs: added as u64, ..Default::default() };
+        let shortfall = demand.saturating_sub(allowed) as u64;
+        // Known-loss-only lower bound. Initial base, decoder rank and modeled future losses
+        // are deliberately excluded; already planned parity can cover a known loss without
+        // a fresh extension. Count each group's actual ordinal allocation, not max(d)*groups.
+        let groups = self.group_lost.len() as u32;
+        let known_shortfall = self.group_lost.iter().enumerate().map(|(g, &d)| {
+            let allocated = allowed / groups + u32::from((g as u32) < allowed % groups);
+            d.saturating_sub(allocated) as u64
+        }).sum::<u64>();
+        delta.demand_repairs = (demand as u64).saturating_sub(acc.budget_demand);
+        delta.cap_shortfall = shortfall.saturating_sub(acc.budget_shortfall);
+        delta.known_loss_shortfall = known_shortfall.saturating_sub(acc.budget_known_shortfall);
+        acc.budget_demand = acc.budget_demand.max(demand as u64);
+        acc.budget_shortfall = acc.budget_shortfall.max(shortfall);
+        acc.budget_known_shortfall = acc.budget_known_shortfall.max(known_shortfall);
+        if shortfall != 0 {
+            if !acc.budget_limited { delta.cap_limited_slots = 1; acc.budget_limited = true; }
+            if !root.limited { delta.cap_limited_roots = 1; root.limited = true; }
+            acc.base_cap_bound = true;
+        }
+        root.sink.lock().unwrap().merge(delta);
+    }
+    /// Last systematic of the logical root, before even a zero-reserve owner can seal.
+
+    fn target_tail_complete(&mut self, selector:u32) {
+        if selector==0 {return;}
+        if self.segment.is_some_and(|s|s.offset as usize+self.message.len()!=s.total as usize) {return;}
+        let Some(budget)=self.repair_accounting.budget.clone() else {return};
+        let (k,draw,root_base,target_state)={
+            let b=budget.lock().unwrap();let mut root=b.root.lock().unwrap();
+            if root.target_tail_applied {return;} root.target_tail_applied=true;
+            let k=root.target_source_symbols;
+            (u32::try_from(k).expect("tail root K overflow"),root.target_draw,root.target_risk.p_base,root.target_state.clone())
+        };
+        let remaining=self.n.saturating_sub(self.next_id);
+        let tail=crate::target_validation::tail_plan(&target_state,k,remaining,selector,draw,root_base).expect("STP_TV_RISK_TAIL reserve search failed");
+        let old=self.n;
+        let demand=self.n.saturating_sub(self.k).checked_add(tail.added).expect("tail repair demand overflow");
+        if tail.added!=0 {self.budget_plan(demand);}
+        let mut b=budget.lock().unwrap();b.target_tail_added=self.n-old;
+        #[cfg(any(test,feature="research_target_validation"))]
+        if let Some(owner)=&b.target_owner {let mut row=owner.lock().unwrap();row.tail_risk=tail.risk;row.tail_k=tail.k;row.tail_added=b.target_tail_added;}
+    }
+    fn refresh_budget_plan(&mut self, a: &crate::fec_adapt::FecAdaptiveState) {
+
+        {
+            let segment=self.repair_accounting.budget.as_ref().unwrap().lock().unwrap();
+            #[cfg(any(test,feature="research_target_validation"))]
+            if let Some(owner)=&segment.target_owner {owner.lock().unwrap().known_losses=segment.target_prior_losses.saturating_add(self.group_lost.iter().copied().sum::<u32>());}
+            if a.target_selector()!=0 {
+                // Frozen proactive plan plus exactly one replacement for EACH known own DATA loss.
+                // Preserve the optional once-only tail grant; later losses still add exactly 1:1.
+                let tail=segment.target_tail_added;
+                let r=segment.target_prior_losses.checked_add(tail).and_then(|start|self.group_lost.iter().zip(&self.repair_accounting.base_b).try_fold(start,|sum,(&d,&b)|sum.checked_add(d)?.checked_add(b)));
+                drop(segment);
+                match r {Some(r) if r<=u32::MAX-self.k=>self.budget_plan(r),_=>self.repair_accounting.budget.as_ref().unwrap().lock().unwrap().root.lock().unwrap().sink.lock().unwrap().merge(BudgetBaseInfo{counter_overflow:1,..Default::default()})}
+                return;
+            }
+        }
+        let layout = crate::fec::MessageLayout::new(self.message.len(), self.block_bytes).unwrap();
+        let groups = layout.groups as u32;
+        let codecs = self.base_codecs(&layout);
+        #[cfg(feature="research_budget_diagnostic")]
+        let capture=self.next_id>=self.k && self.diagnostic.is_some() && diag::active();
+        #[cfg(feature="research_budget_diagnostic")]
+        let checkpoint=if capture {diag::demand_checkpoint()}else{0};
+        let repairs = self.next_id.saturating_sub(self.k);
+        let planned = self.n.saturating_sub(self.k);
+        let own = self.next_id.saturating_sub(self.finalized_symbols) as u64;
+        let (span, invalid) = a.budget_unresolved_span(self.repair_accounting.data_anchor, own);
+        let invalid = invalid || self.repair_accounting.budget_invalid_anchor;
+        if invalid && !self.repair_accounting.budget_invalid_anchor {
+            self.repair_accounting.budget_invalid_anchor = true;
+            let segment = self.repair_accounting.budget.as_ref().unwrap().lock().unwrap();
+            segment.root.lock().unwrap().sink.lock().unwrap().merge(BudgetBaseInfo { invalid_anchor_fallbacks: 1, ..Default::default() });
+        }
+        let mut r = 0;
+        let mut known = 0;
+        for g in 0..layout.groups {
+            let kg = layout.group(g).1 as u32;
+            let d = self.group_lost[g];
+            let bg = self.repair_accounting.base_b[g];
+            known = known.max(d.saturating_add(bg));
+            let rg = if self.next_id < self.k {
+                if a.cost_smooth_active() {d.saturating_add(bg)}else{d.saturating_add(bg).min(kg)}
+            } else {
+                let rs = repairs / groups + u32::from((g as u32) < repairs % groups);
+                let start = planned / groups + u32::from((g as u32) < planned % groups);
+                #[cfg(feature="research_budget_diagnostic")]
+                let mut record=capture.then(|| {
+                    let l=self.diagnostic.unwrap();let anchor=self.repair_accounting.data_anchor;
+                    let mut c=diag::Demand::default();
+                    c.header=diag::DemandHeader {generation:l.generation,package:l.package,root:l.root,
+                        codec_index:g as u32,codec_count:codecs as u32,group_count:groups,k:kg,cap_percent:a.repair_cap_percent(),
+                        old_planned:planned,d,own_finalized:self.finalized_symbols,assembled:self.next_id,rs,start,ug:own,uc:span,
+                        anchor_generation:anchor.map_or(0,|a|a.0),anchor_a:anchor.map_or(0,|a|a.1),flags:u32::from(anchor.is_some())|if invalid {2}else{0},
+                        segment_offset:self.segment.map_or(0,|s|s.offset),..Default::default()};c
+                });
+                let result=a.budget_tail_for_codecs(kg as u64,start as u64,d as u64,rs as u64,own,codecs,span,
+                    segment_source_horizon(self.segment.map_or(self.message.len(),|s|s.total as usize),self.block_bytes,self.plan_ks.as_ref()),
+                    #[cfg(feature="research_budget_diagnostic")] record.as_mut(), #[cfg(not(feature="research_budget_diagnostic"))] None);
+                if a.cost_smooth_active() && result.1 {
+                    self.repair_accounting.budget.as_ref().unwrap().lock().unwrap().root.lock().unwrap().sink.lock().unwrap().merge(BudgetBaseInfo {counter_overflow:1,..Default::default()});
+                }
+                let result=result.0 as u32;
+                #[cfg(feature="research_budget_diagnostic")]
+                if let Some(c)=record {diag::demand_push(c);}
+                result
+            };
+            // After an outage, old foreign in-flight DATA is no longer represented by S/F.
+            // No tighter-span proof survives: demand the maximum model cap, then let the
+            // HARD budget clip it. Never pretend the new generation covers the old interval.
+            r = r.max(if invalid && !a.cost_smooth_active() { kg } else { rg });
+        }
+        let old_n = self.n;
+        let demand=if a.cost_smooth_active() {
+            match r.checked_mul(groups).filter(|v|*v<=u32::MAX-self.k) {
+                Some(v)=>v,
+                None=>{self.repair_accounting.budget.as_ref().unwrap().lock().unwrap().root.lock().unwrap().sink.lock().unwrap().merge(BudgetBaseInfo {counter_overflow:1,..Default::default()});planned}
+            }
+        }else{r.saturating_mul(groups)};
+        #[cfg(feature="research_budget_diagnostic")]
+        let diagnostic=if capture {
+            let previous=self.repair_accounting.diagnostic_last_demand.replace(demand);
+            let reason=u8::from(previous.is_none())|if previous.is_some_and(|p|p!=demand){2}else{0}|if demand>planned {4}else{0};
+            Some((checkpoint,reason))
+        }else{None};
+        self.budget_plan_inner(demand, #[cfg(feature="research_budget_diagnostic")] diagnostic, #[cfg(not(feature="research_budget_diagnostic"))] None);
+        self.repair_accounting.base_r = self.n.saturating_sub(self.k).div_ceil(groups);
+        self.repair_accounting.unbonused_n = self.n;
+        self.repair_accounting.planned_topup += self.n.saturating_sub(old_n).min(self.k.saturating_add(known.saturating_mul(groups)).saturating_sub(old_n));
+    }
+    /// Wirehair codecs of the whole logical root: every segment times this layout's groups.
+    fn base_codecs(&self, layout: &crate::fec::MessageLayout) -> usize {
+        self.segment.map_or(layout.groups, |s| (s.total as usize).div_ceil(FEC_SEGMENT_BYTES) * layout.groups)
+    }
+
     fn refresh_plan(&mut self, a: &crate::fec_adapt::FecAdaptiveState) {
+        #[cfg(feature = "research_budget_diagnostic")]
+        let before = self.n;
+        self.refresh_plan_inner(a);
+        #[cfg(feature = "research_budget_diagnostic")]
+        if self.n != before { if let Some(l) = self.diagnostic { diag::layout_event(l, self.n, self.next_id, monotonic_clock_ns(), 1); } }
+    }
+    fn refresh_plan_inner(&mut self, a: &crate::fec_adapt::FecAdaptiveState) {
         use crate::fec_adapt::RepairPolicy;
         if a.policy == RepairPolicy::MeanOpen || a.policy == RepairPolicy::MeanTopup { return; }
         if matches!(a.policy, RepairPolicy::Streaming | RepairPolicy::MessageBound) {
             // Earlier losses are replaced one-for-one at this group's extension.
             // Only the unresolved in-flight tail gets expected-loss protection.
+            if self.repair_accounting.budget.is_some() { self.refresh_budget_plan(a); return; }
+            if !self.repair_accounting.base_b.is_empty() { self.refresh_base_plan(a); return; }
             let pending = if self.next_id >= self.k { self.next_id.saturating_sub(self.finalized_symbols) } else { 0 };
             let margin = crate::fec_adapt::mean_repairs(pending as u64, a.p).max(2) as u32;
             let layout = crate::fec::MessageLayout::new(self.message.len(), self.block_bytes).unwrap();
-            let repairs = (0..layout.groups).map(|g| self.group_lost[g].saturating_add(margin).min(layout.group(g).1 as u32)).max().unwrap();
+            let event = |g: usize| self.repair_accounting.event_bonus.get(g).copied().unwrap_or(0);
+            let repairs = (0..layout.groups).map(|g| self.group_lost[g].saturating_add(margin).saturating_add(event(g)).min(layout.group(g).1 as u32)).max().unwrap();
             let old_n = self.n;
             let base = layout.round_plan(self.k.saturating_add(repairs * layout.groups as u32));
+            // Event-free counterfactual of this same refresh (identical when no grant exists).
+            let base0 = if self.repair_accounting.event_bonus.is_empty() { base } else {
+                let r0 = (0..layout.groups).map(|g| self.group_lost[g].saturating_add(margin).min(layout.group(g).1 as u32)).max().unwrap();
+                layout.round_plan(self.k.saturating_add(r0 * layout.groups as u32))
+            };
+            let unbonused_before = self.repair_accounting.unbonused_n;
             let bonus = self.repair_accounting.category_bonus;
             // Extend the unbonused adaptive base monotonically, then add the
             // SAME source-K bonus once. Never apply a percentage to extended N
@@ -842,6 +1431,11 @@ impl FecSendSlot {
                 .max(self.n.saturating_sub(bonus)).max(base);
             let target = self.repair_accounting.unbonused_n.saturating_add(bonus);
             self.n = self.n.max(if bonus == 0 { target } else { target.min(self.k.saturating_mul(2)) });
+            if !self.repair_accounting.event_bonus.is_empty() {
+                // bonus == 0 is enforced for event repair, so the event-free n is max(old_n, unbonused_before, base0).
+                let without = old_n.max(unbonused_before).max(base0);
+                if self.n > without { self.event_attribute(without, self.n); }
+            }
             // Attribute each newly planned symbol once. Known-loss deficit gets
             // priority; the rest protects unresolved packets. Initial rank symbols
             // and post-message rescue are reported separately.
@@ -915,7 +1509,7 @@ fn wire_fec_layout(len: usize, block_bytes: usize) -> Option<crate::fec::Message
 
 /// Independently coded, fixed byte-range group of one application message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FecSegment { root: u64, total: u32, offset: u32 }
+pub struct FecSegment { pub(crate) root: u64, total: u32, offset: u32 }
 
 #[derive(Debug)]
 struct SegmentedSend {
@@ -992,6 +1586,8 @@ impl UnreliableSendBuffer {
     // construct SendQueues, which installs the guarded shared identity allocator.
     pub(crate) fn new(target_queue_size_us: u32, min_queue_size_bytes: u32, max_queue_size_bytes: u32) -> Self {
         Self {
+            #[cfg(feature = "research_budget_diagnostic")]
+            diagnostic_last: None,
             target_queue_size_us,
             min_queue_size_bytes,
             max_queue_size_bytes,
@@ -999,6 +1595,7 @@ impl UnreliableSendBuffer {
             message_queue: VecDeque::new(),
             current_dscp: Dscp::BestEffort,
             packet_dscp: None,
+            target_dup_no_chop:false,
             partial_send_slot: None,
             send_package_id: 0,
             package_allocator: None,
@@ -1026,10 +1623,285 @@ impl UnreliableSendBuffer {
             fec_now_ns: 0,
             fec_rtt_ns: 0,
             fec_record: None,
-            category_bonus_percent: crate::fec_adapt::category_bonus_percent(),
+            interleave_width: crate::fec_adapt::research_interleave_width(),
+            interleave_parked: VecDeque::new(),
+            interleave_last_packet: None,
+            slipstream: crate::fec_adapt::research_slipstream(),
+            slipstream_head: true,
+            slipstream_eligible: None,
+            slipstream_turn_head: true,
+            slipstream_packet: None,
+            slipstream_classified: 0,
+            slipstream_eligible_heads: 0,
+            slipstream_head_packets: 0,
+            slipstream_follow_packets: 0,
+            slipstream_started: false,
+            logical_root: 0, logical_tag: 0, logical_len: 0,
+            slipstream_info: SlipstreamInfo::default(),
+            slipstream_trace: None,
+            slipstream_queue: 0,
+            slipstream_payload_len: 0,
+            category_bonus_percent: crate::fec_adapt::research_medium_bonus(),
             category_eligible: None,
             category_bonus_messages: 0,
             category_bonus_repairs: 0,
+            event_repair_q: crate::fec_adapt::research_p4_event_repair(),
+            event_root_latched: false,
+            event_repair: EventRepairInfo::default(),
+            event_sink: std::sync::Arc::new(EventSink::default()),
+            commit_marks: std::collections::BTreeMap::new(),
+            budget_root: None, budget_sink: std::sync::Arc::new(std::sync::Mutex::new(BudgetBaseInfo::default())),
+            target_root_sequence:0,
+            target_state:Default::default(),
+        }
+    }
+
+    fn interleave_source_bytes(&self) -> usize {
+        self.interleave_parked.iter().map(MessageSendContext::source_bytes).sum::<usize>() +
+            source_owner_bytes(self.partial_send_slot.as_ref(), self.segmented_send.as_ref(),
+                self.fec_send_slot.as_ref(), self.fec_suspended.as_ref(), &self.fec_retained)
+    }
+    fn interleave_parkable(&self) -> bool {
+        self.segmented_send.is_none() && self.fec_retained.is_empty() &&
+            self.fec_suspended.is_none() && self.fec_rescue_package.is_none() &&
+            self.fec_send_slot.as_ref().is_none_or(|f| f.segment.is_none() &&
+                f.message.len() <= FEC_SEGMENT_BYTES &&
+                crate::fec::MessageLayout::new(f.message.len(), f.block_bytes).is_some_and(|l| l.groups == 1))
+    }
+    fn slipstream_has_owner(&self) -> bool {
+        self.partial_send_slot.is_some() || self.fec_send_slot.is_some() ||
+            self.segmented_send.is_some() || self.p4_open
+    }
+    // Research policy, not an application knob: estimate packet-train duration
+    // at this application's current equal-byte fair share. Use current full TU
+    // (not source bytes) and the actual source + initially planned repair train.
+    // Eligible whole logical trains span [0.5 RTT, 2 RTT], inclusively; no startup rule.
+    // A promoted partially sent follower uses its remaining planned train.
+    fn slipstream_classify(&mut self, payload_len: usize) {
+        if !self.slipstream_head || self.slipstream_eligible.is_some() { return; }
+        let packets = owner_remaining_packets(self.fec_send_slot.as_ref(), self.fec_suspended.as_ref(),
+            &self.fec_retained, self.segmented_send.as_ref(), payload_len, !self.slipstream_started,
+            self.category_bonus_percent, self.category_eligible == Some(true));
+        let reason = medium_duration_class(packets, payload_len, self.current_bytes_per_second, self.fec_rtt_ns);
+        let eligible = reason == "eligible";
+        self.slipstream_eligible = Some(eligible);
+        self.slipstream_classified += 1;
+        self.slipstream_eligible_heads += u64::from(eligible);
+        let i = &mut self.slipstream_info;
+        let pps = self.current_bytes_per_second as f64 / payload_len as f64;
+        if i.heads_evaluated == 0 {
+            i.rtt_ns_min = self.fec_rtt_ns;
+            i.fair_share_pps_min = pps;
+        } else {
+            i.rtt_ns_min = i.rtt_ns_min.min(self.fec_rtt_ns);
+            i.fair_share_pps_min = i.fair_share_pps_min.min(pps);
+        }
+        i.rtt_ns_max = i.rtt_ns_max.max(self.fec_rtt_ns);
+        i.fair_share_pps_max = i.fair_share_pps_max.max(pps);
+        i.heads_evaluated += 1;
+        match reason {
+            "eligible" => i.heads_eligible += 1, "short" => i.ineligible_short += 1,
+            "long" => i.ineligible_long += 1, _ => i.ineligible_other += 1,
+        }
+        self.slipstream_trace_event("evaluate", reason, "", 0, 0, payload_len);
+    }
+    fn slipstream_select(&mut self, payload_len: usize, space: usize) {
+        self.slipstream_payload_len = payload_len;
+        if space != payload_len || self.slipstream_packet == Some(self.next_packet_seq) { return; }
+        if self.slipstream_has_owner() {
+            self.slipstream_classify(payload_len);
+            let mut c = MessageSendContext::empty();
+            c.swap(self);
+            self.interleave_parked.push_back(c);
+        }
+        // A finished protected head is forgotten, never leased waiting for ACKs.
+        // The sole following owner, including a partially sent giant, is promoted.
+        if !self.interleave_parked.iter().any(|c| c.slipstream_head) {
+            if let Some(c) = self.interleave_parked.front_mut() {
+                c.slipstream_head = true;
+                c.slipstream_eligible = None;
+                self.slipstream_turn_head = true;
+                self.slipstream_info.head_promotions += 1;
+            } else {
+                self.slipstream_head = true;
+                self.slipstream_eligible = None;
+                self.slipstream_turn_head = true;
+                return;
+            }
+        }
+        let head_index = self.interleave_parked.iter().position(|c| c.slipstream_head).unwrap();
+        if self.interleave_parked[head_index].slipstream_eligible.is_none() {
+            let mut c = self.interleave_parked.remove(head_index).unwrap();
+            c.swap(self);
+            self.slipstream_trace_event("promote", "", "", 0, 0, payload_len);
+            self.slipstream_classify(payload_len);
+            c.swap(self);
+            self.interleave_parked.insert(head_index, c);
+        }
+        let eligible = self.interleave_parked[head_index].slipstream_eligible == Some(true);
+        // Admit exactly the next FIFO logical message, any size, only for the
+        // following lane. Tiny messages can retire and refill within its packet.
+        if eligible && !self.slipstream_turn_head && self.interleave_parked.len() == 1 {
+            if let Some((_, m)) = self.message_queue.front() {
+                let reserve = m.capacity().saturating_add(if m.len() > FEC_SEGMENT_BYTES { m.len() } else { 0 });
+                if self.interleave_source_bytes().saturating_add(reserve) <= self.current_byte_capacity() as usize {
+                    let (dscp, m) = self.message_queue.pop_front().unwrap();
+                    self.current_dscp = dscp;
+                    self.slipstream_head = false;
+                    self.slipstream_eligible = None;
+                    self.start_message(m, payload_len);
+                    if self.slipstream_has_owner() {
+                        let mut c = MessageSendContext::empty();
+                        c.swap(self);
+                        self.interleave_parked.push_back(c);
+                    }
+                }
+            }
+        }
+        debug_assert!(self.interleave_parked.len() <= 2);
+        let unstarted = |c: &MessageSendContext| !c.slipstream_started ||
+            c.fec_send_slot.as_ref().is_some_and(|f| f.next_id == 0) ||
+            c.partial_send_slot.as_ref().is_some_and(|(_, offset)| *offset == 0);
+        let older_unstarted = self.interleave_parked.iter().any(|c| c.slipstream_head && unstarted(c));
+        let prefer_head = !eligible || self.slipstream_turn_head;
+        let preferred = self.interleave_parked.iter().position(|c| c.slipstream_head == prefer_head).unwrap_or(head_index);
+        let mut choice = None;
+        for index in [preferred, 1usize.saturating_sub(preferred)] {
+            let Some(c) = self.interleave_parked.get_mut(index) else { continue; };
+            if !c.slipstream_head && unstarted(c) && older_unstarted { continue; }
+            let ready_repair = c.rescue_ready.iter().any(|p| c.fec_retained.get_mut(p)
+                .is_some_and(|r| Self::encoder_ready(&mut r.slot)));
+            let needs_restart = |f: &FecSendSlot| {
+                let header = if f.segment.is_some() { STP_SEGMENT_FEC_HEADER_SIZE } else { STP_FEC_FRAGMENT_HEADER_SIZE };
+                let layout = crate::fec::MessageLayout::new(f.message.len(), f.block_bytes).unwrap();
+                // Match next_fragment's actual next symbol, not the maximum
+                // block width: a short final systematic source may still fit.
+                header + crate::fec::block_len(f.message.len(), f.block_bytes, layout.wire_id(f.next_id)) > payload_len
+            };
+            let needs_layout_id = c.fec_send_slot.as_ref().map_or(c.segmented_send.is_some(), needs_restart);
+            let id_ready = !needs_layout_id || self.package_allocator.as_ref().is_none_or(|ids|
+                *ids.live.lock().unwrap() < 1024 && ids.load(std::sync::atomic::Ordering::Relaxed) < u64::MAX);
+            let ready = ready_repair || id_ready && c.fec_send_slot.as_mut().is_none_or(|f|
+                (!needs_restart(f) || Self::encoder_initialized(f)) && Self::encoder_ready(f));
+            if ready { choice = Some(index); break; }
+        }
+        let mut c = self.interleave_parked.remove(choice.unwrap_or(preferred)).unwrap();
+        c.swap(self);
+    }
+    // Called only after real framing. One latch per emitted physical packet,
+    // not per fragment, failed attempt, nonce, ACK, or immutable ciphertext retry.
+    fn slipstream_emitted(&mut self, payload_len: usize) {
+        if !self.slipstream { return; }
+        if !self.slipstream_started {
+            self.slipstream_started = true;
+            if !self.slipstream_head {
+                let kind = if self.logical_len > FEC_SEGMENT_BYTES { "segmented_giant" }
+                    else if self.fec_send_slot.is_some() { "ordinary_fec" } else { "tiny_whole_or_packed" };
+                match kind {
+                    "segmented_giant" => self.slipstream_info.follower_starts_segmented_giant += 1,
+                    "ordinary_fec" => self.slipstream_info.follower_starts_ordinary_fec += 1,
+                    _ => self.slipstream_info.follower_starts_tiny_whole_or_packed += 1,
+                }
+                self.slipstream_trace_event("start_follower", "", kind, self.logical_root, self.logical_tag, payload_len);
+            }
+        }
+        let concurrent = 1 + self.interleave_parked.iter().filter(|c| c.slipstream_started).count() as u64;
+        self.slipstream_info.max_concurrent_started_messages = self.slipstream_info.max_concurrent_started_messages.max(concurrent);
+        if concurrent > 2 { self.slipstream_info.recursive_windows += 1; }
+        if self.slipstream_packet == Some(self.next_packet_seq) { return; }
+        self.slipstream_packet = Some(self.next_packet_seq);
+        if self.slipstream_head {
+            self.slipstream_head_packets += 1;
+            if self.slipstream_eligible == Some(true) && (!self.interleave_parked.is_empty() || !self.message_queue.is_empty()) {
+                self.slipstream_info.head_packets_alternated += 1;
+            }
+        } else {
+            self.slipstream_follow_packets += 1;
+            self.slipstream_info.follower_packets += 1;
+        }
+        self.slipstream_turn_head = !self.slipstream_head;
+    }
+    fn slipstream_trace_event(&self, event: &str, decision: &str, kind: &str, root: u64, tag: u64, payload_len: usize) {
+        use std::io::Write;
+        let Some(trace) = &self.slipstream_trace else { return; };
+        let payload = if payload_len == 0 { self.slipstream_payload_len } else { payload_len };
+        let (head_root, head_tag, head_len, packets) = if self.slipstream_head {
+            (self.logical_root, self.logical_tag, self.logical_len,
+                owner_remaining_packets(self.fec_send_slot.as_ref(), self.fec_suspended.as_ref(), &self.fec_retained,
+                    self.segmented_send.as_ref(), payload, !self.slipstream_started, self.category_bonus_percent, self.category_eligible == Some(true)))
+        } else if let Some(c) = self.interleave_parked.iter().find(|c| c.slipstream_head) {
+            (c.logical_root, c.logical_tag, c.logical_len,
+                owner_remaining_packets(c.fec_send_slot.as_ref(), c.fec_suspended.as_ref(), &c.fec_retained,
+                    c.segmented_send.as_ref(), payload, !c.slipstream_started, self.category_bonus_percent, c.category_eligible == Some(true)))
+        } else { (0, 0, 0, 0) };
+        let pps = self.current_bytes_per_second as f64 / payload_len.max(self.slipstream_payload_len).max(1) as f64;
+        let ms = if pps > 0.0 { packets as f64 / pps * 1000.0 } else { 0.0 };
+        writeln!(trace.lock().unwrap(), "{},{},{event},{head_root},{head_tag},{head_len},{packets},{},{pps},{ms},{decision},{kind},{root},{tag}",
+            self.fec_now_ns, self.slipstream_queue, self.fec_rtt_ns).expect("write slipstream trace");
+    }
+    fn interleave_select(&mut self, payload_len: usize, space: usize) {
+        if self.slipstream { self.slipstream_select(payload_len, space); return; }
+        if self.interleave_width == 1 || space != payload_len ||
+            self.interleave_last_packet == Some(self.next_packet_seq) ||
+            !self.fec_adaptive.as_ref().is_some_and(|a| a.policy == crate::fec_adapt::RepairPolicy::MessageBound) ||
+            !self.interleave_parkable() { return; }
+        self.interleave_last_packet = Some(self.next_packet_seq);
+        let eligible_head = self.message_queue.front().is_some_and(|(_, m)|
+            m.len() <= payload_len.saturating_sub(STP_WHOLE_HEADER_SIZE) ||
+            m.len() <= FEC_SEGMENT_BYTES && self.fec_block_bytes(m.len(), payload_len)
+                .and_then(|b| crate::fec::MessageLayout::new(m.len(), b)).is_some_and(|l| l.groups == 1));
+        let selected = self.partial_send_slot.is_some() || self.fec_send_slot.is_some();
+        // No peer work: exercise the exact legacy W1 path, without an idle hold.
+        if self.interleave_parked.is_empty() && (!selected || !eligible_head) { return; }
+        if selected {
+            let mut current = MessageSendContext::empty();
+            current.swap(self);
+            self.interleave_parked.push_back(current);
+        }
+        if eligible_head && self.interleave_parked.len() < self.interleave_width {
+            let bytes = self.message_queue.front().unwrap().1.capacity();
+            // queue_bytes_filled continues to charge every ordinary source until
+            // seal/reclaim. Admission adds no payload copy, and can't multiply
+            // the existing configured queue capacity (oversized-alone stays W1).
+            if self.interleave_source_bytes().saturating_add(bytes) <= self.current_byte_capacity() as usize {
+                let (dscp, message) = self.message_queue.pop_front().unwrap();
+                self.current_dscp = dscp;
+                if self.start_message(message, payload_len) {
+                    let mut added = MessageSendContext::empty();
+                    added.swap(self);
+                    self.interleave_parked.push_back(added);
+                }
+            }
+        }
+        // New work joins the tail. Repeated tiny arrivals cannot steal the
+        // oldest message's quantum. A pending worker may be skipped for a
+        // STARTED peer, but not for a younger message's first symbol. Unstarted
+        // leases retain FIFO ID order: a TU restart emits source immediately
+        // under its fresh ID before it can be parked again.
+        let unstarted = |c: &MessageSendContext| c.fec_send_slot.as_ref().is_some_and(|f| f.next_id == 0) ||
+            c.partial_send_slot.as_ref().is_some_and(|(_, offset)| *offset == 0);
+        let first_start = self.interleave_parked.iter().filter(|c| unstarted(c)).map(|c| c.send_package_id).min();
+        let count = self.interleave_parked.len();
+        let mut selected = false;
+        for _ in 0..count {
+            let mut context = self.interleave_parked.pop_front().unwrap();
+            let in_order = !unstarted(&context) || Some(context.send_package_id) == first_start;
+            let ready = in_order && context.fec_send_slot.as_mut().is_none_or(|f|
+                (f.block_bytes + STP_FEC_FRAGMENT_HEADER_SIZE <= payload_len || Self::encoder_initialized(f)) && Self::encoder_ready(f));
+            if ready {
+                context.swap(self);
+                selected = true;
+                break;
+            }
+            self.interleave_parked.push_back(context);
+        }
+        if !selected && count > 0 {
+            // All eligible contexts are blocked. Project the oldest unstarted
+            // owner (if any), never a younger ready first symbol. Return promptly
+            // so other application queues can receive this packet's service.
+            let index = first_start.and_then(|id| self.interleave_parked.iter().position(|c| c.send_package_id == id)).unwrap_or(0);
+            let mut context = self.interleave_parked.remove(index).unwrap();
+            context.swap(self);
         }
     }
 
@@ -1044,12 +1916,16 @@ impl UnreliableSendBuffer {
                 Ok(None) | Err(std::sync::mpsc::TryRecvError::Disconnected) => FecEncoderState::Failed,
                 Err(std::sync::mpsc::TryRecvError::Empty) => return false,
             };
+            #[cfg(feature = "research_cohort_observer")]
+            if matches!(f.encoder, FecEncoderState::Failed) { crate::cohort_observe::fec_encoder_failed(); }
         }
         true
     }
 
     fn can_emit(&mut self) -> bool {
         self.reclaim_finished_partial();
+        if self.interleave_parked.iter_mut().any(|c| c.fec_send_slot.as_mut().is_none_or(Self::encoder_ready)) { return true; }
+        if self.interleave_width > 1 && !self.message_queue.is_empty() && self.interleave_parkable() { return true; }
         if self.partial_send_slot.is_some() { return true; }
         if self.fec_rescue_package.is_none() {
             if let Some(package) = self.ready_rescue_package() {
@@ -1100,6 +1976,16 @@ impl UnreliableSendBuffer {
             let count = ((tag >> 32) & 0xffff_ffff) as u32;
             if count == 0 { continue; }
             let package = (tag >> 64) as u64;
+            // Connection tags encode package identity, not the currently selected
+            // message. Apply both ACK and loss to the owner's unchanged P4 path.
+            if let Some(index) = self.interleave_parked.iter().position(|c| c.owns_package(package)) {
+                let mut context = self.interleave_parked.remove(index).unwrap();
+                context.swap(self);
+                self.fec_finalize_tags(seq, lost, &[tag]);
+                context.swap(self);
+                self.interleave_parked.insert(index, context);
+                continue;
+            }
             let active = self.fec_send_slot.is_some() && package == self.fec_rescue_package.unwrap_or(self.send_package_id);
             let suspended = self.fec_suspended.is_some() && package == self.send_package_id;
             let retained = self.fec_retained.contains_key(&package);
@@ -1219,7 +2105,7 @@ impl UnreliableSendBuffer {
         }
         dynamic_target.max(self.min_queue_size_bytes as u64).min(self.max_queue_size_bytes as u64) as u32
     }
-    
+
     /// Back pressure, never drop: a message once accepted is sent. Messages are accepted in the
     /// caller's order while `queue_bytes_filled + len <= current_byte_capacity()`; a message is
     /// always accepted when nothing is queued, so a message bigger than the capacity can still go
@@ -1257,6 +2143,7 @@ impl UnreliableSendBuffer {
     }
 
     pub fn has_unsent_data(&self) -> bool {
+        if !self.interleave_parked.is_empty() { return true; }
         if !self.message_queue.is_empty() || self.segmented_send.is_some() { return true; }
         if let Some((msg, start_byte)) = &self.partial_send_slot {
             if (*start_byte as usize) < msg.len() { return true; }
@@ -1286,7 +2173,8 @@ impl UnreliableSendBuffer {
     // determine its tail allowance. Ready work uses the ordinary FIFO sender.
     fn p4_refresh_tail(&mut self) {
         if !self.p4_open || self.p4_tail_refreshed || self.segmented_send.is_some() || self.fec_rescue_package.is_some() { return; }
-        if !self.fec_send_slot.as_ref().is_some_and(|f| f.next_id >= f.k) { return; }
+        if !self.fec_send_slot.as_ref().is_some_and(|f| f.next_id >= f.k ||
+            f.repair_accounting.budget.is_some() && f.next_id + 1 == f.k && f.n == f.k) { return; }
         self.p4_tail_refreshed = true;
         let Some(a) = &self.fec_adaptive else { return; };
         for (&package, r) in &mut self.fec_retained {
@@ -1302,12 +2190,110 @@ impl UnreliableSendBuffer {
     fn p4_finish_if_idle(&mut self) {
         if self.p4_open && self.fec_send_slot.is_none() && self.fec_suspended.is_none() &&
             self.segmented_send.is_none() && self.rescue_ready_count == 0 {
+            if self.slipstream { self.slipstream_trace_event("end", "sealed", "", self.logical_root, self.logical_tag, 0); }
+            #[cfg(feature="research_budget_diagnostic")]
+            if let Some(l)=self.diagnostic_last.take() {diag::layout_event(l,l.planned,l.assembled,self.fec_now_ns,4);}
+            #[cfg(any(test,feature="research_target_validation"))]
+            if let Some(root)=&self.budget_root {for owner in &root.lock().unwrap().target_owners {let mut row=owner.lock().unwrap();row.sealed=true;row.sealed_ns=self.fec_now_ns;}}
             self.fec_retained.clear();
             self.retained_bytes = 0;
             self.rescue_ready.clear();
             self.p4_open = false;
             self.p4_closing = false;
             self.p4_tail_refreshed = false;
+            self.event_root_latched = false;
+            self.budget_root = None;
+        }
+    }
+
+    /// p4-event-repair: one immutable grant per logical root, at its first QUALIFYING accepted CC event. A slot
+    /// qualifies iff it is exposed now (active/suspended/retained, root open and not closing) and its first source
+    /// commit precedes the event evidence in both sequence and send time. No later grants, no child inheritance.
+    fn p4_event_repair(&mut self, e: &AcceptedCcEvent) {
+        match e.kind {
+            CC_EVENT_EARLY => self.event_repair.accepted_early += 1,
+            CC_EVENT_TIMEOUT => self.event_repair.accepted_timeout += 1,
+            _ => self.event_repair.accepted_ce += 1,
+        }
+        if self.event_repair_q == 0 { return; }
+        if !self.p4_open || self.p4_closing { self.event_repair.skip_closed += 1; return; }
+        if self.event_root_latched { self.event_repair.skip_latched += 1; return; }
+        let qualifies = |f: &FecSendSlot| f.repair_policy == crate::fec_adapt::RepairPolicy::MessageBound
+            && !matches!(f.encoder, FecEncoderState::Failed)
+            // Exact commit proof + sequence order; time compared at the send-history resolution of the evidence.
+            && f.repair_accounting.first_source_commit.is_some_and(|(seq, t)| seq <= e.evidence_seq && send_history_time_ns(t) <= e.evidence_sent_ns);
+        let exposed = || self.fec_send_slot.iter().chain(self.fec_suspended.iter()).chain(self.fec_retained.values().map(|r| &r.slot));
+        let good = exposed().filter(|f| qualifies(f)).count() as u64;
+        let total = exposed().count() as u64;
+        if good == 0 { self.event_repair.skip_unexposed += 1; return; }
+        let Some(a) = self.fec_adaptive.take() else { self.event_repair.skip_closed += 1; return; };
+        self.event_root_latched = true;
+        let info = &mut self.event_repair;
+        info.roots_granted += 1;
+        info.slots_granted += good;
+        info.slots_unqualified += total - good;
+        let q = self.event_repair_q as u64;
+        let sink = self.event_sink.clone();
+        let mut grant = |f: &mut FecSendSlot, info: &mut EventRepairInfo| {
+            if !qualifies(f) { return; }
+            f.repair_accounting.event_sink = Some(sink.clone());
+            let layout = crate::fec::MessageLayout::new(f.message.len(), f.block_bytes).unwrap();
+            f.repair_accounting.event_bonus = (0..layout.groups).map(|g| (q * layout.group(g).1 as u64).div_ceil(100) as u32).collect();
+            info.grant_symbols += f.repair_accounting.event_bonus.iter().map(|&b| b as u64).sum::<u64>();
+            f.refresh_plan(&a);
+        };
+        if let Some(f) = self.fec_send_slot.as_mut() { grant(f, info); }
+        if let Some(f) = self.fec_suspended.as_mut() { grant(f, info); }
+        for (&package, r) in self.fec_retained.iter_mut() {
+            let was_ready = r.slot.next_id > 0 && r.slot.next_id < r.slot.n;
+            grant(&mut r.slot, info);
+            if r.slot.next_id < r.slot.n && !was_ready {
+                self.rescue_ready.push_back(package);
+                self.rescue_ready_count += 1;
+                info.ready_added += 1;
+            }
+        }
+        self.fec_adaptive = Some(a);
+    }
+
+    /// Public counters: queue-local plus refresh-time attribution from granted slots.
+    fn event_info(&self) -> EventRepairInfo {
+        use std::sync::atomic::Ordering::Relaxed;
+        EventRepairInfo { planned: self.event_sink.planned.load(Relaxed), ids_overflow: self.event_sink.ids_overflow.load(Relaxed),
+            counter_overflow: self.event_repair.counter_overflow.max(self.event_sink.overflow.load(Relaxed)), ..self.event_repair }
+    }
+
+    /// Successful DATA commit of `seq`: consume this queue's marks (event ordinals, repairs, first source).
+    fn fec_commit_marks(&mut self, seq: u64, sent: u64) {
+        if self.commit_marks.is_empty() { return; }
+        while let Some(entry) = self.commit_marks.first_entry() {
+            if *entry.key() >= seq { break; }
+            self.event_repair.marks_abandoned += entry.remove().iter().map(|m| m.event as u64).sum::<u64>();
+        }
+        let Some(marks) = self.commit_marks.remove(&seq) else { return };
+        for m in marks {
+            self.event_repair.emitted += m.event as u64;
+            self.event_repair.repairs_emitted += m.repair as u64;
+            if let Some(budget) = &m.budget {
+                let mut segment = budget.lock().unwrap();
+                segment.emitted += m.repair as u64;
+                #[cfg(any(test,feature="research_target_validation"))]
+                if let Some(owner)=&segment.target_owner {let mut row=owner.lock().unwrap();row.sources_emitted+=m.source as u64;row.repairs_emitted+=m.repair as u64;}
+                #[cfg(feature="research_budget_diagnostic")]
+                {
+                    if let Some(next)=segment.diagnostic_sources_committed.checked_add(m.source as u64) {segment.diagnostic_sources_committed=next;}
+                    else {segment.diagnostic_counter_overflow=true;}
+                }
+                // The reservation proof holds even when pending ciphertext outlives its slot.
+                let overflow = u64::from(segment.emitted > segment.reserved as u64 || segment.reserved > segment.limit);
+                segment.root.lock().unwrap().sink.lock().unwrap().merge(BudgetBaseInfo {
+                    sources_emitted: m.source as u64, repairs_emitted: m.repair as u64, counter_overflow: overflow, ..Default::default() });
+            }
+            if !m.first_source { continue; }
+            let f = if self.fec_send_slot.is_some() && m.package == self.fec_rescue_package.unwrap_or(self.send_package_id) { self.fec_send_slot.as_mut() }
+                else if self.fec_suspended.is_some() && m.package == self.send_package_id { self.fec_suspended.as_mut() }
+                else { self.fec_retained.get_mut(&m.package).map(|r| &mut r.slot) };
+            if let Some(f) = f { f.repair_accounting.first_source_commit.get_or_insert((seq, sent)); }
         }
     }
 
@@ -1317,6 +2303,7 @@ impl UnreliableSendBuffer {
             if *start_byte as usize >= msg.len() {
                 let msg_len = msg.len();
                 self.queue_bytes_filled -= msg_len;
+                if self.slipstream { self.slipstream_trace_event("end", "plain", "", self.logical_root, self.logical_tag, 0); }
                 self.partial_send_slot = None;
                 self.package_lease = None;
                 self.send_package_id = self.send_package_id.checked_add(1).expect("message identity exhausted");
@@ -1355,12 +2342,13 @@ impl UnreliableSendBuffer {
     }
 
     fn start_fec(&mut self, message: std::sync::Arc<Vec<u8>>, block_bytes: usize) {
-        self.start_fec_group(message, block_bytes, None, None, None);
+        self.start_fec_group(message, block_bytes, None, None, None, None);
     }
 
     fn start_fec_group(&mut self, message: std::sync::Arc<Vec<u8>>, block_bytes: usize,
         segment: Option<FecSegment>, root_lease: Option<std::sync::Arc<PackageLease>>,
-        plan_ks: Option<std::sync::Arc<std::sync::Mutex<Vec<u64>>>>) {
+        plan_ks: Option<std::sync::Arc<std::sync::Mutex<Vec<u64>>>>,
+        restart_budget: Option<std::sync::Arc<std::sync::Mutex<BudgetSegment>>>) {
         let layout = crate::fec::MessageLayout::new(message.len(), block_bytes).unwrap();
         let k = layout.k as u32;
         let a = self.fec_adaptive.as_ref().expect("adaptive FEC initialized before coding");
@@ -1375,14 +2363,51 @@ impl UnreliableSendBuffer {
             let group_len = total.div_ceil(total.div_ceil(FEC_SEGMENT_BYTES));
             ks.lock().unwrap()[segment.offset as usize / group_len] = k as u64;
         }
+
+        if a.budget_base_active() && self.budget_root.is_none() && restart_budget.is_none() {
+            self.target_root_sequence=self.target_root_sequence.checked_add(1).expect("target root ordinal exhausted");
+            let mut tag=[0;8];let len=message.len().min(8);tag[..len].copy_from_slice(&message[..len]);
+            self.budget_sink.lock().unwrap().merge(BudgetBaseInfo{roots:1,..Default::default()});
+            self.budget_root=Some(std::sync::Arc::new(std::sync::Mutex::new(BudgetRoot{sink:self.budget_sink.clone(),limited:false,cap_percent:a.repair_cap_percent(),
+                target_tail_applied:false,target_risk:crate::target_validation::risk_admission(&self.target_state),
+                target_draw:crate::target_validation::draw(self.target_root_sequence),target_ordinal:self.target_root_sequence,target_app_tag:tag,#[cfg(any(test,feature="research_target_validation"))] target_owners:Vec::new(),target_state:self.target_state.clone(),target_source_symbols:0})));
+        }
+
+        let target_plans=if a.target_selector()!=0 {
+            if let Some(b)=&restart_budget {b.lock().unwrap().target_plans.clone()} else {
+                let (draw,risk)={let root=self.budget_root.as_ref().unwrap().lock().unwrap();(root.target_draw,root.target_risk)};
+                (0..layout.groups).map(|g|crate::target_validation::plan_at_admission(layout.group(g).1 as u32,a.target_selector(),crate::target_validation::configuration().0,draw,risk).unwrap_or_else(|_|{self.budget_sink.lock().unwrap().merge(BudgetBaseInfo{counter_overflow:1,..Default::default()});crate::target_validation::Plan::default()})).collect::<Vec<_>>()
+            }
+        }else{Vec::new()};
         let whole_k = segment_source_horizon(total, block_bytes, plan_ks.as_ref());
         let target_groups = segment.map_or(layout.groups, |s| (s.total as usize).div_ceil(FEC_SEGMENT_BYTES));
         let repairs = (0..layout.groups).map(|g| a.repair_blocks_for_group_at_tail(layout.group(g).1 as u64,
             whole_k, target_groups, message.len() > self.retention_quota.byte_limit)).max().unwrap_or(0);
-        let (n, loss_estimate) = (k + repairs as u32 * layout.groups as u32, a.p);
-        let n_base = layout.round_plan(n);
-        // First-plan category decision for the whole logical message. Freeze it
-        // across rate/RTT changes, later segments and TU restarts of this message.
+        // p4-burst-base B1: immutable absolute base per codec group from the blind horizon.
+        // p4-budget-deferred C1: admission reserves ONLY decoder rank min(2, Kg) per group, never a
+        // statistical Q before feedback; the full actual-span tail plan is refreshed before the first
+        // repair. The hard cap still clips this (K<=6 reserves 0). B1 below is unchanged.
+        // Cost-smooth instead commits one XOR repair per codec to remain open until
+        // that deferred refresh. This is an explicit admission floor, not an optimum.
+        let (base_b, base_cap_bound) = if a.budget_base_active() {
+            ((0..layout.groups).map(|g| if a.target_selector()!=0 {
+                {target_plans.get(g).map_or_else(||{self.budget_sink.lock().unwrap().merge(BudgetBaseInfo{counter_overflow:1,..Default::default()});0},|p|p.proactive)}
+
+            }else if a.cost_smooth_active() {1}else{2.min(layout.group(g).1 as u32)}).collect::<Vec<u32>>(), false)
+        } else if a.base_parity_active() {
+            let codecs = segment.map_or(layout.groups, |s| (s.total as usize).div_ceil(FEC_SEGMENT_BYTES) * layout.groups);
+            let eps = crate::fec_adapt::base_group_eps(codecs);
+            let mut capped = false;
+            let b = (0..layout.groups).map(|g| { let (b, c) = a.base_initial_repairs(layout.group(g).1 as u64, eps); capped |= c; b as u32 }).collect::<Vec<u32>>();
+            (b, capped)
+        } else { (Vec::new(), false) };
+        let repairs = if base_b.is_empty() { repairs } else { base_b.iter().copied().max().unwrap_or(0) as u64 };
+        let base_r = repairs as u32;
+        let (n, loss_estimate) = (k + if a.target_selector()!=0 {base_b.iter().copied().sum::<u32>()} else {repairs as u32 * layout.groups as u32}, a.p);
+        let n_base = if a.target_selector()!=0 {n}else{layout.round_plan(n)};
+        // Independent first-start category decision for BOTH scheduler lanes,
+        // including the scheduler-off control. Do not inherit the protected head's
+        // class. Freeze across rate/RTT changes and TU restarts of this message.
         let mut category_bonus = 0;
         if a.policy == crate::fec_adapt::RepairPolicy::MessageBound && self.category_bonus_percent != 0 {
             if self.category_eligible.is_none() {
@@ -1404,17 +2429,91 @@ impl UnreliableSendBuffer {
         let n = if category_bonus == 0 { n_base } else { n_base.saturating_add(category_bonus).min(k.saturating_mul(2)) };
         self.category_bonus_repairs += n.saturating_sub(n_base) as u64;
         let encoder = if k as usize <= FEC_INLINE_MAX_BLOCKS {
-            match crate::fec::encode_message(message.clone(), block_bytes) { Some(e) => FecEncoderState::Ready(e), None => FecEncoderState::Failed }
+            match crate::fec::encode_message(message.clone(), block_bytes) { Some(e) => FecEncoderState::Ready(e), None => { #[cfg(feature = "research_cohort_observer")] crate::cohort_observe::fec_encoder_failed(); FecEncoderState::Failed } }
         } else {
             let (tx, rx) = std::sync::mpsc::sync_channel(1);
             let m = message.clone();
             match std::thread::Builder::new().name("stp-fec-encode".into()).spawn(move || { let _ = tx.send(crate::fec::encode_message(m, block_bytes)); }) {
                 Ok(_) => FecEncoderState::Pending(rx),
-                Err(_) => match crate::fec::encode_message(message.clone(), block_bytes) { Some(e) => FecEncoderState::Ready(e), None => FecEncoderState::Failed },
+                Err(_) => match crate::fec::encode_message(message.clone(), block_bytes) { Some(e) => FecEncoderState::Ready(e), None => { #[cfg(feature = "research_cohort_observer")] crate::cohort_observe::fec_encoder_failed(); FecEncoderState::Failed } },
             }
         };
+        let anchor = a.budget_base_active().then(|| a.data_anchor());
+        let budget = if a.budget_base_active() {
+            Some(restart_budget.unwrap_or_else(|| {
+                let root = self.budget_root.get_or_insert_with(|| {
+                    self.budget_sink.lock().unwrap().merge(BudgetBaseInfo { roots: 1, ..Default::default() });
+                    std::sync::Arc::new(std::sync::Mutex::new(BudgetRoot { sink: self.budget_sink.clone(), limited: false, cap_percent: a.repair_cap_percent(),
+                        target_tail_applied:false,
+                        target_risk:crate::target_validation::risk_admission(&self.target_state),
+                        target_draw:0,target_ordinal:0,
+                        target_app_tag:[0;8],#[cfg(any(test,feature="research_target_validation"))] target_owners:Vec::new(),target_state:self.target_state.clone(),target_source_symbols:0 }))
+                }).clone();
+                let cap_percent = root.lock().unwrap().cap_percent;
+                let limit = if cap_percent==0 {u32::MAX-k}else{
+                    (0..layout.groups).map(|g| crate::fec_adapt::budget_repair_limit_for_cap(layout.group(g).1 as u64, cap_percent) as u32).sum()
+                };
+                self.budget_sink.lock().unwrap().merge(BudgetBaseInfo { source_symbols: k as u64, repair_limit: limit as u64, ..Default::default() });
+                {let mut r=root.lock().unwrap();r.target_source_symbols=r.target_source_symbols.checked_add(k as u64).expect("tail root K overflow");}
+                #[cfg(any(test,feature="research_target_validation"))]
+                let target_owner=if crate::target_validation::active() {
+                    let mut r=root.lock().unwrap();let plan=target_plans.first().copied().unwrap_or_default();
+                    let owner=crate::target_validation::register(crate::target_validation::OwnerEvidence{
+                        root_id:segment.map_or(self.send_package_id,|s|s.root),package_id:self.send_package_id,root_ordinal:r.target_ordinal,app_tag:r.target_app_tag,
+                        segment_offset:segment.map_or(0,|s|s.offset),selector:a.target_selector(),k,current_k:k,groups:layout.groups as u32,
+                        proactive:n_base-k,lower:plan.lower,upper:plan.upper,w_bits:plan.upper_probability.to_bits(),mix_threshold:plan.mix_threshold,mix_draw:r.target_draw,
+                        risk:r.target_risk.risk,p_eff:r.target_risk.p_eff,rate_over_anchor:r.target_risk.rate_over_anchor,
+                        queue_delay_us:r.target_risk.queue_delay_us,qd_ref_us:r.target_risk.qd_ref_us,mode:r.target_risk.mode,
+                        started_ns:self.fec_now_ns,..Default::default()});r.target_owners.push(owner.clone());Some(owner)
+                }else{None};
+                std::sync::Arc::new(std::sync::Mutex::new(BudgetSegment {
+                    target_plans:target_plans.clone(),
+                    #[cfg(any(test,feature="research_target_validation"))] target_owner,
+                    target_prior_losses:0,target_tail_added:0,
+                    #[cfg(feature="research_budget_diagnostic")] diagnostic_owner_generation:if diag::active(){0}else{u64::MAX},
+                    #[cfg(feature="research_budget_diagnostic")] diagnostic_original_k:k,
+                    #[cfg(feature="research_budget_diagnostic")] diagnostic_sources_committed:0,
+                    #[cfg(feature="research_budget_diagnostic")] diagnostic_counter_overflow:false,
+                    root, limit, reserved: 0, emitted: 0 }))
+            }))
+        } else { None };
+        #[cfg(any(test,feature="research_target_validation"))]
+        if let Some(b)=&budget {let b=b.lock().unwrap();if let Some(owner)=&b.target_owner {let mut row=owner.lock().unwrap();if row.current_k!=k || row.package_id!=self.send_package_id {row.current_k=k;row.restarts+=1;}}}
         self.fec_packet_tags.get_or_insert_with(|| vec![0u128; PACKETS_WAITING_ACK_CAPACITY as usize].into_boxed_slice());
-        self.fec_send_slot = Some(FecSendSlot { segment, root_lease, plan_ks, retention_lease: None, retain_limit: self.retention_quota.byte_limit, package_lease: self.package_lease.clone(), dscp: self.current_dscp, finalized_symbols: 0, send_started_ns: self.fec_now_ns, original_send_duration_ns: None, repair_policy: a.policy, rescue_rounds: 0, retained_until_ns: None, original_symbols: None, repair_accounting: RepairAccounting { unbonused_n: n_base, category_bonus, ..Default::default() }, group_lost: vec![0; layout.groups], message, block_bytes, k, n, next_id: 0, encoder, block_buf: vec![0u8; block_bytes], first_seq: self.next_packet_seq, lost: 0, n_planned: n, loss_estimate });
+        self.fec_send_slot = Some(FecSendSlot { #[cfg(feature = "research_budget_diagnostic")] diagnostic: None, segment, root_lease, plan_ks, retention_lease: None, retain_limit: self.retention_quota.byte_limit, package_lease: self.package_lease.clone(), dscp: self.current_dscp, finalized_symbols: 0, send_started_ns: self.fec_now_ns, original_send_duration_ns: None, repair_policy: a.policy, rescue_rounds: 0, retained_until_ns: None, original_symbols: None, repair_accounting: RepairAccounting { unbonused_n: n_base, category_bonus, base_b, base_r, base_cap_bound, budget, data_anchor: anchor, ..Default::default() }, group_lost: vec![0; layout.groups], message, block_bytes, k, n, next_id: 0, encoder, block_buf: vec![0u8; block_bytes], first_seq: self.next_packet_seq, lost: 0, n_planned: n, loss_estimate });
+        if let Some(f) = &mut self.fec_send_slot {
+            if f.repair_accounting.budget.is_some() {
+                // Prefix clipping, NEVER round_plan: one extra round could violate the hard floor.
+                f.n = k;
+                f.budget_plan(n.saturating_sub(k));
+                let count = f.n - k;
+                if a.target_selector()==0 {for (g, b) in f.repair_accounting.base_b.iter_mut().enumerate() {
+                    *b = count / layout.groups as u32 + u32::from((g as u32) < count % layout.groups as u32);
+                }}
+                #[cfg(any(test,feature="research_target_validation"))]
+                if let Some(owner)=&f.repair_accounting.budget.as_ref().unwrap().lock().unwrap().target_owner {let mut row=owner.lock().unwrap();if row.restarts==0 {row.proactive=count;}}
+                f.repair_accounting.base_r = count.div_ceil(layout.groups as u32);
+                f.n_planned = f.n;
+                f.repair_accounting.unbonused_n = f.n;
+            }
+            #[cfg(feature = "research_budget_diagnostic")]
+            if diag::active() {
+                let app = f.message.get(..6).filter(|m| m[0] == 0xd5);
+                f.diagnostic = Some(diag::layout_start(diag::Layout {
+                    package: self.send_package_id, root: segment.map_or(self.send_package_id, |s|s.root),
+                    len:f.message.len(),width:f.block_bytes,k:f.k as usize,groups:layout.groups,
+                    limit:f.repair_accounting.budget.as_ref().map(|b|b.lock().unwrap().limit),
+                    planned:f.n, phase:app.map(|m|m[1]),app_id:app.map(|m|u32::from_le_bytes(m[2..6].try_into().unwrap())),
+                    ns:self.fec_now_ns, ..Default::default()
+                }));
+                self.diagnostic_last=f.diagnostic;
+
+                if let Some(segment)=&f.repair_accounting.budget {
+                    let mut segment=segment.lock().unwrap();
+                    if segment.diagnostic_owner_generation==0 {segment.diagnostic_owner_generation=f.diagnostic.unwrap().generation;}
+                }
+            }
+        }
     }
 
     /// Starts `msg` as the message being sent: grouped FEC if enabled and its length fits
@@ -1432,7 +2531,17 @@ impl UnreliableSendBuffer {
             self.send_package_id = lease.id;
             self.package_lease = Some(lease);
         }
+        if self.slipstream {
+            let mut tag = [0; 8];
+            let len = msg.len().min(8);
+            tag[..len].copy_from_slice(&msg[..len]);
+            self.logical_root = self.send_package_id;
+            self.logical_tag = u64::from_le_bytes(tag);
+            self.logical_len = msg.len();
+            self.slipstream_started = false;
+        }
         self.category_eligible = None;
+        self.budget_root = None;
         if self.fec_adaptive.is_some() && msg.len() > FEC_SEGMENT_BYTES {
             self.segmented_send = Some(SegmentedSend { plan_ks: std::sync::Arc::new(std::sync::Mutex::new(vec![0; msg.len().div_ceil(FEC_SEGMENT_BYTES)])), message: std::sync::Arc::new(msg), offset: 0,
                 root: self.send_package_id, root_lease: self.package_lease.take() });
@@ -1470,7 +2579,7 @@ impl UnreliableSendBuffer {
         let message = std::sync::Arc::new(source.message[start..end].to_vec());
         self.segmented_send.as_mut().unwrap().offset = end;
         if end == segment.total as usize { self.segmented_send = None; }
-        self.start_fec_group(message, block_bytes, Some(segment), root_lease, Some(plan_ks));
+        self.start_fec_group(message, block_bytes, Some(segment), root_lease, Some(plan_ks), None);
         true
     }
 
@@ -1484,6 +2593,11 @@ impl UnreliableSendBuffer {
     fn fill_tier(&mut self, payload_len: usize, space: usize, class: Option<Dscp>) -> Option<u8> {
         self.reclaim_finished_partial();
         if class.is_none() { return Some(0); }
+        // A newly dequeued tiny filler must not put its first frame ahead of
+        // an older context which joined RR but has not had its first quantum.
+        if self.partial_send_slot.is_none() && self.fec_send_slot.is_none() &&
+            self.interleave_parked.iter().any(|c| c.fec_send_slot.as_ref().is_some_and(|f| f.next_id == 0) ||
+                c.partial_send_slot.as_ref().is_some_and(|(_, offset)| *offset == 0)) { return None; }
         if self.partial_send_slot.is_none() && (self.fec_send_slot.is_some() ||
             self.segmented_send.is_some() || self.ready_rescue_package().is_some()) { return None; }
         let (dscp, len, offset) = if let Some((m, offset)) = &self.partial_send_slot {
@@ -1491,6 +2605,8 @@ impl UnreliableSendBuffer {
         } else { let (c,m) = self.message_queue.front()?; (*c, m.len(), 0) };
         if class.is_some_and(|c| c != dscp) || len > payload_len.saturating_sub(STP_WHOLE_HEADER_SIZE) { return None; }
         if offset == 0 && len + STP_WHOLE_HEADER_SIZE <= space { return Some(1); }
+
+        if offset==0 && self.target_dup_no_chop {return None;}
         let prefix = space.checked_sub(STP_FRAGMENT_HEADER_SIZE)?;
         if prefix == 0 { return None; }
         if offset > 0 {
@@ -1507,6 +2623,7 @@ impl UnreliableSendBuffer {
     /// packet (or its repair encoder is still being built); send the packet as it is.
     pub fn next_fragment(&mut self, payload_len: usize, space: usize) -> Option<UnreliableFragment<'_>> {
         self.reclaim_finished_partial();
+        self.interleave_select(payload_len, space);
         self.fec_prune_retained();
         let rescue = if self.partial_send_slot.is_none() && self.fec_rescue_package.is_none() {
             self.ready_rescue_package()
@@ -1542,9 +2659,27 @@ impl UnreliableSendBuffer {
             if self.segmented_send.is_some() {
                 if !self.start_segment(payload_len) { return None; }
             } else {
+                if !self.interleave_parked.is_empty() {
+                    let (_, head) = self.message_queue.front()?;
+                    // Legacy tail filling and failed-encoder recursion may reach
+                    // here outside the full-TU RR admission path. Only a tiny
+                    // FIFO head may start, under that same physical-source cap;
+                    // a medium/giant must wait for its ordinary admission turn.
+                    // Recursion also obeys first-symbol FIFO, just like fill_tier.
+                    let extra = head.capacity().saturating_add(if self.slipstream && head.len() > FEC_SEGMENT_BYTES { head.len() } else { 0 });
+                    if self.slipstream && self.slipstream_head ||
+                        (head.len() > payload_len.saturating_sub(STP_WHOLE_HEADER_SIZE) && (!self.slipstream || space < payload_len)) ||
+                        self.interleave_source_bytes().saturating_add(extra) > self.current_byte_capacity() as usize ||
+                        self.interleave_parked.iter().any(|c| c.fec_send_slot.as_ref().is_some_and(|f| f.next_id == 0) ||
+                            c.partial_send_slot.as_ref().is_some_and(|(_, offset)| *offset == 0)) {
+                        return None;
+                    }
+                }
                 let (dscp, front_msg) = self.message_queue.pop_front()?;
                 self.current_dscp = dscp;
+                if self.slipstream && self.slipstream_head { self.slipstream_eligible = None; }
                 if !self.start_message(front_msg, payload_len) { return None; }
+                if self.slipstream { self.slipstream_classify(payload_len); }
             }
         }
         if self.fec_send_slot.is_some() {
@@ -1562,6 +2697,7 @@ impl UnreliableSendBuffer {
                 // never shrinks otherwise). Start the message over under a new package id with
                 // blocks that fit; the receiver drops the abandoned partial package in time.
                 if self.fec_rescue_package.is_none() && self.fec_send_slot.as_ref().unwrap().segment.is_some() {
+                    if self.slipstream && !Self::encoder_initialized(self.fec_send_slot.as_mut().unwrap()) { return None; }
                     let lease = match self.package_allocator.clone() {
                         Some(ids) => { let Some(lease) = ids.allocate() else { return None; }; Some(lease) },
                         None => None,
@@ -1569,14 +2705,15 @@ impl UnreliableSendBuffer {
                     let f = self.fec_send_slot.take().unwrap();
                     self.send_package_id = lease.as_ref().map_or(self.send_package_id.checked_add(1).expect("message identity exhausted"), |l| l.id);
                     self.package_lease = lease;
-                    self.start_fec_group(f.message, payload_len - STP_SEGMENT_FEC_HEADER_SIZE, f.segment, f.root_lease, f.plan_ks);
+
+                    if let Some(b)=&f.repair_accounting.budget {let mut b=b.lock().unwrap();b.target_prior_losses=b.target_prior_losses.saturating_add(f.group_lost.iter().copied().sum::<u32>());}
+                    self.start_fec_group(f.message, payload_len - STP_SEGMENT_FEC_HEADER_SIZE, f.segment, f.root_lease, f.plan_ks, f.repair_accounting.budget);
                     return self.next_fragment(payload_len, space);
                 }
-                if self.category_bonus_percent != 0 && self.fec_rescue_package.is_none() {
-                    // P4 ordinary restart keeps its frozen category: restart with
-                    // the SAME Arc, not try_unwrap-or-copy via start_message. Resolve
-                    // a pending worker first so repeated TU changes cannot leave
-                    // detached old codec jobs uncharged.
+                if (self.slipstream || self.interleave_width > 1 || self.category_bonus_percent != 0 || self.fec_send_slot.as_ref().unwrap().repair_accounting.budget.is_some()) && self.fec_rescue_package.is_none() {
+                    // Ordinary research contexts restart with the SAME Arc, not
+                    // try_unwrap-or-copy. Resolve a pending worker first so repeated
+                    // TU changes cannot leave detached old codec jobs uncharged.
                     if !Self::encoder_initialized(self.fec_send_slot.as_mut().unwrap()) { return None; }
                     let lease = match self.package_allocator.clone() {
                         Some(ids) => { let Some(lease) = ids.allocate() else { return None; }; Some(lease) },
@@ -1586,7 +2723,9 @@ impl UnreliableSendBuffer {
                     drop(f.encoder);
                     self.send_package_id = lease.as_ref().map_or(self.send_package_id.checked_add(1).expect("message identity exhausted"), |l| l.id);
                     self.package_lease = lease;
-                    self.start_fec(f.message, payload_len - STP_FEC_FRAGMENT_HEADER_SIZE);
+
+                    if let Some(b)=&f.repair_accounting.budget {let mut b=b.lock().unwrap();b.target_prior_losses=b.target_prior_losses.saturating_add(f.group_lost.iter().copied().sum::<u32>());}
+                    self.start_fec_group(f.message, payload_len - STP_FEC_FRAGMENT_HEADER_SIZE, None, None, None, f.repair_accounting.budget);
                     return self.next_fragment(payload_len, space);
                 }
                 let f = self.fec_send_slot.take().unwrap();
@@ -1611,12 +2750,16 @@ impl UnreliableSendBuffer {
                             Ok(None) | Err(std::sync::mpsc::TryRecvError::Disconnected) => FecEncoderState::Failed,
                             Err(std::sync::mpsc::TryRecvError::Empty) => return None,
                         };
+                        #[cfg(feature = "research_cohort_observer")]
+                        if matches!(f.encoder, FecEncoderState::Failed) { crate::cohort_observe::fec_encoder_failed(); }
                     }
                     repair_len = match &mut f.encoder {
                         FecEncoderState::Ready(e) => e.block_into(f.next_id, &mut f.block_buf),
                         _ => None,
                     };
                     if repair_len.is_none() {
+                        #[cfg(feature = "research_cohort_observer")]
+                        if f.next_id < f.n { crate::cohort_observe::fec_repair_skipped((f.n - f.next_id) as u64); }
                         // No encoder: the source blocks are all out, end the message there.
                         f.next_id = f.n;
                     }
@@ -1625,6 +2768,22 @@ impl UnreliableSendBuffer {
             let f = self.fec_send_slot.as_ref().unwrap();
             if f.next_id >= f.n { return self.next_fragment(payload_len, space); }
             self.tag_symbol(package_id, self.fec_send_slot.as_ref().unwrap().next_id);
+            {
+                // Observation only (every arm): commit-time marks; never change what is sent.
+                let f = self.fec_send_slot.as_ref().unwrap();
+                let first_source = f.next_id < f.k && f.repair_accounting.first_source_commit.is_none();
+                let event = u32::from(f.event_ordinal(f.next_id));
+                let repair = u32::from(f.next_id >= f.k);
+                let source = u32::from(f.next_id < f.k);
+                let budget = f.repair_accounting.budget.clone();
+                if first_source || event != 0 || repair != 0 || budget.is_some() {
+                    let marks = self.commit_marks.entry(self.next_packet_seq).or_default();
+                    match marks.iter_mut().find(|m| m.package == package_id) {
+                        Some(m) => { m.event += event; m.repair += repair; m.source += source; m.first_source |= first_source; }
+                        None => marks.push(CommitMark { event, repair, first_source, package: package_id, source, budget }),
+                    }
+                }
+            }
             let f = self.fec_send_slot.as_mut().unwrap();
             let id = crate::fec::MessageLayout::new(f.message.len(), f.block_bytes).unwrap().wire_id(f.next_id);
             if let Some(len) = repair_len {
@@ -1634,6 +2793,8 @@ impl UnreliableSendBuffer {
                     } else { f.repair_accounting.sent_tail += 1; }
                 }
                 f.next_id += 1;
+                #[cfg(feature = "research_budget_diagnostic")]
+                if f.next_id >= f.n { if let Some(l)=f.diagnostic {diag::layout_event(l,f.n,f.next_id,self.fec_now_ns,3);} }
                 if self.p4_open && f.next_id >= f.n && self.segmented_send.is_none() &&
                     self.fec_suspended.is_none() && self.rescue_ready_count == 0 {
                     self.p4_closing = true;
@@ -1643,6 +2804,19 @@ impl UnreliableSendBuffer {
                 return Some(UnreliableFragment::Fec { segment: f.segment, package_id, message_len: f.message.len() as u32, block_bytes: f.block_bytes as u16, block_id: id, data: &f.block_buf[..len] });
             }
             f.next_id += 1;
+            #[cfg(feature = "research_budget_diagnostic")]
+            if let Some(l)=f.diagnostic {
+                if f.next_id == f.k {diag::layout_event(l,f.n,f.next_id,self.fec_now_ns,2);}
+                if f.next_id >= f.n {diag::layout_event(l,f.n,f.next_id,self.fec_now_ns,3);}
+            }
+            // Frozen zero-reserve owners still get their source-completion decision BEFORE sealing.
+
+            if f.next_id==f.k {if let Some(a)=&self.fec_adaptive {if a.target_selector()!=0 {f.refresh_plan(a);f.target_tail_complete(a.target_selector());}}}
+            // C1 may have zero repair allowance: the final SOURCE must seal just as the final repair.
+            if f.repair_accounting.budget.is_some() && self.p4_open && f.next_id >= f.n &&
+                self.segmented_send.is_none() && self.fec_suspended.is_none() && self.rescue_ready_count == 0 {
+                self.p4_closing = true;
+            }
             if f.next_id == 1 || f.next_id == f.k {
                 if let Some(rec) = &mut self.fec_record { rec.push(f.progress_info()); }
             }
@@ -1653,6 +2827,8 @@ impl UnreliableSendBuffer {
         }
         let (msg, start_byte) = self.partial_send_slot.as_ref().unwrap();
         let whole = *start_byte == 0 && msg.len() + STP_WHOLE_HEADER_SIZE <= space;
+
+        if !whole && *start_byte==0 && msg.len()<=payload_len.saturating_sub(STP_WHOLE_HEADER_SIZE) && self.target_dup_no_chop {return None;}
         let frag_size = space.checked_sub(if whole { STP_WHOLE_HEADER_SIZE } else { STP_FRAGMENT_HEADER_SIZE })?;
         let (msg, start_byte) = self.partial_send_slot.as_mut().unwrap();
         let start = *start_byte as usize;
@@ -1671,6 +2847,7 @@ impl UnreliableSendBuffer {
 /// The receiver still delivers to ONE connection queue immediately on completion, unordered.
 #[derive(Debug)]
 pub struct SendQueues {
+    target_state:crate::target_validation::RiskState,
     packet_owner: Option<Box<[u8]>>,
     queues: Vec<UnreliableSendBuffer>,
     next_queue: usize,
@@ -1688,6 +2865,9 @@ pub struct SendQueues {
     next_packet_seq: u64,
     fec_record: Option<Vec<crate::fec_adapt::FecMessageInfo>>,
     total_bytes_per_second: u64,
+    target_duplicate:Option<(u64,Dscp,Vec<u8>)>,
+    target_dup_pairs:HashMap<u64,[Option<bool>;2]>,
+    target_dup_fallbacks:u64,
 }
 
 impl SendQueues {
@@ -1695,16 +2875,30 @@ impl SendQueues {
         assert!((1..=64).contains(&count));
         let ids = std::sync::Arc::new(PackageAllocator::new());
         let telemetry = std::sync::Arc::new(RetentionTelemetry::default());
-        let queues = (0..count).map(|_| {
+        let target_state=crate::target_validation::RiskState::default();
+        let queues = (0..count).map(|index| {
             let mut q = UnreliableSendBuffer::new(bounds.0, bounds.1, bounds.2);
+            q.slipstream_queue = index;
+            q.target_state=target_state.clone();
             q.package_allocator = Some(ids.clone());
             let mut quota = RetentionQuota::new(count);
             quota.telemetry = telemetry.clone();
             q.retention_quota = std::sync::Arc::new(quota);
             q
         }).collect();
-        Self { scheduled_bytes: vec![0; count], queue_active: vec![false; count], service_clock: 0, fec_owner_tags: HashMap::new(), packet_owner: None, queues, next_queue: 0, last_queue: 0, last_dscp: Dscp::BestEffort, fec_adaptive: None,
-            fec_packet_tags: None, fec_extra_packet_tags: HashMap::new(), next_packet_seq: 0, fec_record: None, total_bytes_per_second: 0 }
+        Self { target_state,scheduled_bytes: vec![0; count], queue_active: vec![false; count], service_clock: 0, fec_owner_tags: HashMap::new(), packet_owner: None, queues, next_queue: 0, last_queue: 0, last_dscp: Dscp::BestEffort, fec_adaptive: None,
+            fec_packet_tags: None, fec_extra_packet_tags: HashMap::new(), next_packet_seq: 0, fec_record: None, total_bytes_per_second: 0,
+            target_duplicate:None,
+            target_dup_pairs:HashMap::new(),
+            target_dup_fallbacks:0 }
+    }
+    /// Legacy scheduler fixtures have no CC tick: explicitly model a calm peer
+    /// instead of the production rule that unknown evidence is conservative.
+    #[cfg(test)]
+    fn baseline_for_test(count:usize,bounds:(u32,u32,u32))->Self {
+        let s=Self::new(count,bounds);
+        crate::target_validation::risk_rate(&s.target_state,80,100,'G',100_000_000);
+        s
     }
     pub fn submit_messages(&mut self, queue: usize, messages: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
         self.submit_classified_messages(queue, messages.into_iter().map(|m| (Dscp::BestEffort, m)).collect()).into_iter().map(|(_, m)| m).collect()
@@ -1713,7 +2907,11 @@ impl SendQueues {
         match self.queues.get_mut(queue) { Some(q) => q.submit_classified_messages(messages), None => messages }
     }
     pub fn free_bytes(&mut self) -> Vec<u64> { self.queues.iter_mut().map(|q| q.free_bytes()).collect() }
-    pub fn has_unsent_data(&self) -> bool { self.queues.iter().any(|q| q.has_unsent_data()) }
+    fn target_copy_pending(&self)->bool {
+        {return self.target_duplicate.is_some();}
+
+    }
+    pub fn has_unsent_data(&self) -> bool { self.target_copy_pending() || self.queues.iter().any(|q| q.has_unsent_data()) }
     fn set_time(&mut self, now: u64, rtt: u64) {
         for q in &mut self.queues { q.fec_now_ns = now; q.fec_rtt_ns = rtt; q.fec_prune_retained(); q.fec_expire_active_rescue(); }
     }
@@ -1725,8 +2923,8 @@ impl SendQueues {
     fn refresh_queue_rates(&mut self) {
         // Same connection pacer, current equal-byte serviceable weights. A burst
         // may drain/join queues between set_rate calls; only new decisions see it.
-        // Without the P4 bonus (P0-P3) the set_rate snapshot is kept exactly.
-        if self.total_bytes_per_second == 0 || !self.queues.iter().any(|q| q.category_bonus_percent != 0) { return; }
+        // Off/0 preserves the original capacity/rate snapshot exactly.
+        if self.total_bytes_per_second == 0 || !self.queues.iter().any(|q| q.slipstream || q.category_bonus_percent != 0) { return; }
         let active = self.queues.iter_mut().map(|q| u64::from(q.can_emit())).sum::<u64>().max(1);
         for q in &mut self.queues { q.current_bytes_per_second = self.total_bytes_per_second / active; }
     }
@@ -1734,7 +2932,20 @@ impl SendQueues {
         let ppm = self.fec_adaptive.as_ref().unwrap().representative_ppm();
         for q in &mut self.queues { q.fec_capacity_overhead_ppm = ppm; }
     }
+    fn fec_event_repair(&mut self, e: &AcceptedCcEvent) {
+        for q in &mut self.queues {
+            q.fec_adaptive = self.fec_adaptive.take();
+            q.p4_event_repair(e);
+            self.fec_adaptive = q.fec_adaptive.take();
+        }
+    }
+    fn fec_on_data_committed(&mut self, seq: u64, sent: u64) {
+        for q in &mut self.queues { q.fec_commit_marks(seq, sent); }
+    }
     fn fec_prepare_packet(&mut self, seq: u64) {
+        for q in &mut self.queues {
+            if let Some(marks) = q.commit_marks.remove(&seq) { q.event_repair.marks_abandoned += marks.iter().map(|m| m.event as u64).sum::<u64>(); }
+        }
         self.next_packet_seq = seq;
         if let Some(owners) = &mut self.packet_owner { owners[(seq % PACKETS_WAITING_ACK_CAPACITY) as usize] = u8::MAX; }
         if let Some(tags) = &mut self.fec_packet_tags { tags[(seq % PACKETS_WAITING_ACK_CAPACITY) as usize] = 0; }
@@ -1742,6 +2953,22 @@ impl SendQueues {
         self.fec_owner_tags.remove(&(seq % PACKETS_WAITING_ACK_CAPACITY));
     }
     fn fec_on_packet_finalized(&mut self, seq: u64, lost: bool) {
+
+        {
+            let base=if self.target_dup_pairs.contains_key(&seq) {Some(seq)}else{seq.checked_sub(1).filter(|b|self.target_dup_pairs.contains_key(b))};
+            if let Some(base)=base {
+                let pair=self.target_dup_pairs.get_mut(&base).unwrap();
+                pair[(seq-base) as usize]=Some(lost);
+                if let [Some(a),Some(b)]=*pair {
+                    self.target_dup_pairs.remove(&base);
+                    self.fec_finalize_original(base,a && b);
+                }
+                return;
+            }
+        }
+        self.fec_finalize_original(seq,lost);
+    }
+    fn fec_finalize_original(&mut self, seq:u64,lost:bool) {
         if seq > self.next_packet_seq || self.next_packet_seq - seq >= PACKETS_WAITING_ACK_CAPACITY { return; }
         let Some(tags) = &mut self.fec_packet_tags else { return; };
         let index = seq % PACKETS_WAITING_ACK_CAPACITY;
@@ -1783,7 +3010,26 @@ impl SendQueues {
             assert!(used.0 <= q.retention_quota.byte_limit && used.1 <= q.retention_quota.slot_limit);
         }
     }
+
+    fn take_target_copy(&mut self,payload:&mut[u8])->usize {
+        let Some((base,dscp,bytes))=self.target_duplicate.take() else {return 0};
+        assert_eq!(self.next_packet_seq,base+1,"duplicate must be next data-space datagram");
+        assert!(bytes.len()<=payload.len(),"TU cannot shrink across a pending copy");
+        payload[..bytes.len()].copy_from_slice(&bytes);payload[bytes.len()..].fill(0xff);
+        payload[0]=(payload[0]&0x0f)|TARGET_DUP_COPY;self.last_dscp=dscp;
+        payload.len()
+    }
     fn fill_packet(&mut self, payload: &mut [u8]) -> usize {
+        let duplicate=crate::target_validation::duplicate_now(&self.target_state);
+
+        self.fill_packet_with_dup(payload,duplicate)
+    }
+    fn fill_packet_with_dup(&mut self,payload:&mut[u8],_duplicate:bool)->usize {
+
+        {
+            if self.target_copy_pending() {return self.take_target_copy(payload);}
+            for q in &mut self.queues {q.target_dup_no_chop=_duplicate;}
+        }
         let count = self.queues.len();
         self.refresh_queue_rates();
         for i in 0..count {
@@ -1845,6 +3091,7 @@ impl SendQueues {
                     if cursor == 0 || !q.can_emit() { self.queue_active[i] = false; }
                     break;
                 }
+                q.slipstream_emitted(payload.len());
                 class = q.packet_dscp;
                 self.last_dscp = class.unwrap();
                 self.last_queue = i;
@@ -1858,9 +3105,29 @@ impl SendQueues {
                 self.service_clock = self.service_clock.max(clock);
             }
         }
-        if cursor == 0 { return 0; }
+        if cursor == 0 {
+            // Production consumes no nonce for an empty fill. A worker can become
+            // ready before the same-nonce retry, so it must get a fresh RR scan.
+            // Do not reset on a single blocked queue or a partially filled packet:
+            // those still share this packet's one-TU scheduling quantum.
+            for q in &mut self.queues { q.interleave_last_packet = None; }
+            return 0;
+        }
         payload[cursor..].fill(0xff);
+
+        if _duplicate {self.plan_target_copy(payload);}
         payload.len()
+    }
+
+    fn plan_target_copy(&mut self,payload:&mut[u8]) {
+        let (messages,fec)=target_dup_counts(payload);
+        if messages==0 {return;}
+        // The last allocatable nonce cannot be an original needing another slot.
+        if self.next_packet_seq>=crate::sequence::ACK_SPACE-2 {self.target_dup_fallbacks+=1;return;}
+        assert!((1..=6).contains(&payload[0]) && payload[0]&0x30==0,"research flags overlap a frame kind");
+        payload[0]|=TARGET_DUP_ORIGINAL;
+        self.target_duplicate=Some((self.next_packet_seq,self.last_dscp,payload.to_vec()));
+        if fec {self.target_dup_pairs.insert(self.next_packet_seq,[None,None]);}
     }
 }
 
@@ -1995,7 +3262,7 @@ pub struct ConnectionTrackingData {
     pub connection_state: ConnectionState,
     pub handshake_hash: [u8; 64],
     // pub reliable_streams: ReliableStreams,
-    
+
     pub unreliable_send_buffer: SendQueues,
     peer_max_message_size: usize,
     receive_index: ReceiveIndex,
@@ -2183,6 +3450,7 @@ struct PendingSend {
 
 #[derive(Debug)]
 pub struct ConnectionStateConnected {
+    target_state:crate::target_validation::RiskState,
     pending_send: Option<PendingSend>,
     locally_blocked: bool,
     pub cipher: Option<ConnectionCipherTriplet>,
@@ -2192,9 +3460,12 @@ pub struct ConnectionStateConnected {
     pub send_sequence_number: u64,
     pub send_ack_sequence_number: u64,
     pub receive_sequences: crate::sequence::ReceiveSequences,
+    target_dup_receive:Option<Box<crate::sequence::ReceiveSequences>>,
     pub last_sent_data_packet: u64,
     pub last_sent_could_have_sent_data_packet: u64,
     pub last_ack_received_time: u64,
+    /// Fresh authenticated inbound activity; never a substitute for delivery/CC feedback.
+    last_peer_packet_received_time: u64,
     pub last_status_print_time: u64,
     pub packet_since_last_print: u64,
     pub packet_lost_since_last_print: u64,
@@ -2215,20 +3486,26 @@ pub struct ConnectionStateConnected {
     // A sustained majority beyond that horizon can pin growth; fail closed, never guess a send time.
     pub send_time_band: [u64; 1024], // 1024 buckets of 4.194 ms giving 4.295 seconds of tracking.
     pub send_time_band_head_index: u64, // monotonic time ns / 4_194_304 aka 0x400000
-    
+
     pub RTT_sample_sums: [u32; 16],   // sum of RTT measurements per ack, in 0.1 ms units
     pub RTT_sample_counts: [u16; 16], // count of RTT measurements per ack
     pub RTT_sample_cursor: u64,
+    /// Research minimum over this connection's lifetime; intentionally NOT reset on outage.
+    target_min_rtt_ns:u64,
+    delay_event_window:DelayEventWindow,
+    delay_giveup:DelayGiveupState,
+    delay_curve_beta:Option<f64>,
     pub RTT_mean: u16,
     pub RTT_mean_cursor: u64, // RTT_sample_cursor value RTT_mean was last computed from
 
     pub ack_arrival_times: [u64; 16], // timestamp_ns of each ack arrival, ring buffer
     pub ack_pace_estimate: u16,       // median inter-ack gap in 0.1 ms units, clamped to RTT_mean*2
-    
+
     pub packets_waiting_ack_field: [u64; PACKETS_WAITING_ACK_WORDS],
+    rand_background_bits:Option<Box<[u64]>>,
     // head is the send_sequence_number
     pub packets_waiting_ack_tail: u64,
-    
+
     pub current_tu: u64,
     // Effective TU cannot change while an immutable current-TU datagram retries.
     deferred_tu: Option<u64>,
@@ -2237,12 +3514,12 @@ pub struct ConnectionStateConnected {
     pub tu_probe_size: u64,
     pub tu_probe_size_advance: u64,
     pub tu_probe_failed_count: u64,
-    
+
     pub packets_in_flight: u64,
     pub send_pacer_acc_ns: u64,
     pub congestion_event_time_ns: u64,
     pub congestion_event_rate_upps: u64,
-    /// Startup exits only on a genuine loss/ECN event, never on RTT/delivery signals.
+    /// Startup exits only on an accepted loss/CE event (including opt-in persistent delay).
     pub cc_startup_done: bool,
     outage: OutageState,
     pub stats: ConnectionStats,
@@ -2254,6 +3531,12 @@ pub struct ConnectionStateConnected {
     /// Sender feedback and receiver echo are independent directions.
     pub ecn_congestion_received: bool,
     pub ecn_oldest_send_time: u64,
+    /// Sequence of the packet whose send time anchors the pending CE signal (exact CE evidence).
+    pub ecn_oldest_seq: u64,
+    /// ACCEPTED congestion cuts awaiting delivery to the send queues (bounded; p4-event-repair evidence).
+    pub accepted_cc_events: Vec<AcceptedCcEvent>,
+    pub accepted_cc_dropped: u64,
+    pub accepted_cc_missing_anchor: u64,
     /// Per sequence number in [tail - CAPACITY, tail): declared lost and not yet acked since
     /// (spurious-loss detection). Same ring indexing as packets_waiting_ack_field.
     pub declared_lost_field: Box<[u64; PACKETS_WAITING_ACK_WORDS]>,
@@ -2262,6 +3545,7 @@ pub struct ConnectionStateConnected {
 }
 pub fn new_connection_state_connected(cipher: Option<ConnectionCipherTriplet>, magic1: u64, magic2: u64, timestamp_ns: u64) -> ConnectionState {
     ConnectionState::Connected(ConnectionStateConnected {
+        target_state:Default::default(),
         pending_send: None,
         locally_blocked: false,
         cipher,
@@ -2270,9 +3554,11 @@ pub fn new_connection_state_connected(cipher: Option<ConnectionCipherTriplet>, m
         send_sequence_number: 0,
         send_ack_sequence_number: crate::sequence::ACK_SPACE,
         receive_sequences: Default::default(),
+        target_dup_receive:None,
         last_sent_data_packet: 0,
         last_sent_could_have_sent_data_packet: 0,
         last_ack_received_time: timestamp_ns,
+        last_peer_packet_received_time: timestamp_ns,
         last_status_print_time: timestamp_ns,
         packet_since_last_print: 0,
         packet_lost_since_last_print: 0,
@@ -2290,13 +3576,18 @@ pub fn new_connection_state_connected(cipher: Option<ConnectionCipherTriplet>, m
         RTT_sample_sums: [0; 16],
         RTT_sample_counts: [0; 16],
         RTT_sample_cursor: 0,
+        target_min_rtt_ns:u64::MAX,
+        delay_event_window:DelayEventWindow::default(),
+        delay_giveup:DelayGiveupState::default(),
+        delay_curve_beta:None,
         RTT_mean: u16::MAX,
         RTT_mean_cursor: 0,
         ack_arrival_times: [0; 16],
         ack_pace_estimate: 0,
         packets_waiting_ack_field: [0; PACKETS_WAITING_ACK_WORDS],
+        rand_background_bits:None,
         packets_waiting_ack_tail: 0,
-        
+
         current_tu: ASSUMED_UDP_PAYLOAD_SIZE_WITH_GUARANTEED_DELIVERY as u64,
         deferred_tu: None,
         last_sent_tu_probe_time_ns: 0,
@@ -2304,7 +3595,7 @@ pub fn new_connection_state_connected(cipher: Option<ConnectionCipherTriplet>, m
         tu_probe_size: 0,
         tu_probe_size_advance: 0,
         tu_probe_failed_count: 0,
-        
+
         packets_in_flight: 0,
         send_pacer_acc_ns: 0,
         congestion_event_time_ns: 0,
@@ -2319,6 +3610,10 @@ pub fn new_connection_state_connected(cipher: Option<ConnectionCipherTriplet>, m
         app_limit_time_offset: 0,
         ecn_congestion_received: false,
         ecn_oldest_send_time: 0,
+        ecn_oldest_seq: 0,
+        accepted_cc_events: Vec::new(),
+        accepted_cc_dropped: 0,
+        accepted_cc_missing_anchor: 0,
         declared_lost_field: Box::new([0; PACKETS_WAITING_ACK_WORDS]),
         rx_tracker: RxSeqTracker::default(),
     })
@@ -2333,9 +3628,84 @@ impl ConnectionState {
 /// packet up to a second apart, which added up to ~1 s to every message's delivery.
 pub const RATE_FLOOR_UPPS: u64 = 100 * 1_000_000;
 
+/// Fixed-memory research scheduler diagnostics; all zero when disabled.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SlipstreamInfo {
+    pub heads_evaluated: u64,
+    pub heads_eligible: u64,
+    pub ineligible_short: u64,
+    pub ineligible_long: u64,
+    pub ineligible_other: u64,
+    pub follower_starts_tiny_whole_or_packed: u64,
+    pub follower_starts_ordinary_fec: u64,
+    pub follower_starts_segmented_giant: u64,
+    pub head_packets_alternated: u64,
+    pub follower_packets: u64,
+    pub head_promotions: u64,
+    pub max_concurrent_started_messages: u64,
+    pub recursive_windows: u64,
+    pub rtt_ns_min: u64,
+    pub rtt_ns_max: u64,
+    pub fair_share_pps_min: f64,
+    pub fair_share_pps_max: f64,
+}
+impl SlipstreamInfo {
+    fn merge(&mut self, other: Self) {
+        macro_rules! add { ($($f:ident),*) => { $(self.$f += other.$f;)* }; }
+        add!(heads_evaluated, heads_eligible, ineligible_short, ineligible_long,
+            ineligible_other, follower_starts_tiny_whole_or_packed, follower_starts_ordinary_fec,
+            follower_starts_segmented_giant, head_packets_alternated, follower_packets,
+            head_promotions, recursive_windows);
+        self.max_concurrent_started_messages = self.max_concurrent_started_messages.max(other.max_concurrent_started_messages);
+        if other.heads_evaluated > 0 {
+            if self.heads_evaluated == other.heads_evaluated {
+                self.rtt_ns_min = other.rtt_ns_min;
+                self.fair_share_pps_min = other.fair_share_pps_min;
+            } else {
+                self.rtt_ns_min = self.rtt_ns_min.min(other.rtt_ns_min);
+                self.fair_share_pps_min = self.fair_share_pps_min.min(other.fair_share_pps_min);
+            }
+            self.rtt_ns_max = self.rtt_ns_max.max(other.rtt_ns_max);
+            self.fair_share_pps_max = self.fair_share_pps_max.max(other.fair_share_pps_max);
+        }
+    }
+}
+
 /// Cumulative per-connection counters, for measurement.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ConnectionStats {
+    #[cfg(feature="research_target_validation")] pub loss_events_gated:u64,
+    #[cfg(feature="research_target_validation")] pub loss_events_cut_queue:u64,
+    #[cfg(feature="research_target_validation")] pub loss_events_cut_valve:u64,
+    pub slipstream: SlipstreamInfo,
+    /// Logical messages receiving the frozen duration-category bonus (any layout).
+    pub category_bonus_messages: u64,
+    /// Initial extra repair symbols planned across layouts (TU restarts included).
+    pub category_bonus_repairs: u64,
+    /// p4-event-repair evidence (all zero but accepted_* when STP_P4_EVENT_REPAIR=0).
+    pub event_repair: EventRepairInfo,
+    pub budget_base: BudgetBaseInfo,
+    pub rand_bg_packets:u64, pub rand_bg_lost:u64,
+    pub rand_p_ppm:u64, pub rand_p_base_ppm:u64,
+    /// Extra kernel-committed datagrams/UDP bytes and whole messages protected.
+    pub dup_datagrams:u64,
+    pub dup_bytes:u64,
+    pub dup_messages:u64,
+    /// Eligible datagrams skipped at data-nonce exhaustion (no near-TU fallback).
+    pub dup_fallbacks:u64,
+    /// Persistent-delay windows above threshold; accepted is the subset passing the CE event guard.
+    pub delay_events_raised:u64,
+    pub delay_events_accepted:u64,
+    /// Competitive give-up transitions and high-delay windows suppressed while suspended.
+    pub delay_suspensions:u64,
+    pub delay_rearms:u64,
+    pub delay_events_suppressed:u64,
+    /// Low closed windows ignored because the minimum suspension hold is active.
+    pub delay_hold_blocked_rearms:u64,
+    pub delay_cuts_beta_override:u64,
+    /// Outcomes under the optional fractional, bounded-time effectiveness rule.
+    pub delay_effective:u64,
+    pub delay_ineffective:u64,
     /// Current smoothed RTT in microseconds (0 until sampled).
     pub rtt_us: u64,
     /// Last CC command in micro-packets/second, after the local pacing ceiling.
@@ -2344,11 +3714,6 @@ pub struct ConnectionStats {
     pub cc_app_limited_entries: u64,
     /// Current path transmission unit, including STP header/tag inside the UDP payload.
     pub udp_payload_tu: u64,
-    /// Logical messages that received the frozen P4 duration-category parity bonus.
-    pub category_bonus_messages: u64,
-    /// Extra repair symbols PLANNED by that bonus at initial layout starts (a TU
-    /// restart plans again and counts again). Not emitted or delivered packets.
-    pub category_bonus_repairs: u64,
     /// Constant-memory send-loop burst and curve-inversion diagnostics.
     pub pacing_batches: u64,
     pub pacing_packets: u64,
@@ -2564,9 +3929,13 @@ impl TestDropSchedule {
     }
 }
 
+/// p4-event-repair: the send-history time of a packet committed at `t`, exactly as
+/// increment_sequence_number_and_account encodes (t / 0x400000) and get_send_time_for_sequence_number decodes.
+pub fn send_history_time_ns(t: u64) -> u64 { (t / 0x400000) * 0x400000 }
+
 pub fn get_send_time_for_sequence_number(sequence_number: u64, send_time_band: &[u64; 1024], send_time_band_head_index: u64) -> u64 {
     if sequence_number >= send_time_band[(send_time_band_head_index % 1024) as usize] { return u64::MAX; }
-    
+
     let mut cursor = send_time_band_head_index;
     while cursor > send_time_band_head_index.saturating_sub(1023) {
         if send_time_band[((cursor-1) % 1024) as usize] <= sequence_number && sequence_number < send_time_band[(cursor % 1024) as usize] {
@@ -2585,6 +3954,12 @@ impl PositiveReceipt {
 }
 
 impl ConnectionStateConnected {
+    fn peer_expired(&self, now: u64, authenticated_peer_liveness: bool) -> bool {
+        let last_activity = if authenticated_peer_liveness {
+            self.last_ack_received_time.max(self.last_peer_packet_received_time)
+        } else { self.last_ack_received_time };
+        OutageState::expired(now, last_activity)
+    }
     fn send_exhausted(&self, buf: &SendQueues) -> bool {
         self.send_sequence_number >= crate::sequence::ACK_SPACE - 1 || self.send_ack_sequence_number == u64::MAX ||
             buf.queues.first().and_then(|q| q.package_allocator.as_ref())
@@ -2649,7 +4024,7 @@ pub fn increment_sequence_number_and_account(send_time_ns: u64, send_sequence_nu
     if new_head_index >= *send_time_band_head_index + 1023 {
         let current = *send_sequence_number;
         for i in 0..1024 { send_time_band[i] = current; }
-        
+
         send_time_band[(new_head_index % 1024) as usize] = current + 1;
         *send_time_band_head_index = new_head_index;
         *send_sequence_number = current + 1;
@@ -2853,7 +4228,7 @@ impl ReassemblySlot {
             last_segment_ns: 0,
         }
     }
-    
+
     /// Message bytes received so far.
     pub fn bytes_received(&self) -> u64 {
         self.segment_parts.as_ref().map_or_else(|| self.received.iter().map(|&(s, e)| (e - s) as u64).sum(),
@@ -3045,7 +4420,9 @@ pub struct FecRecvSlot {
     reservation: Option<crate::receive_memory::Reservation>,
     /// Blocks handed to this slot's decoder (for loss accounting on eviction).
     blocks_received: u32,
-    last_block_ns: u64,
+    last_block_ns: u64, // Last successfully admitted symbol, never a probe ACK.
+    /// One recovery extension per admitted symbol; None also handles timestamp zero.
+    recovery_resume_ns: Option<u64>,
     ingress_dropped: u64,
     admission_refused: bool,
     worker_limit_refused: bool,
@@ -3055,7 +4432,9 @@ pub struct FecRecvSlot {
 enum FecRecvState {
     #[default]
     Empty,
-    /// Small message: decoded on the network thread.
+    /// Inline systematic symbols, without a native codec until a repair arrives.
+    SourceOnly(crate::fec::SourceOnly),
+    /// Small message with repair: decoded on the network thread.
     Inline(crate::fec::MessageDecoder),
     /// Big message: a byte-bounded, nonblocking ingress queue feeds a decoder thread.
     /// Dropping the sender (eviction, disconnect) ends it and frees the decoder.
@@ -3066,7 +4445,7 @@ enum FecRecvState {
 
 impl std::fmt::Debug for FecRecvSlot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let st = match &self.state { FecRecvState::Empty => "empty", FecRecvState::Inline(_) => "inline", FecRecvState::Worker { .. } => "worker", FecRecvState::Done => "done" };
+        let st = match &self.state { FecRecvState::Empty => "empty", FecRecvState::SourceOnly(_) => "source-only", FecRecvState::Inline(_) => "inline", FecRecvState::Worker { .. } => "worker", FecRecvState::Done => "done" };
         write!(f, "FecRecvSlot {{ package_id: {}, state: {st} }}", self.package_id)
     }
 }
@@ -3076,10 +4455,14 @@ impl FecRecvSlot {
         (0..size).map(|_| FecRecvSlot::default()).collect()
     }
     pub fn in_use(&self) -> bool { !matches!(self.state, FecRecvState::Empty) }
+    fn last_active_ns(&self) -> u64 {
+        self.last_block_ns.max(self.recovery_resume_ns.unwrap_or(0))
+    }
     /// Message bytes received so far (blocks x block size).
     pub fn bytes_received(&self) -> u64 { self.blocks_received as u64 * self.params().map_or(0, |p| p.1) as u64 }
     fn params(&self) -> Option<(usize, usize)> {
         match &self.state {
+            FecRecvState::SourceOnly(s) => Some((s.layout.len, s.layout.block_bytes)),
             FecRecvState::Inline(d) => Some((d.message_len(), d.block_bytes())),
             FecRecvState::Worker { message_len, block_bytes, .. } => Some((*message_len, *block_bytes)),
             _ => None,
@@ -3123,10 +4506,10 @@ fn retire_inactive_fec_workers(slots: &mut [FecRecvSlot], now_ns: u64, grace_ns:
     // Worker-admission pressure only needs to free a worker. The periodic sweep
     // also expires inline decoders, so abandoned small FEC units cannot pin IDs.
     let eligible = |s: &FecRecvSlot| (matches!(s.state, FecRecvState::Worker { .. })
-        || (!oldest_only && matches!(s.state, FecRecvState::Inline(_))))
-        && now_ns.saturating_sub(s.last_block_ns) > grace_ns;
+        || (!oldest_only && matches!(s.state, FecRecvState::SourceOnly(_) | FecRecvState::Inline(_))))
+        && now_ns.saturating_sub(s.last_active_ns()) > grace_ns;
     if oldest_only {
-        if let Some(index) = slots.iter().enumerate().filter(|(_, s)| eligible(s)).min_by_key(|(_, s)| s.last_block_ns).map(|(i, _)| i) {
+        if let Some(index) = slots.iter().enumerate().filter(|(_, s)| eligible(s)).min_by_key(|(_, s)| s.last_active_ns()).map(|(i, _)| i) {
             slots[index].state = FecRecvState::Done;
             return 1;
         }
@@ -3176,27 +4559,29 @@ fn fec_receive_block(
     budget: &std::sync::Arc<crate::receive_memory::ReceiveMemoryBudget>,
 ) -> Option<(Vec<u8>, crate::receive_memory::Reservation)> {
     use crate::fec::*;
-    if matches!(slot.state, FecRecvState::Done) { return None; }
+    if matches!(slot.state, FecRecvState::Done) { #[cfg(feature = "research_budget_diagnostic")] diag::rx_status(3); return None; }
     slot.blocks_received = slot.blocks_received.saturating_add(1);
     let layout = MessageLayout::new(message_len, block_bytes)?;
     if !valid_fec_symbol(layout, block_id, data.len()) { return None; }
-    if slot.params().is_some_and(|p| p != (message_len, block_bytes)) { return None; }
+    if slot.params().is_some_and(|p| p != (message_len, block_bytes)) { #[cfg(feature = "research_budget_diagnostic")] diag::rx_status(4); return None; }
     if !slot.in_use() {
         let worker = layout.k > FEC_INLINE_MAX_BLOCKS;
         let ingress_bytes = fec_ingress_bytes(layout);
-        let charge = receive_memory_charge(layout, worker, ingress_bytes)?;
+        let source_only = !worker && (block_id as usize) < layout.k;
+        let charge = if source_only { SourceOnly::charge(layout)? }
+            else { receive_memory_charge(layout, worker, ingress_bytes)? };
         let reservation = if !worker || workers.load(std::sync::atomic::Ordering::Acquire) < MAX_FEC_DECODE_WORKERS {
             budget.reserve(charge)
         } else { slot.worker_limit_refused = true; None };
         let Some(reservation) = reservation else {
             slot.admission_refused = true;
-            slot.ingress_dropped += 1;
+            #[cfg(feature = "research_budget_diagnostic")] diag::rx_status(5); slot.ingress_dropped += 1;
             return None;
         };
         if worker {
             if !budget.acquire_worker() {
                 slot.worker_limit_refused = true;
-                slot.admission_refused = true; slot.ingress_dropped += 1; return None;
+                slot.admission_refused = true; #[cfg(feature = "research_budget_diagnostic")] diag::rx_status(5); slot.ingress_dropped += 1; return None;
             }
             let (tx, rx) = std::sync::mpsc::sync_channel::<(u32, Vec<u8>)>(ingress_slots(ingress_bytes, block_bytes));
             let done_tx = done_tx.clone();
@@ -3219,30 +4604,90 @@ fn fec_receive_block(
                 }
             });
             if r.is_ok() { slot.state = FecRecvState::Worker { tx, message_len, block_bytes, generation }; }
-            else { slot.ingress_dropped += 1; return None; }
+            else { #[cfg(feature = "research_budget_diagnostic")] diag::rx_status(5); slot.ingress_dropped += 1; return None; }
+        } else if source_only {
+            slot.reservation = Some(reservation);
+            slot.state = FecRecvState::SourceOnly(SourceOnly::new(layout));
         } else {
             slot.state = match MessageDecoder::new(message_len, block_bytes) {
                 Some(d) => { slot.reservation = Some(reservation); FecRecvState::Inline(d) },
-                None => FecRecvState::Done,
+                None => { #[cfg(feature = "research_budget_diagnostic")] diag::rx_status(8); FecRecvState::Done },
             };
+        }
+    }
+    if let FecRecvState::SourceOnly(source) = &mut slot.state {
+        if (block_id as usize) < layout.k {
+            let Ok((status, fresh)) = source.insert(block_id, data) else { #[cfg(feature="research_budget_diagnostic")] diag::rx_status(14); return None; };
+            #[cfg(feature = "research_budget_diagnostic")] diag::rx_status(1);
+            #[cfg(feature = "research_budget_diagnostic")] if !fresh {diag::rx_status(9);}
+            if fresh { slot.last_block_ns = monotonic_clock_ns(); }
+            if status == DecodeStatus::Done { #[cfg(feature = "research_budget_diagnostic")] diag::rx_status(10);
+                let message = std::mem::take(&mut source.output);
+                slot.state = FecRecvState::Done;
+                return Some((message, slot.reservation.take()?));
+            }
+            return None;
+        }
+        // Retain the source lease throughout native creation and buffered-source
+        // replay. A second FULL lease accounts for output + arena + metadata,
+        // including their coexistence with the staged source allocation.
+        if source.native_failed { #[cfg(feature = "research_budget_diagnostic")] diag::rx_status(15); slot.ingress_dropped += 1; return None; }
+        let charge = receive_memory_charge(layout, false, 0)?;
+        let Some(native_reservation) = budget.reserve(charge) else {
+            slot.admission_refused = true;
+            #[cfg(feature = "research_budget_diagnostic")] diag::rx_status(5); slot.ingress_dropped += 1;
+            return None;
+        };
+        let upgraded = source.decoder().and_then(|mut dec| {
+            let status = dec.add(block_id, data)?;
+            let message = if status == DecodeStatus::Done { #[cfg(feature = "research_budget_diagnostic")] diag::rx_status(10);
+                Some(dec.recover().ok_or(DecodeError::Failed(-1))?)
+            } else { None };
+            Ok((dec, message))
+        });
+        match upgraded {
+            Ok((dec, message)) => {
+                #[cfg(feature = "research_budget_diagnostic")] diag::rx_status(if message.is_some(){7}else{6});
+                // Free staged bytes before releasing their lease; move the new
+                // full lease into the slot/completion with no accounting gap.
+                slot.state = if message.is_some() { FecRecvState::Done } else { FecRecvState::Inline(dec) };
+                slot.reservation = Some(native_reservation);
+                slot.last_block_ns = monotonic_clock_ns();
+                return message.map(|m| (m, slot.reservation.take().unwrap()));
+            }
+            Err(_) => {
+                // One allocation/feed attempt per source state on native error.
+                // All sources can still finish directly; refused repairs never
+                // refresh activity or rearm recovery grace.
+                source.native_failed = true;
+                #[cfg(feature = "research_budget_diagnostic")] diag::rx_status(8); slot.ingress_dropped += 1;
+                return None;
+            }
         }
     }
     match &mut slot.state {
         FecRecvState::Inline(dec) => { slot.last_block_ns = monotonic_clock_ns(); match dec.add(block_id, data) {
-            Ok(DecodeStatus::NeedMore) | Err(DecodeError::BadBlock) => None,
+            Ok(DecodeStatus::NeedMore) => { #[cfg(feature = "research_budget_diagnostic")] diag::rx_status(6); None },
+            Err(DecodeError::BadBlock) => { #[cfg(feature = "research_budget_diagnostic")] diag::rx_status(14); None },
             Ok(DecodeStatus::Done) => {
-                let m = dec.recover(); slot.state = FecRecvState::Done;
+                let m = dec.recover(); #[cfg(feature = "research_budget_diagnostic")] diag::rx_status(7);
+                #[cfg(feature = "research_budget_diagnostic")] if m.is_none(){diag::rx_status(8);}
+                slot.state = FecRecvState::Done;
                 let r = slot.reservation.take()?; m.map(|m| (m, r))
             }
-            Err(DecodeError::Failed(_)) => { slot.state = FecRecvState::Done; slot.reservation = None; None }
+            Err(DecodeError::Failed(_)) => { #[cfg(feature = "research_budget_diagnostic")] diag::rx_status(8); slot.state = FecRecvState::Done; slot.reservation = None; None }
         } },
         FecRecvState::Worker { tx, .. } => {
             match tx.try_send((block_id, data.to_vec())) {
-                Ok(()) => slot.last_block_ns = monotonic_clock_ns(),
-                Err(std::sync::mpsc::TrySendError::Full(_)) => slot.ingress_dropped += 1,
+                Ok(()) => {
+                    #[cfg(feature = "research_budget_diagnostic")] diag::rx_status(11);
+                    slot.last_block_ns = monotonic_clock_ns();
+                    slot.recovery_resume_ns = None;
+                },
+                Err(std::sync::mpsc::TrySendError::Full(_)) => { #[cfg(feature = "research_budget_diagnostic")] diag::rx_status(12); slot.ingress_dropped += 1 },
                 // A successful completion may already be queued. Keep this
                 // exact Worker live until it is drained or explicitly retired.
-                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => (),
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => { #[cfg(feature = "research_budget_diagnostic")] diag::rx_status(13); },
             }
             None
         }
@@ -3259,6 +4704,8 @@ pub const ACK_BUFFER_TIME_NS: u64 = 50_000_000;
 
 #[derive(Default)]
 pub struct NetworkThreadPush {
+    #[cfg(feature = "research_budget_diagnostic")]
+    pub diagnostic_take: bool,
     pub initiate_connections: Vec<STPAddress>,
     pub wanted_connections: Vec<(STPAddress, [u8; 64])>,
     /// (connection, queue index, message traffic class, complete message). Class never
@@ -3268,6 +4715,8 @@ pub struct NetworkThreadPush {
 
 #[derive(Default)]
 pub struct NetworkThreadPull {
+    #[cfg(feature = "research_budget_diagnostic")]
+    pub diagnostic: Option<diag::Capture>,
     pub current_connections: Vec<(STPAddress, [u8; 64])>,
     pub received_unreliable_messages: VecDeque<(ConnectionKey, Vec<u8>)>,
     /// Messages from this call's `send_unreliable` that were not queued, handed back unchanged:
@@ -3285,6 +4734,10 @@ pub struct NetworkThreadPull {
     /// largest message each indexed send queue would accept now, after this call's submissions; u64::MAX
     /// when its queue is empty. A connection missing here does not exist.
     pub unreliable_send_free_bytes: Vec<(ConnectionKey, usize, u64)>,
+    /// RESEARCH-ONLY (feature `research_cohort_observer`): read-only per-connection send-work
+    /// snapshot taken after this call's submissions and `free_bytes()` reclamation above.
+    #[cfg(feature = "research_cohort_observer")]
+    pub cohort_observation: Vec<(ConnectionKey, crate::cohort_observe::CohortObservation)>,
     /// Cumulative counters for every connected connection.
     pub connection_stats: Vec<(ConnectionKey, ConnectionStats)>,
     /// Cumulative progress snapshots at first source, source completion and every repair
@@ -3379,6 +4832,10 @@ pub struct NetworkThreadOptions {
     pub datagram_log: Option<std::sync::Arc<std::sync::Mutex<Vec<SentDatagram>>>>,
     #[cfg(test)]
     send_failure: Option<std::sync::Arc<std::sync::Mutex<TestSendFailure>>>,
+    #[cfg(test)]
+    ordinary_started_peak: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    #[cfg(test)]
+    encrypted_payload_log: Option<std::sync::Arc<std::sync::Mutex<Vec<(Vec<u8>, Vec<u8>)>>>>,
     /// Fixed number of FIFO queues per connection (1..=64), also sizing the peer receive cap.
     /// Total app capacity is N x max_queue_size_bytes (plus the inherited oversized-alone
     /// exception). Rescue reservations are 64 MiB/N and 4096/N per magazine, no borrowing.
@@ -3394,10 +4851,12 @@ pub struct NetworkThreadOptions {
     pub record_loss_episodes: bool,
     /// Optional sender packet/fragment/outcome event CSV.
     pub loss_trace: Option<std::path::PathBuf>,
+    #[cfg(feature = "research_budget_diagnostic")]
+    pub budget_diagnostic: bool,
 }
 
 impl Default for NetworkThreadOptions {
-    fn default() -> Self { Self { #[cfg(test)] datagram_log: None, #[cfg(test)] send_failure: None, send_queue_count: 1, receive_memory: None, bind_ip: None, record_fec_messages: false, record_loss_episodes: false, loss_trace: None } }
+    fn default() -> Self { Self { #[cfg(test)] datagram_log: None, #[cfg(test)] send_failure: None, #[cfg(test)] ordinary_started_peak: None, #[cfg(test)] encrypted_payload_log: None, send_queue_count: 1, receive_memory: None, bind_ip: None, record_fec_messages: false, record_loss_episodes: false, loss_trace: None, #[cfg(feature = "research_budget_diagnostic")] budget_diagnostic: false } }
 }
 
 /// `max_message_size` is required local application configuration in both directions,
@@ -3415,9 +4874,9 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
         .expect("receive cap arithmetic overflow");
     assert!(connection_receive_limit.checked_add(RECEIVE_CONNECTION_BYTES).is_some_and(|n| n <= receive_memory.limit()),
         "max_message_size={max_message_size} with {send_queue_count} queues requires {connection_receive_limit} receive bytes plus connection bookkeeping; process budget is {}", receive_memory.limit());
+    crate::fec_adapt::initialize_research_policy().expect("invalid transport research policy");
     // One measured policy, not application configuration.
     let cc = crate::ship::CC;
-    let cc_rate = move |t, r, k, startup_done| connection_rate(t, r, k, &cc, startup_done);
 
 
     // STP setup
@@ -3442,7 +4901,15 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
     let datagram_log = options.datagram_log;
     #[cfg(test)]
     let send_failure = options.send_failure;
+    #[cfg(test)]
+    let ordinary_started_peak = options.ordinary_started_peak;
+    #[cfg(test)]
+    let encrypted_payload_log = options.encrypted_payload_log;
+    #[cfg(feature="research_budget_diagnostic")]
+    let diagnostic_enabled = options.budget_diagnostic;
     let thread = std::thread::spawn(move || {
+        #[cfg(feature = "research_budget_diagnostic")]
+        diag::enable(diagnostic_enabled);
         #[cfg(test)]
         let datagram_expectation = std::cell::Cell::new(("handshake", None::<usize>));
         // Test builds observe EVERY actual native send, including handshakes. The
@@ -3474,6 +4941,11 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
         let (fec_done_tx, fec_done_rx) = std::sync::mpsc::channel::<FecCompletion>();
         let fec_workers = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut fec_sweep_ns = 0;
+        // Frozen ALIVE policy: peer activity changes connection expiry
+        // only; congestion/outage recovery still requires positive ACK progress.
+
+        let authenticated_peer_liveness = crate::ship::policy_var("STP_TV_ALIVE").as_deref() == Ok("1");
+
 
         // Test-only loss injection: STP_TEST_DROP_PPM=n skips sending n per million outgoing
         // data packets while accounting them as sent, so congestion control sees real loss.
@@ -3551,7 +5023,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                         }
                     }
                 }
-                
+
                 // Push unreliable messages to their queues, batched per connection. The sort is
                 // stable so each connection's messages keep the caller's order. Whatever a queue
                 // does not accept, and everything for a connection not in the map, goes back to
@@ -3590,8 +5062,15 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                     };
                     resp.send_unreliable_rejected.extend(rejected.into_iter().map(|(dscp, m)| (key, queue, dscp, m)));
                 }
+                #[cfg(feature = "research_budget_diagnostic")]
+                if req.diagnostic_take { resp.diagnostic = diag::take(current_time_now_ns); }
                 resp.unreliable_send_free_bytes = connections_map.iter_mut()
                     .flat_map(|(key, value)| value.unreliable_send_buffer.free_bytes().into_iter().enumerate().map(|(q, bytes)| (*key, q, bytes))).collect();
+                #[cfg(feature = "research_cohort_observer")]
+                {
+                    let test_drop_configured = test_drop_ppm != 0 || test_drop_schedule.is_some();
+                    resp.cohort_observation = connections_map.iter().map(|(key, value)| (*key, cohort_observation_of(value, test_drop_configured))).collect();
+                }
                 if current_time_now_ns.saturating_sub(cpu_read_ns) >= 100_000_000 {
                     cpu_read_ns = current_time_now_ns;
                     #[cfg(target_os = "linux")]
@@ -3606,10 +5085,17 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                 resp.connection_stats = connections_map.iter().filter_map(|(key, value)| match &value.connection_state {
                     ConnectionState::Connected(c) => {
                         let mut st = c.stats;
+
+                        { (st.rand_bg_packets,st.rand_bg_lost,st.rand_p_ppm,st.rand_p_base_ppm)=crate::target_validation::rand_counters(&c.target_state); }
                         for q in &value.unreliable_send_buffer.queues {
+                            st.slipstream.merge(q.slipstream_info);
                             st.category_bonus_messages += q.category_bonus_messages;
                             st.category_bonus_repairs += q.category_bonus_repairs;
+                            st.event_repair.merge(q.event_info());
+                            st.budget_base.merge(*q.budget_sink.lock().unwrap());
                         }
+                        st.event_repair.accepted_dropped += c.accepted_cc_dropped;
+                        st.event_repair.missing_anchor += c.accepted_cc_missing_anchor;
                         st.fec_decode_peak_workers = value.receive_budget.worker_peak() as u64;
                         st.seq_numbers_used = c.send_sequence_number;
                         st.udp_payload_tu = c.current_tu;
@@ -3655,16 +5141,16 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
 
                 thread_inner.state.store(0, std::sync::atomic::Ordering::Release);
             } else {
-                
+
                 /*  Note(Sam): Scheduling is very important for fairness and good performance under load
                     without strange bugs. Here is the strategy we will use even though it may seem CPU
                     expensive. Try to receive, then loop all connections and try to send for each of them.
                     We go to sleep if everything failed. Because we loop over all connections the calculation
                     for if we can send or not must be very cheap.
                 */
-                
+
                 let mut should_sleep = true;
-                
+
 //////// BEGIN RECEIVE ////////////////////////////////////////////////////////////////////////
                 // Drain ACKs before sending again. Bound the batch so a busy peer cannot
                 // monopolize the thread; the socket is nonblocking, so stop as soon as empty.
@@ -3675,11 +5161,11 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             Err(_) => break,
                         };
                     if buf_len < 6 { continue; }
-                    
+
                     should_sleep = false;
                     let first_six_bytes = load_u48(&packet_memory_encrypted[0..6]);
-                    
-                    
+
+
                     if first_six_bytes & 1 != 0 { // Client Hello
                         let magic1 = first_six_bytes;
                         if magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
@@ -3693,7 +5179,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                             // if OVERLY_VERBOSE { println!("Did NOT respond to connection: magic2 negotiation failed."); }
                                             break;
                                         };
-        
+
                                         let peer_max_message_size = validate_transport_parameters(&magic2_block[MAGIC2_LIST_SIZE..]).unwrap();
                                         let connection_key = ConnectionKey { ip: other_ip_addr, port: other_port, key_15_bits: load_u16(&client_key[0..2]) << 1 };
                                         if let Some(existing_connection) = connections_map.get_mut(&connection_key) {
@@ -3704,7 +5190,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                                         packet_memory_send[6..6+32].copy_from_slice(&my_kp.public[..]);
                                                         packet_memory_send[6+32..6+32+SERVER_HELLO_PAYLOAD_LEN].copy_from_slice(&build_server_hello(chosen_magic2, max_message_size));
                                                         let hello_packet_payload = Vec::from(&packet_memory_send[0..6+32+SERVER_HELLO_PAYLOAD_LEN]);
-        
+
                                                         existing_connection.peer_max_message_size = peer_max_message_size;
                                                         existing_connection.connection_state = ConnectionState::SendingServerHelloPlaintext { magic2: chosen_magic2, last_sent_time_ns: 0, hello_packet_payload };
                                                         if OVERLY_VERBOSE { println!("Transitioned connection {} to SendingServerHelloPlaintext.", connection_key.key_15_bits); }
@@ -3726,7 +5212,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                             packet_memory_send[6..6+32].copy_from_slice(&my_kp.public[..]);
                                             packet_memory_send[6+32..6+32+SERVER_HELLO_PAYLOAD_LEN].copy_from_slice(&build_server_hello(chosen_magic2, max_message_size));
                                             let hello_packet_payload = Vec::from(&packet_memory_send[0..6+32+SERVER_HELLO_PAYLOAD_LEN]);
-        
+
                                             let my_ip = if other_ip_addr.to_ipv4_mapped().is_some() { Ipv6Addr::UNSPECIFIED } else { Ipv6Addr::UNSPECIFIED };
                                             connections_map.insert(
                                                 connection_key,
@@ -3772,7 +5258,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                                 if OVERLY_VERBOSE { println!("Did NOT respond to Client Hello from {:?}: magic2 negotiation failed.", (other_ip_addr, other_port)); }
                                                 break;
                                             };
-        
+
                                             let peer_max_message_size = validate_transport_parameters(&packet_memory_recv[MAGIC2_LIST_SIZE..magic2_block_len]).unwrap();
                                             let connection_key = ConnectionKey { ip: other_ip_addr, port: other_port, key_15_bits: load_u16(&client_key[0..2]) << 1 };
                                             if let Some(existing_connection) = connections_map.get_mut(&connection_key) {
@@ -3783,11 +5269,11 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                                             store_u48(&mut packet_memory_send[0..6], 0xffff_ffff_0000 | (load_u16(&my_kp.public[0..2]) << 1) as u64);
                                                             let handshake_size = new_handshake.write_message(&chosen_magic2_bytes, &mut packet_memory_send[6..]).unwrap();
                                                             let hello_packet_payload = Vec::from(&packet_memory_send[0..6+handshake_size]);
-        
+
                                                             debug_assert!(new_handshake.is_handshake_finished());
                                                             existing_connection.handshake_hash = get_handshake_hash(&new_handshake);
                                                             let cipher = ConnectionCipherTriplet::new_from_old_init_only(new_handshake.into_stateless_transport_mode().expect("Cannot fail given assert above."));
-        
+
                                                             existing_connection.peer_max_message_size = peer_max_message_size;
                                                         existing_connection.connection_state = ConnectionState::SendingServerHello { cipher, magic1: *magic1, magic2: chosen_magic2, last_sent_time_ns: 0, hello_packet_payload };
                                                             if OVERLY_VERBOSE { println!("Transitioned connection {} to SendingServerHello.", connection_key.key_15_bits); }
@@ -3808,11 +5294,11 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                                 store_u48(&mut packet_memory_send[0..6], 0xffff_ffff_0000 | (load_u16(&my_kp.public[0..2]) << 1) as u64);
                                                 let handshake_size = new_handshake.write_message(&chosen_magic2_bytes, &mut packet_memory_send[6..]).unwrap();
                                                 let hello_packet_payload = Vec::from(&packet_memory_send[0..6+handshake_size]);
-        
+
                                                 debug_assert!(new_handshake.is_handshake_finished());
                                                 let handshake_hash = get_handshake_hash(&new_handshake);
                                                 let cipher = ConnectionCipherTriplet::new_from_old_init_only(new_handshake.into_stateless_transport_mode().expect("Cannot fail given assert above."));
-        
+
                                                 let my_ip = if other_ip_addr.to_ipv4_mapped().is_some() { Ipv6Addr::UNSPECIFIED } else { Ipv6Addr::UNSPECIFIED };
                                                 connections_map.insert(
                                                     connection_key,
@@ -3835,7 +5321,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                                         unreliable_fec: FecRecvSlot::new_ring(1024),
                                                     },
                                                 );
-        
+
                                                 if OVERLY_VERBOSE { println!("Transitioned connection {} to SendingServerHello.", connection_key.key_15_bits); }
                                             }
                                         } else {
@@ -3849,7 +5335,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                         }
                     }
                     else { 'conn: { // Not client hello
-        
+
                         let connection_key = ConnectionKey { ip: other_ip_addr, port: other_port, key_15_bits: first_six_bytes as u16 };
                         let Some(existing_connection) = connections_map.get_mut(&connection_key) else {
                             if OVERLY_VERBOSE {
@@ -3857,7 +5343,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             }
                             break 'conn;
                         };
-    
+
                         match &mut existing_connection.connection_state {
                             ConnectionState::SendingClientHelloPlaintext { last_sent_time_ns, hello_packet_payload } => {
                                 if first_six_bytes >> 16 == 0xffff_ffff && buf_len == 6 + 32 + SERVER_HELLO_PAYLOAD_LEN {
@@ -3896,7 +5382,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                             break 'conn;
                                         }
                                         if VERBOSE { println!("Connected to new server {:?}", handshake.get_remote_static().unwrap()); }
-    
+
                                         // Borrow Checker crazyness required here.
                                         let new_state = new_connection_state_connected(None, *magic1, server_magic2, timestamp_ns);
                                         let old_state = std::mem::replace(&mut existing_connection.connection_state, new_state);
@@ -3951,13 +5437,19 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 if epoch != 0 { break 'conn; }
                                 payload = &packet_memory_encrypted[CONNECTED_HEADER_SIZE..buf_len];
                             }
+                            #[cfg(feature = "research_budget_diagnostic")]
+                            diag::context(existing_connection.handshake_hash, &existing_connection.my_transport_identity_keypair.public, &existing_connection.other_transport_identity);
                             // Packet TYPE is still determined by authenticated payload SIZE.
                             let is_ack = payload.len() == crate::ack::ACK_PAYLOAD_LEN;
                             if is_ack != crate::sequence::is_ack_space(non_virtual_nonce) { break 'conn; }
-                            if !state.receive_sequences.commit(nonce) { break 'conn; }
+                            if !state.receive_sequences.commit(nonce) {
+                                #[cfg(feature = "research_budget_diagnostic")]
+                                if !is_ack { diag::replay(nonce,timestamp_ns,payload); }
+                                break 'conn;
+                            }
                             // ACK nonces are not holes in the dense data stream.
                             if !is_ack { state.rx_tracker.on_packet(nonce, &mut state.stats); }
-                            
+
                             if payload.len() < 517 && payload.len() != crate::ack::ACK_PAYLOAD_LEN {
                                 if OVERLY_VERBOSE { println!("Dropping from {connection_key:?}, payload < 517."); }
                                 break 'conn;
@@ -3968,14 +5460,19 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 let bitmap_ack = if payload.len() == crate::ack::ACK_PAYLOAD_LEN {
                                     let Some(a) = crate::ack::BitmapAck::decode(payload) else { break 'conn; };
                                     if a.highest >= state.send_sequence_number { break 'conn; }
+                                    // A fresh authenticated ACK proves peer activity, not
+                                    // positive receipt or round-trip outage recovery.
+                                    state.last_peer_packet_received_time = timestamp_ns;
                                     if let Some(cipher) = &mut state.cipher { cipher.confirm_outgoing(a.highest); }
                                     state.peer_ack_delay_us = a.delay_us;
                                     Some(a)
                                 } else { None };
                                 if state.outage.since_ns.is_some() {
                                     // Only receipt of a RECENT outage probe proves round-trip recovery.
-                                    // Replayed or withheld old authentic ACKs cannot extend the deadline.
+                                    // Old authentic ACKs cannot resume the outage. Fresh inbound
+                                    // activity can extend research peer liveness, not ACK progress.
                                     if !bitmap_ack.as_ref().is_some_and(|a| recent_outage_probe_acked(state, a, timestamp_ns)) { break 'conn; }
+                                    drain_accepted_cc_events(state, &mut existing_connection.unreliable_send_buffer);
                                     resume_outage(state, &mut existing_connection.unreliable_send_buffer,
                                         &mut existing_connection.unreliable_fec, timestamp_ns, max_pps);
                                 }
@@ -3984,13 +5481,14 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 let mut RTT_acc = 0u64;
                                 let mut RTT_count = 0u64;
                                 let mut ack_latency_ns = 0u64;
-                                
+
                                 let mut data_ack_progress = false;
                                 let mut newly_acked_data = 0u64;
                                 let mut delivery_latency_ns = 0u64;
                                 let mut shadow_acked_data = 0u64;
                                 let mut shadow_latency_ns = 0u64;
                                 let mut oldest_newly_acked_send_time: u64 = u64::MAX;
+                                let mut oldest_newly_acked_seq: u64 = 0;
                                 let relevant_ack = bitmap_ack.as_ref().map(|a| a.relevant(&state.packets_waiting_ack_field, &state.declared_lost_field[..]));
                                 let indices = relevant_ack.iter().flat_map(crate::ack::BitmapAck::acknowledged);
                                 for index in indices {
@@ -4001,9 +5499,12 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     state.last_ack_received_time = timestamp_ns;
                                     state.outage.pending_since_ns = None;
                                     if let Some(t) = &mut loss_trace { t.outcome('A', existing_connection.two_byte_send_prefix, index, timestamp_ns); }
+                                    #[cfg(feature = "research_budget_diagnostic")]
+                                    diag::feedback(index,timestamp_ns,if receipt.is_pending(){1}else{2});
                                     let sent_ns = state.send_time(index);
                                     if receipt.is_pending() {
                                         if sent_ns != 0 && sent_ns != u64::MAX {
+                                            if sent_ns < oldest_newly_acked_send_time { oldest_newly_acked_seq = index; }
                                             oldest_newly_acked_send_time = oldest_newly_acked_send_time.min(sent_ns);
                                         }
                                         if receipt == PositiveReceipt::PendingProbe {
@@ -4040,6 +5541,16 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                         if bitmap_ack.as_ref().is_none_or(|a| index == a.sample_seq) {
                                             let delay = bitmap_ack.as_ref().map_or(0, |a| a.delay_us as u64 * 1000);
                                             if delay < raw {
+
+                                                {
+                                                    // Same delay-corrected sample as CC, before 0.1ms quantization.
+                                                    let sample=(raw-delay).max(100_000);
+                                                    // Close the OLD window before admitting this sample;
+                                                    // a boundary sample belongs only to the new window.
+                                                    observe_delay_event(state,timestamp_ns,sample,index,sent_ns,delay_event_config(),&cc,max_pps);
+                                                    state.target_min_rtt_ns=state.target_min_rtt_ns.min(sample);
+                                                    crate::target_validation::risk_rtt(&state.target_state,sample,state.target_min_rtt_ns);
+                                                }
                                                 RTT_acc += (raw - delay).max(100_000) / 100_000;
                                                 RTT_count += 1;
                                             }
@@ -4053,6 +5564,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     let before = state.congestion_event_time_ns;
                                     let context = loss_trace.as_ref().map(|_| cc_trace_context(state, timestamp_ns, &cc, max_pps));
                                     let cut = observe_ack_hole(state, timestamp_ns, &cc, max_pps);
+                                    drain_accepted_cc_events(state, &mut existing_connection.unreliable_send_buffer);
                                     if state.congestion_event_time_ns != before {
                                         if let (Some(t), Some((seq, sent)), Some(context)) = (&mut loss_trace, cut, context) {
                                             t.cut(existing_connection.two_byte_send_prefix, seq, timestamp_ns, sent, "early", context);
@@ -4066,9 +5578,12 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     // acknowledged already. Do not consume that cumulative event silently.
                                     let anchor = if oldest_newly_acked_send_time != u64::MAX { oldest_newly_acked_send_time }
                                         else { bitmap_ack.as_ref().map_or(0, |a| state.send_time(a.sample_seq)) };
+                                    let anchor_seq = if oldest_newly_acked_send_time != u64::MAX { oldest_newly_acked_seq }
+                                        else { bitmap_ack.as_ref().map_or(0, |a| a.sample_seq) };
                                     if anchor != 0 && anchor != u64::MAX {
                                         state.ecn_congestion_received = true;
                                         state.ecn_oldest_send_time = anchor;
+                                        state.ecn_oldest_seq = anchor_seq;
                                     }
                                 }
 
@@ -4113,36 +5628,54 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                         }
                                     }
                                 }
-                                
+
                                 break 'conn;
                             }
-                            // This is not an ack packet.
+                            // This is not an ack packet. AEAD, nonce-space/type,
+                            // replay and minimum-size admission have all succeeded.
+                            state.last_peer_packet_received_time = timestamp_ns;
 
                             // Authentication/replay admission precedes allocation, but positive receipt
                             // follows it. A memory-erased packet must look lost to the sender.
                             let mut memory_erased = false;
 
                             // if OVERLY_VERBOSE { println!("Got data from {:?}  data: {:?}", existing_connection.other_transport_identity, payload); }
-                            
+
                             let mut remaining_payload = payload;
+
+                            let (target_skip_whole,mut target_whole_reservations,target_erased)=target_dup_prepare(
+                                &mut state.target_dup_receive,nonce,payload,&existing_connection.receive_budget);
+
+                            {memory_erased|=target_erased;}
                             while let Some((frame, consumed)) = read_frame(remaining_payload) {
                                 remaining_payload = &remaining_payload[consumed..];
+                                #[cfg(feature = "research_budget_diagnostic")]
+                                let mut diagnostic_arrival = diag::RxGuard::new(&frame,nonce,timestamp_ns);
                                 if matches!(frame, WireFrame::Unknown) { continue; }
                                 // Retired identities cannot reopen. Surplus repairs/late
                                 // fragments are still network receipts, not pressure loss.
                                 if existing_connection.receive_index.frame_is_stale(&frame) {
                                     state.stats.rx_stale_identity_frames += 1;
+                                    #[cfg(feature = "research_budget_diagnostic")]
+                                    diagnostic_arrival.outcome(3);
                                     continue;
                                 }
                                 if let WireFrame::Whole(data) = frame {
                                     if data.len() > max_message_size { break 'conn; }
-                                    let Some(reservation) = existing_connection.receive_budget.reserve(data.len() + 256) else { memory_erased = true; continue; };
+
+                                    if target_skip_whole {continue;}
+
+                                    let preallocated=target_whole_reservations.pop_front();
+
+                                    let Some(reservation) = preallocated.or_else(||existing_connection.receive_budget.reserve(data.len() + 256)) else { memory_erased = true; continue; };
                                     state.stats.rx_messages_completed += 1;
                                     receive_queue.push_reserved(connection_key, data.to_vec(), MAX_RECV_QUEUE_BYTES, Some(reservation));
                                     continue;
                                 }
 
                                 if let WireFrame::Fec { kind, id: package_id, block_id, message_len, block_bytes, segment, data } = frame {
+                                    #[cfg(feature = "research_budget_diagnostic")]
+                                    diagnostic_arrival.outcome(4);
                                     if message_len > max_message_size || segment.is_some_and(|s| s.total as usize > max_message_size) {
                                         if VERBOSE { println!("Error, FEC message exceeds local max_message_size ({max_message_size}) from {connection_key:?}. Disconnecting..."); }
                                         connections_map.remove(&connection_key);
@@ -4152,9 +5685,15 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     if !valid_fec_symbol(layout, block_id, data.len()) { continue; }
                                     if (kind == STP_EXT_KIND_GROUPED_FEC) != (layout.groups > 1) { continue; }
                                     if segment.is_some_and(|s| !s.valid(message_len) || s.root == package_id) { continue; }
+                                    #[cfg(feature = "research_budget_diagnostic")]
+                                    diagnostic_arrival.outcome(5);
                                     let Some(slot_idx) = existing_connection.receive_index.admit_at(package_id,
                                         &mut existing_connection.unreliable_reassembly, &mut existing_connection.unreliable_fec, timestamp_ns, fec_inactive_grace_ns(state.RTT_mean, true)) else { memory_erased = true; continue; };
+                                    #[cfg(feature = "research_budget_diagnostic")]
+                                    diagnostic_arrival.outcome(4);
                                     if !existing_connection.receive_index.claim(package_id, ReceiveRole::Fec { message_len, block_bytes, segment }) { continue; }
+                                    #[cfg(feature = "research_budget_diagnostic")]
+                                    diagnostic_arrival.outcome(0);
                                     if let Some(segment) = segment {
                                         let Some(root_idx) = existing_connection.receive_index.admit_at(segment.root,
                                             &mut existing_connection.unreliable_reassembly, &mut existing_connection.unreliable_fec, timestamp_ns, fec_inactive_grace_ns(state.RTT_mean, true)) else { memory_erased = true; continue; };
@@ -4199,6 +5738,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                         state.stats.fec_decode_preemptions += retired;
                                         state.stats.fec_worker_limit_events += retired;
                                     }
+                                    #[cfg(feature = "research_budget_diagnostic")]
+                                    diagnostic_arrival.outcome(0);
                                     let worker_refused_before = existing_connection.unreliable_fec[slot_idx].worker_limit_refused;
                                     let refused_before = existing_connection.unreliable_fec[slot_idx].admission_refused;
                                     let dropped_before = existing_connection.unreliable_fec[slot_idx].ingress_dropped;
@@ -4224,7 +5765,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     }
                                     continue;
                                 }
-                                
+
                                 let WireFrame::Plain { fin: is_fin, id: package_id, offset, data: frag_data } = frame else { continue; };
                                 let frag_offset = offset as u64;
                                 let frag_len = frag_data.len() as u64;
@@ -4240,7 +5781,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 }
 
                                 //if OVERLY_VERBOSE { println!("Fragment from {:?}: R:{} F:{} ID:{} L:{} O:{}", connection_key, is_reliable, is_fin, package_id, frag_len, frag_offset); }
-                                
+
                                 let Some(slot_idx) = existing_connection.receive_index.admit_at(package_id,
                                     &mut existing_connection.unreliable_reassembly, &mut existing_connection.unreliable_fec, timestamp_ns, fec_inactive_grace_ns(state.RTT_mean, true)) else { memory_erased = true; continue; };
 
@@ -4379,11 +5920,13 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                         debug_assert!(state.magic2 != 0, "Connection entered Connected state without negotiating magic2");
                         if let Some(cipher) = &mut state.cipher { cipher.expire_previous(current_time_now_ns); }
                         if state.send_exhausted(&connection_tracking_data.unreliable_send_buffer) { return false; }
-                        if OutageState::expired(current_time_now_ns, state.last_ack_received_time) {
+                        if state.peer_expired(current_time_now_ns, authenticated_peer_liveness) {
                             if VERBOSE { println!("Disconnected from: {:?}.", connection_tracking_data.other_transport_identity); }
                             return false; // connection timeout
                         }
-                        
+
+                        #[cfg(feature = "research_budget_diagnostic")]
+                        diag::context(connection_tracking_data.handshake_hash, &connection_tracking_data.my_transport_identity_keypair.public, &connection_tracking_data.other_transport_identity);
                         prepare_connected_send_tick(state, &mut connection_tracking_data.unreliable_send_buffer, current_time_now_ns);
                         if let Some(pending) = state.pending_send.take() {
                             // Freeze active time and discard pacing credit throughout the block,
@@ -4401,6 +5944,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 connection_tracking_data.other_ip, connection_tracking_data.other_port,
                                 &pending.bytes, pending.dscp, false);
                             if let Some(sent) = sent {
+                                #[cfg(feature = "research_cohort_observer")]
+                                crate::cohort_observe::observe_commit(pending.kind as usize, &pending.bytes);
                                 commit_connected_send(state, &mut connection_tracking_data.unreliable_send_buffer,
                                     pending.kind, sent, pending.bytes.len(), &pending.plaintext,
                                     connection_tracking_data.two_byte_send_prefix, loss_trace.as_mut());
@@ -4427,7 +5972,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 state.ack_timer = state.ack_receiver.feedback_deadline(current_time_now_ns);
                             }
                         }
-                        
+
                         if state.outage.since_ns.is_none() && state.send_sequence_number > state.packets_waiting_ack_tail
                             && state.outage.pending_since_ns.is_some_and(|start|
                                 current_time_now_ns.saturating_sub(start.max(state.last_ack_received_time)) >= OUTAGE_ACK_SILENCE_NS) {
@@ -4439,20 +5984,26 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 let seq = state.send_sequence_number;
                                 let probe_payload_len = state.current_tu as usize - total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(state.magic1).unwrap();
                                 packet_memory_send[..probe_payload_len].fill(0xff);
+
+                                if connection_tracking_data.unreliable_send_buffer.target_copy_pending() {
+                                    let buf=&mut connection_tracking_data.unreliable_send_buffer;
+                                    buf.fec_prepare_packet(seq);buf.take_target_copy(&mut packet_memory_send[..probe_payload_len]);
+                                }
+                                let probe_dscp=if target_is_copy(&packet_memory_send[..probe_payload_len]) {connection_tracking_data.unreliable_send_buffer.last_dscp}else{Dscp::Af21};
                                 let Some(packet_len) = seal_connected_packet(&mut state.cipher, connection_tracking_data.two_byte_send_prefix,
                                     seq, &packet_memory_send[..probe_payload_len], &mut packet_memory_encrypted[..], current_time_now_ns) else { return false; };
                                 #[cfg(test)]
                                 datagram_expectation.set(("outage", Some(state.current_tu as usize)));
                                 let send_time = udp_send_with_congestion_and_dscp(socket,
                                     connection_tracking_data.other_ip, connection_tracking_data.other_port,
-                                    &packet_memory_encrypted[..packet_len], Dscp::Af21, false);
+                                    &packet_memory_encrypted[..packet_len], probe_dscp, false);
                                 finish_connected_send(state, &mut connection_tracking_data.unreliable_send_buffer,
                                     PendingSendKind::Outage, send_time, current_time_now_ns, &packet_memory_encrypted[..packet_len],
-                                    &packet_memory_send[..probe_payload_len], Dscp::Af21, connection_tracking_data.two_byte_send_prefix, loss_trace.as_mut());
+                                    &packet_memory_send[..probe_payload_len], probe_dscp, connection_tracking_data.two_byte_send_prefix, loss_trace.as_mut());
                             }
                             return true;
                         }
-                        
+
                         if state.congestion_event_time_ns == 0 {
                             state.congestion_event_rate_upps = cc.initial_rate_upps;
                             state.congestion_event_time_ns = current_time_now_ns;
@@ -4499,20 +6050,12 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 }
                                 else if old_k > 0 && new_k > 0 {
                                     // Move the anchor so the rate is continuous across the change in K.
-                                    let (old_rate, _) = cc_rate(current_t, state.congestion_event_rate_upps, old_k, state.cc_startup_done);
-                                    let mut lo = if new_k >= old_k { current_t } else { 0u64 };
-                                    let mut hi = if new_k >= old_k { current_t * 2 + new_k } else { current_t };
-                                    for _ in 0..64 {
-                                        let mid = lo + (hi - lo) / 2;
-                                        if cc_rate(mid, state.congestion_event_rate_upps, new_k, state.cc_startup_done).0 >= old_rate {
-                                            hi = mid;
-                                        } else {
-                                            lo = mid + 1;
+                                    // No age can reach the old rate only on an unrampable curve: keep the anchor.
+                                    if let Some(hi) = rtt_reanchor_age(current_t, state.congestion_event_rate_upps, old_k, new_k, &connection_curve_policy(state,&cc), state.cc_startup_done) {
+                                        state.congestion_event_time_ns = current_time_now_ns.saturating_sub(hi);
+                                        if state.is_app_limited {
+                                            state.app_limit_time_offset = hi;
                                         }
-                                    }
-                                    state.congestion_event_time_ns = current_time_now_ns.saturating_sub(hi);
-                                    if state.is_app_limited {
-                                        state.app_limit_time_offset = hi;
                                     }
                                 }
                             }
@@ -4522,12 +6065,21 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
 
 
                         // ECN congestion event: the receiver saw CE-marked packets and relayed it via the ack's IP header
-                        apply_ecn_congestion(state, current_time_now_ns, &cc, max_pps);
+                        let (ce_seq, ce_sent) = (state.ecn_oldest_seq, state.ecn_oldest_send_time);
+                        if apply_ecn_congestion(state, current_time_now_ns, &cc, max_pps) {
+                            accept_cc_event(state, &mut connection_tracking_data.unreliable_send_buffer,
+                                AcceptedCcEvent { kind: CC_EVENT_CE, evidence_seq: ce_seq, evidence_sent_ns: ce_sent, feedback_ns: current_time_now_ns });
+                        }
+
+                        if let Some(c)=delay_event_config() {
+                            close_delay_event(state,current_time_now_ns,c,&cc,max_pps);
+                            drain_accepted_cc_events(state,&mut connection_tracking_data.unreliable_send_buffer);
+                        }
 
                         let time_to_considered_dropped = state.loss_timer.timeout_ns(
                             state.RTT_mean as u64 * 100_000,
                             current_time_now_ns.saturating_sub(state.last_ack_received_time), &cc);
-                        
+
                         // every send site (data loop, tu probe, keepalive, both ack paths) gates on ring space, so head never laps tail
                         assert!(state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY);
                         while state.packets_waiting_ack_tail < state.send_sequence_number {
@@ -4536,6 +6088,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             state.declared_lost_field[(bit_index / 64) as usize] &= !(1u64 << (bit_index % 64));
                             if state.packets_waiting_ack_field[(bit_index / 64) as usize] & (1u64 << (bit_index % 64)) != 0 {
                                 let mut send_time = state.send_time(state.packets_waiting_ack_tail);
+                                let original_send_time = send_time;
                                 if send_time != 0 && (state.RTT_mean == 0 || (current_time_now_ns - send_time) < time_to_considered_dropped) {
                                     break;
                                 }
@@ -4543,7 +6096,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     let history_ns = 4_295_000_000;
                                     send_time = current_time_now_ns.saturating_sub(history_ns);
                                 }
-                                
+
                                 if state.packets_waiting_ack_tail == state.tu_probe_sequence_number {
                                     state.tu_probe_sequence_number = u64::MAX;
                                     state.tu_probe_size_advance /= 5;
@@ -4559,7 +6112,12 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     if trigger {
                                         let before = state.congestion_event_time_ns;
                                         let context = loss_trace.as_ref().map(|_| cc_trace_context(state, current_time_now_ns, &cc, max_pps));
-                                        apply_loss_congestion(state, send_time, current_time_now_ns, &cc, max_pps);
+                                        if apply_loss_congestion(state, send_time, current_time_now_ns, &cc, max_pps) {
+                                            let seq = state.packets_waiting_ack_tail;
+                                            // The 4.295 s CC fallback for missing history is not evidence: publish the ORIGINAL history only.
+                                            accept_cc_event(state, &mut connection_tracking_data.unreliable_send_buffer,
+                                                AcceptedCcEvent { kind: CC_EVENT_TIMEOUT, evidence_seq: seq, evidence_sent_ns: original_send_time, feedback_ns: current_time_now_ns });
+                                        }
                                         if state.congestion_event_time_ns != before {
                                             if let (Some(t), Some(context)) = (&mut loss_trace, context) {
                                                 t.cut(connection_tracking_data.two_byte_send_prefix, state.packets_waiting_ack_tail,
@@ -4573,6 +6131,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     state.stats.packets_lost += 1;
                                     if state.packets_waiting_ack_tail < state.outage.ignore_loss_before_seq { state.outage.ignored_losses += 1; }
                                     if let Some(t) = &mut loss_trace { t.outcome('L', connection_tracking_data.two_byte_send_prefix, state.packets_waiting_ack_tail, current_time_now_ns); }
+                                    #[cfg(feature = "research_budget_diagnostic")]
+                                    diag::feedback(state.packets_waiting_ack_tail,current_time_now_ns,3);
                                     state.declared_lost_field[(bit_index / 64) as usize] |= 1u64 << (bit_index % 64);
                                 }
                             }
@@ -4590,23 +6150,28 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                     a.on_sequence_finalized(state.packets_waiting_ack_tail, lost, current_time_now_ns);
                                 }
                             }
+
+                            rand_finalize_packet(state,state.packets_waiting_ack_tail,lost);
+                            drain_accepted_cc_events(state, &mut connection_tracking_data.unreliable_send_buffer);
                             connection_tracking_data.unreliable_send_buffer.fec_on_packet_finalized(state.packets_waiting_ack_tail, lost);
                             state.packets_waiting_ack_tail += 1;
                         }
-                        
+
                         state.congestion_event_rate_upps = state.congestion_event_rate_upps.max(cc.rate_floor_upps);
-                        
+
                         let (allowed_bandwidth_upps, cubic_mode) = if state.is_app_limited {
                             // Freeze at the exact active age, including during recovery.
                             // A minimum age of two RTTs would spuriously grow an idle curve.
-                            (cc_rate(state.app_limit_time_offset, state.congestion_event_rate_upps, time_to_bandwidth_recovery, state.cc_startup_done).0, 'A')
+                            (connection_rate(state.app_limit_time_offset, state.congestion_event_rate_upps, time_to_bandwidth_recovery, &connection_curve_policy(state,&cc), state.cc_startup_done).0, 'A')
                         } else {
-                            cc_rate(current_time_now_ns - state.congestion_event_time_ns, state.congestion_event_rate_upps, time_to_bandwidth_recovery, state.cc_startup_done)
+                            connection_rate(current_time_now_ns - state.congestion_event_time_ns, state.congestion_event_rate_upps, time_to_bandwidth_recovery, &connection_curve_policy(state,&cc), state.cc_startup_done)
                         };
                         // A local pacing ceiling is not evidence of network congestion.
                         let allowed_bandwidth_upps = local_rate_limit(allowed_bandwidth_upps.max(cc.rate_floor_upps), max_pps);
                         let allowed_bandwidth_upps = state.delivery_growth.limit(allowed_bandwidth_upps);
                         state.stats.cc_rate_upps = allowed_bandwidth_upps;
+
+                        crate::target_validation::risk_rate(&state.target_state,allowed_bandwidth_upps, state.congestion_event_rate_upps, cubic_mode, if state.RTT_mean==u16::MAX {0}else{state.RTT_mean as u64*100_000});
                         if let Some(t) = &mut loss_trace {
                             let mut context = cc_trace_context(state, current_time_now_ns, &cc, max_pps);
                             context.pps = allowed_bandwidth_upps as f64 / 1_000_000.0;
@@ -4628,17 +6193,17 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                         let pacing_first_sequence = state.send_sequence_number;
                         state.stats.pacing_commanded_packets += packet_send_allowance_now;
                         let could_have_sent = packet_send_allowance_now != 0;
-                        
+
                         // ring space is checked live at each send site below so the head can never lap the tail within a tick
 
                         state.current_tu = state.current_tu.min(ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE as u64);
-                        if state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY - 1 && state.current_tu != ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE as u64 && state.tu_probe_sequence_number == u64::MAX && state.last_sent_tu_probe_time_ns + (state.tu_probe_failed_count.min(50)*state.tu_probe_failed_count.min(50)*250_000_000).max(time_between_sends_ns) < current_time_now_ns {
+                        if !connection_tracking_data.unreliable_send_buffer.target_copy_pending() && state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY - 1 && state.current_tu != ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE as u64 && state.tu_probe_sequence_number == u64::MAX && state.last_sent_tu_probe_time_ns + (state.tu_probe_failed_count.min(50)*state.tu_probe_failed_count.min(50)*250_000_000).max(time_between_sends_ns) < current_time_now_ns {
                             state.tu_probe_size_advance = state.tu_probe_size_advance.max(1).min(ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE as u64);
                             state.tu_probe_size = (state.current_tu + state.tu_probe_size_advance).min(ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE as u64);
                             let payload_size = state.tu_probe_size as usize - total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(state.magic1).unwrap();
                             let null_bytes = [0xffu8; ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE];
-                            
-                        
+
+
                             let virtual_nonce = state.send_sequence_number;
                             let Some(packet_len) = seal_connected_packet(&mut state.cipher, connection_tracking_data.two_byte_send_prefix,
                                 virtual_nonce, &null_bytes[..payload_size], &mut packet_memory_encrypted[..], current_time_now_ns) else { return false; };
@@ -4650,12 +6215,12 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 PendingSendKind::MtuProbe, send_time_ns, current_time_now_ns, &packet_memory_encrypted[..packet_len],
                                 &[], Dscp::Af21, connection_tracking_data.two_byte_send_prefix, loss_trace.as_mut()) { return true; }
                         }
-                        
+
                         let payload_size = state.current_tu as usize - total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(state.magic1).unwrap();
-                        
-                        if state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY - 1 && state.last_sent_data_packet + 15_000_000_000/3 < current_time_now_ns {
+
+                        if !connection_tracking_data.unreliable_send_buffer.target_copy_pending() && state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY - 1 && state.last_sent_data_packet + 15_000_000_000/3 < current_time_now_ns {
                             let null_bytes = [0xffu8; ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE];
-                        
+
                             let virtual_nonce = state.send_sequence_number;
                             let Some(packet_len) = seal_connected_packet(&mut state.cipher, connection_tracking_data.two_byte_send_prefix,
                                 virtual_nonce, &null_bytes[..payload_size], &mut packet_memory_encrypted[..], current_time_now_ns) else { return false; };
@@ -4674,19 +6239,46 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                             let buf = &mut connection_tracking_data.unreliable_send_buffer;
                             let a = buf.fec_adaptive.get_or_insert_with(|| crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, current_time_now_ns));
                             a.on_tick(current_time_now_ns);
+                            if a.base_parity_active() || a.budget_base_active() {
+                                // p4-burst-base B1 context: actual allowed pacing x current loss timeout. No RTT
+                                // sample yet (0 or the u16::MAX placeholder) leaves H unknown (cold h = Kg).
+                                let known = state.RTT_mean != 0 && state.RTT_mean != u16::MAX;
+                                a.set_base_context(current_time_now_ns, allowed_bandwidth_upps, known.then_some(time_to_considered_dropped));
+                            }
                             buf.set_overhead();
                             if record_fec_messages && buf.fec_record.is_none() { buf.fec_record = Some(Vec::new()); }
+                            if let Some(t) = &loss_trace {
+                                for q in &mut buf.queues {
+                                    if q.slipstream && q.slipstream_trace.is_none() { q.slipstream_trace = Some(t.slipstream_writer()); }
+                                }
+                            }
                         }
                         let mut unreliable_payload_size = 0;
+                        drain_accepted_cc_events(state, &mut connection_tracking_data.unreliable_send_buffer);
                         while state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY - 1 && packet_send_allowance_now > 0 && state.packets_in_flight < allowed_packets_in_flight && {
                             connection_tracking_data.unreliable_send_buffer.fec_prepare_packet(state.send_sequence_number);
                             unreliable_payload_size = connection_tracking_data.unreliable_send_buffer.fill_packet(&mut packet_memory_send[0..payload_size]);
+                            #[cfg(test)]
+                            if let Some(peak) = &ordinary_started_peak {
+                                // Read-only observer: only actually started, ordinary
+                                // (not segmented giant) contexts in one app queue.
+                                for q in &connection_tracking_data.unreliable_send_buffer.queues {
+                                    let started = |f: &FecSendSlot| f.segment.is_none() && f.next_id > 0;
+                                    let count = usize::from(q.fec_send_slot.as_ref().is_some_and(started)) +
+                                        q.interleave_parked.iter().filter(|c| c.fec_send_slot.as_ref().is_some_and(started)).count();
+                                    peak.fetch_max(count, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
                             unreliable_payload_size > 0
                         } {
-                        
+
                             let virtual_nonce = state.send_sequence_number;
                             let Some(packet_len) = seal_connected_packet(&mut state.cipher, connection_tracking_data.two_byte_send_prefix,
                                 virtual_nonce, &packet_memory_send[..unreliable_payload_size], &mut packet_memory_encrypted[..], current_time_now_ns) else { return false; };
+                            #[cfg(test)]
+                            if let Some(log) = &encrypted_payload_log {
+                                log.lock().unwrap().push((packet_memory_encrypted[..packet_len].to_vec(), packet_memory_send[..unreliable_payload_size].to_vec()));
+                            }
 
                             should_sleep = false;
                             let test_drop = if test_drop_burst_left > 0 { test_drop_burst_left -= 1; true } else {
@@ -4724,7 +6316,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                         // must neither lower the command nor grow it while idle.
                         // Shared with the no-loss idle/resume regressions below.
                         update_app_limit(state, current_time_now_ns, has_data);
-                        
+
                         if could_have_sent {
                             state.last_sent_could_have_sent_data_packet = current_time_now_ns;
                             if packet_send_allowance_now == 0 {
@@ -4734,7 +6326,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 state.send_pacer_acc_ns = 0;
                             }
                         }
-                        
+
                         // bonus status debug print
                         if state.last_status_print_time + 1_000_000_000 < current_time_now_ns {
                             state.last_status_print_time = current_time_now_ns;
@@ -4936,6 +6528,8 @@ struct OutageState {
     max_probe_age_ns: u64,
     ignored_losses: u64,
     ignored_spurious: u64,
+    pre_anchor_upps: u64,
+    pre_startup_done: bool,
 }
 fn recent_outage_probe_acked(state: &ConnectionStateConnected, ack: &crate::ack::BitmapAck, now: u64) -> bool {
     ack.acknowledged().any(|seq| {
@@ -4967,6 +6561,8 @@ impl OutageState {
 
 fn enter_outage(state: &mut ConnectionStateConnected, buf: &mut SendQueues,
     now: u64, prefix: u16, mut trace: Option<&mut crate::loss_trace::LossTrace>) {
+    state.outage.pre_anchor_upps = state.congestion_event_rate_upps;
+    state.outage.pre_startup_done = state.cc_startup_done;
     state.outage.enter(now, state.stats.cc_rate_upps.max(1));
     state.outage.max_probe_age_ns = OUTAGE_MAX_PROBE_NS.max(2 * state.RTT_mean as u64 * 100_000);
     for q in &mut buf.queues { q.fec_now_ns = now; q.fec_prune_retained(); }
@@ -4985,10 +6581,15 @@ fn enter_outage(state: &mut ConnectionStateConnected, buf: &mut SendQueues,
                 state.packet_lost_since_last_print += 1;
                 state.declared_lost_field[(bit / 64) as usize] |= 1 << (bit % 64);
                 if let Some(t) = trace.as_deref_mut() { t.outcome('L', prefix, seq, now); }
+                #[cfg(feature = "research_budget_diagnostic")]
+                diag::feedback(seq,now,4);
             } else { state.stats.tu_probes_lost += 1; }
         }
         state.packets_waiting_ack_field[(bit / 64) as usize] &= !(1 << (bit % 64));
         // Finalize source tags for rescue, but never teach SpanLossProfile an outage.
+        drain_accepted_cc_events(state, buf);
+
+        rand_finalize_packet(state,seq,lost);
         buf.fec_on_packet_finalized(seq, lost);
         state.packets_waiting_ack_tail += 1;
     }
@@ -5024,22 +6625,34 @@ fn resume_outage(state: &mut ConnectionStateConnected, buf: &mut SendQueues,
         fresh.policy = policy;
         buf.fec_adaptive = Some(fresh);
     }
-    // Receiver-only peers notice the outage later, at their own keepalive. A
-    // partial worker's entire silence must be paused, not only time since that
-    // later entry. Round-trip recovery starts its inactivity grace afresh.
+    // Receiver-only peers may notice a genuine outage late. Allow a worker one
+    // fresh grace after recovery, but only another admitted symbol can rearm it:
+    // probe-only round trips must not keep abandoned decoders alive indefinitely.
     for slot in slots {
-        if matches!(slot.state, FecRecvState::Worker { .. }) { slot.last_block_ns = now; }
+        if matches!(slot.state, FecRecvState::Worker { .. }) && slot.recovery_resume_ns.is_none() {
+            slot.recovery_resume_ns = Some(now);
+        }
     }
     state.outage.ignore_loss_before_seq = state.send_sequence_number;
-    state.congestion_event_rate_upps = local_rate_limit(state.outage.resume_rate_upps, max_pps).max(1);
+    // CALM research: a short silence answered by the first probe (tail loss after the
+    // app went idle) is not a path outage: keep the learned anchor (cut by beta) and RTT
+    // instead of restarting startup from the floor and overshooting the queue again.
+    let short = paused <= 1_000_000_000 && state.outage.pre_startup_done;
+    state.congestion_event_rate_upps = if short {
+        local_rate_limit(state.outage.pre_anchor_upps, max_pps).max(crate::ship::CC.rate_floor_upps)
+    } else { local_rate_limit(state.outage.resume_rate_upps, max_pps).max(1) };
     state.congestion_event_time_ns = now;
     state.delivery_growth = DeliveryGrowth::new(now, state.congestion_event_rate_upps);
-    state.cc_startup_done = false;
+    state.cc_startup_done = short;
+
+    { state.delay_curve_beta=None; }
+    if !short {
     state.RTT_sample_sums.fill(0);
     state.RTT_sample_counts.fill(0);
     state.RTT_sample_cursor = 0;
     state.RTT_mean_cursor = 0;
     state.RTT_mean = u16::MAX;
+    }
     state.ack_arrival_times.fill(0);
     state.ack_pace_estimate = 0;
     state.send_pacer_acc_ns = 0;
@@ -5120,8 +6733,19 @@ fn retry_handshake(created: u64, last_sent: &mut u64, now: u64, lifetime: u64,
 // No NEW repair may be formed after expiry; the single pre-assembled ciphertext
 // remains immutable and may still be accepted after expiry.
 fn prepare_connected_send_tick(state: &mut ConnectionStateConnected, buf: &mut SendQueues, now: u64) {
+    if !buf.target_state.same_connection(&state.target_state) {
+        buf.target_state = state.target_state.clone();
+        for q in &mut buf.queues {
+            q.target_state = state.target_state.clone();
+            if let Some(root)=&q.budget_root {root.lock().unwrap().target_state=state.target_state.clone();}
+            for context in &mut q.interleave_parked {
+                if let Some(root)=&context.budget_root {root.lock().unwrap().target_state=state.target_state.clone();}
+            }
+        }
+    }
     // Real path outages pause the retention budget for every policy. A local
     // socket refusal is not an outage, and must still free expired sources.
+    drain_accepted_cc_events(state, buf);
     if state.outage.since_ns.is_none() { buf.set_time(now, state.RTT_mean as u64 * 100_000); }
     if state.locally_blocked { freeze_local_send(state, now); }
 }
@@ -5133,12 +6757,58 @@ fn freeze_local_send(state: &mut ConnectionStateConnected, now: u64) {
     state.send_pacer_acc_ns = 0;
 }
 
+/// RESEARCH-ONLY read of existing state (feature `research_cohort_observer`); mutates nothing.
+#[cfg(feature = "research_cohort_observer")]
+fn cohort_observation_of(t: &ConnectionTrackingData, test_drop_configured: bool) -> crate::cohort_observe::CohortObservation {
+    let connected = match &t.connection_state { ConnectionState::Connected(c) => Some(c), _ => None };
+    cohort_observation_parts(&t.unreliable_send_buffer, connected, &t.handshake_hash, test_drop_configured)
+}
+#[cfg(feature = "research_cohort_observer")]
+fn cohort_observation_parts(buf: &SendQueues, connected: Option<&ConnectionStateConnected>, handshake_hash: &[u8; 64], test_drop_configured: bool) -> crate::cohort_observe::CohortObservation {
+    use crate::cohort_observe::{CohortObservation, QueueObservation, ThreadSendCounters, next_service_seq};
+    let queues = buf.queues.iter().map(|q| QueueObservation {
+        queue_bytes_filled: q.queue_bytes_filled as u64,
+        message_queue_len: q.message_queue.len() as u64,
+        partial_send_slot: q.partial_send_slot.is_some(),
+        fec_send_slot: q.fec_send_slot.is_some(),
+        fec_suspended: q.fec_suspended.is_some(),
+        segmented_send: q.segmented_send.is_some(),
+        interleave_parked_len: q.interleave_parked.len() as u64,
+        rescue_ready_count: q.rescue_ready_count as u64,
+        rescue_ready_len: q.rescue_ready.len() as u64,
+        p4_open: q.p4_open,
+        p4_closing: q.p4_closing,
+        p4_tail_refreshed: q.p4_tail_refreshed,
+        fec_rescue_package: q.fec_rescue_package.is_some(),
+        fec_retained_len: q.fec_retained.len() as u64,
+    }).collect();
+    let mut o = CohortObservation { queues, test_drop_configured, handshake_prefix: u64::from_le_bytes(handshake_hash[..8].try_into().unwrap()), ..Default::default() };
+    if let Some(c) = connected {
+        o.connected = true;
+        // A proactive copy awaiting its next pacing slot is pending DATA too:
+        // the cohort barrier must not seal a phase between original and copy.
+        o.pending_send = c.pending_send.is_some() || buf.target_copy_pending();
+        o.pending_send_kind = c.pending_send.as_ref().map(|p| p.kind as u8)
+            .or_else(||buf.target_copy_pending().then_some(PendingSendKind::Data as u8));
+        o.locally_blocked = c.locally_blocked;
+        o.send_sequence_number = c.send_sequence_number;
+        o.last_sent_data_packet = c.last_sent_data_packet;
+        o.test_dropped = c.stats.test_dropped;
+    }
+    o.thread = ThreadSendCounters::read();
+    o.service_seq = next_service_seq();
+    o.observed_ns = monotonic_clock_ns();
+    o
+}
+
 /// The send buffer has already assembled this packet. On refusal its FEC tags
 /// remain attached to the uncommitted sequence; do not prepare or fill again.
 fn finish_connected_send(state: &mut ConnectionStateConnected, buf: &mut SendQueues,
     kind: PendingSendKind, sent: Option<u64>, now: u64, bytes: &[u8], plaintext: &[u8],
     dscp: Dscp, prefix: u16, trace: Option<&mut crate::loss_trace::LossTrace>) -> bool {
     if let Some(sent) = sent {
+        #[cfg(feature = "research_cohort_observer")]
+        crate::cohort_observe::observe_commit(kind as usize, bytes);
         commit_connected_send(state, buf, kind, sent, bytes.len(), plaintext, prefix, trace);
         if kind == PendingSendKind::Ack { update_app_limit(state, now, buf.has_unsent_data()); }
         true
@@ -5151,6 +6821,18 @@ fn finish_connected_send(state: &mut ConnectionStateConnected, buf: &mut SendQue
         freeze_local_send(state, now);
         false
     }
+}
+
+/// One physical DATA outcome per ring retirement, before duplicate-pair aggregation.
+/// Subsequent spurious ACK corrections intentionally do not undo samples.
+
+fn rand_finalize_packet(state:&mut ConnectionStateConnected,seq:u64,lost:bool) {
+    let Some(bits)=state.rand_background_bits.as_mut() else {return};
+    let bit=seq%PACKETS_WAITING_ACK_CAPACITY;
+    let mask=1u64<<(bit%64);
+    let background=bits[(bit/64) as usize]&mask!=0;
+    bits[(bit/64) as usize]&=!mask;
+    crate::target_validation::rand_resolved(&state.target_state,background,lost);
 }
 
 fn commit_connected_send(state: &mut ConnectionStateConnected, buf: &mut SendQueues,
@@ -5166,6 +6848,22 @@ fn commit_connected_send(state: &mut ConnectionStateConnected, buf: &mut SendQue
         return;
     }
     let seq = state.send_sequence_number;
+
+    if crate::target_validation::rand_enabled() {
+        let background=kind==PendingSendKind::Data && crate::target_validation::rand_background(&state.target_state,state.outage.since_ns.is_some());
+        let bits=state.rand_background_bits.get_or_insert_with(||vec![0;PACKETS_WAITING_ACK_WORDS].into_boxed_slice());
+        let bit=seq%PACKETS_WAITING_ACK_CAPACITY;
+        bits[(bit/64) as usize]&=!(1u64<<(bit%64));
+        if background {bits[(bit/64) as usize]|=1u64<<(bit%64);}
+    }
+
+    {
+        state.stats.dup_fallbacks=buf.target_dup_fallbacks;
+        if target_is_copy(plaintext) {
+            state.stats.dup_datagrams+=1;state.stats.dup_bytes+=len as u64;
+            state.stats.dup_messages+=target_dup_counts(plaintext).0;
+        }
+    }
     if kind != PendingSendKind::Data { buf.fec_prepare_packet(seq); }
     state.account_send(sent);
     state.packet_since_last_print += 1;
@@ -5175,6 +6873,9 @@ fn commit_connected_send(state: &mut ConnectionStateConnected, buf: &mut SendQue
         return;
     }
     if kind == PendingSendKind::Data {
+        #[cfg(feature = "research_budget_diagnostic")]
+        diag::tx(seq, sent, plaintext);
+        buf.fec_on_data_committed(seq, sent);
         if let Some(a) = &mut buf.fec_adaptive { a.on_data_sent(seq); }
     }
     if kind == PendingSendKind::Outage {
@@ -5211,6 +6912,18 @@ fn update_app_limit(state: &mut ConnectionStateConnected, now_ns: u64, has_data:
     }
 }
 
+// Keep the CE-discovered anchor, epoch and guard; only this event's recovery
+// starts at b*anchor. For b>rate_rp lift R's endpoint to b to avoid a backwards
+// step at R->P. The absolute/relative growth envelopes remain unchanged.
+fn connection_curve_policy(state:&ConnectionStateConnected, cc:&CongestionPolicy) -> CongestionPolicy {
+
+    if let Some(beta)=state.delay_curve_beta {
+        return CongestionPolicy { beta,rate_rp:cc.rate_rp.max(beta),..*cc };
+    }
+    let _=state;
+    *cc
+}
+
 fn connection_rate(t_ns: u64, anchor_upps: u64, k_ns: u64, cc: &CongestionPolicy, startup_done: bool) -> (u64, char) {
     if !startup_done {
         let rtt_ns = k_ns / cc.recovery_rtts;
@@ -5220,9 +6933,141 @@ fn connection_rate(t_ns: u64, anchor_upps: u64, k_ns: u64, cc: &CongestionPolicy
     } else { cubic_rate_with_options(t_ns, anchor_upps, k_ns, cc) }
 }
 
+// Age on the new-K curve that first reaches the old-K rate at `current_t`, searched
+// from the original lower bound. The original upper bound is only a first guess: it
+// doubles (saturating) until reached. Invariant: hi reaches the rate, and lo is the
+// original bound or lo - 1 does not. None means no u64 age reaches it, which with a
+// growing startup multiplier only occurs on the flat no-sample sentinel curve.
+fn rtt_reanchor_age(current_t: u64, anchor_upps: u64, old_k: u64, new_k: u64, cc: &CongestionPolicy, startup_done: bool) -> Option<u64> {
+    let (old_rate, _) = connection_rate(current_t, anchor_upps, old_k, cc, startup_done);
+    let reaches = |t| connection_rate(t, anchor_upps, new_k, cc, startup_done).0 >= old_rate;
+    let mut lo = if new_k >= old_k { current_t } else { 0u64 };
+    let mut hi = if new_k >= old_k { current_t.saturating_mul(2).saturating_add(new_k) } else { current_t };
+    while !reaches(hi) {
+        if hi == u64::MAX { return None; }
+        lo = hi + 1;
+        hi = hi.saturating_add(hi.max(1));
+    }
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if reaches(mid) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    Some(hi)
+}
+
+#[cfg(test)]
+mod rtt_reanchor_fix_tests {
+    use super::*;
+    const CC: CongestionPolicy = crate::ship::CC;
+
+    fn k(rtt_tenth_ms: u16) -> u64 { CC.recovery_rtts * (rtt_tenth_ms as u64 * 100_000) }
+    fn rate(t: u64, anchor: u64, k_ns: u64, done: bool) -> u64 { connection_rate(t, anchor, k_ns, &CC, done).0 }
+
+    // The original bracket and 64-step search, run only where that bracket is feasible
+    // (elsewhere the original panics in debug and wraps in release).
+    fn original(current_t: u64, anchor: u64, old_k: u64, new_k: u64, done: bool) -> Option<u64> {
+        let target = rate(current_t, anchor, old_k, done);
+        let (mut lo, mut hi) = if new_k >= old_k { (current_t, current_t.checked_mul(2)?.checked_add(new_k)?) } else { (0, current_t) };
+        if rate(hi, anchor, new_k, done) < target { return None; }
+        for _ in 0..64 {
+            let mid = lo + (hi - lo) / 2;
+            if rate(mid, anchor, new_k, done) >= target { hi = mid; } else { lo = mid + 1; }
+        }
+        Some(hi)
+    }
+
+    // Endpoint contract: reaches the old rate, is the original lower bound or has an
+    // infeasible predecessor, and equals the original result wherever that was sound.
+    fn check(current_t: u64, anchor: u64, old_k: u64, new_k: u64, done: bool) -> (u64, bool) {
+        let target = rate(current_t, anchor, old_k, done);
+        let lo = if new_k >= old_k { current_t } else { 0 };
+        let age = rtt_reanchor_age(current_t, anchor, old_k, new_k, &CC, done).expect("reachable target");
+        assert!(age >= lo && rate(age, anchor, new_k, done) >= target, "t={current_t} a={anchor} {old_k}->{new_k} {done}");
+        assert!(age == lo || rate(age - 1, anchor, new_k, done) < target, "not minimal: t={current_t} a={anchor} {old_k}->{new_k} {done}");
+        let orig = original(current_t, anchor, old_k, new_k, done);
+        if let Some(orig) = orig { assert_eq!(age, orig, "t={current_t} a={anchor} {old_k}->{new_k} {done}"); }
+        (age, orig.is_none())
+    }
+
+    #[test]
+    fn reviewer_repro_reaches_exact_root() {
+        let (anchor, age, old_k, new_k) = (100_000_000, 200_000_000, k(100), k(1000));
+        let target = rate(age, anchor, old_k, false);
+        assert_eq!(target, 265_329_770);
+        assert_eq!(rate(age * 2 + new_k, anchor, new_k, false), 188_564_914, "original hi=1.3 s is infeasible");
+        assert_eq!(original(age, anchor, old_k, new_k, false), None);
+        assert_eq!(rtt_reanchor_age(age, anchor, old_k, new_k, &CC, false), Some(1_999_999_997));
+        assert_eq!(rate(1_999_999_997, anchor, new_k, false), 265_329_770);
+        assert!(rate(1_999_999_996, anchor, new_k, false) < target);
+    }
+
+    #[test]
+    fn all_phases_grow_shrink_caps_and_max_ages() {
+        let anchors = [1, 100_000_000, 5_000_000_000, MAX_CC_RATE_UPPS, u64::MAX];
+        let rtts = [1u16, 10, 100, 1000, 10_000, u16::MAX - 1];
+        // unsound[startup_done][grow][bracket overflow, infeasible representable bracket]
+        let (mut cases, mut unsound, mut modes) = (0, [[[0; 2]; 2]; 2], std::collections::BTreeSet::new());
+        for done in [false, true] {
+            for &anchor in &anchors {
+                for &old in &rtts {
+                    for &new in &rtts {
+                        if old == new { continue; }
+                        let (old_k, new_k) = (k(old), k(new));
+                        let mut ages = vec![0, 1, 200_000_000, 10_000_000_000, 1_000_000_000_000, u64::MAX / 2, u64::MAX - 1, u64::MAX];
+                        ages.extend([1, 2, 3, 4, 6, 8, 12, 16, 40].map(|m| old_k / 2 * m));
+                        for t in ages {
+                            modes.insert(connection_rate(t, anchor, old_k, &CC, done).1);
+                            let (age, was_unsound) = check(t, anchor, old_k, new_k, done);
+                            modes.insert(connection_rate(age, anchor, new_k, &CC, done).1);
+                            cases += 1;
+                            let grow = new_k > old_k;
+                            let overflow = grow && t.checked_mul(2).and_then(|v| v.checked_add(new_k)).is_none();
+                            if was_unsound { unsound[done as usize][grow as usize][(!overflow) as usize] += 1; }
+                        }
+                    }
+                }
+            }
+        }
+        println!("cases={cases} original_unsound[startup_done][grow][overflow,infeasible]={unsound:?} modes={modes:?}");
+        assert!(unsound[0][1][1] > 0, "grid must include the startup RTT-growth infeasible bracket");
+        for m in ['I', 'R', 'P', 'G', 'S', 'L'] { assert!(modes.contains(&m), "phase {m} not covered: {modes:?}"); }
+    }
+
+    #[test]
+    fn capped_old_rate_keeps_lower_bound() {
+        for done in [false, true] {
+            for t in [0, 200_000_000, u64::MAX] {
+                let (age, _) = check(t, MAX_CC_RATE_UPPS, k(10), k(1000), done);
+                if !done || t == u64::MAX { assert_eq!(age, t, "{done} {t}"); }
+            }
+        }
+    }
+
+    #[test]
+    fn unrampable_sentinel_startup_target_keeps_anchor() {
+        // RTT_mean clamps to the no-sample sentinel, whose startup curve is flat at the anchor.
+        let (anchor, sentinel) = (100_000_000, k(u16::MAX));
+        assert_eq!(rate(u64::MAX, anchor, sentinel, false), anchor);
+        for t in [1_000, 200_000_000, u64::MAX] {
+            assert!(rate(t, anchor, k(100), false) > anchor);
+            assert_eq!(rtt_reanchor_age(t, anchor, k(100), sentinel, &CC, false), None, "t={t}");
+            check(t, anchor, k(100), sentinel, true);
+        }
+        // A target the flat curve still meets (rounded back to the anchor) re-anchors normally.
+        assert_eq!(rate(1, anchor, k(100), false), anchor);
+        assert_eq!(rtt_reanchor_age(1, anchor, k(100), sentinel, &CC, false), Some(1));
+        assert_eq!(rtt_reanchor_age(0, anchor, k(100), sentinel, &CC, false), Some(0));
+    }
+}
+
 // Trace-only context: evaluate the same curve and local cap used by the pacer.
 // A 1 ms right derivative is uniform across all curve phases, not a startup rule.
 fn cc_trace_context(state: &ConnectionStateConnected, now: u64, cc: &CongestionPolicy, max_pps: Option<u64>) -> crate::loss_trace::CcContext {
+    let curve=connection_curve_policy(state,cc); let cc=&curve;
     let rtt_ns = state.RTT_mean as u64 * 100_000;
     let k = cc.recovery_rtts * rtt_ns;
     let age = if state.is_app_limited { state.app_limit_time_offset }
@@ -5308,7 +7153,9 @@ fn observe_ack_hole(state: &mut ConnectionStateConnected, now: u64, cc: &Congest
                 let trigger = count_congestion_signal(state, seq, sent, now, cc);
                 state.ack_hole.confirmed_before = seq + 1;
                 if trigger {
-                    apply_loss_congestion(state, sent, now, cc, max_pps);
+                    if apply_loss_congestion(state, sent, now, cc, max_pps) {
+                        push_accepted_cc_event(state, AcceptedCcEvent { kind: CC_EVENT_EARLY, evidence_seq: seq, evidence_sent_ns: sent, feedback_ns: now });
+                    }
                     println!("congestion early ACK HOLE {seq} at {now} ns");
                     cut = Some((seq, sent));
                 }
@@ -5362,9 +7209,953 @@ fn congestion_discovery_rate(state: &ConnectionStateConnected, discovered: u64, 
     local_rate_limit(if actual == 0 { discovered } else { discovered.min(actual) }, max_pps)
 }
 
-// Kept separate so tests exercise the same ECN cut as the send loop.
-fn apply_ecn_congestion(state: &mut ConnectionStateConnected, now: u64, cc: &CongestionPolicy, max_pps: Option<u64>) {
-    if !take_ecn_signal(state, cc.event_guard_rtts) { return; }
+// RESEARCH ONLY: persistent RTT inflation is an additional CE-style EVENT source.
+// No bandwidth estimate or pacing model; all accepted cuts use apply_ecn_congestion.
+
+#[derive(Clone, Copy, Debug)]
+struct DelayEventConfig {
+    k:f64, min_ms:f64, max_ms:f64, interval_rtts:f64, giveup:u64, hold:Option<DelayHoldConfig>,
+    beta:Option<f64>, #[cfg(any(test,feature="research_target_validation"))] effect:Option<DelayEffectConfig>,
+}
+#[cfg(any(test,feature="research_target_validation"))]
+#[derive(Clone, Copy, Debug)]
+struct DelayEffectConfig { frac:f64, rtts:f64 }
+#[cfg(any(test,feature="research_target_validation"))]
+#[derive(Debug)]
+struct DelayEffectPending { excess_ns:u64, guard_until_ns:u64, deadline_ns:u64 }
+
+#[derive(Clone, Copy, Debug)]
+struct DelayHoldConfig { rtts:f64, max_rtts:f64 }
+
+impl DelayHoldConfig {
+    fn duration_ns(self, consecutive:u64, srtt_ns:u64) -> u64 {
+        let mut rtts=self.rtts;
+        // At most 2098 doublings span all positive finite f64 values. Cap
+        // before converting to nanoseconds, including extreme research inputs.
+        for _ in 0..consecutive.saturating_sub(1).min(2098) {
+            if rtts>=self.max_rtts { break; }
+            rtts=(rtts*2.).min(self.max_rtts);
+        }
+        (rtts*srtt_ns as f64).ceil() as u64
+    }
+    fn clean_ns(self, srtt_ns:u64) -> u64 { (self.max_rtts*srtt_ns as f64).ceil() as u64 }
+}
+
+impl DelayEventConfig {
+    fn parse(mut get:impl FnMut(&str)->Option<String>) -> Option<Self> {
+        let enabled=get("STP_CC_DELAY_EVENT").unwrap_or_else(||"0".into());
+        assert!(enabled=="0" || enabled=="1", "STP_CC_DELAY_EVENT must be 0 or 1");
+        if enabled=="0" { return None; }
+        let mut required=|name:&str| {
+            let v=get(name).unwrap_or_else(||panic!("{name} is required when STP_CC_DELAY_EVENT=1"));
+            let x=v.parse::<f64>().unwrap_or_else(|_|panic!("{name} must be a finite float"));
+            assert!(x.is_finite(), "{name} must be finite"); x
+        };
+        let mut c=Self { k:required("STP_CC_DELAY_K"), min_ms:required("STP_CC_DELAY_MIN_MS"),
+            max_ms:required("STP_CC_DELAY_MAX_MS"), interval_rtts:required("STP_CC_DELAY_INTERVAL_RTTS"), giveup:0, hold:None, beta:None, #[cfg(any(test,feature="research_target_validation"))] effect:None };
+        if let Some(v)=get("STP_CC_DELAY_BETA") {
+            let b=v.parse::<f64>().expect("STP_CC_DELAY_BETA must be a finite float in (0,1]");
+            assert!(b.is_finite() && b>0. && b<=1., "STP_CC_DELAY_BETA must be in (0,1]");
+            c.beta=Some(b);
+        }
+        // Unset/0 preserves the original delay-event path.
+        c.giveup=get("STP_CC_DELAY_GIVEUP").map_or(0, |v|v.parse::<u64>()
+            .unwrap_or_else(|_|panic!("STP_CC_DELAY_GIVEUP must be an integer >= 0")));
+        // Never inspect hold knobs outside competitive give-up; an unset initial
+        // hold also leaves MAX unread, preserving the existing give-up mode.
+        if c.giveup>0 {
+            if let Some(v)=get("STP_CC_DELAY_HOLD_RTTS") {
+                let rtts=v.parse::<f64>().expect("STP_CC_DELAY_HOLD_RTTS must be a finite float > 0");
+                assert!(rtts.is_finite() && rtts>0., "STP_CC_DELAY_HOLD_RTTS must be a finite float > 0");
+                let max_rtts=get("STP_CC_DELAY_HOLD_MAX_RTTS")
+                    .expect("STP_CC_DELAY_HOLD_MAX_RTTS is required when STP_CC_DELAY_HOLD_RTTS is set")
+                    .parse::<f64>().expect("STP_CC_DELAY_HOLD_MAX_RTTS must be a finite float");
+                assert!(max_rtts.is_finite() && max_rtts>=rtts,
+                    "STP_CC_DELAY_HOLD_MAX_RTTS must be finite and >= STP_CC_DELAY_HOLD_RTTS");
+                c.hold=Some(DelayHoldConfig { rtts,max_rtts });
+            }
+        }
+        // EFFECT_RTTS is mandatory only when FRAC is enabled; neither is read
+        // without GIVEUP, and an orphan EFFECT_RTTS is ignored.
+        #[cfg(any(test,feature="research_target_validation"))]
+        if c.giveup>0 {
+            if let Some(v)=get("STP_CC_DELAY_EFFECT_FRAC") {
+                let frac=v.parse::<f64>().expect("STP_CC_DELAY_EFFECT_FRAC must be a finite float in (0,1)");
+                assert!(frac.is_finite() && frac>0. && frac<1., "STP_CC_DELAY_EFFECT_FRAC must be in (0,1)");
+                let rtts=get("STP_CC_DELAY_EFFECT_RTTS")
+                    .expect("STP_CC_DELAY_EFFECT_RTTS is required when STP_CC_DELAY_EFFECT_FRAC is set")
+                    .parse::<f64>().expect("STP_CC_DELAY_EFFECT_RTTS must be a finite float > 0");
+                assert!(rtts.is_finite() && rtts>0., "STP_CC_DELAY_EFFECT_RTTS must be finite and > 0");
+                c.effect=Some(DelayEffectConfig { frac,rtts });
+            }
+        }
+        assert!(c.k>0., "STP_CC_DELAY_K must be > 0");
+        assert!(c.min_ms>=0., "STP_CC_DELAY_MIN_MS must be >= 0");
+        assert!(c.max_ms>=c.min_ms, "STP_CC_DELAY_MAX_MS must be >= STP_CC_DELAY_MIN_MS");
+        assert!(c.interval_rtts>0., "STP_CC_DELAY_INTERVAL_RTTS must be > 0");
+        Some(c)
+    }
+    fn threshold_ns(self, min_rtt_ns:u64) -> f64 {
+        (self.k*min_rtt_ns as f64).clamp(self.min_ms*1e6, self.max_ms*1e6)
+    }
+    fn interval_ns(self, srtt_ns:u64) -> u64 { (self.interval_rtts*srtt_ns as f64).max(20_000_000.) as u64 }
+}
+
+fn delay_event_config() -> Option<DelayEventConfig> {
+    static CONFIG:std::sync::OnceLock<Option<DelayEventConfig>>=std::sync::OnceLock::new();
+    *CONFIG.get_or_init(||DelayEventConfig::parse(|n|crate::ship::policy_var(n).ok()))
+}
+
+pub(crate) fn initialize_delay_event() { let _=delay_event_config(); }
+
+#[derive(Debug, Default)]
+struct DelayGiveupState {
+    pending_event_ns:Option<u64>, ineffective:u64, suspended:bool,
+    #[cfg(any(test,feature="research_target_validation"))] pending_effect:Option<DelayEffectPending>,
+    // Only touched when HOLD_RTTS is set. Deadlines freeze RTT_mean at the
+    // suspension/rearm transition; low windows never shorten or extend them.
+    consecutive_suspensions:u64, hold_until_ns:Option<u64>, clean_until_ns:Option<u64>,
+}
+
+#[derive(Debug, Default)]
+struct DelayEventWindow {
+    deadline_ns:Option<u64>, min_sample_ns:Option<u64>, evidence_seq:u64, evidence_sent_ns:u64,
+}
+
+impl DelayEventWindow {
+    // Fixed duration per window, based on the smoothed CC RTT at its start. The
+    // first valid sample seeds SRTT before the send loop has calculated RTT_mean.
+    fn observe(&mut self, now:u64, sample_ns:u64, seq:u64, sent_ns:u64, srtt_ns:u64, c:DelayEventConfig) {
+        if self.deadline_ns.is_none() { self.deadline_ns=Some(now.saturating_add(c.interval_ns(srtt_ns))); }
+        self.min_sample_ns=Some(self.min_sample_ns.map_or(sample_ns, |m|m.min(sample_ns)));
+        self.evidence_seq=seq; self.evidence_sent_ns=sent_ns;
+    }
+    // Called BEFORE inserting a sample at/after the boundary, and on send ticks.
+    // Empty windows do nothing; no synthetic RTT samples and no repeated idle cuts.
+    fn close(&mut self, now:u64, min_rtt_ns:u64, srtt_ns:u64, c:DelayEventConfig) -> Option<(u64,u64)> {
+        if !self.deadline_ns.is_some_and(|deadline|now>=deadline) { return None; }
+        let sample=self.min_sample_ns;
+        let evidence=(self.evidence_seq,self.evidence_sent_ns);
+        *self=Self { deadline_ns:Some(now.saturating_add(c.interval_ns(srtt_ns))), ..Self::default() };
+        sample.filter(|&m|m.saturating_sub(min_rtt_ns) as f64>c.threshold_ns(min_rtt_ns)).map(|_|evidence)
+    }
+}
+
+// One fractional experiment at a time. Timing is a simple attribution heuristic,
+// not proof of causality. Guard/deadline freeze RTT_mean at acceptance. Empty
+// ticks can expire it; only nonempty post-guard windows can prove a drop.
+#[cfg(any(test,feature="research_target_validation"))]
+fn delay_effect_update(state:&mut ConnectionStateConnected, now:u64, sample:Option<u64>,
+    high:bool, c:DelayEventConfig, srtt:u64) -> bool {
+    let effect=c.effect.unwrap();
+    let g=&mut state.delay_giveup;
+    if let Some(p)=&g.pending_effect {
+        let effective=now>p.guard_until_ns && now<=p.deadline_ns && sample.is_some_and(|m|
+            m.saturating_sub(state.target_min_rtt_ns) as f64<=(1.-effect.frac)*p.excess_ns as f64);
+        if effective || now>p.deadline_ns {
+            g.pending_effect=None;
+            if effective {
+                state.stats.delay_effective+=1;
+                g.ineffective=0;
+            } else {
+                state.stats.delay_ineffective+=1;
+                g.ineffective=g.ineffective.saturating_add(1);
+                if g.ineffective>=c.giveup && !g.suspended {
+                    g.suspended=true;
+                    if let Some(h)=c.hold {
+                        g.consecutive_suspensions=g.consecutive_suspensions.saturating_add(1);
+                        g.hold_until_ns=Some(now.saturating_add(h.duration_ns(g.consecutive_suspensions,srtt)));
+                        g.clean_until_ns=None;
+                    }
+                    state.stats.delay_suspensions+=1;
+                }
+            }
+        }
+    }
+    // Low windows still rearm suspension subject to HOLD, but an armed low
+    // window must not erase an unresolved fractional experiment or its strikes.
+    if sample.is_some() && !high && g.suspended {
+        if g.hold_until_ns.is_some_and(|deadline|now<deadline) {
+            state.stats.delay_hold_blocked_rearms+=1;
+        } else {
+            state.stats.delay_rearms+=1;
+            g.suspended=false; g.ineffective=0; g.hold_until_ns=None;
+            if let Some(h)=c.hold { g.clean_until_ns=Some(now.saturating_add(h.clean_ns(srtt))); }
+            else { *g=DelayGiveupState::default(); }
+        }
+    }
+    if high && g.suspended { state.stats.delay_events_suppressed+=1; }
+    // Do not overwrite q0/deadline with another accepted delay cut.
+    g.suspended || g.pending_effect.is_some()
+}
+
+fn close_delay_event(state:&mut ConnectionStateConnected, now:u64, c:DelayEventConfig,
+    cc:&CongestionPolicy, max_pps:Option<u64>) -> bool {
+    let srtt=state.RTT_mean as u64*100_000;
+    if c.hold.is_some() {
+        let g=&mut state.delay_giveup;
+        // Check before a possible new suspension, including on empty send ticks.
+        if !g.suspended && g.clean_until_ns.is_some_and(|deadline|now>=deadline) {
+            g.consecutive_suspensions=0;
+            g.clean_until_ns=None;
+        }
+    }
+    // Preserve the original window/cut path when give-up is disabled. A low
+    // closed window must be distinguished from an empty or still-open window.
+    let closed_sample=if c.giveup>0 && state.delay_event_window.deadline_ns.is_some_and(|d|now>=d) {
+        state.delay_event_window.min_sample_ns
+    } else { None };
+    let event=state.delay_event_window.close(now,state.target_min_rtt_ns,srtt,c);
+    #[cfg(any(test,feature="research_target_validation"))]
+    if c.effect.is_some() && delay_effect_update(state,now,closed_sample,event.is_some(),c,srtt) {
+        return false;
+    }
+    #[cfg(any(test,feature="research_target_validation"))]
+    let effect_enabled=c.effect.is_some();
+    #[cfg(not(any(test,feature="research_target_validation")))]
+    let effect_enabled=false;
+    if !effect_enabled && closed_sample.is_some() {
+        let g=&mut state.delay_giveup;
+        if event.is_none() {
+            if let Some(h)=c.hold {
+                if g.suspended && g.hold_until_ns.is_some_and(|deadline|now<deadline) {
+                    state.stats.delay_hold_blocked_rearms+=1;
+                    return false;
+                }
+                if g.suspended {
+                    state.stats.delay_rearms+=1;
+                    g.clean_until_ns=Some(now.saturating_add(h.clean_ns(srtt)));
+                }
+                g.suspended=false; g.pending_event_ns=None; g.ineffective=0;
+                g.hold_until_ns=None;
+            } else {
+                // Original give-up: drain evidence rearms immediately, even in a guard.
+                if g.suspended { state.stats.delay_rearms+=1; }
+                *g=DelayGiveupState::default();
+            }
+        } else {
+            // Resolve an accepted delay cut ONCE, at the first nonempty window
+            // closing strictly after its guard. Rejected cuts never add a strike.
+            if g.pending_event_ns.is_some_and(|at|now>at.saturating_add((srtt as f64*cc.event_guard_rtts) as u64)) {
+                g.pending_event_ns=None;
+                g.ineffective=g.ineffective.saturating_add(1);
+                if g.ineffective>=c.giveup && !g.suspended {
+                    g.suspended=true;
+                    if let Some(h)=c.hold {
+                        g.consecutive_suspensions=g.consecutive_suspensions.saturating_add(1);
+                        g.hold_until_ns=Some(now.saturating_add(h.duration_ns(g.consecutive_suspensions,srtt)));
+                        g.clean_until_ns=None;
+                    }
+                    state.stats.delay_suspensions+=1;
+                }
+            }
+            if g.suspended {
+                state.stats.delay_events_suppressed+=1;
+                return false;
+            }
+        }
+    }
+    let Some((seq,sent))=event else { return false; };
+    state.stats.delay_events_raised+=1;
+    // Do not clobber a real pending CE signal. Use its EXACT guard and cut path,
+    // including startup exit, local rate ceiling, beta recovery and risk qd_ref.
+    let saved=(state.ecn_congestion_received,state.ecn_oldest_seq,state.ecn_oldest_send_time);
+    state.ecn_congestion_received=true; state.ecn_oldest_seq=seq; state.ecn_oldest_send_time=sent;
+    let accepted=apply_ecn_congestion(state,now,cc,max_pps);
+    (state.ecn_congestion_received,state.ecn_oldest_seq,state.ecn_oldest_send_time)=saved;
+    if accepted {
+        state.stats.delay_events_accepted+=1;
+        if let Some(beta)=c.beta {
+            state.delay_curve_beta=Some(beta);
+            state.stats.delay_cuts_beta_override+=1;
+        }
+        #[cfg(any(test,feature="research_target_validation"))]
+        if let Some(effect)=c.effect {
+            let guard_until_ns=now.saturating_add((srtt as f64*cc.event_guard_rtts) as u64);
+            state.delay_giveup.pending_effect=Some(DelayEffectPending {
+                excess_ns:closed_sample.unwrap().saturating_sub(state.target_min_rtt_ns),
+                guard_until_ns,deadline_ns:guard_until_ns.saturating_add((effect.rtts*srtt as f64).ceil() as u64),
+            });
+        } else if c.giveup>0 { state.delay_giveup.pending_event_ns=Some(now); }
+        #[cfg(not(any(test,feature="research_target_validation")))]
+        if c.giveup>0 { state.delay_giveup.pending_event_ns=Some(now); }
+        push_accepted_cc_event(state,AcceptedCcEvent { kind:CC_EVENT_CE,evidence_seq:seq,evidence_sent_ns:sent,feedback_ns:now });
+    }
+    accepted
+}
+
+fn observe_delay_event(state:&mut ConnectionStateConnected, now:u64, sample:u64, seq:u64, sent:u64,
+    config:Option<DelayEventConfig>, cc:&CongestionPolicy, max_pps:Option<u64>) {
+    let Some(c)=config else { return; };
+    close_delay_event(state,now,c,cc,max_pps);
+    let srtt=if state.RTT_sample_cursor==0 {sample} else {state.RTT_mean as u64*100_000};
+    state.delay_event_window.observe(now,sample,seq,sent,srtt,c);
+}
+
+#[cfg(test)]
+mod delay_event_tests {
+    use super::*;
+    const MS:u64=1_000_000;
+    fn config() -> DelayEventConfig { DelayEventConfig { k:0.5,min_ms:10.,max_ms:100.,interval_rtts:1.,giveup:0,hold:None,beta:None,effect:None } }
+    fn state() -> ConnectionStateConnected {
+        let ConnectionState::Connected(mut s)=new_connection_state_connected(None,0,1,MS) else {unreachable!()};
+        s.RTT_mean=1000; s.RTT_sample_cursor=1; s.target_min_rtt_ns=100*MS;
+        s.congestion_event_rate_upps=2_000_000_000; s.stats.cc_rate_upps=2_000_000_000;
+        s.congestion_event_time_ns=100*MS;
+        s
+    }
+    #[test]
+    fn threshold_clamp_and_interval_floor() {
+        let c=config();
+        assert_eq!(c.threshold_ns(MS),10.*MS as f64);
+        assert_eq!(c.threshold_ns(100*MS),50.*MS as f64);
+        assert_eq!(c.threshold_ns(1000*MS),100.*MS as f64);
+        assert_eq!(c.interval_ns(MS),20*MS);
+        assert_eq!(c.interval_ns(200*MS),200*MS);
+        let c=DelayEventConfig { interval_rtts:2.5,..c };
+        assert_eq!(c.interval_ns(100*MS),250*MS);
+        let c=DelayEventConfig { min_ms:0.,max_ms:0.,..c };
+        assert_eq!(c.threshold_ns(100*MS),0.);
+    }
+    #[test]
+    fn persistence_low_jitter_sample_prevents_event_and_boundary_is_exclusive() {
+        let c=config(); let mut w=DelayEventWindow::default();
+        w.observe(1000*MS,200*MS,1,800*MS,100*MS,c);
+        w.observe(1040*MS,120*MS,2,920*MS,100*MS,c);
+        w.observe(1099*MS,250*MS,3,849*MS,100*MS,c);
+        assert_eq!(w.close(1099*MS,100*MS,100*MS,c),None);
+        assert_eq!(w.close(1100*MS,100*MS,100*MS,c),None);
+        assert_eq!(w.close(1200*MS,100*MS,100*MS,c),None); // empty window
+        w.observe(1210*MS,151*MS,4,1059*MS,100*MS,c);
+        w.observe(1299*MS,190*MS,5,1109*MS,100*MS,c);
+        assert_eq!(w.close(1300*MS,100*MS,100*MS,c),Some((5,1109*MS)));
+        // This low sample is in the NEW interval and cannot erase the raised event.
+        w.observe(1300*MS,100*MS,6,1200*MS,100*MS,c);
+        assert_eq!(w.close(1400*MS,100*MS,100*MS,c),None);
+        w.observe(1401*MS,150*MS,7,1251*MS,100*MS,c);
+        assert_eq!(w.close(1500*MS,100*MS,100*MS,c),None); // strictly >, not >=
+        assert_eq!(w.close(1600*MS,100*MS,100*MS,c),None); // no idle repeat
+    }
+    #[test]
+    fn delay_event_uses_exact_ce_cut_guard_and_preserves_pending_ce() {
+        let c=config(); let cc=crate::ship::CC;
+        let mut delay=state(); let mut ce=state();
+        delay.ecn_congestion_received=true; delay.ecn_oldest_seq=999; delay.ecn_oldest_send_time=777*MS;
+        delay.delay_event_window.observe(1000*MS,200*MS,4,800*MS,100*MS,c);
+        ce.ecn_congestion_received=true; ce.ecn_oldest_seq=4; ce.ecn_oldest_send_time=800*MS;
+        assert!(apply_ecn_congestion(&mut ce,1100*MS,&cc,None));
+        assert!(close_delay_event(&mut delay,1100*MS,c,&cc,None));
+        assert_eq!((delay.congestion_event_time_ns,delay.congestion_event_rate_upps,delay.cc_startup_done,delay.app_limit_time_offset),
+            (ce.congestion_event_time_ns,ce.congestion_event_rate_upps,ce.cc_startup_done,ce.app_limit_time_offset));
+        let k=cc.recovery_rtts*100*MS;
+        let cut=connection_rate(0,delay.congestion_event_rate_upps,k,&cc,delay.cc_startup_done).0;
+        assert_eq!(cut,(delay.congestion_event_rate_upps as f64*cc.beta) as u64);
+        assert!(cut<2_000_000_000);
+        assert_eq!((delay.ecn_congestion_received,delay.ecn_oldest_seq,delay.ecn_oldest_send_time),(true,999,777*MS));
+        assert_eq!(delay.accepted_cc_events,vec![AcceptedCcEvent { kind:CC_EVENT_CE,evidence_seq:4,evidence_sent_ns:800*MS,feedback_ns:1100*MS }]);
+        // A later persistent window whose sample was sent inside the event guard
+        // still raises, but is consumed without a second cut or exposure event.
+        delay.delay_event_window.observe(1101*MS,200*MS,5,1120*MS,100*MS,c);
+        assert!(!close_delay_event(&mut delay,1200*MS,c,&cc,None));
+        assert_eq!((delay.stats.delay_events_raised,delay.stats.delay_events_accepted),(2,1));
+        assert_eq!(delay.congestion_event_time_ns,1100*MS);
+        assert_eq!(delay.accepted_cc_events.len(),1);
+        assert!(!close_delay_event(&mut delay,1300*MS,c,&cc,None));
+        assert_eq!(delay.stats.delay_events_raised,2);
+    }
+    #[test]
+    fn off_is_exact_connection_state_noop_and_does_not_read_parameters() {
+        for flag in [None,Some("0")] {
+            let c=DelayEventConfig::parse(|name| {
+                assert_eq!(name,"STP_CC_DELAY_EVENT"); flag.map(str::to_string)
+            });
+            assert!(c.is_none());
+            let mut s=state(); let before=format!("{s:?}");
+            for i in 0..100 {
+                observe_delay_event(&mut s,(1000+i*100)*MS,900*MS,i,100*MS,c,&crate::ship::CC,None);
+            }
+            assert_eq!(format!("{s:?}"),before);
+        }
+    }
+    #[test]
+    fn enabled_requires_all_parameters_and_rejects_invalid_ranges() {
+        let base=[("STP_CC_DELAY_EVENT","1"),("STP_CC_DELAY_K","0.5"),("STP_CC_DELAY_MIN_MS","10"),
+            ("STP_CC_DELAY_MAX_MS","100"),("STP_CC_DELAY_INTERVAL_RTTS","1")];
+        let parse=|pairs:&[(&str,&str)]|DelayEventConfig::parse(|n|pairs.iter().find(|(k,_)|*k==n).map(|(_,v)|v.to_string()));
+        assert!(parse(&base).is_some());
+        for i in 1..base.len() {
+            let pairs:Vec<_>=base.iter().copied().enumerate().filter(|(j,_)|*j!=i).map(|(_,p)|p).collect();
+            assert!(std::panic::catch_unwind(||parse(&pairs)).is_err(),"missing {}",base[i].0);
+        }
+        for (i,bad) in [(0,"2"),(0,"true"),(1,"0"),(1,"-1"),(1,"NaN"),(1,"inf"),(2,"-1"),
+            (2,"NaN"),(3,"9"),(3,"inf"),(4,"0"),(4,"-1"),(4,"NaN"),(4,"nope")] {
+            let mut pairs=base; pairs[i].1=bad;
+            assert!(std::panic::catch_unwind(||parse(&pairs)).is_err(),"{}={bad}",base[i].0);
+        }
+    }
+    fn window(s:&mut ConnectionStateConnected, start_ms:u64, sample_ms:u64, c:DelayEventConfig) -> bool {
+        let start=start_ms*MS;
+        s.delay_event_window.observe(start,sample_ms*MS,start_ms,start.saturating_sub(sample_ms*MS),100*MS,c);
+        close_delay_event(s,start+c.interval_ns(100*MS),c,&crate::ship::CC,None)
+    }
+    #[test]
+    fn giveup_after_m_ineffective_accepted_events_and_suppresses_without_touching_cc() {
+        for m in [1,2,3] {
+            let c=DelayEventConfig { giveup:m,..config() }; let mut s=state();
+            for i in 0..m {
+                assert!(window(&mut s,1000+i*1000,200,c));
+                assert_eq!(s.delay_giveup.ineffective,i);
+                assert!(!s.delay_giveup.suspended);
+            }
+            let cc_before=(s.congestion_event_time_ns,s.congestion_event_rate_upps,s.cc_startup_done,s.app_limit_time_offset);
+            assert!(!window(&mut s,1000+m*1000,200,c));
+            assert!(s.delay_giveup.suspended);
+            assert_eq!(s.delay_giveup.ineffective,m);
+            assert_eq!((s.stats.delay_events_raised,s.stats.delay_events_accepted),(m,m));
+            assert_eq!((s.stats.delay_suspensions,s.stats.delay_rearms,s.stats.delay_events_suppressed),(1,0,1));
+            assert!(!window(&mut s,2000+m*1000,200,c));
+            assert_eq!(s.stats.delay_events_suppressed,2);
+            assert_eq!(s.stats.delay_suspensions,1);
+            assert_eq!(s.accepted_cc_events.len(),m as usize);
+            assert_eq!((s.congestion_event_time_ns,s.congestion_event_rate_upps,s.cc_startup_done,s.app_limit_time_offset),cc_before);
+            // A real ECN signal still takes the unchanged cut path while suspended.
+            s.ecn_congestion_received=true; s.ecn_oldest_seq=99;
+            s.ecn_oldest_send_time=(3000+m*1000)*MS;
+            assert!(apply_ecn_congestion(&mut s,(3200+m*1000)*MS,&crate::ship::CC,None));
+            assert!(s.delay_giveup.suspended);
+        }
+    }
+    #[test]
+    fn giveup_rearms_on_drained_window_at_threshold_then_can_suspend_again() {
+        let c=DelayEventConfig { giveup:1,..config() }; let mut s=state();
+        assert!(window(&mut s,1000,200,c));
+        assert!(!window(&mut s,2000,200,c));
+        // An empty closed window is NOT drain evidence.
+        assert!(!close_delay_event(&mut s,2200*MS,c,&crate::ship::CC,None));
+        assert!(s.delay_giveup.suspended); assert_eq!(s.stats.delay_rearms,0);
+        assert!(!window(&mut s,3000,150,c)); // <= threshold includes equality
+        assert!(!s.delay_giveup.suspended); assert_eq!(s.delay_giveup.ineffective,0);
+        assert_eq!((s.stats.delay_suspensions,s.stats.delay_rearms,s.stats.delay_events_suppressed),(1,1,1));
+        assert!(!window(&mut s,4000,100,c)); assert_eq!(s.stats.delay_rearms,1);
+        assert!(window(&mut s,5000,200,c));
+        assert!(!window(&mut s,6000,200,c));
+        assert_eq!((s.stats.delay_suspensions,s.stats.delay_rearms,s.stats.delay_events_suppressed),(2,1,2));
+    }
+    #[test]
+    fn giveup_effective_event_resets_consecutive_ineffective_count() {
+        let c=DelayEventConfig { giveup:2,..config() }; let mut s=state();
+        assert!(window(&mut s,1000,200,c));
+        assert!(window(&mut s,2000,200,c)); assert_eq!(s.delay_giveup.ineffective,1);
+        assert!(!window(&mut s,3000,120,c));
+        assert_eq!(s.delay_giveup.ineffective,0); assert_eq!(s.delay_giveup.pending_event_ns,None);
+        assert!(window(&mut s,4000,200,c));
+        assert!(window(&mut s,5000,200,c)); // only one consecutive ineffective event
+        assert_eq!(s.delay_giveup.ineffective,1); assert!(!s.delay_giveup.suspended);
+        assert_eq!((s.stats.delay_suspensions,s.stats.delay_rearms),(0,0));
+    }
+    #[test]
+    fn giveup_waits_for_guard_and_does_not_count_empty_windows_or_rejected_events() {
+        let c=DelayEventConfig { giveup:2,interval_rtts:0.2,..config() }; let mut s=state();
+        assert!(window(&mut s,1000,200,c)); // accepted at 1020 ms; guard ends at 1070
+        assert!(!window(&mut s,1020,200,c));
+        assert!(!window(&mut s,1040,200,c));
+        assert_eq!(s.delay_giveup.ineffective,0);
+        assert!(!close_delay_event(&mut s,1080*MS,c,&crate::ship::CC,None)); // empty
+        assert_eq!(s.delay_giveup.ineffective,0);
+        assert!(!window(&mut s,1080,200,c)); // first nonempty post-guard, rejected evidence
+        assert_eq!(s.delay_giveup.ineffective,1); assert_eq!(s.delay_giveup.pending_event_ns,None);
+        assert!(!window(&mut s,1100,200,c)); // another rejected event, no second strike
+        assert_eq!(s.delay_giveup.ineffective,1); assert!(!s.delay_giveup.suspended);
+        assert_eq!(s.stats.delay_events_accepted,1);
+    }
+    #[test]
+    fn giveup_parses_only_its_own_optional_integer_and_is_not_read_when_off() {
+        for (value,want) in [(None,0),(Some("0"),0),(Some("1"),1),(Some("3"),3)] {
+            let c=DelayEventConfig::parse(|name|Some(match name {
+                "STP_CC_DELAY_EVENT"=>"1", "STP_CC_DELAY_K"=>"0.5", "STP_CC_DELAY_MIN_MS"=>"10",
+                "STP_CC_DELAY_MAX_MS"=>"100", "STP_CC_DELAY_INTERVAL_RTTS"=>"1",
+                "STP_CC_DELAY_GIVEUP"=>return value.map(str::to_string),
+                "STP_CC_DELAY_HOLD_RTTS"=>return None, "STP_CC_DELAY_BETA"|"STP_CC_DELAY_EFFECT_FRAC"=>return None, _=>panic!("unexpected knob {name}"),
+            }.to_string())).unwrap();
+            assert_eq!(c.giveup,want);
+        }
+        for bad in ["-1","1.5","NaN","","18446744073709551616"] {
+            assert!(std::panic::catch_unwind(||DelayEventConfig::parse(|name|Some(match name {
+                "STP_CC_DELAY_EVENT"=>"1", "STP_CC_DELAY_K"=>"0.5", "STP_CC_DELAY_MIN_MS"=>"10",
+                "STP_CC_DELAY_MAX_MS"=>"100", "STP_CC_DELAY_INTERVAL_RTTS"=>"1",
+                "STP_CC_DELAY_GIVEUP"=>bad, "STP_CC_DELAY_BETA"|"STP_CC_DELAY_EFFECT_FRAC"=>return None, _=>panic!("unexpected knob {name}"),
+            }.to_string()))).is_err());
+        }
+        // The existing off-is-exact-noop test also asserts EVENT is the only read.
+    }
+    #[test]
+    fn giveup_unset_and_zero_are_state_identical_to_original_delay_scenario() {
+        // Frozen pre-giveup close path, used as a reference rather than comparing
+        // the new implementation to itself. Replays the existing guard/pending-CE
+        // scenario, then adds a low and an empty window.
+        fn original_close(s:&mut ConnectionStateConnected,now:u64,c:DelayEventConfig) -> bool {
+            let srtt=s.RTT_mean as u64*100_000;
+            let Some((seq,sent))=s.delay_event_window.close(now,s.target_min_rtt_ns,srtt,c) else { return false; };
+            s.stats.delay_events_raised+=1;
+            let saved=(s.ecn_congestion_received,s.ecn_oldest_seq,s.ecn_oldest_send_time);
+            s.ecn_congestion_received=true; s.ecn_oldest_seq=seq; s.ecn_oldest_send_time=sent;
+            let accepted=apply_ecn_congestion(s,now,&crate::ship::CC,None);
+            (s.ecn_congestion_received,s.ecn_oldest_seq,s.ecn_oldest_send_time)=saved;
+            if accepted {
+                s.stats.delay_events_accepted+=1;
+                push_accepted_cc_event(s,AcceptedCcEvent { kind:CC_EVENT_CE,evidence_seq:seq,evidence_sent_ns:sent,feedback_ns:now });
+            }
+            accepted
+        }
+        for giveup in [None,Some("0")] {
+            let c=DelayEventConfig::parse(|name|Some(match name {
+                "STP_CC_DELAY_EVENT"=>"1", "STP_CC_DELAY_K"=>"0.5", "STP_CC_DELAY_MIN_MS"=>"10",
+                "STP_CC_DELAY_MAX_MS"=>"100", "STP_CC_DELAY_INTERVAL_RTTS"=>"1",
+                "STP_CC_DELAY_GIVEUP"=>return giveup.map(str::to_string), "STP_CC_DELAY_BETA"|"STP_CC_DELAY_EFFECT_FRAC"=>return None, _=>panic!("unexpected knob {name}"),
+            }.to_string())).unwrap();
+            let mut actual=state(); let mut reference=state();
+            for s in [&mut actual,&mut reference] {
+                s.ecn_congestion_received=true; s.ecn_oldest_seq=999; s.ecn_oldest_send_time=777*MS;
+            }
+            for (start,sample,seq,sent) in [(1000,200,4,800),(1101,200,5,1120),(1201,120,6,1081)] {
+                for s in [&mut actual,&mut reference] { s.delay_event_window.observe(start*MS,sample*MS,seq,sent*MS,100*MS,c); }
+                let close=(start/100+1)*100*MS;
+                assert_eq!(close_delay_event(&mut actual,close,c,&crate::ship::CC,None),original_close(&mut reference,close,c));
+                // Exact full-state serialization includes CC, evidence, window and all counters.
+                assert_eq!(format!("{actual:?}"),format!("{reference:?}"));
+            }
+            assert_eq!(close_delay_event(&mut actual,1400*MS,c,&crate::ship::CC,None),original_close(&mut reference,1400*MS,c));
+            assert_eq!(format!("{actual:?}"),format!("{reference:?}"));
+        }
+    }
+    fn hold_config(rtts:f64, max_rtts:f64) -> DelayEventConfig {
+        DelayEventConfig { giveup:1,hold:Some(DelayHoldConfig { rtts,max_rtts }),..config() }
+    }
+    #[test]
+    fn hold_blocks_early_low_windows_and_still_needs_drain_after_expiry() {
+        let c=hold_config(10.,40.); let mut s=state();
+        assert!(window(&mut s,1000,200,c));
+        assert!(!window(&mut s,2000,200,c)); // suspend at 2100; hold until 3100
+        assert_eq!(s.delay_giveup.hold_until_ns,Some(3100*MS));
+        let cc_before=(s.congestion_event_time_ns,s.congestion_event_rate_upps,s.cc_startup_done,s.accepted_cc_events.clone());
+        assert!(!window(&mut s,2200,150,c));
+        assert!(!window(&mut s,2900,100,c));
+        assert!(s.delay_giveup.suspended);
+        assert_eq!(s.stats.delay_hold_blocked_rearms,2);
+        assert_eq!(s.stats.delay_rearms,0);
+        assert_eq!((s.congestion_event_time_ns,s.congestion_event_rate_upps,s.cc_startup_done,s.accepted_cc_events.clone()),cc_before);
+        assert!(!close_delay_event(&mut s,3100*MS,c,&crate::ship::CC,None)); // empty at expiry
+        assert!(s.delay_giveup.suspended);
+        assert!(!window(&mut s,3200,200,c)); // high after expiry still cannot rearm
+        assert!(s.delay_giveup.suspended);
+        assert!(!window(&mut s,3400,150,c));
+        assert!(!s.delay_giveup.suspended);
+        assert_eq!(s.stats.delay_rearms,1);
+        assert_eq!(s.delay_giveup.consecutive_suspensions,1);
+        assert_eq!(s.delay_giveup.clean_until_ns,Some(7500*MS));
+    }
+    #[test]
+    fn hold_doubles_across_rearms_and_caps_without_repeated_suspension_entries() {
+        let c=hold_config(100.,250.); let mut s=state(); let mut start=1000;
+        for (count,rtts) in [(1,100),(2,200),(3,250),(4,250)] {
+            assert!(window(&mut s,start,200,c));
+            assert!(!window(&mut s,start+1000,200,c));
+            let suspended_at=start+1100;
+            let deadline=suspended_at+rtts*100;
+            assert_eq!(s.delay_giveup.consecutive_suspensions,count);
+            assert_eq!(s.stats.delay_suspensions,count);
+            assert_eq!(s.delay_giveup.hold_until_ns,Some(deadline*MS));
+            assert!(!window(&mut s,suspended_at,200,c));
+            assert_eq!(s.delay_giveup.consecutive_suspensions,count);
+            assert!(!window(&mut s,deadline-200,150,c)); // closes 100 ms early
+            assert!(s.delay_giveup.suspended);
+            assert!(!window(&mut s,deadline-100,150,c)); // equality rearms
+            assert!(!s.delay_giveup.suspended);
+            start=deadline+1000; // next suspension well inside the clean period
+        }
+        assert_eq!((s.stats.delay_rearms,s.stats.delay_hold_blocked_rearms),(4,4));
+        let h=DelayHoldConfig {rtts:0.5,max_rtts:2.5};
+        assert_eq!(h.duration_ns(1,3),2); // round UP to a whole nanosecond
+        assert_eq!(h.duration_ns(u64::MAX,100*MS),250*MS);
+        assert_eq!(DelayHoldConfig {rtts:f64::from_bits(1),max_rtts:1.}.duration_ns(u64::MAX,MS),MS);
+    }
+    #[test]
+    fn hold_clean_period_resets_only_after_rearm_and_does_not_slide_on_low_windows() {
+        let c=hold_config(10.,40.); let mut s=state();
+        assert!(window(&mut s,1000,200,c));
+        assert!(!window(&mut s,2000,200,c));
+        assert!(!window(&mut s,3000,150,c)); // rearm at 3100; clean until 7100
+        assert_eq!(s.delay_giveup.clean_until_ns,Some(7100*MS));
+        assert!(!window(&mut s,3200,100,c));
+        assert_eq!(s.delay_giveup.clean_until_ns,Some(7100*MS));
+        assert!(!close_delay_event(&mut s,7099*MS,c,&crate::ship::CC,None));
+        assert_eq!(s.delay_giveup.consecutive_suspensions,1);
+        assert!(!close_delay_event(&mut s,7100*MS,c,&crate::ship::CC,None));
+        assert_eq!(s.delay_giveup.consecutive_suspensions,0);
+        assert_eq!(s.delay_giveup.clean_until_ns,None);
+        assert!(window(&mut s,8000,200,c));
+        assert!(!window(&mut s,9000,200,c));
+        assert_eq!(s.delay_giveup.consecutive_suspensions,1);
+        assert_eq!(s.delay_giveup.hold_until_ns,Some(10100*MS));
+    }
+    #[test]
+    fn hold_deadlines_freeze_rtt_at_each_transition() {
+        let c=hold_config(10.,40.); let mut s=state();
+        assert!(window(&mut s,1000,200,c));
+        assert!(!window(&mut s,2000,200,c));
+        s.RTT_mean=2000;
+        assert!(!window(&mut s,2900,150,c));
+        assert_eq!(s.delay_giveup.hold_until_ns,Some(3100*MS));
+        assert!(!window(&mut s,3000,150,c));
+        // The window also lengthened to 200 ms at the previous close.
+        assert!(!close_delay_event(&mut s,3200*MS,c,&crate::ship::CC,None));
+        assert_eq!(s.delay_giveup.clean_until_ns,Some(11200*MS));
+        s.RTT_mean=1000;
+        assert!(!close_delay_event(&mut s,11199*MS,c,&crate::ship::CC,None));
+        assert_eq!(s.delay_giveup.consecutive_suspensions,1);
+        assert!(!close_delay_event(&mut s,11200*MS,c,&crate::ship::CC,None));
+        assert_eq!(s.delay_giveup.consecutive_suspensions,0);
+    }
+    #[test]
+    fn hold_parser_gates_reads_and_requires_positive_finite_bounded_pair() {
+        let parse=|giveup:Option<&str>,hold:Option<&str>,max:Option<&str>| {
+            DelayEventConfig::parse(|name|Some(match name {
+                "STP_CC_DELAY_EVENT"=>"1", "STP_CC_DELAY_K"=>"0.5", "STP_CC_DELAY_MIN_MS"=>"10",
+                "STP_CC_DELAY_MAX_MS"=>"100", "STP_CC_DELAY_INTERVAL_RTTS"=>"1",
+                "STP_CC_DELAY_GIVEUP"=>return giveup.map(str::to_string),
+                "STP_CC_DELAY_HOLD_RTTS"=> {
+                    assert!(giveup.is_some_and(|v|v!="0")); return hold.map(str::to_string);
+                }
+                "STP_CC_DELAY_HOLD_MAX_RTTS"=> {
+                    assert!(hold.is_some()); return max.map(str::to_string);
+                }
+                "STP_CC_DELAY_BETA"|"STP_CC_DELAY_EFFECT_FRAC"=>return None, _=>panic!("unexpected knob {name}"),
+            }.to_string())).unwrap()
+        };
+        for giveup in [None,Some("0")] { assert!(parse(giveup,Some("invalid"),Some("invalid")).hold.is_none()); }
+        assert!(parse(Some("1"),None,Some("invalid")).hold.is_none());
+        for (hold,max) in [("0.5","0.5"),("1.25","5")] {
+            let c=parse(Some("3"),Some(hold),Some(max));
+            let h=c.hold.unwrap();
+            assert_eq!(h.rtts,hold.parse::<f64>().unwrap());
+            assert_eq!(h.max_rtts,max.parse::<f64>().unwrap());
+        }
+        for bad in ["0","-1","NaN","inf","-inf","","nope"] {
+            assert!(std::panic::catch_unwind(||parse(Some("1"),Some(bad),Some("10"))).is_err());
+            assert!(std::panic::catch_unwind(||parse(Some("1"),Some("1"),Some(bad))).is_err());
+        }
+        assert!(std::panic::catch_unwind(||parse(Some("1"),Some("1"),None)).is_err());
+        assert!(std::panic::catch_unwind(||parse(Some("1"),Some("2"),Some("1"))).is_err());
+    }
+    #[test]
+    fn hold_unset_is_full_state_identical_to_frozen_giveup_path() {
+        // Frozen directly from .bak-hold: compare against the pre-hold algorithm,
+        // not another invocation of the new path. Includes suspension, repeated
+        // rearm, rejected cuts, pending real CE, low and empty windows.
+        fn frozen_close(state:&mut ConnectionStateConnected, now:u64, c:DelayEventConfig,
+            cc:&CongestionPolicy, max_pps:Option<u64>) -> bool {
+            let srtt=state.RTT_mean as u64*100_000;
+            // Preserve the original window/cut path when give-up is disabled. A low
+            // closed window must be distinguished from an empty or still-open window.
+            let closed_sample=if c.giveup>0 && state.delay_event_window.deadline_ns.is_some_and(|d|now>=d) {
+                state.delay_event_window.min_sample_ns
+            } else { None };
+            let event=state.delay_event_window.close(now,state.target_min_rtt_ns,srtt,c);
+            if closed_sample.is_some() {
+                let g=&mut state.delay_giveup;
+                if event.is_none() {
+                    // Drain evidence is sufficient even inside a guard or while suspended.
+                    if g.suspended { state.stats.delay_rearms+=1; }
+                    *g=DelayGiveupState::default();
+                } else {
+                    // Resolve an accepted delay cut ONCE, at the first nonempty window
+                    // closing strictly after its guard. Rejected cuts never add a strike.
+                    if g.pending_event_ns.is_some_and(|at|now>at.saturating_add((srtt as f64*cc.event_guard_rtts) as u64)) {
+                        g.pending_event_ns=None;
+                        g.ineffective=g.ineffective.saturating_add(1);
+                        if g.ineffective>=c.giveup && !g.suspended {
+                            g.suspended=true;
+                            state.stats.delay_suspensions+=1;
+                        }
+                    }
+                    if g.suspended {
+                        state.stats.delay_events_suppressed+=1;
+                        return false;
+                    }
+                }
+            }
+            let Some((seq,sent))=event else { return false; };
+            state.stats.delay_events_raised+=1;
+            // Do not clobber a real pending CE signal. Use its EXACT guard and cut path,
+            // including startup exit, local rate ceiling, beta recovery and risk qd_ref.
+            let saved=(state.ecn_congestion_received,state.ecn_oldest_seq,state.ecn_oldest_send_time);
+            state.ecn_congestion_received=true; state.ecn_oldest_seq=seq; state.ecn_oldest_send_time=sent;
+            let accepted=apply_ecn_congestion(state,now,cc,max_pps);
+            (state.ecn_congestion_received,state.ecn_oldest_seq,state.ecn_oldest_send_time)=saved;
+            if accepted {
+                state.stats.delay_events_accepted+=1;
+                if c.giveup>0 { state.delay_giveup.pending_event_ns=Some(now); }
+                #[cfg(not(any(test,feature="research_target_validation")))]
+        if c.giveup>0 { state.delay_giveup.pending_event_ns=Some(now); }
+        push_accepted_cc_event(state,AcceptedCcEvent { kind:CC_EVENT_CE,evidence_seq:seq,evidence_sent_ns:sent,feedback_ns:now });
+            }
+            accepted
+        }
+        for giveup in [1,2,3] {
+            let c=DelayEventConfig::parse(|name|Some(match name {
+                "STP_CC_DELAY_EVENT"=>"1", "STP_CC_DELAY_K"=>"0.5", "STP_CC_DELAY_MIN_MS"=>"10",
+                "STP_CC_DELAY_MAX_MS"=>"100", "STP_CC_DELAY_INTERVAL_RTTS"=>"1",
+                "STP_CC_DELAY_GIVEUP"=>return Some(giveup.to_string()),
+                "STP_CC_DELAY_HOLD_RTTS"=>return None, "STP_CC_DELAY_BETA"|"STP_CC_DELAY_EFFECT_FRAC"=>return None, _=>panic!("unexpected knob {name}"),
+            }.to_string())).unwrap();
+            let mut actual=state(); let mut reference=state();
+            for s in [&mut actual,&mut reference] {
+                s.ecn_congestion_received=true; s.ecn_oldest_seq=999; s.ecn_oldest_send_time=777*MS;
+            }
+            for (start,sample) in [(1000,200),(2000,200),(3000,200),(4000,200),(4100,150),
+                (4200,200),(4300,200),(5000,200),(6000,120),(7000,200),(8000,200)] {
+                for s in [&mut actual,&mut reference] {
+                    s.delay_event_window.observe(start*MS,sample*MS,start,(start-sample)*MS,100*MS,c);
+                }
+                let now=(start+100)*MS;
+                assert_eq!(close_delay_event(&mut actual,now,c,&crate::ship::CC,None),
+                    frozen_close(&mut reference,now,c,&crate::ship::CC,None));
+                assert_eq!(format!("{actual:?}"),format!("{reference:?}"));
+            }
+            assert_eq!(close_delay_event(&mut actual,10000*MS,c,&crate::ship::CC,None),
+                frozen_close(&mut reference,10000*MS,c,&crate::ship::CC,None));
+            assert_eq!(format!("{actual:?}"),format!("{reference:?}"));
+            assert_eq!(actual.stats.delay_hold_blocked_rearms,0);
+        }
+    }
+
+    fn post_event_rate(s:&ConnectionStateConnected, t:u64) -> u64 {
+        connection_rate(t,s.congestion_event_rate_upps,crate::ship::CC.recovery_rtts*100*MS,
+            &connection_curve_policy(s,&crate::ship::CC),s.cc_startup_done).0
+    }
+    #[test]
+    fn beta_only_delay_keeps_ce_anchor_epoch_guard_and_monotone_recovery_boundary() {
+        for b in [0.25,0.8,0.95,1.] {
+            let c=DelayEventConfig { beta:Some(b),..config() };
+            let mut delay=state(); let mut ce=state();
+            assert!(window(&mut delay,1000,200,c));
+            ce.ecn_congestion_received=true; ce.ecn_oldest_seq=1000; ce.ecn_oldest_send_time=800*MS;
+            assert!(apply_ecn_congestion(&mut ce,1100*MS,&crate::ship::CC,None));
+            assert_eq!(delay.congestion_event_rate_upps,ce.congestion_event_rate_upps);
+            assert_eq!(delay.congestion_event_time_ns,ce.congestion_event_time_ns);
+            let expected=(b*ce.congestion_event_rate_upps as f64) as u64;
+            assert!(post_event_rate(&delay,0).abs_diff(expected)<=2);
+            assert_eq!(post_event_rate(&ce,0),(crate::ship::CC.beta*ce.congestion_event_rate_upps as f64) as u64);
+            assert_eq!(delay.stats.delay_cuts_beta_override,1);
+            let k=crate::ship::CC.recovery_rtts*100*MS;
+            let mut prior=post_event_rate(&delay,0);
+            for t in [k-1,k,k+1,k+MS,2*k,6*k] {
+                let r=post_event_rate(&delay,t);
+                assert!(r>=prior,"beta={b}, t={t}, rate={r}, prior={prior}"); prior=r;
+            }
+            // Rejected real signals do not discard the current delay curve.
+            delay.ecn_congestion_received=true;delay.ecn_oldest_send_time=1120*MS;
+            assert!(!apply_ecn_congestion(&mut delay,1200*MS,&crate::ship::CC,None));
+            assert_eq!(delay.delay_curve_beta,Some(b));
+            for loss in [false,true] {
+                let mut s=state(); assert!(window(&mut s,1000,200,c));
+                if loss { assert!(apply_loss_congestion(&mut s,1800*MS,2000*MS,&crate::ship::CC,None)); }
+                else {
+                    s.ecn_congestion_received=true; s.ecn_oldest_send_time=1800*MS;
+                    assert!(apply_ecn_congestion(&mut s,2000*MS,&crate::ship::CC,None));
+                }
+                assert_eq!(s.delay_curve_beta,None);
+                assert_eq!(post_event_rate(&s,0),(s.congestion_event_rate_upps as f64*crate::ship::CC.beta) as u64);
+                assert_eq!(s.stats.delay_cuts_beta_override,1);
+            }
+        }
+    }
+    fn effect_config() -> DelayEventConfig {
+        DelayEventConfig { giveup:1,interval_rtts:0.2,
+            effect:Some(DelayEffectConfig { frac:0.5,rtts:2. }),..config() }
+    }
+    #[test]
+    fn effect_fraction_drop_within_limit_including_deadline_equality_is_effective() {
+        for start in [1080,1250] { // closes at 1100 or exact deadline 1270
+            let c=effect_config(); let mut s=state();
+            assert!(window(&mut s,1000,200,c)); // accepted1020, guard1070, deadline1270
+            let p=s.delay_giveup.pending_effect.as_ref().unwrap();
+            assert_eq!((p.excess_ns,p.guard_until_ns,p.deadline_ns),(100*MS,1070*MS,1270*MS));
+            assert!(!window(&mut s,start,150,c)); // q=50, exactly 50% drop
+            assert_eq!((s.stats.delay_effective,s.stats.delay_ineffective),(1,0));
+            assert!(s.delay_giveup.pending_effect.is_none()); assert!(!s.delay_giveup.suspended);
+        }
+    }
+    #[test]
+    fn effect_fraction_late_drain_is_ineffective_but_still_rearms_subject_to_hold() {
+        for hold in [None,Some(DelayHoldConfig { rtts:10.,max_rtts:40. })] {
+            let c=DelayEventConfig {hold,..effect_config()};let mut s=state();
+            assert!(window(&mut s,1000,200,c));
+            assert!(!window(&mut s,1300,100,c)); // drains only after deadline
+            assert_eq!((s.stats.delay_effective,s.stats.delay_ineffective),(0,1));
+            assert_eq!(s.stats.delay_suspensions,1);
+            assert_eq!(s.delay_giveup.suspended,hold.is_some());
+            assert_eq!(s.stats.delay_rearms,if hold.is_some(){0}else{1});
+            assert!(!window(&mut s,2500,100,c));
+            assert!(!s.delay_giveup.suspended); assert_eq!(s.stats.delay_rearms,1);
+            assert_eq!(s.stats.delay_ineffective,1);
+        }
+    }
+    #[test]
+    fn effect_fraction_small_drop_and_empty_expiry_are_ineffective_once() {
+        let c=effect_config();let mut s=state();
+        assert!(window(&mut s,1000,200,c));
+        assert!(!window(&mut s,1080,160,c)); // 40% drop < 50%; still high
+        assert_eq!(s.stats.delay_events_accepted,1); // no overlapping cuts
+        assert!(!close_delay_event(&mut s,1270*MS,c,&crate::ship::CC,None));
+        assert_eq!(s.stats.delay_ineffective,0); // inclusive deadline
+        assert!(!close_delay_event(&mut s,1271*MS,c,&crate::ship::CC,None));
+        assert_eq!((s.stats.delay_effective,s.stats.delay_ineffective),(0,1));
+        assert!(s.delay_giveup.suspended);
+        assert!(!close_delay_event(&mut s,1500*MS,c,&crate::ship::CC,None));
+        assert_eq!(s.stats.delay_ineffective,1);
+    }
+    #[test]
+    fn effect_fraction_low_but_insufficient_or_inside_guard_cannot_cancel_experiment() {
+        let c=DelayEventConfig {effect:Some(DelayEffectConfig {frac:0.8,rtts:2.}),..effect_config()};
+        let mut s=state(); assert!(window(&mut s,1000,200,c));
+        assert!(!window(&mut s,1020,100,c)); // sufficient but closes inside guard
+        assert!(s.delay_giveup.pending_effect.is_some());
+        assert!(!window(&mut s,1080,130,c)); // low, but only 70% drop < 80%
+        assert!(s.delay_giveup.pending_effect.is_some());
+        assert!(!close_delay_event(&mut s,1271*MS,c,&crate::ship::CC,None));
+        assert_eq!(s.stats.delay_ineffective,1);
+    }
+    #[test]
+    fn beta_and_effect_parser_ranges_dependencies_and_gated_reads() {
+        let parse=|giveup:&str,beta:Option<&str>,frac:Option<&str>,rtts:Option<&str>| {
+            DelayEventConfig::parse(|name| Some(match name {
+                "STP_CC_DELAY_EVENT"=>"1", "STP_CC_DELAY_K"=>"0.5", "STP_CC_DELAY_MIN_MS"=>"10",
+                "STP_CC_DELAY_MAX_MS"=>"100", "STP_CC_DELAY_INTERVAL_RTTS"=>"1",
+                "STP_CC_DELAY_GIVEUP"=>giveup,"STP_CC_DELAY_HOLD_RTTS"=>return None,
+                "STP_CC_DELAY_BETA"=>return beta.map(str::to_string),
+                "STP_CC_DELAY_EFFECT_FRAC"=> { assert_ne!(giveup,"0");return frac.map(str::to_string); }
+                "STP_CC_DELAY_EFFECT_RTTS"=> { assert!(frac.is_some());return rtts.map(str::to_string); }
+                _=>panic!("unexpected {name}"),
+            }.to_string())).unwrap()
+        };
+        assert!(parse("0",None,Some("bad"),Some("bad")).effect.is_none());
+        assert!(parse("1",None,None,Some("bad")).effect.is_none());
+        for b in ["0.1","1"] { assert_eq!(parse("0",Some(b),None,None).beta,Some(b.parse().unwrap())); }
+        let c=parse("2",Some("0.95"),Some("0.4"),Some("1.5"));
+        assert_eq!(c.effect.unwrap().frac,0.4);assert_eq!(c.effect.unwrap().rtts,1.5);
+        for bad in ["0","-1","NaN","inf","-inf","","bad","1.01"] {
+            assert!(std::panic::catch_unwind(||parse("1",Some(bad),None,None)).is_err());
+            assert!(std::panic::catch_unwind(||parse("1",None,Some(bad),Some("1"))).is_err());
+        }
+        assert!(std::panic::catch_unwind(||parse("1",None,Some("1"),Some("1"))).is_err());
+        for bad in [None,Some("0"),Some("-1"),Some("NaN"),Some("inf"),Some("bad")] {
+            assert!(std::panic::catch_unwind(||parse("1",None,Some("0.5"),bad)).is_err());
+        }
+    }
+    #[test]
+    fn beta_and_effect_unset_full_state_identical_to_frozen_pre_dbeta() {
+        for giveup in [0,1,2,3] { for hold in [None,Some(DelayHoldConfig {rtts:10.,max_rtts:40.})] {
+            if giveup==0 && hold.is_some() {continue;}
+            let c=DelayEventConfig {giveup,hold,..config()};
+            let mut actual=state();let mut reference=state();
+            for s in [&mut actual,&mut reference] {
+                s.ecn_congestion_received=true;s.ecn_oldest_seq=999;s.ecn_oldest_send_time=777*MS;
+            }
+            for (start,sample) in [(1000,200),(1101,200),(1201,120),(2000,200),(3000,200),
+                (4000,200),(4100,150),(4200,200),(5000,200),(6000,100),(7000,200),(8000,200)] {
+                for s in [&mut actual,&mut reference] {
+                    s.delay_event_window.observe(start*MS,sample*MS,start,(start-sample)*MS,100*MS,c);
+                }
+                assert_eq!(close_delay_event(&mut actual,(start+100)*MS,c,&crate::ship::CC,None),
+                    frozen_pre_dbeta_close(&mut reference,(start+100)*MS,c,&crate::ship::CC,None));
+                assert_eq!(format!("{actual:?}"),format!("{reference:?}"));
+            }
+            assert_eq!(close_delay_event(&mut actual,10000*MS,c,&crate::ship::CC,None),
+                frozen_pre_dbeta_close(&mut reference,10000*MS,c,&crate::ship::CC,None));
+            assert_eq!(format!("{actual:?}"),format!("{reference:?}"));
+        }}
+    }
+
+    // Frozen from .bak-dbeta, independent of the modified close and CE functions.
+fn frozen_pre_dbeta_close(state:&mut ConnectionStateConnected, now:u64, c:DelayEventConfig,
+    cc:&CongestionPolicy, max_pps:Option<u64>) -> bool {
+    let srtt=state.RTT_mean as u64*100_000;
+    if c.hold.is_some() {
+        let g=&mut state.delay_giveup;
+        // Check before a possible new suspension, including on empty send ticks.
+        if !g.suspended && g.clean_until_ns.is_some_and(|deadline|now>=deadline) {
+            g.consecutive_suspensions=0;
+            g.clean_until_ns=None;
+        }
+    }
+    // Preserve the original window/cut path when give-up is disabled. A low
+    // closed window must be distinguished from an empty or still-open window.
+    let closed_sample=if c.giveup>0 && state.delay_event_window.deadline_ns.is_some_and(|d|now>=d) {
+        state.delay_event_window.min_sample_ns
+    } else { None };
+    let event=state.delay_event_window.close(now,state.target_min_rtt_ns,srtt,c);
+    if closed_sample.is_some() {
+        let g=&mut state.delay_giveup;
+        if event.is_none() {
+            if let Some(h)=c.hold {
+                if g.suspended && g.hold_until_ns.is_some_and(|deadline|now<deadline) {
+                    state.stats.delay_hold_blocked_rearms+=1;
+                    return false;
+                }
+                if g.suspended {
+                    state.stats.delay_rearms+=1;
+                    g.clean_until_ns=Some(now.saturating_add(h.clean_ns(srtt)));
+                }
+                g.suspended=false; g.pending_event_ns=None; g.ineffective=0;
+                g.hold_until_ns=None;
+            } else {
+                // Original give-up: drain evidence rearms immediately, even in a guard.
+                if g.suspended { state.stats.delay_rearms+=1; }
+                *g=DelayGiveupState::default();
+            }
+        } else {
+            // Resolve an accepted delay cut ONCE, at the first nonempty window
+            // closing strictly after its guard. Rejected cuts never add a strike.
+            if g.pending_event_ns.is_some_and(|at|now>at.saturating_add((srtt as f64*cc.event_guard_rtts) as u64)) {
+                g.pending_event_ns=None;
+                g.ineffective=g.ineffective.saturating_add(1);
+                if g.ineffective>=c.giveup && !g.suspended {
+                    g.suspended=true;
+                    if let Some(h)=c.hold {
+                        g.consecutive_suspensions=g.consecutive_suspensions.saturating_add(1);
+                        g.hold_until_ns=Some(now.saturating_add(h.duration_ns(g.consecutive_suspensions,srtt)));
+                        g.clean_until_ns=None;
+                    }
+                    state.stats.delay_suspensions+=1;
+                }
+            }
+            if g.suspended {
+                state.stats.delay_events_suppressed+=1;
+                return false;
+            }
+        }
+    }
+    let Some((seq,sent))=event else { return false; };
+    state.stats.delay_events_raised+=1;
+    // Do not clobber a real pending CE signal. Use its EXACT guard and cut path,
+    // including startup exit, local rate ceiling, beta recovery and risk qd_ref.
+    let saved=(state.ecn_congestion_received,state.ecn_oldest_seq,state.ecn_oldest_send_time);
+    state.ecn_congestion_received=true; state.ecn_oldest_seq=seq; state.ecn_oldest_send_time=sent;
+    let accepted=frozen_pre_dbeta_ce(state,now,cc,max_pps);
+    (state.ecn_congestion_received,state.ecn_oldest_seq,state.ecn_oldest_send_time)=saved;
+    if accepted {
+        state.stats.delay_events_accepted+=1;
+        if c.giveup>0 { state.delay_giveup.pending_event_ns=Some(now); }
+        #[cfg(not(any(test,feature="research_target_validation")))]
+        if c.giveup>0 { state.delay_giveup.pending_event_ns=Some(now); }
+        push_accepted_cc_event(state,AcceptedCcEvent { kind:CC_EVENT_CE,evidence_seq:seq,evidence_sent_ns:sent,feedback_ns:now });
+    }
+    accepted
+}
+
+fn frozen_pre_dbeta_ce(state: &mut ConnectionStateConnected, now: u64, cc: &CongestionPolicy, max_pps: Option<u64>) -> bool {
+    if !take_ecn_signal(state, cc.event_guard_rtts) { return false; }
     let k = cc.recovery_rtts * state.RTT_mean as u64 * 100_000;
     let send_dt = state.ecn_oldest_send_time - state.congestion_event_time_ns;
     let send_t_factor = send_dt as f64 / k as f64;
@@ -5381,7 +8172,72 @@ fn apply_ecn_congestion(state: &mut ConnectionStateConnected, now: u64, cc: &Con
     state.congestion_event_time_ns = now;
     state.app_limit_time_offset = 0;
     state.cc_startup_done = true;
+
+    crate::target_validation::risk_congestion(&state.target_state,state.congestion_event_rate_upps, if state.RTT_mean==u16::MAX {0}else{state.RTT_mean as u64*100_000}, cc.event_guard_rtts, cc.recovery_rtts, true);
     println!("congestion event ECN CE ...  rate discovered: {} pps  sent:{send_mode}@{send_t_factor:.2}", state.congestion_event_rate_upps as f64 / 1000000.0);
+    true
+}
+    #[test]
+    fn sample_path_boundary_closes_old_window_before_low_sample() {
+        let mut s=state(); let c=config(); let cc=crate::ship::CC;
+        observe_delay_event(&mut s,1000*MS,200*MS,3,800*MS,Some(c),&cc,None);
+        observe_delay_event(&mut s,1100*MS,100*MS,4,1000*MS,Some(c),&cc,None);
+        assert_eq!((s.stats.delay_events_raised,s.stats.delay_events_accepted),(1,1));
+        assert_eq!(s.delay_event_window.min_sample_ns,Some(100*MS));
+        assert!(!close_delay_event(&mut s,1200*MS,c,&cc,None));
+        assert_eq!(s.stats.delay_events_raised,1);
+    }
+}
+
+// Kept separate so tests exercise the same ECN cut as the send loop.
+/// Returns true iff the CE signal was accepted as a congestion cut (CC state changed).
+fn apply_ecn_congestion(state: &mut ConnectionStateConnected, now: u64, cc: &CongestionPolicy, max_pps: Option<u64>) -> bool {
+    if !take_ecn_signal(state, cc.event_guard_rtts) { return false; }
+    let k = cc.recovery_rtts * state.RTT_mean as u64 * 100_000;
+    let curve=connection_curve_policy(state,cc);
+    let send_dt = state.ecn_oldest_send_time - state.congestion_event_time_ns;
+    let send_t_factor = send_dt as f64 / k as f64;
+    let (_, send_mode) = connection_rate(send_dt, state.congestion_event_rate_upps, k, &curve, state.cc_startup_done);
+    let discover_dt = if send_mode == 'P' { (k + send_dt) / 2 } else { send_dt };
+    let mut discovered = connection_rate(discover_dt, state.congestion_event_rate_upps, k, &curve, state.cc_startup_done).0;
+    if send_mode == 'I' {
+        discovered = connection_rate(send_dt.saturating_sub((state.RTT_mean as f64 * 100_000.0 * cc.startup_backoff_rtts) as u64), state.congestion_event_rate_upps, k, &curve, false).0;
+    } else if send_mode == 'G' || send_mode == 'S' {
+        let r_pg = (state.congestion_event_rate_upps as f64 * cc.rate_pg) as u64;
+        discovered = r_pg + ((discovered.saturating_sub(r_pg)) as f64 * 0.5) as u64;
+    }
+    state.congestion_event_rate_upps = congestion_discovery_rate(state, discovered, max_pps);
+    state.congestion_event_time_ns = now;
+    state.app_limit_time_offset = 0;
+    state.cc_startup_done = true;
+
+    { state.delay_curve_beta=None; }
+
+    crate::target_validation::risk_congestion(&state.target_state,state.congestion_event_rate_upps, if state.RTT_mean==u16::MAX {0}else{state.RTT_mean as u64*100_000}, cc.event_guard_rtts, cc.recovery_rtts, true);
+    println!("congestion event ECN CE ...  rate discovered: {} pps  sent:{send_mode}@{send_t_factor:.2}", state.congestion_event_rate_upps as f64 / 1000000.0);
+    true
+}
+
+/// Records an ACCEPTED cut for the send queues; bounded, overflow counted (measurement-invalid if nonzero).
+/// Delivers accepted cuts to the send queues; called before ANY later finalize, reclaim, resume or fill, so the
+/// exposure snapshot is the one at acceptance (nothing can be emitted or sealed in between).
+fn drain_accepted_cc_events(state: &mut ConnectionStateConnected, buf: &mut SendQueues) {
+    if !state.accepted_cc_events.is_empty() {
+        for e in std::mem::take(&mut state.accepted_cc_events) { buf.fec_event_repair(&e); }
+    }
+}
+
+/// Records an accepted cut and applies it to the send queues synchronously (acceptance-time exposure snapshot).
+fn accept_cc_event(state: &mut ConnectionStateConnected, buf: &mut SendQueues, e: AcceptedCcEvent) {
+    push_accepted_cc_event(state, e);
+    drain_accepted_cc_events(state, buf);
+}
+
+/// An unknown ORIGINAL send history (0/MAX) is never published as exposure evidence (the CC cut is unaffected).
+fn push_accepted_cc_event(state: &mut ConnectionStateConnected, e: AcceptedCcEvent) {
+    if e.evidence_sent_ns == 0 || e.evidence_sent_ns == u64::MAX { state.accepted_cc_missing_anchor += 1; return; }
+    if state.accepted_cc_events.len() < CC_EVENT_QUEUE_CAP { state.accepted_cc_events.push(e); }
+    else { state.accepted_cc_dropped += 1; }
 }
 
 /// One covered delivery stream. Retained counts keep their full send-to-ACK
@@ -5498,23 +8354,25 @@ impl DeliveryGrowth {
     }
 }
 
-fn apply_loss_congestion(state: &mut ConnectionStateConnected, send_time: u64, current_time_now_ns: u64, cc: &CongestionPolicy, max_pps: Option<u64>) {
+/// Returns true iff this loss was accepted as a congestion cut (outside the event guard).
+fn apply_loss_congestion(state: &mut ConnectionStateConnected, send_time: u64, current_time_now_ns: u64, cc: &CongestionPolicy, max_pps: Option<u64>) -> bool {
     let rtt_ns = state.RTT_mean as u64 * 100_000;
     // An RTT re-anchor may have moved the origin while a cohort was retiring.
     // Re-check its loss send-time, not just the packet which completed the cohort.
-    if send_time <= state.congestion_event_time_ns.saturating_add((rtt_ns as f64 * cc.event_guard_rtts) as u64) { return; }
+    if send_time <= state.congestion_event_time_ns.saturating_add((rtt_ns as f64 * cc.event_guard_rtts) as u64) { return false; }
     let time_to_bandwidth_recovery = cc.recovery_rtts * rtt_ns;
+    let curve=connection_curve_policy(state,cc);
     let send_dt = send_time - state.congestion_event_time_ns;
     let send_t_factor = send_dt as f64 / time_to_bandwidth_recovery as f64;
-    let (_, send_mode) = connection_rate(send_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery, cc, state.cc_startup_done);
+    let (_, send_mode) = connection_rate(send_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery, &curve, state.cc_startup_done);
     let now_dt = current_time_now_ns - state.congestion_event_time_ns;
     let now_t_factor = now_dt as f64 / time_to_bandwidth_recovery as f64;
-    let (_, now_mode) = connection_rate(now_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery, cc, state.cc_startup_done);
+    let (_, now_mode) = connection_rate(now_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery, &curve, state.cc_startup_done);
     // R: use rate at send time.
     // P/G/S: blend 50% toward R/P boundary rate.
-    let mut discovered = connection_rate(send_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery, cc, state.cc_startup_done).0;
+    let mut discovered = connection_rate(send_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery, &curve, state.cc_startup_done).0;
     if send_mode == 'I' {
-        discovered = connection_rate(send_dt.saturating_sub((rtt_ns as f64 * cc.startup_backoff_rtts) as u64), state.congestion_event_rate_upps, time_to_bandwidth_recovery, cc, false).0;
+        discovered = connection_rate(send_dt.saturating_sub((rtt_ns as f64 * cc.startup_backoff_rtts) as u64), state.congestion_event_rate_upps, time_to_bandwidth_recovery, &curve, false).0;
     } else if send_mode != 'R' {
         let boundary = (state.congestion_event_rate_upps as f64 * cc.rate_rp) as u64;
         discovered = (discovered + boundary) / 2;
@@ -5524,7 +8382,12 @@ fn apply_loss_congestion(state: &mut ConnectionStateConnected, send_time: u64, c
     state.app_limit_time_offset = 0;
     state.loss_count_in_window = 0;
     state.cc_startup_done = true;
+
+    { state.delay_curve_beta=None; }
+
+    crate::target_validation::risk_congestion(&state.target_state,state.congestion_event_rate_upps, if state.RTT_mean==u16::MAX {0}else{state.RTT_mean as u64*100_000}, cc.event_guard_rtts, cc.recovery_rtts, false);
     println!("congestion event PACKET DROPPED {} ...  rate discovered: {} pps  now:{now_mode}@{now_t_factor:.2} sent:{send_mode}@{send_t_factor:.2}", state.packets_waiting_ack_tail, state.congestion_event_rate_upps as f64 / 1000000.0);
+    true
 }
 
 // Early holes and timeout losses share one RTT cohort and send-time eligibility.
@@ -6309,7 +9172,8 @@ mod congestion_tests {
             let mut reached = None;
             let baseline_ms = ((target as f64 / cc.initial_rate_upps as f64).ln()
                 / cc.startup_multiplier.ln() * rtt as f64 / 1_000_000.0).ceil() as u64;
-            for tick in 1..=40_000 {
+            // 1.05/RTT startup reaches 7000 pps after ~87.08 RTTs (52.25 s at 600 ms).
+            for tick in 1..=baseline_ms + 4 * feedback / 1_000_000 {
                 let now = resume + tick * 1_000_000;
                 ack_packets += pipe.pop_front().unwrap();
                 if tick % 10 == 0 {
@@ -6341,7 +9205,7 @@ mod congestion_tests {
         s.delivery_growth.acknowledged(100_000_000, 1000, 50_000_000, 50_000_000, RATE_FLOOR_UPPS);
         assert_eq!(s.delivery_growth.limit(MAX_CC_RATE_UPPS), 20_000_000_000);
         s.outage.enter(1_000_000_000, 20_000_000_000);
-        let mut buf = SendQueues::new(1, (1000, 1 << 20, 1 << 24));
+        let mut buf = SendQueues::baseline_for_test(1, (1000, 1 << 20, 1 << 24));
         resume_outage(&mut s, &mut buf, &mut [], 61_000_000_000, None);
         assert_eq!(s.delivery_growth.limit(MAX_CC_RATE_UPPS), crate::ship::CC.initial_rate_upps);
         assert_eq!(s.delivery_growth.shadow.previous_packets, 0);
@@ -6408,6 +9272,34 @@ mod congestion_tests {
         assert_eq!(s.ack_hole.confirmed_before, 1);
         assert_eq!(s.congestion_event_time_ns, 0);
         assert_eq!(s.congestion_event_rate_upps, 2_000_000_000);
+    }
+
+    #[test]
+    fn event_repair_accepted_cuts_only_with_exact_evidence_anchor() {
+        let mut s = hole_state();
+        let cc = crate::ship::CC;
+        for seq in [3, 4, 5] { data_receipt(&mut s, seq); }
+        assert_eq!(observe_ack_hole(&mut s, 1_100_000_000, &cc, None), None);
+        assert!(s.accepted_cc_events.is_empty());
+        data_receipt(&mut s, 6);
+        let sent = s.send_time(1);
+        assert_eq!(observe_ack_hole(&mut s, 1_110_000_000, &cc, None), Some((1, sent)));
+        assert_eq!(s.accepted_cc_events, vec![AcceptedCcEvent { kind: CC_EVENT_EARLY, evidence_seq: 1, evidence_sent_ns: sent, feedback_ns: 1_110_000_000 }]);
+        // Guarded duplicates are not accepted.
+        let sent0 = s.send_time(0);
+        assert!(!apply_loss_congestion(&mut s, sent0, 1_120_000_000, &cc, None));
+        assert!(apply_loss_congestion(&mut s, 1_500_000_000, 1_600_000_000, &cc, None));
+        // CE: accepted once, rejected inside the guard.
+        s.ecn_congestion_received = true;
+        s.ecn_oldest_send_time = 1_700_000_000;
+        assert!(apply_ecn_congestion(&mut s, 1_800_000_000, &cc, None));
+        s.ecn_congestion_received = true;
+        s.ecn_oldest_send_time = 1_700_000_001;
+        assert!(!apply_ecn_congestion(&mut s, 1_800_000_100, &cc, None));
+        // Bounded queue: overflow counted, never unbounded.
+        for i in 1..(CC_EVENT_QUEUE_CAP as u64 + 4) { push_accepted_cc_event(&mut s, AcceptedCcEvent { kind: CC_EVENT_CE, evidence_seq: i, evidence_sent_ns: i, feedback_ns: i }); }
+        assert_eq!(s.accepted_cc_events.len(), CC_EVENT_QUEUE_CAP);
+        assert_eq!(s.accepted_cc_dropped, 4);
     }
 
     #[test]
@@ -6689,8 +9581,8 @@ mod congestion_tests {
         let rtt = 200_000_000;
         let k = cc.recovery_rtts * rtt;
         assert_eq!(connection_rate(0, r, k, &cc, false), (r, 'I'));
-        assert!((connection_rate(rtt, r, k, &cc, false).0 as f64 / r as f64 - 1.1).abs() < 1e-6);
-        assert!((connection_rate(10*rtt, r, k, &cc, false).0 as f64 / r as f64 - 1.1f64.powi(10)).abs() < 1e-6);
+        assert!((connection_rate(rtt, r, k, &cc, false).0 as f64 / r as f64 - 1.05).abs() < 1e-6);
+        assert!((connection_rate(10*rtt, r, k, &cc, false).0 as f64 / r as f64 - 1.05f64.powi(10)).abs() < 1e-6);
         assert_eq!(connection_rate(100*rtt, r, cc.recovery_rtts * u16::MAX as u64 * 100_000, &cc, false), (r, 'I'));
         assert_eq!(connection_rate(0, r, k, &cc, true), cubic_rate(0, r, k));
         assert!(connection_rate(u64::MAX, r, k, &cc, false).0 <= 1_000_000_000_000);
@@ -6752,7 +9644,7 @@ mod congestion_tests {
         // even after genuine loss. Cap the new anchor, not only the final output.
         let anchor = local_rate_limit(stale_discovery, Some(1000));
         assert_eq!(anchor, r);
-        assert_eq!(local_rate_limit(cubic_rate(0, anchor, k).0, Some(1000)), 670_000_000);
+        assert_eq!(local_rate_limit(cubic_rate(0, anchor, k).0, Some(1000)), 800_000_000);
     }
 
     #[test]
@@ -6768,7 +9660,7 @@ mod congestion_tests {
     fn local_ceiling_does_not_create_recovery_sawtooth() {
         let (r, k) = (1_000_000_000, 900_000_000);
         // The old local event restarted R at 0.67 * r on every cap crossing.
-        assert_eq!(cubic_rate(0, r, k).0, 670_000_000);
+        assert_eq!(cubic_rate(0, r, k).0, 800_000_000);
         for t in (20 * k..40 * k).step_by(10_000_000) {
             assert_eq!(local_rate_limit(cubic_rate(t, r, k).0, Some(1000)), r);
         }
@@ -6797,7 +9689,7 @@ mod congestion_tests {
                     let rate = cubic_rate(t, r, k).0;
                     assert!(rate >= previous);
                     // Arithmetic reordering can differ by one millionth of a pps.
-                    assert!(rate <= (r as f64 * cc.beta + 525e6 * t as f64 / 1e9) as u64 + 1,
+                    assert!(rate <= (r as f64 * cc.beta + 1025e6 * t as f64 / 1e9) as u64 + 1,
                         "r={r} rtt={rtt} t={t} rate={rate}");
                     previous = rate;
                 }
@@ -6910,7 +9802,7 @@ mod fec_send_tests {
 
     fn new_buf() -> UnreliableSendBuffer {
         let mut b = UnreliableSendBuffer::new(1_000_000, 1 << 26, 1 << 26);
-        let a = crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0);
+        let a = crate::fec_adapt::FecAdaptiveState::baseline_for_test(crate::ship::FEC, 0);
         b.fec_capacity_overhead_ppm = a.representative_ppm();
         b.fec_adaptive = Some(a);
         b
@@ -7282,14 +10174,15 @@ mod fec_closed_loop_tests {
 
     fn race_buffer(policy: crate::fec_adapt::RepairPolicy) -> UnreliableSendBuffer {
         let mut b = UnreliableSendBuffer::new(1000000, 1000000, 1000000);
-        let mut a = FecAdaptiveState::new(crate::ship::FEC, 0);
+        let mut a = FecAdaptiveState::baseline_for_test(crate::ship::FEC, 0);
         a.policy = policy; a.p = 0.02; b.fec_adaptive = Some(a);
         b
     }
     #[test]
     fn race_open_loop_does_not_refresh_or_retain() {
         let mut b = race_buffer(crate::fec_adapt::RepairPolicy::MeanOpen);
-        b.queue_bytes_filled = 1433 * 20; // Direct start bypasses normal submission accounting.
+        // Direct fixture setup must charge the bytes ordinary enqueue owns.
+        b.queue_bytes_filled = 1433 * 20;
         b.start_fec(std::sync::Arc::new(vec![1; 1433*20]), 1433);
         let f = b.fec_send_slot.as_mut().unwrap();
         let n = f.n; f.lost = 19; f.group_lost[0] = 19;
@@ -7334,7 +10227,7 @@ mod fec_closed_loop_tests {
     #[test]
     fn packed_small_messages_are_send_once_even_when_lost() {
         let mut b = UnreliableSendBuffer::new(100000, 1000000, 1000000);
-        b.fec_adaptive = Some(FecAdaptiveState::new(crate::ship::FEC, 0));
+        b.fec_adaptive = Some(FecAdaptiveState::baseline_for_test(crate::ship::FEC, 0));
         b.submit_messages(vec![vec![7; 100], vec![8; 100]]);
         b.fec_prepare_packet(0);
         for package in 0..2 {
@@ -7350,7 +10243,7 @@ mod fec_closed_loop_tests {
 
     #[test]
     fn oversized_messages_keep_floor_when_feedback_rescue_cannot_retain_them() {
-        let mut a = FecAdaptiveState::new(crate::ship::FEC, 0);
+        let mut a = FecAdaptiveState::baseline_for_test(crate::ship::FEC, 0);
         for seq in 0..10000 {
             a.on_data_sent(seq);
             a.on_sequence_finalized(seq, false, seq * 1000);
@@ -7358,7 +10251,7 @@ mod fec_closed_loop_tests {
         let message = std::sync::Arc::new(vec![0; FEC_RETAIN_SOURCE_BYTES + 1]);
         let layout = crate::fec::MessageLayout::new(message.len(), 1433).unwrap();
         let k = layout.k as u32;
-        let mut f = FecSendSlot { segment: None, root_lease: None, plan_ks: None, retention_lease: None, retain_limit: FEC_RETAIN_SOURCE_BYTES, package_lease: None, dscp: Dscp::BestEffort, message, block_bytes: 1433, k, n: k, next_id: k,
+        let mut f = FecSendSlot { #[cfg(feature="research_budget_diagnostic")] diagnostic: None, segment: None, root_lease: None, plan_ks: None, retention_lease: None, retain_limit: FEC_RETAIN_SOURCE_BYTES, package_lease: None, dscp: Dscp::BestEffort, message, block_bytes: 1433, k, n: k, next_id: k,
             encoder: FecEncoderState::Failed, block_buf: Vec::new(), first_seq: 0,
             lost: 0, group_lost: vec![0; layout.groups], n_planned: k,
             loss_estimate: 0.0, finalized_symbols: 0, send_started_ns: 0, original_send_duration_ns: None, repair_policy: crate::fec_adapt::RepairPolicy::Reliability, rescue_rounds: 0, retained_until_ns: None, original_symbols: None, repair_accounting: RepairAccounting::default() };
@@ -7405,10 +10298,10 @@ mod fec_closed_loop_tests {
     #[test]
     fn retained_rescue_has_fixed_source_and_time_bounds() {
         let mut b = UnreliableSendBuffer::new(100000, 1000000, 1000000);
-        b.fec_adaptive = Some(FecAdaptiveState::new(crate::ship::FEC, 0));
+        b.fec_adaptive = Some(FecAdaptiveState::baseline_for_test(crate::ship::FEC, 0));
         // A large coded stand-in tests accounting with an unrelated tiny ready codec.
         for package in 0..5 {
-            let slot = FecSendSlot { segment: None, root_lease: None, plan_ks: None, retention_lease: None, retain_limit: FEC_RETAIN_SOURCE_BYTES, package_lease: None, dscp: Dscp::BestEffort, message: std::sync::Arc::new(vec![0; 17 * 1024 * 1024]),
+            let slot = FecSendSlot { #[cfg(feature="research_budget_diagnostic")] diagnostic: None, segment: None, root_lease: None, plan_ks: None, retention_lease: None, retain_limit: FEC_RETAIN_SOURCE_BYTES, package_lease: None, dscp: Dscp::BestEffort, message: std::sync::Arc::new(vec![0; 17 * 1024 * 1024]),
                 block_bytes: 1, k: 2, n: 2, next_id: 2, encoder: FecEncoderState::Ready(crate::fec::encode_message(std::sync::Arc::new(vec![1; 64]), 32).unwrap()),
                 block_buf: Vec::new(), first_seq: 0, lost: 0, group_lost: vec![0],
                 n_planned: 1, loss_estimate: 0.0, finalized_symbols: 0, send_started_ns: 0, original_send_duration_ns: Some(0), repair_policy: crate::fec_adapt::RepairPolicy::Reliability, rescue_rounds: 0, retained_until_ns: None, original_symbols: None, repair_accounting: RepairAccounting::default() };
@@ -7492,7 +10385,7 @@ mod fec_closed_loop_tests {
         let cfg = AdaptiveFecConfig { eps: 0.5, ..Default::default() };
         let mut b = UnreliableSendBuffer::new(100000, 1000000, 1000000);
         b.fec_capacity_overhead_ppm = 10000;
-        b.fec_adaptive = Some(FecAdaptiveState::new(cfg, 0));
+        b.fec_adaptive = Some(FecAdaptiveState::baseline_for_test(cfg, 0));
         b.start_fec(std::sync::Arc::new(vec![0u8; 1428 * 64]), 1428);
         let initial_n = b.fec_send_slot.as_ref().unwrap().n;
         for seq in 0..64 {
@@ -7541,9 +10434,10 @@ mod fec_closed_loop_tests {
         let (done, _) = std::sync::mpsc::channel();
         let key = ConnectionKey { ip: std::net::Ipv6Addr::LOCALHOST, port: 1, key_15_bits: 0 };
         let mut a = FecRecvSlot::default(); let mut b = FecRecvSlot::default();
-        fec_receive_block(&mut a, key, 0, 256000, 1000, 0, &[0;1000], &done, &workers, &budget);
+        // Repair-first admission still needs the original full native charge.
+        fec_receive_block(&mut a, key, 0, 256000, 1000, 256, &[0;1000], &done, &workers, &budget);
         assert!(matches!(a.state, FecRecvState::Inline(_))); assert!(budget.used() > 256000);
-        fec_receive_block(&mut b, key, 1, 256000, 1000, 0, &[0;1000], &done, &workers, &budget);
+        fec_receive_block(&mut b, key, 1, 256000, 1000, 256, &[0;1000], &done, &workers, &budget);
         assert!(b.admission_refused); assert_eq!(b.ingress_dropped,1);
         drop(a); assert_eq!(budget.used(),0);
     }
@@ -7561,7 +10455,7 @@ mod send_queue_tests {
     #[test]
     fn backlogged_magazines_share_packets_exactly() {
         for n in [2, 3] {
-            let mut s = SendQueues::new(n, (1000000, 16<<20, 16<<20));
+            let mut s = SendQueues::baseline_for_test(n, (1000000, 16<<20, 16<<20));
             for q in 0..n { assert!(s.submit_messages(q, vec![vec![q as u8; 8<<20]]).is_empty()); }
             let mut counts = vec![0; n];
             for seq in 0..3000 { counts[packet(&mut s, seq).0] += 1; }
@@ -7570,7 +10464,7 @@ mod send_queue_tests {
     }
     #[test]
     fn idle_magazine_gets_next_packet_and_full_bulk_does_not_block_enqueue() {
-        let mut s = SendQueues::new(8, (1000000, 2000, 2000));
+        let mut s = SendQueues::baseline_for_test(8, (1000000, 2000, 2000));
         s.submit_messages(0, vec![vec![1; 4000]]);
         assert_eq!(s.submit_messages(0, vec![vec![2; 1000]]).len(), 1);
         assert_eq!(packet(&mut s, 0).0, 0);
@@ -7584,7 +10478,7 @@ mod send_queue_tests {
     }
     #[test]
     fn fifo_and_connection_app_limited_only_when_every_magazine_empty() {
-        let mut s = SendQueues::new(3, (1000000, 10000, 10000));
+        let mut s = SendQueues::baseline_for_test(3, (1000000, 10000, 10000));
         assert!(!s.has_unsent_data());
         s.submit_messages(2, vec![vec![1; 3000], vec![2; 3000], vec![3; 1000], vec![4; 1000]]);
         let mut seq = 0;
@@ -7611,8 +10505,8 @@ mod send_queue_tests {
     fn coded_topup_on_nonzero_magazine_counts_in_share_and_routes_suspended_feedback() {
         use crate::fec_adapt::RepairPolicy;
         for policy in [RepairPolicy::MeanTopup, RepairPolicy::Streaming] {
-            let mut s = SendQueues::new(2, (1000000, 2<<20, 2<<20));
-            let mut a = crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0);
+            let mut s = SendQueues::baseline_for_test(2, (1000000, 2<<20, 2<<20));
+            let mut a = crate::fec_adapt::FecAdaptiveState::baseline_for_test(crate::ship::FEC, 0);
             a.policy = policy; a.p = 0.02; s.fec_adaptive = Some(a);
             s.submit_messages(1, vec![vec![7; 1433*12]]);
             let mut seq = 0;
@@ -7651,8 +10545,8 @@ mod send_queue_tests {
     }
     #[test]
     fn per_magazine_retention_reservation_preserves_coded_history() {
-        let mut s = SendQueues::new(2, (1000000, 1<<20, 1<<20));
-        let slot = |len| FecSendSlot { segment: None, root_lease: None, plan_ks: None, retention_lease: None, retain_limit: FEC_RETAIN_SOURCE_BYTES, package_lease: None, dscp: Dscp::BestEffort, message: std::sync::Arc::new(vec![0; len]), block_bytes: len,
+        let mut s = SendQueues::baseline_for_test(2, (1000000, 1<<20, 1<<20));
+        let slot = |len| FecSendSlot { #[cfg(feature="research_budget_diagnostic")] diagnostic: None, segment: None, root_lease: None, plan_ks: None, retention_lease: None, retain_limit: FEC_RETAIN_SOURCE_BYTES, package_lease: None, dscp: Dscp::BestEffort, message: std::sync::Arc::new(vec![0; len]), block_bytes: len,
             k: 2, n: 2, next_id: 2, encoder: FecEncoderState::Ready(crate::fec::encode_message(std::sync::Arc::new(vec![1;64]),32).unwrap()), block_buf: Vec::new(),
             first_seq: 0, lost: 0, group_lost: vec![0], n_planned: 1, loss_estimate: 0.0,
             finalized_symbols: 0, send_started_ns: 0, original_send_duration_ns: None, repair_policy: crate::fec_adapt::RepairPolicy::Reliability, rescue_rounds: 0, retained_until_ns: None, original_symbols: None, repair_accounting: RepairAccounting::default() };
@@ -7670,7 +10564,7 @@ mod traffic_class_tests {
     use super::*;
     #[test]
     fn packing_never_upgrades_bulk_and_equal_classes_still_pack() {
-        let mut s = SendQueues::new(1, (1000000, 10000, 10000));
+        let mut s = SendQueues::baseline_for_test(1, (1000000, 10000, 10000));
         s.submit_classified_messages(0, vec![(Dscp::Ef, vec![1; 100]), (Dscp::BestEffort, vec![2; 100]), (Dscp::BestEffort, vec![3; 100])]);
         let mut p = vec![0; 1449];
         s.fec_prepare_packet(0);
@@ -7685,8 +10579,8 @@ mod traffic_class_tests {
     }
     #[test]
     fn fec_sources_and_repairs_keep_message_class() {
-        let mut s = SendQueues::new(2, (1000000, 100000, 100000));
-        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0));
+        let mut s = SendQueues::baseline_for_test(2, (1000000, 100000, 100000));
+        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::baseline_for_test(crate::ship::FEC, 0));
         s.submit_classified_messages(1, vec![(Dscp::Ef, vec![1; 1000]), (Dscp::Af11, vec![2; 3000])]);
         let mut p = vec![0; 1449];
         s.fec_prepare_packet(0); assert!(s.fill_packet(&mut p) > 0); assert_eq!(s.last_dscp, Dscp::Ef);
@@ -7709,7 +10603,7 @@ mod traffic_class_tests {
         let enabled: libc::c_int = 1;
         unsafe { assert_eq!(libc::setsockopt(fd, libc::IPPROTO_IP, libc::IP_RECVTOS, &enabled as *const _ as *const _, 4), 0); }
         let sender = setup_and_bind_udp_socket(0).unwrap();
-        let mut s = SendQueues::new(1, (1000000, 100000, 100000));
+        let mut s = SendQueues::baseline_for_test(1, (1000000, 100000, 100000));
         for class in [Dscp::BestEffort, Dscp::Af11, Dscp::Af21, Dscp::Ef] {
             s.submit_classified_messages(0, vec![(class, vec![class as u8; 1000])]);
             let mut p = vec![0; 1449];
@@ -7753,8 +10647,8 @@ mod review_tests {
     // A long FEC train on one magazine keeps its package id while a small-message magazine burns ids.
     #[test]
     fn review_package_window_overrun_across_queues() {
-        let mut s = SendQueues::new(2, (1000000, 64<<20, 64<<20));
-        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0));
+        let mut s = SendQueues::baseline_for_test(2, (1000000, 64<<20, 64<<20));
+        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::baseline_for_test(crate::ship::FEC, 0));
         s.submit_messages(1, vec![vec![7; 1433*2000]]);
         s.submit_messages(0, (0..5000).map(|i| vec![i as u8; 100]).collect());
         let mut seq = 0; let mut bulk_id = None; let mut collided_at = None;
@@ -7776,12 +10670,12 @@ mod review_tests {
     }
     #[test]
     fn review_hot_path_cost_with_full_retention() {
-        let slot = |len| FecSendSlot { segment: None, root_lease: None, plan_ks: None, retention_lease: None, retain_limit: FEC_RETAIN_SOURCE_BYTES, package_lease: None, dscp: Dscp::BestEffort, message: std::sync::Arc::new(vec![0; len]), block_bytes: len,
+        let slot = |len| FecSendSlot { #[cfg(feature="research_budget_diagnostic")] diagnostic: None, segment: None, root_lease: None, plan_ks: None, retention_lease: None, retain_limit: FEC_RETAIN_SOURCE_BYTES, package_lease: None, dscp: Dscp::BestEffort, message: std::sync::Arc::new(vec![0; len]), block_bytes: len,
             k: 2, n: 2, next_id: 2, encoder: FecEncoderState::Ready(crate::fec::encode_message(std::sync::Arc::new(vec![1;64]),32).unwrap()), block_buf: Vec::new(),
             first_seq: 0, lost: 0, group_lost: vec![0], n_planned: 1, loss_estimate: 0.0,
             finalized_symbols: 0, send_started_ns: 0, original_send_duration_ns: None, repair_policy: crate::fec_adapt::RepairPolicy::Reliability, rescue_rounds: 0, retained_until_ns: None, original_symbols: None, repair_accounting: RepairAccounting::default() };
         for (retained, QQ) in [(0usize, 1usize), (4000, 1), (4000, 0)] {
-            let mut s = SendQueues::new(2, (1000000, 1<<30, 1<<30));
+            let mut s = SendQueues::baseline_for_test(2, (1000000, 1<<30, 1<<30));
             for i in 0..retained { s.queues[QQ].retain_fec(slot(100), i as u64); }
             s.submit_messages(0, (0..20000).map(|_| vec![3; 1400]).collect());
             let mut p = vec![0; 1449];
@@ -7805,7 +10699,7 @@ mod sender_lifetime_tests {
     use super::*;
     #[test]
     fn plain_originals_also_pin_receiver_ring_positions() {
-        let mut s = SendQueues::new(2, (1000000, 8<<20, 8<<20));
+        let mut s = SendQueues::baseline_for_test(2, (1000000, 8<<20, 8<<20));
         s.submit_messages(1, vec![vec![9; 1433*2000]]);
         s.submit_messages(0, (0..5000).map(|_| vec![8; 100]).collect());
         let mut p = vec![0; 1449]; let mut bulk = None;
@@ -7872,7 +10766,7 @@ mod sender_lifetime_tests {
     #[test]
     fn packet_owner_ring_excludes_other_queues_even_with_a_forged_alias() {
         // This regression exercises P0 retention/reliability, not the shipped P4 lifecycle.
-        let mut s = SendQueues::new(2, (1000000, 100000, 100000));
+        let mut s = SendQueues::baseline_for_test(2, (1000000, 100000, 100000));
         s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::reliability_for_test(crate::ship::FEC, 0));
         s.submit_messages(1, vec![vec![7; 3000]]);
         let mut p = vec![0; 1449]; let mut seq = 0;
@@ -7913,7 +10807,7 @@ mod ring_pressure_rescue_tests {
     #[test]
     fn ring_pressure_preserves_retained_sources_until_feedback() {
         // This regression exercises P0 retention/reliability, not the shipped P4 lifecycle.
-        let mut s = SendQueues::new(1, (1_000_000, 8<<20, 8<<20));
+        let mut s = SendQueues::baseline_for_test(1, (1_000_000, 8<<20, 8<<20));
         s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::reliability_for_test(crate::ship::FEC, 0));
         s.submit_messages(0, (0..1025).map(|_| vec![1; 3000]).collect());
         let mut seq = 0;
@@ -7945,8 +10839,35 @@ mod outage_review_repros {
         let ConnectionState::Connected(s) = new_connection_state_connected(None, 0, 1, 1_000_000_000) else { unreachable!() }; s
     }
     fn buffer() -> SendQueues {
-        let mut b = SendQueues::new(1, (100000, 1000000, 1000000));
-        b.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 1_000_000_000)); b
+        let mut b = SendQueues::baseline_for_test(1, (100000, 1000000, 1000000));
+        b.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::baseline_for_test(crate::ship::FEC, 1_000_000_000)); b
+    }
+    #[test]
+    fn authenticated_peer_liveness_is_separate_from_round_trip_progress() {
+        let mut s = state();
+        s.outage.enter(3_000_000_000, 100_000_000);
+        // Both authenticated data and fresh ACKs use this clock, even when
+        // the ACK adds no positive receipt or cannot resume the outage.
+        for now in [60_000_000_000, 120_000_000_000, 180_000_000_000] {
+            s.last_peer_packet_received_time = now;
+            assert!(!s.peer_expired(now, true));
+            assert_eq!(s.last_ack_received_time, 1_000_000_000);
+            assert_eq!(s.outage.since_ns, Some(3_000_000_000));
+        }
+        assert!(s.peer_expired(180_000_000_000, false)); // default is unchanged
+        assert!(!s.peer_expired(299_999_999_999, true));
+        assert!(s.peer_expired(300_000_000_000, true));
+        s.account_send(299_000_000_000); // local sends never keep a dead peer alive
+        assert!(s.peer_expired(300_000_000_000, true));
+    }
+    #[test]
+    fn alive_mode_preserves_initial_and_positive_receipt_deadlines() {
+        let mut s = state();
+        assert!(!s.peer_expired(120_999_999_999, true));
+        assert!(s.peer_expired(121_000_000_000, true));
+        s.last_ack_received_time = 100_000_000_000;
+        assert!(!s.peer_expired(219_999_999_999, true));
+        assert!(s.peer_expired(220_000_000_000, true));
     }
     #[test]
     fn resume_preserves_ready_fec_rescue_tu() {
@@ -7977,17 +10898,226 @@ mod outage_review_repros {
     fn receiver_decoder_has_full_grace_after_resume() {
         let mut s = state(); let mut b = buffer(); s.stats.cc_rate_upps = 100_000_000;
         let (tx, _rx) = std::sync::mpsc::sync_channel(1);
-        let mut slots = [FecRecvSlot { segment: None, reservation: None, package_id: 0, state: FecRecvState::Worker { tx, message_len: 1_000_000, block_bytes: 1000, generation: Default::default() }, blocks_received: 1, last_block_ns: 1_000_000_000, ingress_dropped: 0, admission_refused: false, worker_limit_refused: false }];
+        let mut slots = [FecRecvSlot { state: FecRecvState::Worker { tx, message_len: 1_000_000, block_bytes: 1000, generation: Default::default() }, blocks_received: 1, last_block_ns: 1_000_000_000, ..Default::default() }];
         s.account_send(6_000_000_000); s.packets_in_flight = 1;
         enter_outage(&mut s, &mut b, 6_001_000_000, 0, None);
         assert_eq!(retire_inactive_fec_workers(&mut slots, 25_000_000_000, OUTAGE_TIMEOUT_NS, false), 0);
         // A decoder may receive delayed ingress AFTER the sender-side entry.
         slots[0].last_block_ns = 8_000_000_000;
         resume_outage(&mut s, &mut b, &mut slots, 25_000_000_000, None);
-        assert_eq!(slots[0].last_block_ns, 25_000_000_000);
+        assert_eq!(slots[0].last_block_ns, 8_000_000_000); // recovery is not FEC progress
+        assert_eq!(slots[0].last_active_ns(), 25_000_000_000);
         assert_eq!(retire_inactive_fec_workers(&mut slots, 25_000_000_000, fec_inactive_grace_ns(s.RTT_mean, false), false), 0);
         assert!(matches!(slots[0].state, FecRecvState::Worker { .. }));
+        let grace = fec_inactive_grace_ns(s.RTT_mean, false);
+        assert_eq!(retire_inactive_fec_workers(&mut slots, 25_000_000_000 + grace, grace, false), 0);
+        assert_eq!(retire_inactive_fec_workers(&mut slots, 25_000_000_000 + grace + 1, grace, false), 1);
     }
+    #[test]
+    fn receiver_probe_only_resumes_release_all_workers_within_outage_bound() {
+        use std::sync::atomic::Ordering::Acquire;
+        let mut s = state(); let mut b = buffer();
+        let process = crate::receive_memory::ReceiveMemoryBudget::new(32 << 20);
+        let budget = crate::receive_memory::ReceiveMemoryBudget::connection_with_limit(&process, 32 << 20)
+            .with_worker_limit(MAX_FEC_DECODE_WORKERS);
+        let workers = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (done, completions) = std::sync::mpsc::channel();
+        let mut slots = FecRecvSlot::new_ring(MAX_FEC_DECODE_WORKERS);
+        for (id, slot) in slots.iter_mut().enumerate() {
+            slot.package_id = id as u64;
+            fec_receive_block(slot, ConnectionKey::default(), id as u64, 300 * 32, 32, 0,
+                &[7; 32], &done, &workers, &budget);
+            assert!(matches!(slot.state, FecRecvState::Worker { .. }));
+            // Zero is a valid progress timestamp, not a sentinel.
+            slot.last_block_ns = 0;
+        }
+        assert_eq!(workers.load(Acquire), MAX_FEC_DECODE_WORKERS);
+        let mut retry = FecRecvSlot { package_id: 100, ..Default::default() };
+        fec_receive_block(&mut retry, ConnectionKey::default(), 100, 300 * 32, 32, 0,
+            &[7; 32], &done, &workers, &budget);
+        assert!(retry.worker_limit_refused && matches!(retry.state, FecRecvState::Empty));
+        let scan = 100_000_000;
+        let cycle = 2_009_000_000;
+        let first_resume = cycle;
+        let mut next_resume = first_resume;
+        let mut retired = 0;
+        let mut retired_at = None;
+        // Deliberately retain the longest periodic-sweep grace, even immediately
+        // after recovery: no dependence on catching the brief normal-grace window.
+        for now in (0..=first_resume + OUTAGE_TIMEOUT_NS + scan).step_by(scan as usize) {
+            if now >= next_resume {
+                s.outage.enter(next_resume - 1_000_000, 100_000_000);
+                resume_outage(&mut s, &mut b, &mut slots, next_resume, None);
+                next_resume += cycle;
+            }
+            retired += retire_inactive_fec_workers(&mut slots, now, OUTAGE_TIMEOUT_NS, false);
+            if retired == MAX_FEC_DECODE_WORKERS as u64 { retired_at = Some(now); break; }
+        }
+        assert_eq!(retired, MAX_FEC_DECODE_WORKERS as u64,
+            "probe-only resumes must not renew abandoned decoders forever");
+        assert!(retired_at.unwrap() <= first_resume + OUTAGE_TIMEOUT_NS + scan);
+        assert!(slots.iter().all(|slot| matches!(slot.state, FecRecvState::Done)));
+        // Closing all real ingress channels releases decoder reservations and
+        // process + connection worker admission; no counter decrements in retire.
+        drop(done);
+        assert!(matches!(completions.recv_timeout(std::time::Duration::from_secs(5)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while workers.load(Acquire) != 0 {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(budget.used(), 0); assert_eq!(process.used(), 0);
+        assert!(!budget.worker_limit_reached());
+        // The previously refused package can now create a worker.
+        let (done, completions) = std::sync::mpsc::channel();
+        fec_receive_block(&mut retry, ConnectionKey::default(), 100, 300 * 32, 32, 1,
+            &[8; 32], &done, &workers, &budget);
+        assert!(matches!(retry.state, FecRecvState::Worker { .. }));
+        drop(retry); drop(done);
+        assert!(matches!(completions.recv_timeout(std::time::Duration::from_secs(5)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)));
+    }
+
+    #[test]
+    fn receiver_probe_only_resumes_do_not_renew_pressure_grace() {
+        for pressure in [false, true] {
+            let mut s = state(); let mut b = buffer();
+            let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+            let mut slots = [FecRecvSlot { state: FecRecvState::Worker { tx,
+                message_len: 300 * 32, block_bytes: 32, generation: Default::default() },
+                last_block_ns: 0, ..Default::default() }];
+            let grace = fec_inactive_grace_ns(200, pressure);
+            s.outage.enter(1, 100_000_000);
+            resume_outage(&mut s, &mut b, &mut slots, 10_000_000_000, None);
+            assert_eq!(retire_inactive_fec_workers(&mut slots, 10_000_000_000 + grace, grace, pressure), 0);
+            s.outage.enter(10_000_000_001, 100_000_000);
+            resume_outage(&mut s, &mut b, &mut slots, 10_000_000_000 + grace + 1, None);
+            assert_eq!(retire_inactive_fec_workers(&mut slots, 10_000_000_000 + grace + 1, grace, pressure), 1);
+        }
+    }
+
+    #[test]
+    fn receiver_recovery_grant_rearms_only_on_successful_ingress() {
+        let mut s = state(); let mut b = buffer();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut slots = [FecRecvSlot { state: FecRecvState::Worker { tx,
+            message_len: 300 * 32, block_bytes: 32, generation: Default::default() },
+            ..Default::default() }];
+        let (done, _completions) = std::sync::mpsc::channel();
+        let workers = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let budget = crate::receive_memory::ReceiveMemoryBudget::new(32 << 20);
+        s.outage.enter(0, 100_000_000);
+        resume_outage(&mut s, &mut b, &mut slots, 0, None);
+        assert_eq!(slots[0].recovery_resume_ns, Some(0));
+        // Invalid symbol and changed layout never touch progress or the grant.
+        for (len, data) in [(300 * 32, &[][..]), (301 * 32, &[7; 32][..])] {
+            fec_receive_block(&mut slots[0], ConnectionKey::default(), 0, len, 32, 0,
+                data, &done, &workers, &budget);
+            assert_eq!(slots[0].last_block_ns, 0);
+            assert_eq!(slots[0].recovery_resume_ns, Some(0));
+        }
+        // Only valid ingress accepted by the worker channel rearms recovery.
+        fec_receive_block(&mut slots[0], ConnectionKey::default(), 0, 300 * 32, 32, 1,
+            &[7; 32], &done, &workers, &budget);
+        let progress = slots[0].last_block_ns;
+        assert_eq!(slots[0].recovery_resume_ns, None);
+        let resumed = progress + 25_000_000_000;
+        s.outage.enter(progress + 1, 100_000_000);
+        resume_outage(&mut s, &mut b, &mut slots, resumed, None);
+        assert_eq!(slots[0].last_block_ns, progress);
+        assert_eq!(slots[0].recovery_resume_ns, Some(resumed));
+        // Full ingress, then disconnected ingress, cannot rearm the same grant.
+        fec_receive_block(&mut slots[0], ConnectionKey::default(), 0, 300 * 32, 32, 2,
+            &[8; 32], &done, &workers, &budget);
+        assert_eq!(slots[0].ingress_dropped, 1);
+        assert_eq!(slots[0].last_block_ns, progress);
+        assert_eq!(slots[0].recovery_resume_ns, Some(resumed));
+        assert_eq!(rx.try_recv().unwrap().0, 1); drop(rx);
+        fec_receive_block(&mut slots[0], ConnectionKey::default(), 0, 300 * 32, 32, 3,
+            &[9; 32], &done, &workers, &budget);
+        assert_eq!(slots[0].last_block_ns, progress);
+        assert_eq!(slots[0].recovery_resume_ns, Some(resumed));
+        s.outage.enter(resumed + 1, 100_000_000);
+        resume_outage(&mut s, &mut b, &mut slots, resumed + 20_000_000_000, None);
+        assert_eq!(slots[0].recovery_resume_ns, Some(resumed));
+        assert_eq!(retire_inactive_fec_workers(&mut slots, resumed + 20_000_000_000,
+            fec_inactive_grace_ns(200, true), true), 1);
+        // Late data cannot reopen/rearm the retired generation.
+        fec_receive_block(&mut slots[0], ConnectionKey::default(), 0, 300 * 32, 32, 4,
+            &[10; 32], &done, &workers, &budget);
+        assert!(matches!(slots[0].state, FecRecvState::Done));
+        assert_eq!(slots[0].recovery_resume_ns, Some(resumed));
+        // New/refused empty admission does not manufacture activity or a grant.
+        let mut refused = FecRecvSlot::default();
+        workers.store(MAX_FEC_DECODE_WORKERS, std::sync::atomic::Ordering::Release);
+        fec_receive_block(&mut refused, ConnectionKey::default(), 100, 300 * 32, 32, 0,
+            &[7; 32], &done, &workers, &budget);
+        assert!(refused.worker_limit_refused && matches!(refused.state, FecRecvState::Empty));
+        assert_eq!(refused.last_block_ns, 0); assert_eq!(refused.recovery_resume_ns, None);
+    }
+
+    #[test]
+    fn receiver_index_pressure_obeys_bounded_recovery_grant() {
+        let mut s = state(); let mut b = buffer();
+        let mut index = ReceiveIndex::default();
+        let mut plain = ReassemblySlot::new_ring(1);
+        let mut slots = FecRecvSlot::new_ring(1);
+        assert_eq!(index.admit(0, &mut plain, &mut slots), Some(0));
+        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+        slots[0].state = FecRecvState::Worker { tx, message_len: 300 * 32,
+            block_bytes: 32, generation: Default::default() };
+        let grace = fec_inactive_grace_ns(200, true);
+        s.outage.enter(1, 100_000_000);
+        resume_outage(&mut s, &mut b, &mut slots, 10_000_000_000, None);
+        assert!(index.admit_at(1, &mut plain, &mut slots, 10_000_000_000 + grace, grace).is_none());
+        s.outage.enter(10_000_000_001, 100_000_000);
+        resume_outage(&mut s, &mut b, &mut slots, 10_000_000_000 + grace + 1, None);
+        assert_eq!(index.admit_at(1, &mut plain, &mut slots, 10_000_000_000 + grace + 1, grace), Some(0));
+        assert_eq!(index.get(0), None); assert_eq!(index.floor, 1);
+        assert_eq!(slots[0].recovery_resume_ns, None);
+    }
+
+    #[test]
+    fn receiver_active_segmented_giant_has_no_absolute_lifetime_cap() {
+        let mut s = state(); let mut b = buffer();
+        let budget = crate::receive_memory::ReceiveMemoryBudget::new(64 << 20);
+        let (done, _completions) = std::sync::mpsc::channel();
+        let workers = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let segment = FecSegment { root: 4, total: 20_000_000, offset: 0 };
+        let unit_len = (segment.total as usize).div_ceil((segment.total as usize).div_ceil(FEC_SEGMENT_BYTES));
+        let layout = crate::fec::MessageLayout::new(unit_len, 1000).unwrap();
+        let mut roots = ReassemblySlot::new_ring(1);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut slots = [FecRecvSlot { package_id: 5, segment: Some(segment),
+            state: FecRecvState::Worker { tx, message_len: layout.len,
+                block_bytes: layout.block_bytes, generation: Default::default() }, ..Default::default() }];
+        let grace = fec_inactive_grace_ns(200, false);
+        // Actual ingress on a long-lived, segmented 20 MB root; timestamps are
+        // advanced deterministically after each real successful channel admission.
+        for i in 0..200u32 {
+            let now = 1_000_000_000 + i as u64 * 1_500_000_000;
+            assert!(roots[0].admit_segment(segment, layout, i, 1000, now, &budget));
+            fec_receive_block(&mut slots[0], ConnectionKey::default(), 5, layout.len, 1000, i,
+                &[7; 1000], &done, &workers, &budget);
+            assert_eq!(rx.try_recv().unwrap().0, i);
+            assert_eq!(slots[0].recovery_resume_ns, None);
+            slots[0].last_block_ns = now;
+            s.outage.enter(now, 100_000_000);
+            resume_outage(&mut s, &mut b, &mut slots, now + 1, None);
+            assert_eq!(retire_inactive_fec_workers(&mut slots, now + grace, grace, true), 0);
+            assert_eq!(retire_inactive_fec_workers(&mut slots, now + grace, grace, false), 0);
+            retire_inactive_segment_roots(&mut roots, now + grace, grace);
+            assert!(roots[0].segment_parts.is_some());
+        }
+        assert!(slots[0].last_block_ns > 2 * OUTAGE_TIMEOUT_NS);
+        assert_eq!(slots[0].ingress_dropped, 0);
+        let inactive = slots[0].last_active_ns() + grace + 1;
+        assert_eq!(retire_inactive_fec_workers(&mut slots, inactive, grace, false), 1);
+        retire_inactive_segment_roots(&mut roots, slots[0].last_block_ns + grace + 1, grace);
+        assert!(roots[0].segment_parts.is_none()); assert_eq!(budget.used(), 0);
+    }
+
     #[test]
     fn entry_does_not_resurrect_source_already_outside_retention() {
         // This regression exercises P0 retention/reliability, not the shipped P4 lifecycle.
@@ -8036,7 +11166,7 @@ mod outage_review_repros {
         s.outage.ignored_losses = 50;
         s.outage.enter(3_000_000_000, 100_000_000);
         resume_outage(&mut s, &mut b, &mut [], 27_000_000_000, None);
-        let fresh = crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 27_000_000_000);
+        let fresh = crate::fec_adapt::FecAdaptiveState::baseline_for_test(crate::ship::FEC, 27_000_000_000);
         assert_eq!(b.fec_adaptive.as_ref().unwrap().repair_blocks(128), fresh.repair_blocks(128));
         assert_eq!(b.fec_adaptive.as_ref().unwrap().p, fresh.p);
         s.stats.packets_lost += 2; // genuine post-resume loss
@@ -8092,7 +11222,7 @@ mod byte_fair_packing_tests {
     #[test]
     fn unequal_whole_message_sizes_get_equal_byte_service_and_fifo() {
         for n in [2, 3] {
-            let mut s = SendQueues::new(n, (1_000_000, 16<<20, 16<<20));
+            let mut s = SendQueues::baseline_for_test(n, (1_000_000, 16<<20, 16<<20));
             for q in 0..n {
                 let len = [80, 1000, 400][q];
                 s.submit_messages(q, (0..10000u32).map(|i| {
@@ -8130,8 +11260,8 @@ mod byte_fair_packing_tests {
     }
     #[test]
     fn cross_queue_packed_small_sources_are_not_retained_or_rescued() {
-        let mut s = SendQueues::new(2, (1_000_000, 10000, 10000));
-        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0));
+        let mut s = SendQueues::baseline_for_test(2, (1_000_000, 10000, 10000));
+        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::baseline_for_test(crate::ship::FEC, 0));
         for q in 0..2 { s.submit_messages(q, vec![vec![q as u8;80];7]); }
         let mut p = [0;1162]; s.fec_prepare_packet(0); s.fill_packet(&mut p);
         let f = frames(&p); assert_eq!(f.len(),14);
@@ -8143,8 +11273,8 @@ mod byte_fair_packing_tests {
     }
     #[test]
     fn mtu_growth_tail_can_carry_another_queues_whole_messages_without_reencoding() {
-        let mut s = SendQueues::new(2, (1_000_000, 1<<20, 1<<20));
-        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC,0));
+        let mut s = SendQueues::baseline_for_test(2, (1_000_000, 1<<20, 1<<20));
+        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::baseline_for_test(crate::ship::FEC,0));
         s.submit_messages(0,vec![vec![9;65536]]);
         s.fec_prepare_packet(0); s.fill_packet(&mut [0;1162]);
         assert_eq!(s.queues[0].fec_send_slot.as_ref().unwrap().block_bytes,1141);
@@ -8165,12 +11295,88 @@ mod uniform_udp_capture_tests {
     use std::sync::{Arc, Mutex, atomic::{AtomicBool, AtomicUsize, Ordering}};
     use std::time::{Duration, Instant};
 
+    #[test]
+    fn interleave_size_proof_child() {
+        let Ok(width) = std::env::var("STP_INTERLEAVE_SIZE_PROOF_CHILD") else { return; };
+        let width = width.parse::<usize>().unwrap();
+        assert!(matches!(width, 2 | 4));
+        // Explicit benchmark initialization in this isolated child process is
+        // essential: an environment variable alone never enables library width.
+        crate::fec_adapt::initialize_research_policy().unwrap();
+        assert_eq!(crate::fec_adapt::research_interleave_width(), width);
+        let queues = SendQueues::baseline_for_test(2, (1_000_000, 16 << 20, 16 << 20));
+        assert!(queues.queues.iter().all(|q| q.interleave_width == width));
+        drop(queues);
+        let peak = encrypted_size_proof(4);
+        assert_eq!(peak, width, "real network sender must overlap exactly the configured number of started ordinary contexts");
+        println!("UDP_SIZE_INTERLEAVE_PROOF initialized=P4 width={width} medium_messages=4 peak_started_ordinary_contexts={peak}");
+    }
+
+    fn interleave_size_proof_process(width: usize) {
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "stp::uniform_udp_capture_tests::interleave_size_proof_child", "--nocapture", "--test-threads=1"])
+            .env("STP_INTERLEAVE_SIZE_PROOF_CHILD", width.to_string())
+            .env("STP_P4_INTERLEAVE_WIDTH", width.to_string())
+            .env("STP_RACE_POLICY", "P4")
+            .output().unwrap();
+        print!("{}", String::from_utf8_lossy(&result.stdout));
+        eprint!("{}", String::from_utf8_lossy(&result.stderr));
+        assert!(result.status.success(), "P4 W{width} encrypted size proof failed");
+        assert!(String::from_utf8_lossy(&result.stdout).contains(&format!("UDP_SIZE_INTERLEAVE_PROOF initialized=P4 width={width} medium_messages=4")));
+    }
+
+    // Legacy policy startup is exercised by the four predecessor-feature full gates.
+    // This feature intentionally refuses those non-isolated policies before transport starts.
+    #[cfg(feature="research_target_validation")]
+    #[ignore = "historical predecessor-feature configuration, not frozen RC defaults"]
+    #[test]
+    fn interleave_w2_encrypted_udp_size_proof() { interleave_size_proof_process(2); }
+    // Legacy policy startup is exercised by the four predecessor-feature full gates.
+    // This feature intentionally refuses those non-isolated policies before transport starts.
+    #[cfg(feature="research_target_validation")]
+    #[ignore = "historical predecessor-feature configuration, not frozen RC defaults"]
+    #[test]
+    fn interleave_w4_encrypted_udp_size_proof() { interleave_size_proof_process(4); }
+
+    #[test]
+    fn slipstream_size_proof_child() {
+        let Ok(value) = std::env::var("STP_SLIPSTREAM_SIZE_PROOF_CHILD") else { return; };
+        let enabled = value == "1";
+        crate::fec_adapt::initialize_research_policy().unwrap();
+        assert_eq!(crate::fec_adapt::research_p4_configuration(), ("P4", 1, enabled, 0));
+        encrypted_size_proof_mode(1, Some(enabled));
+    }
+    // Legacy policy startup is exercised by the four predecessor-feature full gates.
+    // This feature intentionally refuses those non-isolated policies before transport starts.
+    #[cfg(feature="research_target_validation")]
+    #[ignore = "historical predecessor-feature configuration, not frozen RC defaults"]
+    #[test]
+    fn slipstream_off_on_encrypted_udp_size_and_real_following_lane_proof() {
+        for value in ["0", "1"] {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "stp::uniform_udp_capture_tests::slipstream_size_proof_child", "--nocapture", "--test-threads=1"])
+                .env("STP_SLIPSTREAM_SIZE_PROOF_CHILD", value)
+                .env("STP_P4_SLIPSTREAM", value).env("STP_P4_MEDIUM_BONUS_PERCENT", "0")
+                .env("STP_P4_INTERLEAVE_WIDTH", "1").env("STP_RACE_POLICY", "P4")
+                .output().unwrap();
+            print!("{}", String::from_utf8_lossy(&result.stdout));
+            eprint!("{}", String::from_utf8_lossy(&result.stderr));
+            assert!(result.status.success(), "slipstream={value} encrypted dynamic eligibility proof failed");
+            assert!(String::from_utf8_lossy(&result.stdout).contains("UDP_SIZE_SLIPSTREAM_PROOF"));
+        }
+    }
+
     /// A real UDP relay records every encrypted datagram from BOTH peers. It holds
     /// MTU discovery at 1204, then admits up to 1472, and later blackholes both
     /// directions. Send-site expectations are cross-checked against actual bytes,
     /// not just against payload construction or packet counters.
     #[test]
     fn every_encrypted_udp_datagram_has_only_current_tu_ack_or_mtu_probe_size() {
+        encrypted_size_proof(2);
+    }
+
+    fn encrypted_size_proof(medium_count: usize) -> usize { encrypted_size_proof_mode(medium_count, None) }
+    fn encrypted_size_proof_mode(medium_count: usize, slip: Option<bool>) -> usize {
         let port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
         let server_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let relay = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -8183,17 +11389,25 @@ mod uniform_udp_capture_tests {
         let (observed, stopping, blackholing, allowed) = (actual.clone(), stop.clone(), blackout.clone(), mtu.clone());
         let forwarder = std::thread::spawn(move || {
             let mut buf = [0; 10000]; let mut client_addr = None;
+            // Real 100ms feedback path for dynamic medium eligibility. No mock
+            // RTT/class override; both encrypted directions traverse this relay.
+            let delay = if slip.is_some() { Duration::from_millis(50) } else { Duration::ZERO };
+            let mut delayed = std::collections::VecDeque::new();
             while !stopping.load(Ordering::Acquire) {
                 match relay.recv_from(&mut buf) {
                     Ok((len, source)) => {
                         observed.lock().unwrap().push(buf[..len].to_vec());
                         let target = if source == server_addr { client_addr } else { client_addr = Some(source); Some(server_addr) };
                         if !blackholing.load(Ordering::Acquire) && len <= allowed.load(Ordering::Acquire) {
-                            if let Some(target) = target { relay.send_to(&buf[..len], target).unwrap(); }
+                            if let Some(target) = target { delayed.push_back((Instant::now() + delay, target, buf[..len].to_vec())); }
                         }
                     }
                     Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => (),
                     Err(e) => panic!("UDP capture relay: {e}"),
+                }
+                while delayed.front().is_some_and(|(at, _, _)| *at <= Instant::now()) {
+                    let (_, target, bytes) = delayed.pop_front().unwrap();
+                    relay.send_to(&bytes, target).unwrap();
                 }
             }
         });
@@ -8201,7 +11415,9 @@ mod uniform_udp_capture_tests {
         let server_key = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).unwrap();
         let address = STPAddress { ip: "127.0.0.1".parse::<std::net::Ipv4Addr>().unwrap().to_ipv6_mapped(), port: relay_port, magic1: server_key.magic1, key: server_key.public.clone() };
         let key = address.to_connection_key();
-        let options = || NetworkThreadOptions { send_queue_count: 2, datagram_log: Some(log.clone()), ..Default::default() };
+        let ordinary_started_peak = Arc::new(AtomicUsize::new(0));
+        let payload_log = Arc::new(Mutex::new(Vec::new()));
+        let options = || NetworkThreadOptions { send_queue_count: 2, datagram_log: Some(log.clone()), ordinary_started_peak: Some(ordinary_started_peak.clone()), encrypted_payload_log: slip.map(|_| payload_log.clone()), ..Default::default() };
         let mut server = new_network_thread_with_options(vec![server_key], port, Some(1000), (1_000_000, 16<<20, 16<<20), 16 << 20, options());
         let refused = Arc::new(Mutex::new(TestSendFailure { kind: Some("data"), remaining: 8, ..Default::default() }));
         let client_options = NetworkThreadOptions { send_failure: Some(refused.clone()), ..options() };
@@ -8209,8 +11425,10 @@ mod uniform_udp_capture_tests {
         server.join_on_drop = true; client.join_on_drop = true;
         let mut cw = service_connections(&client, NetworkThreadPush { initiate_connections: vec![address], ..Default::default() }).unwrap().current_connections;
         let mut sw = Vec::new(); let mut received = Vec::new();
+        let last_stats = std::cell::Cell::new(ConnectionStats::default());
         let poll = |cw: &mut Vec<(STPAddress,[u8;64])>, sw: &mut Vec<(STPAddress,[u8;64])>, received: &mut Vec<Vec<u8>>| {
             let c = service_connections(&client, NetworkThreadPush { wanted_connections: cw.clone(), ..Default::default() }).unwrap();
+            if let Some((_, stats)) = c.connection_stats.first() { last_stats.set(*stats); }
             let tu = c.connection_stats.first().map(|(_,s)| s.udp_payload_tu).unwrap_or(0);
             *cw = c.current_connections;
             let s = service_connections(&server, NetworkThreadPush { wanted_connections: sw.clone(), ..Default::default() }).unwrap();
@@ -8224,7 +11442,26 @@ mod uniform_udp_capture_tests {
             assert!(Instant::now() < deadline, "encrypted connection did not finish handshake");
             std::thread::sleep(Duration::from_millis(1));
         }
-        let mut messages = vec![(key,0,Dscp::BestEffort,vec![3;65536]);2];
+        let medium_len = if slip.is_some() {
+            // Obtain authenticated RTT feedback BEFORE selecting this fixture's
+            // dynamic medium size. No transport policy/class/RTT override.
+            service_connections(&client, NetworkThreadPush { wanted_connections: cw.clone(), send_unreliable: vec![(key,1,Dscp::BestEffort,vec![8;80])], ..Default::default() }).unwrap();
+            while last_stats.get().rtt_us == 0 || !received.iter().any(|m| m.as_slice() == [8;80]) {
+                poll(&mut cw,&mut sw,&mut received);
+                assert!(Instant::now() < deadline, "warmup must produce real RTT feedback");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            received.clear();
+            let st = last_stats.get();
+            let pps = st.cc_rate_upps.max(crate::ship::CC.initial_rate_upps) as f64 / 1_000_000.0;
+            let n = (st.rtt_us as f64 / 1e6 * pps * 0.75).ceil() as usize;
+            let len = n.max(8).saturating_sub(2) * 1141;
+            println!("SLIPSTREAM_SIZE_FIXTURE measured_rtt_us={} measured_cc_pps={pps} medium_len={len}", st.rtt_us);
+            len
+        } else { 65536 };
+        let extra_tiny = if slip.is_some() { 20 } else { 0 };
+        let mut messages = vec![(key,0,Dscp::BestEffort,vec![3;medium_len]);medium_count];
+        messages.extend(vec![(key,0,Dscp::BestEffort,vec![9;80]);extra_tiny]);
         messages.push((key,0,Dscp::BestEffort,vec![7;4<<20]));
         messages.extend(vec![(key,1,Dscp::BestEffort,vec![1;80]);20]);
         messages.extend(vec![(key,1,Dscp::BestEffort,vec![2;1000]);10]);
@@ -8233,14 +11470,14 @@ mod uniform_udp_capture_tests {
         let growth_time = Instant::now() + Duration::from_millis(200);
         while Instant::now() < growth_time { poll(&mut cw,&mut sw,&mut received); std::thread::sleep(Duration::from_millis(1)); }
         mtu.store(1472,Ordering::Release);
-        while received.len() < 34 {
+        while received.len() < 32 + medium_count + extra_tiny {
             poll(&mut cw,&mut sw,&mut received);
             assert!(Instant::now() < deadline, "mixed messages failed delivery: {}",received.len());
             std::thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(received.iter().filter(|m| m.len()==80 && m.iter().all(|&b| b==1)).count(),20);
         assert_eq!(received.iter().filter(|m| m.len()==1000 && m.iter().all(|&b| b==2)).count(),10);
-        assert_eq!(received.iter().filter(|m| m.len()==65536 && m.iter().all(|&b| b==3)).count(),2);
+        assert_eq!(received.iter().filter(|m| m.len()==medium_len && m.iter().all(|&b| b==3)).count(),medium_count);
         assert_eq!(received.iter().filter(|m| m.len()==4<<20 && m.iter().all(|&b| b==7)).count(),1);
         assert_eq!(received.iter().filter(|m| m.is_empty()).count(),1);
         // Timing/CPU load can drain the mixed train before a held MTU probe retries.
@@ -8293,7 +11530,45 @@ mod uniform_udp_capture_tests {
         assert_eq!(refused.attempts.len(), 8);
         assert!(refused.attempts.iter().all(|b| b == &refused.attempts[0]), "retry must preserve exact Noise ciphertext/nonce");
         assert!(sent.iter().any(|d| d.kind == "data" && d.bytes == refused.attempts[0]));
-        println!("UDP_SIZE_PROOF encrypted mixed=1x0B+20x80B+10x1000B+2x65536B+1x4MiB MTU=1204->1472 outage=3s idle=8s; every actual datagram matched send-site TU/ACK/probe expectation");
+        println!("UDP_SIZE_PROOF encrypted mixed=1x0B+20x80B+10x1000B+{medium_count}x{medium_len}B+1x4MiB+{extra_tiny}x80B-in-head-queue MTU=1204->1472 outage=3s idle=8s; every actual datagram matched send-site TU/ACK/probe expectation");
+        if let Some(enabled) = slip {
+            let mut order = Vec::new(); let mut packed_tiny = 0;
+            for (ciphertext, payload) in payload_log.lock().unwrap().iter() {
+                assert!(actual_packets.contains_key(ciphertext), "observed plaintext must correspond to an actual captured encrypted UDP datagram");
+                let mut cursor = 0; let mut tiny = 0;
+                while let Some((frame, used)) = read_frame(&payload[cursor..]) {
+                    match frame {
+                        WireFrame::Fec { segment: None, message_len, .. } if message_len == medium_len => order.push('M'),
+                        WireFrame::Fec { segment: Some(s), .. } if s.total == 4 << 20 => order.push('G'),
+                        WireFrame::Whole(data) if data == [9;80] => { tiny += 1; order.push('T'); },
+                        _ => (),
+                    }
+                    cursor += used;
+                }
+                packed_tiny = packed_tiny.max(tiny);
+            }
+            let first_giant = order.iter().position(|&v| v == 'G').expect("giant really sent");
+            let medium_after_giant = order[first_giant..].iter().any(|&v| v == 'M');
+            let stats = last_stats.get().slipstream;
+            println!("SLIPSTREAM_SIZE_ACTUAL {stats:?}; order_prefix={:?}", &order[..order.len().min(40)]);
+            assert!(packed_tiny >= 2, "several tiny FIFO followers packed in one real encrypted packet");
+            if enabled {
+                assert!(stats.heads_eligible > 0);
+                assert!(stats.follower_starts_segmented_giant > 0);
+                assert!(stats.follower_starts_tiny_whole_or_packed > 0);
+                assert!(medium_after_giant, "giant following stream must really overtake unfinished medium head");
+                assert!(order.windows(4).any(|w| w == ['M','G','M','G']), "actual packet alternation, not only configuration");
+                assert_eq!(stats.recursive_windows, 0);
+            } else {
+                assert_eq!(stats.heads_evaluated, 0);
+                assert_eq!(stats.follower_packets, 0);
+                assert!(!medium_after_giant, "off control remains serial");
+            }
+            assert_eq!(received.iter().filter(|m| m.as_slice() == [9;80]).count(), extra_tiny);
+            println!("UDP_SIZE_SLIPSTREAM_PROOF enabled={enabled} actual_medium_after_giant={medium_after_giant} packed_tiny={packed_tiny} eligible={} giant_followers={} tiny_followers={} min_rtt_ns={} fair_pps_min={}",
+                stats.heads_eligible, stats.follower_starts_segmented_giant, stats.follower_starts_tiny_whole_or_packed, stats.rtt_ns_min, stats.fair_share_pps_min);
+        }
+        ordinary_started_peak.load(Ordering::Relaxed)
     }
 }
 
@@ -8303,8 +11578,8 @@ use super::*;
 
 #[test]
 fn stalled_encoder_does_not_bank_service_credit() {
-    let mut s = SendQueues::new(2, (1_000_000, 32 << 20, 32 << 20));
-    s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0));
+    let mut s = SendQueues::baseline_for_test(2, (1_000_000, 32 << 20, 32 << 20));
+    s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::baseline_for_test(crate::ship::FEC, 0));
     s.submit_messages(0, vec![vec![0; 65536]]);
     let mut p = [0; 1162];
     s.fec_prepare_packet(0); assert_eq!(s.fill_packet(&mut p), 1162);
@@ -8348,8 +11623,8 @@ fn stalled_encoder_does_not_bank_service_credit() {
 #[test]
 fn multi_item_fec_plain_feedback_is_once_each() {
     for lost in [false,true] {
-    let mut s = SendQueues::new(2, (1_000_000, 32 << 20, 32 << 20));
-    s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0));
+    let mut s = SendQueues::baseline_for_test(2, (1_000_000, 32 << 20, 32 << 20));
+    s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::baseline_for_test(crate::ship::FEC, 0));
     s.submit_messages(0, vec![vec![0;65536]]);
     s.fec_prepare_packet(0); s.fill_packet(&mut [0;1162]);
     s.submit_messages(1, vec![vec![1;80];100]);
@@ -8373,7 +11648,7 @@ fn multi_item_fec_plain_feedback_is_once_each() {
 
 #[test]
 fn idle_join_and_clock_normalization_are_bounded() {
-    let mut s = SendQueues::new(2, (1_000_000, 32 << 20, 32 << 20));
+    let mut s = SendQueues::baseline_for_test(2, (1_000_000, 32 << 20, 32 << 20));
     s.submit_messages(0, vec![vec![0;80];20000]);
     let mut p = [0;1162];
     for seq in 0..100 {s.fec_prepare_packet(seq); s.fill_packet(&mut p);}
@@ -8399,7 +11674,7 @@ mod lazy_fec_segment_tests {
     #[test]
     fn segment_tail_policy_matches_actual_retained_unit_not_root_length() {
         // This regression exercises P0 retention/reliability, not the shipped P4 lifecycle.
-        let mut s = SendQueues::new(2, (1_000_000, 64<<20, 64<<20));
+        let mut s = SendQueues::baseline_for_test(2, (1_000_000, 64<<20, 64<<20));
         s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::reliability_for_test(crate::ship::FEC, 0));
         s.submit_messages(0, vec![vec![7; 50<<20]]);
         let mut packet = vec![0; 1450];
@@ -8430,7 +11705,7 @@ mod lazy_fec_segment_tests {
     fn lazy_group_plans_use_their_own_k_after_tu_growth() {
         // This regression exercises P0 retention/reliability, not the shipped P4 lifecycle.
         for learned_burst in [false, true] {
-            let mut s = SendQueues::new(1, (1_000_000, 16<<20, 16<<20));
+            let mut s = SendQueues::baseline_for_test(1, (1_000_000, 16<<20, 16<<20));
             let mut a = crate::fec_adapt::FecAdaptiveState::reliability_for_test(crate::ship::FEC, 0);
             if learned_burst {
                 // The measured trace contains 331 declared losses in a 2048-packet
@@ -8474,8 +11749,8 @@ mod lazy_fec_segment_tests {
 
     #[test]
     fn lazy_groups_pick_up_tu_growth_burst_loss_and_deliver_original_once() {
-        let mut s = SendQueues::new(1, (1_000_000, 16<<20, 16<<20));
-        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC,0));
+        let mut s = SendQueues::baseline_for_test(1, (1_000_000, 16<<20, 16<<20));
+        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::baseline_for_test(crate::ship::FEC,0));
         let original = vec![91; (4<<20)+123];
         s.submit_messages(0,vec![original.clone()]);
         let mut root = ReassemblySlot::new();
@@ -8650,8 +11925,8 @@ mod lazy_fec_segment_tests {
         for magic in [CONNECT_MAGIC1_PLAIN_TEXT, CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s] {
             let payload = ASSUMED_UDP_PAYLOAD_SIZE_WITH_GUARANTEED_DELIVERY
                 - total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(magic).unwrap();
-            let mut sender = SendQueues::new(1, (1_000_000, 1 << 20, 1 << 20));
-            sender.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0));
+            let mut sender = SendQueues::baseline_for_test(1, (1_000_000, 1 << 20, 1 << 20));
+            sender.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::baseline_for_test(crate::ship::FEC, 0));
             let mut packet = vec![0; payload];
             sender.submit_messages(0, vec![vec![7; payload - STP_WHOLE_HEADER_SIZE + 1]]);
             sender.fec_prepare_packet(0); assert!(sender.fill_packet(&mut packet) > 0);
@@ -8758,8 +12033,8 @@ mod lazy_fec_segment_tests {
 
     #[test]
     fn segmented_root_id_and_all_queue_ids_share_the_bounded_allocator() {
-        let mut s=SendQueues::new(2,(1_000_000,64<<20,64<<20));
-        s.fec_adaptive=Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC,0));
+        let mut s=SendQueues::baseline_for_test(2,(1_000_000,64<<20,64<<20));
+        s.fec_adaptive=Some(crate::fec_adapt::FecAdaptiveState::baseline_for_test(crate::ship::FEC,0));
         s.submit_messages(0,vec![vec![4;4<<20]]);
         let mut p=vec![0;1162]; s.fec_prepare_packet(0); assert!(s.fill_packet(&mut p)>0);
         let f=s.queues[0].fec_send_slot.as_ref().unwrap();
@@ -8898,8 +12173,8 @@ mod lazy_fec_segment_tests {
     #[test]
     fn near_tu_whole_messages_use_three_byte_frame_not_fec() {
         for len in 1146..=1158 {
-            let mut s=SendQueues::new(1,(1_000_000,1<<20,1<<20));
-            s.fec_adaptive=Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC,0));
+            let mut s=SendQueues::baseline_for_test(1,(1_000_000,1<<20,1<<20));
+            s.fec_adaptive=Some(crate::fec_adapt::FecAdaptiveState::baseline_for_test(crate::ship::FEC,0));
             s.submit_messages(0,vec![vec![8;len]]);
             let mut p=vec![0;1162]; s.fec_prepare_packet(0);
             assert_eq!(s.fill_packet(&mut p),1162);
@@ -9173,7 +12448,7 @@ mod local_backpressure_tests {
         for kind in [PendingSendKind::Data, PendingSendKind::MtuProbe,
             PendingSendKind::Keepalive, PendingSendKind::Outage] {
             let mut s = state();
-            let mut b = SendQueues::new(1, (1_000_000, 8<<20, 8<<20));
+            let mut b = SendQueues::baseline_for_test(1, (1_000_000, 8<<20, 8<<20));
             let bytes = vec![7; 1184];
             let plain = vec![8; 1162];
             let ack_nonce = s.send_ack_sequence_number;
@@ -9251,7 +12526,7 @@ mod local_backpressure_tests {
     #[test]
     fn refused_outage_probe_does_not_preadvance_backoff() {
         let mut s = state();
-        let mut b = SendQueues::new(1, (1_000_000, 8<<20, 8<<20));
+        let mut b = SendQueues::baseline_for_test(1, (1_000_000, 8<<20, 8<<20));
         s.outage.enter(1_000_000_000, 1_000_000_000);
         assert!(s.outage.probe_due(1_000_000_000));
         assert!(!finish_connected_send(&mut s, &mut b, PendingSendKind::Outage, None,
@@ -9278,7 +12553,7 @@ mod local_backpressure_tests {
         let mut sender = a.into_stateless_transport_mode().unwrap();
         let receiver = b.into_stateless_transport_mode().unwrap();
         let mut s = state();
-        let mut queues = SendQueues::new(1, (1_000_000, 8<<20, 8<<20));
+        let mut queues = SendQueues::baseline_for_test(1, (1_000_000, 8<<20, 8<<20));
         s.ack_receiver.receive(0, 2_000_000_000, false, &mut s.ack_timer);
         let original_nonce = s.send_ack_sequence_number;
         let first = s.ack_receiver.ack(2_001_000_000).encode();
@@ -9353,8 +12628,8 @@ mod local_backpressure_tests {
     #[test]
     fn refused_data_keeps_original_fec_tags_until_success() {
         let mut s = state();
-        let mut b = SendQueues::new(1, (1_000_000, 8<<20, 8<<20));
-        b.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 1_000_000_000));
+        let mut b = SendQueues::baseline_for_test(1, (1_000_000, 8<<20, 8<<20));
+        b.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::baseline_for_test(crate::ship::FEC, 1_000_000_000));
         b.submit_messages(0, vec![vec![7; 3<<20]]);
         b.fec_prepare_packet(0);
         let mut plain = vec![0; 1162];
@@ -9387,7 +12662,7 @@ use crate::fec_adapt::{FecAdaptiveState, RepairPolicy};
 
 fn buffer(policy: RepairPolicy) -> UnreliableSendBuffer {
     let mut b = UnreliableSendBuffer::new(1_000_000, 1_000_000, 1_000_000);
-    let mut a = FecAdaptiveState::new(crate::ship::FEC, 0);
+    let mut a = FecAdaptiveState::baseline_for_test(crate::ship::FEC, 0);
     a.policy = policy;
     a.p = 0.02;
     b.fec_adaptive = Some(a);
@@ -9467,8 +12742,8 @@ mod race_expiry_block_tests {
     #[test]
     fn retention_expires_while_locally_refused_ciphertext_remains_pending() {
         for policy in [RepairPolicy::MeanTopup, RepairPolicy::Streaming] {
-            let mut q = SendQueues::new(1, (1000000, 1000000, 1000000));
-            let mut a = FecAdaptiveState::new(crate::ship::FEC, 0);
+            let mut q = SendQueues::baseline_for_test(1, (1000000, 1000000, 1000000));
+            let mut a = FecAdaptiveState::baseline_for_test(crate::ship::FEC, 0);
             a.policy = policy; a.p = 0.02; q.fec_adaptive = Some(a);
             q.submit_messages(0, vec![vec![7;1433*20], vec![8;1433*20]]);
             let mut seq = 0;
@@ -9515,7 +12790,7 @@ use super::*;
 #[test]
 fn review_p0_retention_must_survive_outage_send_ticks() {
         // This regression exercises P0 retention/reliability, not the shipped P4 lifecycle.
-    let mut b = SendQueues::new(1, (100000, 1000000, 1000000));
+    let mut b = SendQueues::baseline_for_test(1, (100000, 1000000, 1000000));
     b.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::reliability_for_test(crate::ship::FEC, 1_000_000_000));
     let ConnectionState::Connected(mut s) = new_connection_state_connected(None, 0, 1, 1_000_000_000) else { unreachable!() };
     s.stats.cc_rate_upps = 100_000_000;
@@ -9551,8 +12826,8 @@ mod race_outage_pause_tests {
     fn mean_policy_retained_and_active_topups_pause_during_outage_without_renewal() {
         for policy in [RepairPolicy::MeanTopup, RepairPolicy::Streaming] {
             for active in [false, true] {
-                let mut b = SendQueues::new(1, (1000000,1000000,1000000));
-                let mut a = FecAdaptiveState::new(crate::ship::FEC, 1_000_000_000);
+                let mut b = SendQueues::baseline_for_test(1, (1000000,1000000,1000000));
+                let mut a = FecAdaptiveState::baseline_for_test(crate::ship::FEC, 1_000_000_000);
                 a.policy = policy; a.p = 0.02; b.fec_adaptive = Some(a);
                 b.set_time(1_000_000_000, 100_000_000);
                 b.submit_messages(0,vec![vec![7;1433*20]]);
@@ -9594,7 +12869,7 @@ mod race_outage_pause_tests {
 #[cfg(test)]
 mod fill_rule_tests {
     use super::*;
-    fn sender(n: usize) -> SendQueues { SendQueues::new(n, (1_000_000, 16<<20, 16<<20)) }
+    fn sender(n: usize) -> SendQueues { SendQueues::baseline_for_test(n, (1_000_000, 16<<20, 16<<20)) }
     fn emit(s: &mut SendQueues, seq: u64) -> [u8;1449] {
         s.fec_prepare_packet(seq); let mut p = [0;1449];
         assert_eq!(s.fill_packet(&mut p), p.len()); p
@@ -9673,7 +12948,7 @@ mod fill_rule_tests {
     #[test]
     fn sole_fillable_indebted_queue_uses_otherwise_unusable_gap() {
         let mut s = sender(2);
-        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC,0));
+        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::baseline_for_test(crate::ship::FEC,0));
         s.submit_messages(0,vec![vec![9;65536]]);
         s.fec_prepare_packet(0); s.fill_packet(&mut [0;1162]);
         s.submit_messages(1,vec![vec![1;80];100]);
@@ -9704,7 +12979,7 @@ mod fill_rule_tests {
     #[test]
     fn large_symbols_are_never_gap_fillers_even_when_they_fit() {
         let mut s = sender(2);
-        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC,0));
+        s.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::baseline_for_test(crate::ship::FEC,0));
         s.submit_messages(1, vec![vec![9;65536]]);
         s.fec_prepare_packet(0); s.fill_packet(&mut [0;1162]);
         let before = s.queues[1].fec_send_slot.as_ref().unwrap().next_id;
@@ -9733,7 +13008,7 @@ mod fill_rule_tests {
     #[test]
     fn chopped_small_requires_both_packets_and_is_never_retried() {
         let mut s=sender(1);
-        s.fec_adaptive=Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC,0));
+        s.fec_adaptive=Some(crate::fec_adapt::FecAdaptiveState::baseline_for_test(crate::ship::FEC,0));
         s.submit_messages(0,vec![vec![0;1000],vec![7;1000]]);
         let p0=emit(&mut s,0); let p1=emit(&mut s,1);
         let a=heads(&p0).pop().unwrap(); let b=heads(&p1).remove(0);
@@ -9760,7 +13035,7 @@ mod fill_rule_tests {
 mod wire_v2_tests {
     use super::*;
 
-    fn ciphers() -> (ConnectionCipherTriplet, ConnectionCipherTriplet) {
+    pub(super) fn ciphers() -> (ConnectionCipherTriplet, ConnectionCipherTriplet) {
         let params: snow::params::NoiseParams = "Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
         let ka = snow::Builder::new(params.clone()).generate_keypair().unwrap();
         let kb = snow::Builder::new(params.clone()).generate_keypair().unwrap();
@@ -10005,7 +13280,7 @@ mod wire_v2_tests {
         let workers = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         assert!(fec_receive_block(&mut fec[0], ConnectionKey::default(), 0,
             2272, 1136, 0, &[3; 1136], &tx, &workers, &budget).is_none());
-        assert!(matches!(fec[0].state, FecRecvState::Inline(_)));
+        assert!(matches!(fec[0].state, FecRecvState::SourceOnly(_)));
         let grace = fec_inactive_grace_ns(0, false);
         fec[0].last_block_ns = 10;
         assert_eq!(retire_inactive_fec_workers(&mut fec, grace + 10, grace, false), 0);
@@ -10174,7 +13449,7 @@ mod wire_v2_tests {
         for kind in [PendingSendKind::Data, PendingSendKind::Keepalive, PendingSendKind::Outage] {
             let ConnectionState::Connected(mut state) = new_connection_state_connected(
                 None, CONNECT_MAGIC1_PLAIN_TEXT, MAGIC2_APP_CROSSLINK, 1_000_000_000) else { unreachable!() };
-            let mut queues = SendQueues::new(1, (1_000_000, 1 << 20, 1 << 20));
+            let mut queues = SendQueues::baseline_for_test(1, (1_000_000, 1 << 20, 1 << 20));
             let bytes = vec![0; state.current_tu as usize];
             assert!(!finish_connected_send(&mut state, &mut queues, kind,
                 None, 1_000_000_000, &bytes, &[], Dscp::Af21, 0, None));
@@ -10260,7 +13535,7 @@ mod wire_v2_tests {
         assert!(!receiver.ratchet_forward_incoming());
         let ConnectionState::Connected(mut state) = new_connection_state_connected(
             None, CONNECT_MAGIC1_PLAIN_TEXT, MAGIC2_APP_CROSSLINK, 1) else { unreachable!() };
-        let queues = SendQueues::new(1, (1_000_000, 1 << 20, 1 << 20));
+        let queues = SendQueues::baseline_for_test(1, (1_000_000, 1 << 20, 1 << 20));
         state.send_ack_sequence_number = u64::MAX - 1;
         assert_eq!(state.reserve_ack_nonce(), Some(u64::MAX - 1));
         assert_eq!(state.reserve_ack_nonce(), None);
@@ -10284,7 +13559,7 @@ mod p4_tests {
 
     fn buffer(policy: RepairPolicy, p: f64) -> UnreliableSendBuffer {
         let mut b = UnreliableSendBuffer::new(0, 16 << 20, 16 << 20);
-        let mut a = FecAdaptiveState::new(crate::ship::FEC, 0);
+        let mut a = FecAdaptiveState::baseline_for_test(crate::ship::FEC, 0);
         a.policy = policy;
         a.p = p;
         b.fec_adaptive = Some(a);
@@ -10320,6 +13595,426 @@ mod p4_tests {
         assert_eq!(b.rescue_ready_count, 0);
         assert!(b.fec_send_slot.is_none() && b.fec_suspended.is_none());
         assert_eq!(*b.retention_quota.used.lock().unwrap(), (0, 0));
+    }
+
+    // ---- p4-event-repair (RESEARCH) ----
+    fn ev_emit(b: &mut UnreliableSendBuffer, seq: &mut u64) -> Option<(u64, u32, Option<FecSegment>)> {
+        let s0 = *seq;
+        let r = emit(b, seq);
+        if r.is_some() { b.fec_commit_marks(s0, EV_T + s0 * 0x400000 + 1); }
+        r
+    }
+    // Commit of seq s at EV_T + s*bucket + 1 ns; its send-history time is EV_T + s*bucket (production quantization).
+    const EV_T: u64 = 1_000 * 0x400000;
+    fn ev(kind: u8, seq: u64) -> AcceptedCcEvent {
+        AcceptedCcEvent { kind, evidence_seq: seq, evidence_sent_ns: send_history_time_ns(EV_T + seq * 0x400000 + 1), feedback_ns: EV_T + (seq + 9) * 0x400000 }
+    }
+    fn ev_drain(b: &mut UnreliableSendBuffer, seq: &mut u64) {
+        for _ in 0..20000 { if ev_emit(b, seq).is_none() && !b.has_unsent_data() { return; } }
+        panic!("sender did not drain");
+    }
+    const EV_BLOCK: usize = 1449 - STP_FEC_FRAGMENT_HEADER_SIZE;
+
+    #[test]
+    fn event_repair_q0_is_wire_and_plan_identical_to_untouched_baseline() {
+        let run = |deliver: bool| {
+            let mut b = buffer(RepairPolicy::MessageBound, 0.05);
+            assert_eq!(b.event_repair_q, 0);
+            b.submit_messages(vec![vec![7; EV_BLOCK * 300], vec![8; 3 << 20], vec![9; EV_BLOCK * 40]]);
+            let (mut seq, mut out) = (0u64, Vec::new());
+            for i in 0..20000 {
+                let s0 = seq;
+                match ev_emit(&mut b, &mut seq) { Some(x) => out.push(x), None if !b.has_unsent_data() => break, None => {} }
+                if i % 37 == 5 { b.fec_on_packet_finalized(s0, true); }
+                if deliver && i % 50 == 20 { b.p4_event_repair(&ev(CC_EVENT_EARLY, s0)); }
+            }
+            assert!(b.commit_marks.is_empty(), "every prepared mark was consumed at commit");
+            (out, b.event_info())
+        };
+        let (base, info0) = run(false);
+        let (with, info) = run(true);
+        assert_eq!(base, with, "q=0: delivering accepted events changes nothing on the wire");
+        assert!(info0.repairs_emitted > 0, "total actual repairs observed in the baseline too");
+        assert_eq!(EventRepairInfo { repairs_emitted: 0, ..info0 }, EventRepairInfo::default());
+        assert!(info.accepted_early > 0);
+        assert_eq!(EventRepairInfo { accepted_early: 0, ..info }, info0);
+    }
+
+    #[test]
+    fn event_repair_grants_once_ceil_qk_after_first_source_commit_and_emits_all() {
+        for (q, b_g) in [(5u32, 5u32), (10, 10)] {
+            let mut b = buffer(RepairPolicy::MessageBound, 0.0);
+            b.event_repair_q = q;
+            b.submit_messages(vec![vec![7; EV_BLOCK * 100]]);
+            let mut seq = 0;
+            for _ in 0..10 { ev_emit(&mut b, &mut seq); }
+            let f = b.fec_send_slot.as_ref().unwrap();
+            assert_eq!((f.k, f.n, f.repair_accounting.first_source_commit), (100, 102, Some((0, EV_T + 1))));
+            b.p4_event_repair(&ev(CC_EVENT_CE, 5));
+            let f = b.fec_send_slot.as_ref().unwrap();
+            assert_eq!(f.repair_accounting.event_bonus, vec![b_g]);
+            let n = f.n;
+            assert!(n >= 100 + 2 + b_g, "{n}");
+            assert_eq!(f.repair_accounting.event_ids, vec![(102, n)]);
+            assert_eq!(b.event_info().planned, (n - 102) as u64);
+            assert_eq!((b.event_repair.roots_granted, b.event_repair.slots_granted, b.event_repair.grant_symbols), (1, 1, b_g as u64));
+            // One-shot: later accepted events of the same root grant nothing more.
+            b.p4_event_repair(&ev(CC_EVENT_EARLY, 9));
+            b.p4_event_repair(&ev(CC_EVENT_TIMEOUT, 9));
+            assert_eq!(b.fec_send_slot.as_ref().unwrap().n, n);
+            assert_eq!(b.event_repair.skip_latched, 2);
+            ev_drain(&mut b, &mut seq);
+            assert_eq!(seq, n as u64, "no other losses: exactly the event-extended plan is sent");
+            assert_eq!(b.event_repair.emitted, b.event_info().planned);
+            assert_eq!(b.event_repair.marks_abandoned, 0);
+            assert!(!b.p4_open && !b.event_root_latched, "seal resets the root latch");
+        }
+    }
+
+    #[test]
+    fn event_repair_later_refreshes_reach_public_planned_and_total_repairs() {
+        let mut b = buffer(RepairPolicy::MessageBound, 0.0);
+        b.event_repair_q = 10;
+        b.submit_messages(vec![vec![7; EV_BLOCK * 100]]);
+        let mut seq = 0;
+        for _ in 0..10 { ev_emit(&mut b, &mut seq); }
+        b.p4_event_repair(&ev(CC_EVENT_CE, 9));
+        for lost in 0..10 { b.fec_on_packet_finalized(lost, true); }
+        let f = b.fec_send_slot.as_ref().unwrap();
+        assert_eq!(f.repair_accounting.event_planned as u64, b.event_info().planned, "every refresh reaches the public total");
+        ev_drain(&mut b, &mut seq);
+        let i = b.event_info();
+        assert_eq!(i.emitted, i.planned);
+        assert_eq!(i.repairs_emitted, seq - 100, "total committed repairs regardless of attribution");
+        assert_eq!(i.ids_overflow, 0);
+    }
+
+    #[test]
+    fn event_repair_accepted_ce_before_last_repair_extends_in_same_tick() {
+        // Reviewer-81 schedule: K20,next21,n22; prepare, accepted CE, then fill+commit in the same tick.
+        let ConnectionState::Connected(mut s) = new_connection_state_connected(None, 0, 1, 1_000_000_000) else { unreachable!() };
+        s.RTT_mean = 1000;
+        let mut b = SendQueues::baseline_for_test(1, (0, 16 << 20, 16 << 20));
+        let mut a = FecAdaptiveState::baseline_for_test(crate::ship::FEC, 0);
+        a.policy = RepairPolicy::MessageBound;
+        a.p = 0.0;
+        b.fec_adaptive = Some(a);
+        b.queues[0].event_repair_q = 10;
+        b.queues[0].submit_messages(vec![vec![7; EV_BLOCK * 20]]);
+        let mut p = vec![0u8; 1449];
+        for i in 0..21 {
+            b.fec_prepare_packet(s.send_sequence_number);
+            assert!(b.fill_packet(&mut p) > 0);
+            commit_connected_send(&mut s, &mut b, PendingSendKind::Data, 1_000_000_000 + i * 1_000_000, 1449, &p, 0, None);
+        }
+        let f = b.queues[0].fec_send_slot.as_ref().unwrap();
+        assert_eq!((f.k, f.next_id, f.n), (20, 21, 22));
+        prepare_connected_send_tick(&mut s, &mut b, 2_000_000_000);
+        s.congestion_event_time_ns = 0;
+        s.ecn_congestion_received = true;
+        s.ecn_oldest_seq = 20;
+        s.ecn_oldest_send_time = 1_020_000_000;
+        assert!(apply_ecn_congestion(&mut s, 2_000_000_000, &crate::ship::CC, None));
+        accept_cc_event(&mut s, &mut b, AcceptedCcEvent { kind: CC_EVENT_CE, evidence_seq: 20, evidence_sent_ns: 1_020_000_000, feedback_ns: 2_000_000_000 });
+        assert_eq!(b.queues[0].event_repair.roots_granted, 1, "{:?}", b.queues[0].event_repair);
+        let n = b.queues[0].fec_send_slot.as_ref().unwrap().n;
+        assert_eq!(n, 20 + 2 + 2, "B = ceil(10% of 20) = 2 extends the live root before the last repair is formed");
+        for i in 0..3 {
+            b.fec_prepare_packet(s.send_sequence_number);
+            assert!(b.fill_packet(&mut p) > 0);
+            commit_connected_send(&mut s, &mut b, PendingSendKind::Data, 2_000_000_001 + i, 1449, &p, 0, None);
+        }
+        let info = b.queues[0].event_info();
+        assert_eq!((info.planned, info.emitted, info.repairs_emitted), (2, 2, 4));
+    }
+
+    #[test]
+    fn event_repair_own_first_source_anchor_uses_production_history_resolution() {
+        let ConnectionState::Connected(mut s) = new_connection_state_connected(None, 0, 1, 1_000_000_000) else { unreachable!() };
+        s.RTT_mean = 1000;
+        let mut b = SendQueues::baseline_for_test(1, (0, 16 << 20, 16 << 20));
+        let mut a = FecAdaptiveState::baseline_for_test(crate::ship::FEC, 0);
+        a.policy = RepairPolicy::MessageBound;
+        b.fec_adaptive = Some(a);
+        b.queues[0].event_repair_q = 10;
+        b.queues[0].submit_messages(vec![vec![7; EV_BLOCK * 20]]);
+        let mut p = vec![0u8; 1449];
+        b.fec_prepare_packet(s.send_sequence_number);
+        assert!(b.fill_packet(&mut p) > 0);
+        commit_connected_send(&mut s, &mut b, PendingSendKind::Data, 1_000_000_001, 1449, &p, 0, None);
+        let anchor = s.send_time(0);
+        assert_eq!(anchor, send_history_time_ns(1_000_000_001), "helper == production encode/decode");
+        assert!(anchor < 1_000_000_001);
+        // Evidence one bucket earlier never qualifies; a later sequence is never pulled forward.
+        b.fec_event_repair(&AcceptedCcEvent { kind: CC_EVENT_CE, evidence_seq: 0, evidence_sent_ns: anchor - 1, feedback_ns: 2_000_000_000 });
+        assert_eq!(b.queues[0].event_repair.skip_unexposed, 1);
+        // The slot's own first packet as the CE anchor (real history time) qualifies.
+        accept_cc_event(&mut s, &mut b, AcceptedCcEvent { kind: CC_EVENT_CE, evidence_seq: 0, evidence_sent_ns: anchor, feedback_ns: 2_000_000_000 });
+        assert_eq!(b.queues[0].event_repair.roots_granted, 1);
+    }
+
+    #[test]
+    fn event_repair_counter_merge_latches_overflow() {
+        let mut x = EventRepairInfo { emitted: u64::MAX - 1, ..Default::default() };
+        x.merge(EventRepairInfo { emitted: 1, ..Default::default() });
+        assert_eq!(x.counter_overflow, 0);
+        x.merge(EventRepairInfo { emitted: 1, ..Default::default() });
+        assert_eq!((x.emitted, x.counter_overflow), (u64::MAX, 1));
+        x.merge(EventRepairInfo::default());
+        assert_eq!(x.counter_overflow, 1, "latched");
+    }
+
+    #[test]
+    fn event_repair_missing_send_history_keeps_cc_cut_but_publishes_no_exposure() {
+        let ConnectionState::Connected(mut s) = new_connection_state_connected(None, 0, 1, 1) else { unreachable!() };
+        s.RTT_mean = 1000;
+        // Baseline CC fallback (now - 4.295 s) still cuts ...
+        assert!(apply_loss_congestion(&mut s, 10_000_000_000u64 - 4_295_000_000, 10_000_000_000, &crate::ship::CC, None));
+        // ... but the unknown ORIGINAL history (0) / MAX is never evidence.
+        for sent in [0, u64::MAX] {
+            push_accepted_cc_event(&mut s, AcceptedCcEvent { kind: CC_EVENT_TIMEOUT, evidence_seq: 7, evidence_sent_ns: sent, feedback_ns: 10_000_000_000 });
+        }
+        assert!(s.accepted_cc_events.is_empty());
+        assert_eq!((s.accepted_cc_missing_anchor, s.accepted_cc_dropped), (2, 0));
+    }
+
+    // ---- Independent review tests (session 81, p4-event-repair-review/INDEPENDENT_TESTS.rs; ADAPTED lines marked) ----
+    #[test]
+    fn independent_event_review_accepted_ce_before_last_repair_must_extend_in_same_tick() {
+        let ConnectionState::Connected(mut s) = new_connection_state_connected(None, 0, 1, 1_000_000_000) else { unreachable!() };
+        s.RTT_mean = 1000; // 100 ms established RTT
+        let mut b = SendQueues::baseline_for_test(1, (0, 16 << 20, 16 << 20));
+        let mut a = FecAdaptiveState::baseline_for_test(crate::ship::FEC, 0);
+        a.policy = RepairPolicy::MessageBound;
+        a.p = 0.0;
+        b.fec_adaptive = Some(a);
+        b.queues[0].event_repair_q = 10;
+        b.queues[0].submit_messages(vec![vec![7; EV_BLOCK * 20]]);
+        let mut p = vec![0u8; 1449];
+        // Ordinary send-loop framing and commit: leave precisely the last repair.
+        for i in 0..21 {
+            b.fec_prepare_packet(s.send_sequence_number);
+            assert!(b.fill_packet(&mut p) > 0);
+            commit_connected_send(&mut s, &mut b, PendingSendKind::Data, 1_000_000_000 + i * 1_000_000, 1449, &p, 0, None);
+        }
+        let f = b.queues[0].fec_send_slot.as_ref().unwrap();
+        assert_eq!((f.k, f.next_id, f.n), (20, 21, 22));
+        // This is the production tick order: prepare, accepted CE, data fill+commit.
+        prepare_connected_send_tick(&mut s, &mut b, 2_000_000_000);
+        s.congestion_event_time_ns = 0; // earlier accepted-cut origin, outside the guard
+        s.ecn_congestion_received = true;
+        s.ecn_oldest_seq = 20;
+        s.ecn_oldest_send_time = 1_020_000_000;
+        assert!(apply_ecn_congestion(&mut s, 2_000_000_000, &crate::ship::CC, None));
+        let e = AcceptedCcEvent { kind: CC_EVENT_CE, evidence_seq: 20, evidence_sent_ns: 1_020_000_000, feedback_ns: 2_000_000_000 };
+        accept_cc_event(&mut s, &mut b, e); // ADAPTED: production CE/timeout sites now call accept_cc_event (push + synchronous drain)
+        b.fec_prepare_packet(s.send_sequence_number);
+        assert!(b.fill_packet(&mut p) > 0);
+        commit_connected_send(&mut s, &mut b, PendingSendKind::Data, 2_000_000_001, 1449, &p, 0, None);
+        prepare_connected_send_tick(&mut s, &mut b, 2_001_000_000);
+        assert_eq!(b.queues[0].event_repair.roots_granted, 1,
+            "accepted live-root CE was deferred past last repair: {:?}", b.queues[0].event_repair);
+    }
+
+    #[test]
+    fn independent_event_review_later_refresh_planned_counter_matches_emitted() {
+        let mut b = buffer(RepairPolicy::MessageBound, 0.0);
+        b.event_repair_q = 10;
+        b.submit_messages(vec![vec![7; EV_BLOCK * 100]]);
+        let mut seq = 0;
+        for _ in 0..10 { ev_emit(&mut b, &mut seq); }
+        b.p4_event_repair(&ev(CC_EVENT_CE, 9));
+        for lost in 0..10 { b.fec_on_packet_finalized(lost, true); }
+        let f = b.fec_send_slot.as_ref().unwrap();
+        assert_eq!(f.repair_accounting.event_planned, b.event_info().planned as u32, // ADAPTED: public accessor
+            "refresh grew ordinal attribution without updating public planned total");
+        ev_drain(&mut b, &mut seq);
+        assert_eq!(b.event_info().emitted, b.event_info().planned); // ADAPTED: public accessor
+    }
+
+    #[test]
+    fn independent_event_review_no_event_e5_e10_match_e0_plain_coded_segmented() {
+        let run = |q| {
+            let mut b = buffer(RepairPolicy::MessageBound, 0.05);
+            b.event_repair_q = q;
+            b.submit_messages(vec![vec![1; 100], vec![7; EV_BLOCK * 30], vec![8; 3 << 20]]);
+            let (mut seq, mut out) = (0, Vec::new());
+            for i in 0..20000 {
+                let old = seq;
+                match ev_emit(&mut b, &mut seq) {
+                    Some(x) => out.push(x),
+                    None if !b.has_unsent_data() => break,
+                    None => {},
+                }
+                if i % 37 == 5 { b.fec_on_packet_finalized(old, true); }
+            }
+            assert!(!b.has_unsent_data());
+            // ADAPTED: repairs_emitted is now an all-arm observation counter (total actual repairs), else all zero.
+            assert_eq!(EventRepairInfo { repairs_emitted: 0, ..b.event_info() }, EventRepairInfo::default());
+            out
+        };
+        let e0 = run(0);
+        assert_eq!(run(5), e0);
+        assert_eq!(run(10), e0);
+    }
+
+    #[test]
+    fn independent_event_review_pending_first_source_commit_and_ciphertext_freeze() {
+        let ConnectionState::Connected(mut s) = new_connection_state_connected(None, 0, 1, 1_000_000_000) else { unreachable!() };
+        let mut b = SendQueues::baseline_for_test(1, (0, 16 << 20, 16 << 20));
+        let mut a = FecAdaptiveState::baseline_for_test(crate::ship::FEC, 0);
+        a.policy = RepairPolicy::MessageBound;
+        a.p = 0.0;
+        b.fec_adaptive = Some(a);
+        b.queues[0].event_repair_q = 10;
+        b.queues[0].submit_messages(vec![vec![7; EV_BLOCK * 20]]);
+        b.fec_prepare_packet(0);
+        let mut p = vec![0; 1449];
+        assert!(b.fill_packet(&mut p) > 0);
+        let cipher = vec![0xa5; 1500];
+        assert!(!finish_connected_send(&mut s, &mut b, PendingSendKind::Data, None, 1_000_000_000, &cipher, &p, Dscp::BestEffort, 0, None));
+        assert_eq!(b.queues[0].fec_send_slot.as_ref().unwrap().repair_accounting.first_source_commit, None);
+        let e = AcceptedCcEvent { kind: CC_EVENT_EARLY, evidence_seq: 0, evidence_sent_ns: 1_100_000_000, feedback_ns: 1_200_000_000 };
+        b.fec_event_repair(&e);
+        assert_eq!(b.queues[0].event_repair.roots_granted, 0);
+        assert_eq!(s.pending_send.as_ref().unwrap().bytes, cipher);
+        assert_eq!(s.pending_send.as_ref().unwrap().plaintext, p);
+        prepare_connected_send_tick(&mut s, &mut b, 1_200_000_000);
+        let pending = s.pending_send.take().unwrap();
+        #[cfg(feature = "research_cohort_observer")]
+        {
+            crate::cohort_observe::udp_send_full(&pending.bytes);
+            crate::cohort_observe::observe_commit(pending.kind as usize, &pending.bytes);
+        }
+        commit_connected_send(&mut s, &mut b, pending.kind, 1_300_000_000, pending.bytes.len(), &pending.plaintext, 0, None);
+        assert_eq!(b.queues[0].fec_send_slot.as_ref().unwrap().repair_accounting.first_source_commit, Some((0, 1_300_000_000)));
+        b.fec_event_repair(&e); // Same-seq but older send evidence must still fail.
+        assert_eq!(b.queues[0].event_repair.roots_granted, 0);
+        b.fec_event_repair(&AcceptedCcEvent { evidence_sent_ns: 1_300_000_000, feedback_ns: 1_400_000_000, ..e });
+        assert_eq!(b.queues[0].event_repair.roots_granted, 1);
+        assert_eq!(pending.bytes, cipher);
+    }
+
+    #[test]
+    fn independent_event_review_pmtu_replacement_keeps_root_latch_not_slot_bonus() {
+        let mut b = buffer(RepairPolicy::MessageBound, 0.0);
+        b.event_repair_q = 10;
+        b.submit_messages(vec![vec![7; EV_BLOCK * 100]]);
+        let mut seq = 0;
+        for _ in 0..5 { ev_emit(&mut b, &mut seq); }
+        b.p4_event_repair(&ev(CC_EVENT_CE, 4));
+        assert!(b.event_root_latched);
+        let old_package = b.send_package_id;
+        b.fec_prepare_packet(seq);
+        assert!(matches!(b.next_fragment(800, 800), Some(UnreliableFragment::Fec { .. })));
+        b.fec_commit_marks(seq, 1_000 + seq);
+        assert_ne!(b.send_package_id, old_package);
+        assert!(b.event_root_latched);
+        assert!(b.fec_send_slot.as_ref().unwrap().repair_accounting.event_bonus.is_empty());
+        assert_eq!(b.fec_send_slot.as_ref().unwrap().repair_accounting.first_source_commit, Some((seq, 1_000 + seq)));
+        b.p4_event_repair(&ev(CC_EVENT_EARLY, seq));
+        assert_eq!(b.event_repair.roots_granted, 1);
+        assert_eq!(b.event_repair.skip_latched, 1);
+        seq += 1;
+        ev_drain(&mut b, &mut seq);
+        assert!(!b.event_root_latched && !b.p4_open);
+    }
+
+    #[test]
+    fn independent_event_review_own_first_packet_anchor_equality_with_real_send_history() {
+        let ConnectionState::Connected(mut s) = new_connection_state_connected(None, 0, 1, 0) else { unreachable!() };
+        s.RTT_mean = 1000;
+        let mut b = SendQueues::baseline_for_test(1, (0, 16 << 20, 16 << 20));
+        let mut a = FecAdaptiveState::baseline_for_test(crate::ship::FEC, 0);
+        a.policy = RepairPolicy::MessageBound;
+        b.fec_adaptive = Some(a);
+        b.queues[0].event_repair_q = 10;
+        b.queues[0].submit_messages(vec![vec![7; EV_BLOCK * 20]]);
+        b.fec_prepare_packet(0);
+        let mut p = vec![0; 1449];
+        assert!(b.fill_packet(&mut p) > 0);
+        let actual_send = 1_000_000_001;
+        commit_connected_send(&mut s, &mut b, PendingSendKind::Data, actual_send, 1449, &p, 0, None);
+        let anchor = s.send_time(0);
+        assert!(anchor > 0 && anchor < actual_send, "real history is a lower-resolution bucket");
+        s.ecn_congestion_received = true;
+        s.ecn_oldest_seq = 0;
+        s.ecn_oldest_send_time = anchor;
+        assert!(apply_ecn_congestion(&mut s, 2_000_000_000, &crate::ship::CC, None));
+        b.fec_event_repair(&AcceptedCcEvent { kind: CC_EVENT_CE, evidence_seq: 0, evidence_sent_ns: anchor, feedback_ns: 2_000_000_000 });
+        assert_eq!(b.queues[0].event_repair.roots_granted, 1,
+            "evidence packet's own committed source must qualify: actual={actual_send} anchor={anchor}");
+    }
+
+    #[test]
+    fn event_repair_requires_committed_source_before_evidence_and_open_root() {
+        let mut b = buffer(RepairPolicy::MessageBound, 0.0);
+        b.event_repair_q = 10;
+        b.p4_event_repair(&ev(CC_EVENT_EARLY, 0));
+        assert_eq!(b.event_repair.skip_closed, 1, "no open root");
+        b.submit_messages(vec![vec![7; EV_BLOCK * 100]]);
+        let mut seq = 0;
+        for _ in 0..3 { emit(&mut b, &mut seq); } // prepared, never committed
+        b.p4_event_repair(&ev(CC_EVENT_EARLY, 2));
+        assert_eq!(b.event_repair.skip_unexposed, 1);
+        assert!(!b.event_root_latched, "a non-qualifying event does not consume the root grant");
+        // Abandoned (never committed) prepared marks are purged at the next commit.
+        let s0 = seq; ev_emit(&mut b, &mut seq);
+        assert_eq!(b.fec_send_slot.as_ref().unwrap().repair_accounting.first_source_commit, Some((s0, EV_T + s0 * 0x400000 + 1)));
+        assert!(b.commit_marks.is_empty());
+        // Evidence older than the first committed source (seq or send time) does not qualify.
+        b.p4_event_repair(&ev(CC_EVENT_EARLY, s0 - 1));
+        b.p4_event_repair(&AcceptedCcEvent { kind: CC_EVENT_CE, evidence_seq: s0, evidence_sent_ns: EV_T + s0 * 0x400000 - 1, feedback_ns: 0 });
+        assert_eq!(b.event_repair.skip_unexposed, 3);
+        b.p4_event_repair(&ev(CC_EVENT_CE, s0));
+        assert_eq!(b.event_repair.roots_granted, 1);
+        // Root closing (last planned symbol emitted): no grant.
+        let mut c = buffer(RepairPolicy::MessageBound, 0.0);
+        c.event_repair_q = 10;
+        c.submit_messages(vec![vec![7; EV_BLOCK * 20]]);
+        let mut seq = 0;
+        loop { ev_emit(&mut c, &mut seq); if c.p4_closing { break; } }
+        c.p4_event_repair(&ev(CC_EVENT_EARLY, seq - 1));
+        assert_eq!((c.event_repair.skip_closed, c.event_repair.roots_granted), (1, 0));
+    }
+
+    #[test]
+    fn event_repair_snapshots_exposed_slots_no_child_inheritance_and_retained_becomes_ready() {
+        let mut b = buffer(RepairPolicy::MessageBound, 0.0);
+        b.event_repair_q = 10;
+        b.submit_messages(vec![vec![7; 6 << 20]]); // three 2 MB segments of one logical root
+        let mut seq = 0;
+        let first = ev_emit(&mut b, &mut seq).unwrap().0;
+        while b.fec_send_slot.as_ref().unwrap().next_id < b.fec_send_slot.as_ref().unwrap().n { ev_emit(&mut b, &mut seq); }
+        let second = ev_emit(&mut b, &mut seq).unwrap().0;
+        assert_ne!(first, second);
+        let r = &b.fec_retained[&first].slot;
+        assert!(r.next_id >= r.n, "first segment fully sent, retained and idle");
+        let ready_before = b.rescue_ready_count;
+        for _ in 0..5 { ev_emit(&mut b, &mut seq); }
+        b.p4_event_repair(&ev(CC_EVENT_EARLY, seq - 1));
+        let r = &b.fec_retained[&first].slot;
+        let kg = crate::fec::MessageLayout::new(r.message.len(), r.block_bytes).unwrap();
+        let expect: Vec<u32> = (0..kg.groups).map(|g| (10 * kg.group(g).1 as u32).div_ceil(100)).collect();
+        assert_eq!(r.repair_accounting.event_bonus, expect);
+        assert!(r.next_id < r.n, "granted retained slot gets new ready work");
+        assert_eq!(b.rescue_ready_count, ready_before + 1);
+        assert_eq!(b.event_repair.ready_added, 1);
+        assert_eq!(b.event_repair.slots_granted, 2);
+        assert!(!b.fec_send_slot.as_ref().unwrap().repair_accounting.event_bonus.is_empty());
+        // Third segment starts after the grant: no inheritance, and the root never grants again.
+        let mut third = None;
+        for _ in 0..200000 {
+            let Some((p, _, _)) = ev_emit(&mut b, &mut seq) else { if !b.has_unsent_data() { break; } continue; };
+            if p != first && p != second { third = Some(p); break; }
+        }
+        assert!(third.is_some());
+        assert!(b.fec_send_slot.as_ref().unwrap().repair_accounting.event_bonus.is_empty());
+        b.p4_event_repair(&ev(CC_EVENT_CE, seq - 1));
+        assert_eq!((b.event_repair.roots_granted, b.event_repair.skip_latched), (1, 1));
+        ev_drain(&mut b, &mut seq);
+        assert_eq!(b.event_repair.emitted, b.event_info().planned);
+        assert!(!b.p4_open);
     }
 
     #[test]
@@ -10466,7 +14161,7 @@ mod p4_tests {
         // Quotas share one exact connection peak, rather than adding unrelated
         // per-queue peaks. Leases moved or cloned are counted only once.
         use std::sync::atomic::Ordering::Relaxed;
-        let s = SendQueues::new(2, (0, 1000, 1000));
+        let s = SendQueues::baseline_for_test(2, (0, 1000, 1000));
         let a = s.queues[0].retention_quota.acquire(100).unwrap();
         let b = s.queues[1].retention_quota.acquire(200).unwrap();
         let clone = a.clone();
@@ -10505,7 +14200,7 @@ mod p4_review_tests {
     use crate::fec_adapt::{FecAdaptiveState, RepairPolicy};
     fn buffer() -> UnreliableSendBuffer {
         let mut b = UnreliableSendBuffer::new(0, 16 << 20, 16 << 20);
-        let mut a = FecAdaptiveState::new(crate::ship::FEC, 0);
+        let mut a = FecAdaptiveState::baseline_for_test(crate::ship::FEC, 0);
         a.policy = RepairPolicy::MessageBound;
         a.p = 0.0;
         b.fec_adaptive = Some(a);
@@ -10524,7 +14219,7 @@ mod p4_review_tests {
     }
     #[test]
     fn review_p4_scheduler_growth_fill_feedback_and_forget() {
-        let mut s = SendQueues::new(2, (0, 16 << 20, 16 << 20));
+        let mut s = SendQueues::baseline_for_test(2, (0, 16 << 20, 16 << 20));
         s.fec_adaptive = buffer().fec_adaptive;
         s.fec_adaptive.as_mut().unwrap().p = 0.1;
         s.submit_messages(0, vec![vec![7; 3 << 20], vec![9; 80]]);
@@ -10607,224 +14302,3425 @@ mod p4_review_tests {
 }
 
 #[cfg(test)]
-mod p4_category_bonus_tests {
+mod p4_interleave_tests {
     use super::*;
-    use crate::fec_adapt::RepairPolicy;
-    // 1449-byte TU at 1_449_000 B/s and 100 ms RTT: RTT = 100 packets, the
-    // inclusive category window is [50, 200] packets of the whole planned train.
-    fn queues(policy: RepairPolicy, percent: u32) -> SendQueues {
-        let mut s = SendQueues::new(2, (0, 16 << 20, 16 << 20));
-        let mut a = crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, 0);
-        a.policy = policy;
-        a.p = 0.1;
-        s.fec_adaptive = Some(a);
-        for q in &mut s.queues { q.category_bonus_percent = percent; }
-        s.set_time(1, 100_000_000);
-        s.set_rate(1_449_000);
-        s
+    #[test]
+    fn independent_review_giant_root_only_id_admission_must_not_deadlock_head() {
+        let mut s = slip_scheduler();
+        s.submit_messages(0, vec![vec![7; 142800], vec![8; 4 << 20]]);
+        slip_packet(&mut s, 0, 1449);
+        let ids = s.queues[0].package_allocator.as_ref().unwrap().clone();
+        let holds: Vec<_> = (0..1022).map(|_| ids.allocate().unwrap()).collect();
+        s.fec_prepare_packet(1);
+        assert_eq!(s.fill_packet(&mut [0;1449]), 1449, "root-only follower may not deadlock ready head");
+        assert_eq!(*ids.live.lock().unwrap(), 1024);
+        assert!(s.queues[0].interleave_parked.iter().any(|c| c.segmented_send.is_some() && c.fec_send_slot.is_none()));
+        drop(holds);
+        let p = slip_packet(&mut s, 2, 1449);
+        assert_eq!(first_tag(&p), 8);
+        drop(s);
+        assert_eq!(*ids.live.lock().unwrap(), 0);
     }
-    fn p4(percent: u32) -> SendQueues { queues(RepairPolicy::MessageBound, percent) }
-    fn settle(s: &mut SendQueues) {
+    #[test]
+    fn independent_review_dynamic_giant_head_classifies_whole_train() {
+        let mut s = slip_scheduler();
+        s.set_time(1, 3_000_000_000);
+        s.submit_messages(0, vec![vec![7; 3 << 20], vec![8; 80]]);
+        slip_packet(&mut s, 0, 1449);
+        let q = &s.queues[0];
+        let f = q.fec_send_slot.as_ref().unwrap();
+        let segments = f.segment.unwrap().total as usize / f.message.len();
+        assert_eq!(segments, 2);
+        assert!((1500..=6000).contains(&(f.n as usize * segments)));
+        assert_eq!(q.slipstream_eligible, Some(true));
+        assert_eq!(first_tag(&slip_packet(&mut s, 1, 1449)), 8);
+    }
+    #[test]
+    fn independent_review_classification_uses_current_active_queue_weights() {
+        let mut s = slip_scheduler();
+        s.submit_messages(0, vec![vec![7; 60 * 1428], vec![8; 80]]);
+        s.submit_messages(1, vec![vec![9; 80]]);
+        s.set_rate(2_898_000);
+        s.next_queue = 1;
+        assert_eq!(first_tag(&slip_packet(&mut s, 0, 1449)), 9);
+        assert!(!s.queues[1].has_unsent_data());
+        assert_eq!(first_tag(&slip_packet(&mut s, 1, 1449)), 7);
+        let q = &s.queues[0];
+        assert!((50..100).contains(&q.fec_send_slot.as_ref().unwrap().n));
+        assert_eq!(q.slipstream_eligible, Some(false));
+        assert_eq!(q.slipstream_info.fair_share_pps_min, 2000.0);
+    }
+    #[test]
+    fn independent_review_slipstream_pending_cipher_commit_does_not_consume_second_quantum() {
+        let mut s = slip_scheduler();
+        s.submit_messages(0, vec![vec![7; 142800], vec![8; 142800]]);
+        let p = slip_packet(&mut s, 0, 1449);
+        let ConnectionState::Connected(mut state) = new_connection_state_connected(
+            None, CONNECT_MAGIC1_PLAIN_TEXT, MAGIC2_APP_CROSSLINK, 1_000_000_000) else { unreachable!() };
+        let before = (s.queues[0].slipstream_head_packets, s.queues[0].slipstream_follow_packets, s.queues[0].slipstream_turn_head);
+        let bytes = vec![42; state.current_tu as usize];
+        assert!(!finish_connected_send(&mut state, &mut s, PendingSendKind::Data, None, 1_000_000_000,
+            &bytes, &p, Dscp::BestEffort, 0, None));
+        for now in [2_000_000_000, 3_000_000_000] {
+            freeze_local_send(&mut state, now);
+            assert_eq!(state.pending_send.as_ref().unwrap().bytes, bytes);
+            assert_eq!((s.queues[0].slipstream_head_packets, s.queues[0].slipstream_follow_packets, s.queues[0].slipstream_turn_head), before);
+        }
+        let pending = state.pending_send.take().unwrap();
+        commit_connected_send(&mut state, &mut s, pending.kind, 3_000_000_001, pending.bytes.len(), &pending.plaintext, 0, None);
+        assert_eq!(state.send_sequence_number, 1);
+        assert_eq!((s.queues[0].slipstream_head_packets, s.queues[0].slipstream_follow_packets, s.queues[0].slipstream_turn_head), before);
+        assert_eq!(first_tag(&slip_packet(&mut s, 1, 1449)), 8);
+    }
+    #[test]
+    fn slipstream_pending_tu_shrink_first_symbol_fifo_and_started_peer_progress() {
+        for young_tiny in [false, true] {
+            let mut s = slip_scheduler();
+            s.submit_messages(0, vec![vec![7; 142800], vec![8; 142800], vec![9; if young_tiny { 80 } else { 142800 }]]);
+            slip_packet(&mut s, 0, 1449);
+            settle_slip_workers(&mut s);
+            let q = &mut s.queues[0];
+            q.fec_adaptive = s.fec_adaptive.take();
+            q.next_packet_seq = 1;
+            q.slipstream_select(1449, 1449); // prepare B but emit no first symbol
+            let f = q.fec_send_slot.as_mut().unwrap();
+            assert_eq!((f.message[0], f.next_id), (8, 0));
+            let source = f.message.clone();
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            f.encoder = FecEncoderState::Pending(rx);
+            s.fec_adaptive = q.fec_adaptive.take();
+            s.submit_messages(1, vec![vec![6; 142800]]);
+            let mut progress = [0; 2];
+            for seq in 1..20 {
+                s.fec_prepare_packet(seq);
+                let mut p = [0; 1162];
+                assert_eq!(s.fill_packet(&mut p), p.len());
+                progress[s.last_queue] += 1;
+                assert!(![8, 9].contains(&first_tag(&p)), "pending B or younger C started early");
+            }
+            assert!(progress[0] > 0 && progress[1] > 0);
+            assert_eq!(s.queues[0].message_queue.front().unwrap().1[0], 9);
+            tx.send(crate::fec::encode_message(source, 1428)).unwrap();
+            let mut found = false;
+            for seq in 20..40 {
+                let p = slip_packet(&mut s, seq, 1162);
+                if first_tag(&p) == 8 { found = true; break; }
+            }
+            assert!(found, "resolved oldest first symbol resumes");
+        }
+    }
+    #[test]
+    fn slipstream_empty_same_nonce_retry_does_not_advance_turn_and_reselects_ready_peer() {
+        let mut s = slip_scheduler();
+        s.submit_messages(0, vec![vec![7; 142800], vec![8; 142800]]);
+        for seq in 0..3 { slip_packet(&mut s, seq, 1449); }
+        settle_slip_workers(&mut s);
+        let q = &mut s.queues[0];
+        let mut txs = HashMap::new();
+        for f in q.fec_send_slot.iter_mut().chain(q.interleave_parked.iter_mut().filter_map(|c| c.fec_send_slot.as_mut())) {
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            txs.insert(f.message[0], tx);
+            f.encoder = FecEncoderState::Pending(rx);
+        }
+        let before = (q.slipstream_turn_head, q.slipstream_info.follower_packets, q.slipstream_head_packets);
+        s.fec_prepare_packet(3);
+        assert_eq!(s.fill_packet(&mut [0; 1162]), 0);
+        let q = &s.queues[0];
+        assert_eq!((q.slipstream_turn_head, q.slipstream_info.follower_packets, q.slipstream_head_packets), before);
+        let c = &q.interleave_parked[0];
+        let f = c.fec_send_slot.as_ref().unwrap();
+        txs.remove(&f.message[0]).unwrap().send(crate::fec::encode_message(f.message.clone(), f.block_bytes)).unwrap();
+        s.fec_prepare_packet(3);
+        assert_eq!(s.fill_packet(&mut [0; 1162]), 1162);
+        assert_eq!(s.queues[0].slipstream_head_packets + s.queues[0].slipstream_follow_packets, 4);
+    }
+    #[test]
+    fn slipstream_global_id_pressure_and_failed_worker_release() {
+        let mut s = slip_scheduler();
+        s.submit_messages(0, vec![vec![7; 142800], vec![8; 142800]]);
+        slip_packet(&mut s, 0, 1449);
+        let ids = s.queues[0].package_allocator.as_ref().unwrap().clone();
+        let holds: Vec<_> = (0..1023).map(|_| ids.allocate().unwrap()).collect();
+        for seq in 1..5 { slip_packet(&mut s, seq, 1449); }
+        assert_eq!(s.queues[0].message_queue.len(), 1);
+        assert_eq!(s.queues[0].slipstream_info.follower_packets, 0);
+        drop(holds);
+        slip_packet(&mut s, 5, 1449);
+        assert_eq!(s.queues[0].slipstream_info.follower_starts_ordinary_fec, 1);
+        settle_slip_workers(&mut s);
+        let mut weak = Vec::new();
         for q in &mut s.queues {
-            for f in q.fec_send_slot.iter_mut().chain(q.fec_suspended.iter_mut()) {
-                if let FecEncoderState::Pending(rx) = &f.encoder {
-                    f.encoder = match rx.recv().unwrap() { Some(e) => FecEncoderState::Ready(e), None => FecEncoderState::Failed };
-                }
+            for f in q.fec_send_slot.iter_mut().chain(q.interleave_parked.iter_mut().filter_map(|c| c.fec_send_slot.as_mut())) {
+                weak.push(std::sync::Arc::downgrade(&f.message));
+                f.next_id = f.k;
+                let (tx, rx) = std::sync::mpsc::sync_channel(1); drop(tx);
+                f.encoder = FecEncoderState::Pending(rx);
             }
         }
-    }
-    fn packet(s: &mut SendQueues, seq: u64, size: usize) {
-        settle(s);
-        s.fec_prepare_packet(seq);
-        let mut p = vec![0; size];
-        assert_eq!(s.fill_packet(&mut p), size, "seq={seq}");
-        settle(s);
-    }
-    fn slot(s: &SendQueues, q: usize) -> &FecSendSlot { s.queues[q].fec_send_slot.as_ref().unwrap() }
-
-    #[test]
-    fn shipped_default_is_p4_with_fixed_ten_and_older_policies_get_zero() {
-        assert_eq!(crate::fec_adapt::category_bonus_percent(), crate::ship::P4_CATEGORY_BONUS_PERCENT);
-        assert_eq!(UnreliableSendBuffer::new(0, 1 << 20, 1 << 20).category_bonus_percent, 10);
-        // Even a nonzero field never applies outside P4 (P0-P3 research semantics).
-        for policy in [RepairPolicy::Reliability, RepairPolicy::MeanOpen, RepairPolicy::MeanTopup, RepairPolicy::Streaming] {
-            let mut s = queues(policy, 10);
-            s.submit_messages(0, vec![vec![1; 100 * 1428]]);
-            packet(&mut s, 0, 1449);
-            assert_eq!(s.queues[0].category_eligible, None, "{policy:?}");
-            assert_eq!((s.queues[0].category_bonus_messages, s.queues[0].category_bonus_repairs), (0, 0));
-            assert_eq!(slot(&s, 0).repair_accounting.category_bonus, 0);
+        for seq in 6..15 {
+            s.fec_prepare_packet(seq);
+            s.fill_packet(&mut [0;1449]);
+            if !s.has_unsent_data() { break; }
         }
+        assert!(!s.has_unsent_data());
+        assert!(weak.iter().all(|w| w.upgrade().is_none()));
+        assert_eq!(*ids.live.lock().unwrap(), 0);
     }
-
     #[test]
-    fn duration_class_is_inclusive_and_zero_context_has_no_category() {
-        let class = |packets| medium_duration_class(packets, 1449, 1_449_000, 100_000_000);
-        assert_eq!((class(49), class(50), class(200), class(201)), ("short", "eligible", "eligible", "long"));
-        assert_eq!(medium_duration_class(100, 1449, 0, 100_000_000), "other");
-        assert_eq!(medium_duration_class(100, 1449, 1_449_000, 0), "other");
-        assert_eq!(medium_duration_class(0, 1449, 1_449_000, 100_000_000), "other");
-        // No startup special case: any nonzero RTT model value, including the
-        // pre-sample placeholder, is classified as an ordinary RTT.
-        assert_eq!(medium_duration_class(100, 1449, 1_449_000, 6_553_500_000), "short");
-        assert_eq!(medium_duration_class(6553, 1449, 1_449_000, 6_553_500_000), "eligible");
-        assert_eq!(source_bonus(1, 10), 1);
-        assert_eq!(source_bonus(100, 10), 10);
-        assert_eq!(source_bonus(101, 10), 11);
+    fn delta_review_short_final_source_fits_shrunk_tu_without_replacement_id() {
+        let mut s = slip_scheduler();
+        s.submit_messages(0, vec![vec![7; 49 * 2877 + 1000]]);
+        for seq in 0..49 { assert_eq!(first_tag(&slip_packet(&mut s, seq, 2898)), 7); }
+        let f = s.queues[0].fec_send_slot.as_ref().unwrap();
+        assert_eq!((f.k, f.next_id), (50, 49));
+        s.submit_messages(0, vec![vec![8; 142800]]);
+        assert_eq!(first_tag(&slip_packet(&mut s, 49, 1449)), 8);
+        let ids = s.queues[0].package_allocator.as_ref().unwrap().clone();
+        let holds: Vec<_> = (0..1022).map(|_| ids.allocate().unwrap()).collect();
+        assert_eq!(*ids.live.lock().unwrap(), 1024);
+        assert_eq!(first_tag(&slip_packet(&mut s, 50, 1449)), 7,
+            "ready head's short final source needs no new identity and must keep its turn");
+        drop(holds);
+        settle_slip_workers(&mut s);
+        drop(s);
+        assert_eq!(*ids.live.lock().unwrap(), 0);
     }
-
     #[test]
-    fn ten_points_add_to_base_once_capped_and_never_compound() {
-        for (percent, n0, n_lost, n_lost_extra) in [(0, 102, 132, 132), (10, 112, 142, 142)] {
-            let mut s = p4(percent);
-            s.submit_messages(0, vec![vec![0xa1; 100 * 1428]]);
-            packet(&mut s, 0, 1449);
-            let a = s.fec_adaptive.clone().unwrap();
-            let q = &mut s.queues[0];
-            assert_eq!((q.category_bonus_messages, q.category_bonus_repairs), if percent == 0 { (0, 0) } else { (1, 10) });
-            let f = q.fec_send_slot.as_mut().unwrap();
-            assert_eq!((f.k, f.n, f.repair_accounting.category_bonus), (100, n0, percent));
+    fn delta_review_tu_restart_id_stall_must_fallback_to_fitting_head() {
+        let mut s = slip_scheduler();
+        s.submit_messages(0, vec![vec![7; 142800], vec![8; 285600]]);
+        assert_eq!(first_tag(&slip_packet(&mut s, 0, 1449)), 7);
+        assert_eq!(first_tag(&slip_packet(&mut s, 1, 2898)), 8);
+        settle_slip_workers(&mut s);
+        let ids = s.queues[0].package_allocator.as_ref().unwrap().clone();
+        let holds: Vec<_> = (0..1022).map(|_| ids.allocate().unwrap()).collect();
+        assert_eq!(first_tag(&slip_packet(&mut s, 2, 1449)), 7);
+        s.fec_prepare_packet(3);
+        assert_eq!(s.fill_packet(&mut [0;1449]), 1449, "ID-blocked TU restart must not hide fitting ready head");
+        drop(holds);
+        assert_eq!(first_tag(&slip_packet(&mut s, 4, 1449)), 8);
+        settle_slip_workers(&mut s);
+        drop(s);
+        assert_eq!(*ids.live.lock().unwrap(), 0);
+    }
+    #[test]
+    fn category_bonus_both_roles_add_to_dynamic_base_once_and_never_compound() {
+        let mut s = slip_scheduler();
+        s.queues[0].category_bonus_percent = 10;
+        s.submit_messages(0, vec![vec![0xa1; 100 * 1428], vec![0xb2; 100 * 1428]]);
+        assert_eq!(first_tag(&slip_packet(&mut s, 0, 1449)), 0xa1);
+        assert_eq!(first_tag(&slip_packet(&mut s, 1, 1449)), 0xb2);
+        assert_eq!(s.queues[0].category_bonus_messages, 2);
+        assert_eq!(s.queues[0].category_bonus_repairs, 20);
+        let a = s.fec_adaptive.clone().unwrap();
+        let q = &mut s.queues[0];
+        for f in q.fec_send_slot.iter_mut().chain(q.interleave_parked.iter_mut().filter_map(|c| c.fec_send_slot.as_mut())) {
+            assert_eq!((f.k, f.n, f.repair_accounting.category_bonus), (100, 112, 10));
             f.group_lost[0] = 30;
             f.refresh_plan(&a);
-            assert_eq!(f.n, n_lost, "adaptive base plus the fixed source-K bonus");
-            for _ in 0..30 { f.refresh_plan(&a); assert_eq!(f.n, n_lost_extra); }
+            assert_eq!(f.n, 142, "132 adaptive base + fixed 10 source-K repairs");
+            for _ in 0..30 { f.refresh_plan(&a); assert_eq!(f.n, 142); }
             f.next_id = f.k; f.finalized_symbols = f.next_id;
-            for _ in 0..30 { f.refresh_plan(&a); assert_eq!(f.n, n_lost_extra); }
+            for _ in 0..30 { f.refresh_plan(&a); assert_eq!(f.n, 142); }
             f.group_lost[0] = 1000;
             f.refresh_plan(&a);
-            assert_eq!(f.n, 200, "bonus shares the existing 2K repair cap");
+            assert_eq!(f.n, 200, "bonus shares the existing 2K limit");
         }
     }
-
     #[test]
-    fn initial_bonus_respects_two_k_cap() {
-        // K=2: P4 base is already 2K=4 packets; RTT 4 ms makes it eligible.
-        let mut s = p4(10);
-        s.set_time(1, 4_000_000);
-        s.submit_messages(0, vec![vec![3; 2 * 1428]]);
-        packet(&mut s, 0, 1449);
-        let f = slot(&s, 0);
-        assert_eq!((f.k, f.n, f.repair_accounting.category_bonus), (2, 4, 1));
-        assert_eq!((s.queues[0].category_bonus_messages, s.queues[0].category_bonus_repairs), (1, 0));
-    }
-
-    #[test]
-    fn classification_uses_prebonus_train_and_freezes_through_tu_restart() {
-        let mut s = p4(10);
-        // Pre-bonus n=198 is inside 2 RTT; bonused n=218 would be outside.
+    fn category_bonus_scheduler_off_control_prebonus_threshold_and_tu_restart() {
+        let mut s = slip_scheduler();
+        s.queues[0].slipstream = false;
+        s.queues[0].category_bonus_percent = 10;
+        // n=198 is inside 2RTT, while bonused n=218 would be outside.
         s.submit_messages(0, vec![vec![0xa1; 196 * 1428], vec![0xb2; 80]]);
-        packet(&mut s, 0, 1449);
+        slip_packet(&mut s, 0, 1449);
         assert_eq!(s.queues[0].category_eligible, Some(true));
-        assert_eq!((slot(&s, 0).k, slot(&s, 0).n), (196, 218));
-        let first_id = s.queues[0].send_package_id;
-        // RTT/rate collapse plus a real TU shrink: re-plan, same frozen category.
+        let f = s.queues[0].fec_send_slot.as_ref().unwrap();
+        assert_eq!((f.k, f.n), (196, 218));
+        assert_eq!(s.queues[0].slipstream_info.heads_evaluated, 0);
+        // Frozen parity category survives RTT/rate changes and a real layout restart.
         s.set_time(2, 1); s.set_rate(1);
-        packet(&mut s, 1, 1162);
+        slip_packet(&mut s, 1, 1162);
         let q = &s.queues[0];
-        let f = slot(&s, 0);
-        assert_ne!(q.send_package_id, first_id, "TU restart is a new package identity");
-        assert!(f.k > 196);
+        let f = q.fec_send_slot.as_ref().unwrap();
         assert_eq!(q.category_eligible, Some(true));
         assert_eq!(q.category_bonus_messages, 1);
         assert_eq!(f.repair_accounting.category_bonus, source_bonus(f.k as u64, 10));
         assert_eq!(f.n, f.repair_accounting.unbonused_n + f.repair_accounting.category_bonus);
-        assert_eq!(q.category_bonus_repairs, 20 + f.repair_accounting.category_bonus as u64,
-            "planned additions count per layout start, fresh base each time");
+        assert_eq!(q.slipstream_info.follower_packets, 0);
     }
-
     #[test]
-    fn zero_rtt_context_stays_ineligible_through_restart() {
-        let mut s = p4(10);
-        s.set_time(1, 0);
-        s.submit_messages(0, vec![vec![0xa1; 100 * 1428]]);
-        packet(&mut s, 0, 1449);
-        assert_eq!(s.queues[0].category_eligible, Some(false));
-        s.set_time(2, 100_000_000);
-        packet(&mut s, 1, 1162);
-        assert!(slot(&s, 0).k > 100, "TU restart happened");
-        assert_eq!(s.queues[0].category_eligible, Some(false));
-        assert_eq!(slot(&s, 0).repair_accounting.category_bonus, 0);
-        assert_eq!((s.queues[0].category_bonus_messages, s.queues[0].category_bonus_repairs), (0, 0));
-    }
-
-    #[test]
-    fn current_fair_share_replaces_stale_set_rate_snapshot() {
-        // Snapshot taken with both queues idle (full rate each), but at the first
-        // plan both queues are serviceable: 724_500 B/s => 102 packets > 2 RTT.
-        let mut s = p4(10);
-        s.submit_messages(0, vec![vec![0xa1; 100 * 1428]]);
-        s.submit_messages(1, vec![vec![0xb2; 100 * 1428]]);
-        packet(&mut s, 0, 1449);
-        assert_eq!(s.queues[0].current_bytes_per_second, 724_500);
-        let started: Vec<_> = s.queues.iter().map(|q| q.category_eligible).filter(|c| c.is_some()).collect();
-        assert_eq!(started, vec![Some(false)]);
-        // Reverse staleness: snapshot halves, but only one queue is serviceable.
-        let mut t = p4(10);
-        t.submit_messages(0, vec![vec![0xa1; 100 * 1428]]);
-        t.submit_messages(1, vec![vec![0xb2; 80]]);
-        t.set_rate(1_449_000);
-        assert_eq!(t.queues[0].current_bytes_per_second, 724_500);
-        t.queues[1].message_queue.clear();
-        t.queues[1].queue_bytes_filled = 0;
-        packet(&mut t, 0, 1449);
-        assert_eq!(t.queues[0].current_bytes_per_second, 1_449_000);
-        assert_eq!(t.queues[0].category_eligible, Some(true));
-        // Without the bonus (P0-P3 shipping 0) the set_rate snapshot is untouched.
-        let mut u = p4(0);
-        u.submit_messages(0, vec![vec![0xa1; 100 * 1428]]);
-        u.submit_messages(1, vec![vec![0xb2; 100 * 1428]]);
-        u.set_rate(1_449_000);
-        u.queues[1].message_queue.clear();
-        u.queues[1].queue_bytes_filled = 0;
-        packet(&mut u, 0, 1449);
-        assert_eq!(u.queues[0].current_bytes_per_second, 724_500);
-    }
-
-    #[test]
-    fn tiny_send_once_and_long_giant_are_ineligible() {
-        let mut s = p4(10);
-        s.submit_messages(0, vec![vec![0xa1; 80], vec![0xb2; 80]]);
-        packet(&mut s, 0, 1449);
-        assert_eq!((s.queues[0].category_eligible, s.queues[0].category_bonus_messages), (None, 0));
-        assert!(s.queues[0].fec_send_slot.is_none());
-        let mut t = p4(10);
-        t.submit_messages(0, vec![vec![0xa1; 100 * 1428], vec![0xb2; 4 << 20]]);
-        packet(&mut t, 0, 1449);
-        t.queues[0].fec_send_slot.as_mut().map(|f| { f.next_id = f.n; f.finalized_symbols = f.n; });
-        packet(&mut t, 1, 1449);
-        assert!(slot(&t, 0).segment.is_some());
-        assert_eq!((t.queues[0].category_eligible, t.queues[0].category_bonus_messages), (Some(false), 1));
-    }
-
-    #[test]
-    fn segmented_message_is_classified_whole_with_root_ceiling_and_frozen_restart() {
-        let mut s = p4(10);
+    fn category_bonus_logical_segmented_duration_and_root_ceiling_not_per_segment() {
+        let mut s = slip_scheduler();
+        s.queues[0].category_bonus_percent = 10;
         s.set_time(1, 3_000_000_000);
         s.submit_messages(0, vec![vec![0xa1; 3 << 20]]);
-        packet(&mut s, 0, 1449);
-        assert_eq!(s.queues[0].category_eligible, Some(true));
+        slip_packet(&mut s, 0, 1449);
         let (first_k, first_bonus) = {
-            let f = s.queues[0].fec_send_slot.as_mut().unwrap();
-            assert_eq!(f.segment.unwrap().offset, 0);
+            let q = &mut s.queues[0];
+            assert_eq!(q.category_eligible, Some(true));
+            assert_eq!(q.slipstream_eligible, Some(true));
+            let f = q.fec_send_slot.as_mut().unwrap();
             let values = (f.k, f.repair_accounting.category_bonus);
             f.next_id = f.n; f.finalized_symbols = f.n;
             values
         };
-        packet(&mut s, 1, 1449);
-        let f = slot(&s, 0);
+        slip_packet(&mut s, 1, 1449);
+        let q = &s.queues[0];
+        let f = q.fec_send_slot.as_ref().unwrap();
         assert!(f.segment.unwrap().offset > 0);
-        let second_k = f.k;
-        assert_eq!(first_bonus + f.repair_accounting.category_bonus, source_bonus((first_k + second_k) as u64, 10));
-        assert_eq!(s.queues[0].category_bonus_messages, 1);
-        assert_eq!(s.queues[0].category_bonus_repairs, source_bonus((first_k + second_k) as u64, 10) as u64);
-        // Segment TU restart under a context that would now be ineligible.
-        s.set_time(2, 1); s.set_rate(1);
-        packet(&mut s, 2, 1162);
-        let f = slot(&s, 0);
-        assert!(f.segment.unwrap().offset > 0 && f.k > second_k);
-        assert_eq!(s.queues[0].category_eligible, Some(true));
-        assert_eq!(s.queues[0].category_bonus_messages, 1);
         assert_eq!(first_bonus + f.repair_accounting.category_bonus, source_bonus((first_k + f.k) as u64, 10));
-        assert_eq!(f.n, f.repair_accounting.unbonused_n + f.repair_accounting.category_bonus);
+        assert_eq!(q.category_bonus_messages, 1);
+        assert_eq!(q.category_bonus_repairs, source_bonus((first_k + f.k) as u64, 10) as u64);
+    }
+    #[test]
+    fn category_bonus_ineligible_tiny_and_long_giant_and_eligible_segmented_follower() {
+        let mut s = slip_scheduler();
+        s.queues[0].category_bonus_percent = 10;
+        s.submit_messages(0, vec![vec![0xa1; 100 * 1428], vec![0xb2; 4 << 20]]);
+        slip_packet(&mut s, 0, 1449); slip_packet(&mut s, 1, 1449);
+        assert_eq!(s.queues[0].category_bonus_messages, 1);
+        assert_eq!(s.queues[0].category_eligible, Some(false));
+        let mut t = slip_scheduler();
+        t.queues[0].category_bonus_percent = 10;
+        t.submit_messages(0, vec![vec![0xa1; 80], vec![0xb2; 80]]);
+        slip_packet(&mut t, 0, 1449);
+        assert_eq!(t.queues[0].category_bonus_messages, 0);
+        let mut u = slip_scheduler();
+        u.queues[0].category_bonus_percent = 10;
+        u.set_time(1, 2_000_000_000);
+        u.submit_messages(0, vec![vec![0xa1; 1_100 * 1428], vec![0xb2; 3 << 20]]);
+        slip_packet(&mut u, 0, 1449); slip_packet(&mut u, 1, 1449);
+        assert_eq!(u.queues[0].category_bonus_messages, 2);
+        assert_eq!(u.queues[0].slipstream_info.follower_starts_segmented_giant, 1);
+        assert_eq!(u.queues[0].category_eligible, Some(true));
+    }
+    #[test]
+    fn category_bonus_promotion_reclassifies_role_not_frozen_parity_category() {
+        let mut s = slip_scheduler();
+        s.queues[0].category_bonus_percent = 10;
+        s.submit_messages(0, vec![vec![0xa1; 100 * 1428], vec![0xb2; 100 * 1428], vec![0xc3; 80]]);
+        slip_packet(&mut s, 0, 1449); slip_packet(&mut s, 1, 1449);
+        let q = &mut s.queues[0];
+        q.fec_send_slot.as_mut().unwrap().next_id = 99;
+        let head = q.interleave_parked.front_mut().unwrap().fec_send_slot.as_mut().unwrap();
+        head.next_id = head.n; head.finalized_symbols = head.n;
+        slip_packet(&mut s, 2, 1449);
+        let q = &s.queues[0];
+        assert!(q.slipstream_head);
+        assert_eq!(q.slipstream_eligible, Some(false), "remaining 12 packets < half RTT");
+        assert_eq!(q.category_eligible, Some(true));
+        assert_eq!(q.fec_send_slot.as_ref().unwrap().repair_accounting.category_bonus, 10);
+        assert_eq!(q.category_bonus_messages, 2);
+    }
+    fn slip_scheduler() -> SendQueues {
+        let mut s = scheduler();
+        s.queues[0].slipstream = true;
+        s.set_time(1, 100_000_000);
+        s.set_rate(1_449_000);
+        s
+    }
+    fn settle_slip_workers(s: &mut SendQueues) {
+        fn settle(f: &mut FecSendSlot) {
+            if let FecEncoderState::Pending(rx) = &f.encoder {
+                f.encoder = match rx.recv().unwrap() {
+                    Some(e) => FecEncoderState::Ready(e), None => FecEncoderState::Failed,
+                };
+            }
+        }
+        for q in &mut s.queues {
+            for f in q.fec_send_slot.iter_mut().chain(q.fec_suspended.iter_mut()).chain(q.fec_retained.values_mut().map(|r| &mut r.slot)) { settle(f); }
+            for c in &mut q.interleave_parked {
+                for f in c.fec_send_slot.iter_mut().chain(c.fec_suspended.iter_mut()).chain(c.fec_retained.values_mut().map(|r| &mut r.slot)) { settle(f); }
+            }
+        }
+    }
+    fn slip_packet(s: &mut SendQueues, seq: u64, size: usize) -> Vec<u8> {
+        settle_slip_workers(s);
+        s.fec_prepare_packet(seq);
+        let mut p = vec![0; size];
+        assert_eq!(s.fill_packet(&mut p), size, "seq={seq}");
+        p
+    }
+    fn first_tag(p: &[u8]) -> u8 {
+        match read_frame(p).unwrap().0 {
+            WireFrame::Fec { data, .. } | WireFrame::Whole(data) | WireFrame::Plain { data, .. } => data[0],
+            _ => panic!("unexpected padding"),
+        }
+    }
+    #[test]
+    fn slipstream_many_tiny_pack_one_following_packet_not_one_per_turn() {
+        let mut s = slip_scheduler();
+        let mut messages = vec![vec![7; 142800]];
+        messages.extend((0..70).map(|i| vec![20 + i; 80]));
+        s.submit_messages(0, messages);
+        assert_eq!(first_tag(&slip_packet(&mut s, 0, 1449)), 7);
+        let p = slip_packet(&mut s, 1, 1449);
+        let mut cursor = 0;
+        let mut tiny = Vec::new();
+        while let Some((f, used)) = read_frame(&p[cursor..]) {
+            match f { WireFrame::Whole(d) | WireFrame::Plain { data: d, .. } => tiny.push(d[0]), _ => panic!("following lane only") }
+            cursor += used;
+        }
+        assert!(tiny.len() >= 17, "tiny FIFO stream should fill a TU: {tiny:?}");
+        assert!(tiny.windows(2).all(|w| w[1] == w[0] + 1));
+        assert_eq!(first_tag(&slip_packet(&mut s, 2, 1449)), 7);
+        assert_eq!(s.queues[0].slipstream_info.follower_packets, 1);
+        assert!(s.queues[0].slipstream_info.follower_starts_tiny_whole_or_packed >= 17);
+        assert_eq!(s.queues[0].slipstream_info.max_concurrent_started_messages, 2);
+    }
+    // Mixed live bounds are a one-second dynamic target, not a 64 MiB
+    // source allowance. Keep both public submission and owner admission covered.
+    fn mixed_resource_fixture(root: u64, tiny: usize, bonus: u32, prequeue: bool) -> SendQueues {
+        let mut s = scheduler();
+        s.queues.truncate(1);
+        s.queues[0].slipstream = true;
+        s.queues[0].category_bonus_percent = bonus;
+        s.queues[0].target_queue_size_us = 1_000_000;
+        s.queues[0].min_queue_size_bytes = if prequeue { 16 << 20 } else { 262144 };
+        s.queues[0].max_queue_size_bytes = 64 << 20;
+        s.set_time(1, if tiny == 6 { 265_400_000 } else { 202_300_000 });
+        s.set_rate(if tiny == 6 { 2_740_445 } else { 2_328_350 });
+        s.set_overhead();
+        let ids = s.queues[0].package_allocator.as_ref().unwrap().clone();
+        for _ in 0..root { drop(ids.allocate().unwrap()); }
+        let mut messages = vec![vec![7; 393216]];
+        messages.extend((0..tiny).map(|i| vec![20 + i as u8; 1000]));
+        if prequeue { messages.extend([vec![90; 5242880], vec![91; 1000]]); }
+        assert!(s.submit_messages(0, messages).is_empty());
+        s.queues[0].min_queue_size_bytes = 262144;
+        s
+    }
+    #[test]
+    fn slipstream_mixed_live_dynamic_capacity_rejects_giant_before_scheduler() {
+        for (root, tiny) in [(43, 6), (56, 2)] {
+            for bonus in [0, 10] {
+                let mut s = mixed_resource_fixture(root, tiny, bonus, false);
+                let capacity = s.queues[0].current_byte_capacity();
+                assert!(capacity < 5242880);
+                assert_eq!(s.submit_messages(0, vec![vec![90; 5242880]]).len(), 1);
+                assert_eq!(s.queues[0].queue_bytes_filled, 393216 + tiny * 1000);
+                let mut starts = Vec::new();
+                for seq in 0..20 {
+                    let p = slip_packet(&mut s, seq, 1441);
+                    let mut cursor = 0;
+                    while let Some((f, used)) = read_frame(&p[cursor..]) {
+                        match f {
+                            WireFrame::Fec { block_id: 0, data, .. } |
+                            WireFrame::Plain { offset: 0, data, .. } |
+                            WireFrame::Whole(data) => starts.push(data[0]), _ => (),
+                        }
+                        cursor += used;
+                    }
+                    assert_eq!(s.submit_messages(0, vec![vec![90; 5242880]]).len(), 1);
+                }
+                assert_eq!(starts, std::iter::once(7).chain((0..tiny).map(|i| 20+i as u8)).collect::<Vec<_>>());
+                let q = &s.queues[0];
+                assert!(q.message_queue.is_empty(), "giant still belongs to the application");
+                assert_eq!(q.slipstream_info.follower_starts_segmented_giant, 0);
+                assert!(q.interleave_source_bytes() <= 394216);
+                println!("submission root={root} tiny={tiny} bonus={bonus} cap={capacity} free={} source={} ids={}",
+                    capacity as usize - q.queue_bytes_filled, q.interleave_source_bytes(), *q.package_allocator.as_ref().unwrap().live.lock().unwrap());
+            }
+        }
+    }
+    #[test]
+    fn slipstream_mixed_prequeued_giant_respects_dynamic_source_reservation() {
+        for (root, tiny) in [(43, 6), (56, 2)] {
+            for bonus in [0, 10] {
+                let mut s = mixed_resource_fixture(root, tiny, bonus, true);
+                for seq in 0..20 { slip_packet(&mut s, seq, 1441); }
+                let q = &s.queues[0];
+                println!("prequeued root={root} tiny={tiny} bonus={bonus} cap={} source={} reserve={} next={} remaining={} ids={}",
+                    q.current_byte_capacity(), q.interleave_source_bytes(), 2*5242880,
+                    q.message_queue.front().unwrap().1.len(), q.fec_send_slot.as_ref().unwrap().n-q.fec_send_slot.as_ref().unwrap().next_id,
+                    *q.package_allocator.as_ref().unwrap().live.lock().unwrap());
+                assert_eq!(q.slipstream_info.follower_starts_segmented_giant, 0);
+                assert_eq!(q.slipstream_info.follower_starts_tiny_whole_or_packed, tiny as u64);
+                assert_eq!(q.message_queue.len(), 2, "giant and younger tiny remain FIFO");
+                assert_eq!(q.interleave_source_bytes(), 393216);
+                assert_eq!(*q.package_allocator.as_ref().unwrap().live.lock().unwrap(), 1);
+                assert_eq!(q.slipstream_eligible, Some(true));
+            }
+        }
+    }
+    #[test]
+    fn slipstream_mixed_adequate_source_budget_starts_same_giant_after_all_tinies() {
+        for (root, tiny) in [(43, 6), (56, 2)] {
+            for bonus in [0, 10] {
+                let mut s = mixed_resource_fixture(root, tiny, bonus, true);
+                // Inclusive equality at the existing reservation boundary. Only
+                // the configured budget changes; rates, sizes and policy do not.
+                s.queues[0].min_queue_size_bytes = 393216 + 2*5242880;
+                let ids = s.queues[0].package_allocator.as_ref().unwrap().clone();
+                let mut starts = Vec::new();
+                let mut giant_root = None;
+                let mut giant_packets = Vec::new();
+                for seq in 0..20 {
+                    let p = slip_packet(&mut s, seq, 1441);
+                    let mut cursor = 0;
+                    while let Some((f, used)) = read_frame(&p[cursor..]) {
+                        match f {
+                            WireFrame::Whole(data) | WireFrame::Plain { offset: 0, data, .. } => starts.push(data[0]),
+                            WireFrame::Fec { block_id, segment, data, .. } => {
+                                if block_id == 0 {
+                                    starts.push(data[0]);
+                                    if data[0] == 90 { giant_root = segment.map(|g| g.root); }
+                                }
+                                if data[0] == 90 { giant_packets.push(seq); }
+                            }, _ => (),
+                        }
+                        cursor += used;
+                    }
+                    assert!(s.queues[0].interleave_parked.len() <= 1);
+                    assert!(s.queues[0].interleave_source_bytes() <= 393216 + 2*5242880);
+                }
+                assert_eq!(starts, std::iter::once(7).chain((0..tiny).map(|i| 20+i as u8)).chain(std::iter::once(90)).collect::<Vec<_>>());
+                assert_eq!(giant_root, Some(root + tiny as u64 + 1));
+                assert!(giant_packets.len() >= 5);
+                assert!(giant_packets.windows(2).all(|w| w[1] == w[0]+2));
+                let q = &s.queues[0];
+                assert_eq!(q.slipstream_info.follower_starts_segmented_giant, 1);
+                assert_eq!(q.slipstream_info.max_concurrent_started_messages, 2);
+                assert_eq!(q.slipstream_info.recursive_windows, 0);
+                assert_eq!(q.message_queue.len(), 1, "younger tiny cannot recursively start");
+                println!("adequate root={root} tiny={tiny} bonus={bonus} cap={} reserved_source={} giant_root={} first_packet={} ids={}",
+                    q.current_byte_capacity(), q.interleave_source_bytes(), giant_root.unwrap(), giant_packets[0], *ids.live.lock().unwrap());
+                let original = q.segmented_send.as_ref().or_else(|| q.interleave_parked.iter().find_map(|c| c.segmented_send.as_ref())).unwrap();
+                let source = std::sync::Arc::downgrade(&original.message);
+                let physical = |q: &UnreliableSendBuffer| {
+                    q.interleave_source_bytes() - q.segmented_send.as_ref().map_or(0, |g| g.message.len()-g.offset)
+                        - q.interleave_parked.iter().filter_map(|c| c.segmented_send.as_ref()).map(|g| g.message.len()-g.offset).sum::<usize>()
+                };
+                let mut peak = physical(q);
+                for seq in 20..6000 {
+                    settle_slip_workers(&mut s);
+                    if !s.has_unsent_data() { break; }
+                    slip_packet(&mut s, seq, 1441);
+                    peak = peak.max(physical(&s.queues[0]));
+                }
+                assert!(!s.has_unsent_data(), "P4 must seal without waiting for ACKs");
+                s.queues[0].reclaim_finished_partial();
+                assert_eq!(s.queues[0].queue_bytes_filled, 0);
+                assert_eq!(s.queues[0].interleave_source_bytes(), 0);
+                assert!(source.upgrade().is_none());
+                assert_eq!(*ids.live.lock().unwrap(), 0);
+                assert_eq!(peak, 5242880 + 2*5242880usize.div_ceil(3));
+                println!("released root={root} bonus={bonus} peak_physical_owner_source={peak} source=0 ids=0");
+                drop(s);
+            }
+        }
+    }
+    #[test]
+    fn slipstream_mixed_following_fifo_does_not_skip_giant_or_open_nested_window() {
+        let mut s = slip_scheduler();
+        s.submit_messages(0, vec![vec![7; 142800], vec![8; 80], vec![9; 80],
+            vec![10; 5712], vec![11; 80], vec![12; 4 << 20], vec![13; 80]]);
+        let mut starts = Vec::new();
+        let mut giant_start = None;
+        for seq in 0..90 {
+            let p = slip_packet(&mut s, seq, 1449);
+            let mut cursor = 0;
+            while let Some((f, used)) = read_frame(&p[cursor..]) {
+                match f {
+                    WireFrame::Whole(d) => starts.push(d[0]),
+                    WireFrame::Plain { offset: 0, data, .. } => starts.push(data[0]),
+                    WireFrame::Fec { block_id: 0, segment, data, .. } => {
+                        if segment.is_none_or(|g| g.offset == 0) { starts.push(data[0]); }
+                        if data[0] == 12 { giant_start = Some(seq); }
+                    }, _ => (),
+                }
+                cursor += used;
+            }
+            assert!(s.queues[0].interleave_parked.len() <= 1);
+        }
+        assert_eq!(starts, [7, 8, 9, 10, 11, 12]);
+        assert!(giant_start.is_some());
+        let i = s.queues[0].slipstream_info;
+        assert_eq!(i.follower_starts_segmented_giant, 1);
+        assert_eq!(i.follower_starts_ordinary_fec, 1);
+        assert_eq!(i.recursive_windows, 0);
+    }
+    #[test]
+    fn slipstream_medium_medium_promotion_reclassifies_remaining_head() {
+        let mut s = slip_scheduler();
+        s.submit_messages(0, vec![vec![7; 142800], vec![8; 285600], vec![9; 142800]]);
+        for seq in 0..8 {
+            assert_eq!(first_tag(&slip_packet(&mut s, seq, 1449)), if seq % 2 == 0 { 7 } else { 8 });
+        }
+        let mut promoted = false;
+        for seq in 8..400 {
+            slip_packet(&mut s, seq, 1449);
+            let q = &s.queues[0];
+            if q.slipstream_info.head_promotions > 0 {
+                promoted = true;
+                assert!(q.slipstream_info.heads_evaluated >= 2);
+                assert!(q.slipstream_info.heads_eligible >= 2);
+                assert!(q.slipstream_info.max_concurrent_started_messages <= 2);
+                break;
+            }
+        }
+        assert!(promoted);
+    }
+    #[test]
+    fn slipstream_duration_boundaries_are_dynamic_and_frozen_per_head() {
+        let mut s = slip_scheduler();
+        let q = &mut s.queues[0];
+        q.fec_adaptive = s.fec_adaptive.take();
+        q.start_fec(std::sync::Arc::new(vec![7; 14280]), 1428);
+        q.fec_send_slot.as_mut().unwrap().n = 100;
+        for (rate, rtt, expected) in [(2_898_000, 100_000_000, true), (2_898_001, 100_000_000, false),
+            (724_500, 100_000_000, true), (724_499, 100_000_000, false),
+            (1_449_000, 50_000_000, true), (1_449_000, 49_999_999, false)] {
+            q.slipstream_eligible = None;
+            q.current_bytes_per_second = rate;
+            q.fec_rtt_ns = rtt;
+            q.slipstream_classify(1449);
+            assert_eq!(q.slipstream_eligible, Some(expected), "rate={rate} rtt={rtt}");
+            q.current_bytes_per_second = 1;
+            q.fec_rtt_ns = 1;
+            q.slipstream_classify(1449);
+            assert_eq!(q.slipstream_eligible, Some(expected), "decision cannot oscillate");
+        }
+    }
+    #[test]
+    fn slipstream_tiny_and_giant_heads_are_ineligible_serial() {
+        for bytes in [80, 3 << 20] {
+            let mut s = slip_scheduler();
+            s.submit_messages(0, vec![vec![7; bytes], vec![8; 142800]]);
+            for seq in 0..if bytes == 80 { 1 } else { 50 } { slip_packet(&mut s, seq, 1449); }
+            let i = s.queues[0].slipstream_info;
+            assert_eq!(i.heads_eligible, 0);
+            assert_eq!(i.follower_packets, 0);
+            assert!(s.queues[0].interleave_parked.is_empty());
+        }
+    }
+    #[test]
+    fn slipstream_equal_outer_byte_fairness_with_different_lane_work() {
+        let mut s = slip_scheduler();
+        s.submit_messages(0, vec![vec![7; 142800], vec![8; 4 << 20]]);
+        s.submit_messages(1, vec![vec![9; 142800]; 15]);
+        s.set_rate(2_898_000);
+        for seq in 0..250 {
+            slip_packet(&mut s, seq, 1449);
+            assert!(s.scheduled_bytes[0].abs_diff(s.scheduled_bytes[1]) <= 1449);
+        }
+        assert!(s.queues[0].slipstream_info.follower_packets > 0);
+        assert!(s.queues[0].slipstream_info.follower_starts_segmented_giant > 0);
+    }
+    #[test]
+    fn slipstream_dscp_follower_tiny_packing_keeps_classes_separate() {
+        let mut s = slip_scheduler();
+        s.submit_classified_messages(0, vec![(Dscp::BestEffort, vec![7; 142800]),
+            (Dscp::Ef, vec![8; 80]), (Dscp::Ef, vec![9; 80]), (Dscp::BestEffort, vec![10; 142800])]);
+        for seq in 0..12 {
+            let p = slip_packet(&mut s, seq, 1449);
+            let mut cursor = 0;
+            while let Some((f, used)) = read_frame(&p[cursor..]) {
+                let tag = match f { WireFrame::Whole(d) | WireFrame::Plain { data: d, .. } | WireFrame::Fec { data: d, .. } => d[0], _ => break };
+                assert_eq!(s.last_dscp, if tag == 8 || tag == 9 { Dscp::Ef } else { Dscp::BestEffort });
+                cursor += used;
+            }
+        }
+    }
+    #[test]
+    fn slipstream_giant_reservation_blocks_extra_ownership_not_other_queue() {
+        let mut s = slip_scheduler();
+        s.submit_messages(0, vec![vec![7; 142800], vec![8; 4 << 20]]);
+        s.submit_messages(1, vec![vec![9; 142800]]);
+        s.queues[0].min_queue_size_bytes = 5 << 20;
+        s.queues[0].max_queue_size_bytes = 5 << 20;
+        for seq in 0..50 { slip_packet(&mut s, seq, 1449); }
+        assert!(s.scheduled_bytes[0] > 0 && s.scheduled_bytes[1] > 0);
+        let q = &s.queues[0];
+        assert_eq!(q.slipstream_info.follower_starts_segmented_giant, 0);
+        assert_eq!(q.message_queue.len(), 1);
+        assert!(q.interleave_source_bytes() < 5 << 20);
+    }
+    #[test]
+    fn slipstream_full_giant_lifecycle_releases_sources_and_late_feedback_cannot_reopen() {
+        let mut s = slip_scheduler();
+        s.submit_messages(0, vec![vec![7; 142800], vec![8; 4 << 20], vec![9; 80]]);
+        slip_packet(&mut s, 0, 1449);
+        slip_packet(&mut s, 1, 1449);
+        let giant = std::sync::Arc::downgrade(&s.queues[0].segmented_send.as_ref().unwrap().message);
+        let mut last = 1;
+        for seq in 2..7000 {
+            settle_slip_workers(&mut s);
+            if !s.has_unsent_data() { break; }
+            slip_packet(&mut s, seq, if seq < 1600 { 1449 } else { 1162 });
+            // Physical ACK/loss feedback stays with each own segment/root while
+            // it is parked, active, retained or suspended. Include late repeats.
+            if seq > 20 { s.fec_on_packet_finalized(seq - 20, seq % 67 == 0); }
+            last = seq;
+        }
+        assert!(!s.has_unsent_data(), "must seal without a feedback-only wait");
+        for q in &mut s.queues { q.reclaim_finished_partial(); }
+        let q = &s.queues[0];
+        assert!(giant.upgrade().is_none());
+        assert!(q.fec_retained.is_empty() && q.fec_suspended.is_none() && q.segmented_send.is_none());
+        assert_eq!(q.queue_bytes_filled, 0);
+        assert_eq!(q.interleave_source_bytes(), 0);
+        assert_eq!(*q.package_allocator.as_ref().unwrap().live.lock().unwrap(), 0);
+        for seq in 0..=last { s.fec_on_packet_finalized(seq, true); s.fec_on_packet_finalized(seq, false); }
+        assert!(!s.has_unsent_data());
+    }
+    #[test]
+    fn slipstream_decision_sidecar_attributes_tiny_and_giant_followers() {
+        use std::io::Write;
+        let path = std::env::temp_dir().join(format!("stp-slip-decisions-{}", std::process::id()));
+        let trace = crate::loss_trace::LossTrace::open(&path).unwrap();
+        let mut s = slip_scheduler();
+        s.queues[0].slipstream_trace = Some(trace.slipstream_writer());
+        s.submit_messages(0, vec![vec![7; 142800], vec![8; 80], vec![9; 4 << 20]]);
+        for seq in 0..5 { slip_packet(&mut s, seq, 1449); }
+        trace.slipstream_writer().lock().unwrap().flush().unwrap();
+        let sidecar = format!("{}.slip.csv", path.display());
+        let text = std::fs::read_to_string(&sidecar).unwrap();
+        assert!(text.contains(",evaluate,") && text.contains(",eligible,"));
+        assert!(text.contains(",tiny_whole_or_packed,") && text.contains(",segmented_giant,"));
+        assert!(text.lines().all(|line| line.split(',').count() == 14));
+        drop(s); drop(trace);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(sidecar).unwrap();
+    }
+    #[test]
+    fn slipstream_medium_giant_alternates_actual_context() {
+        let mut s = scheduler();
+        s.queues[0].slipstream = true;
+        s.set_time(1, 100_000_000);
+        s.set_rate(1_449_000);
+        s.submit_messages(0, vec![vec![7; 100 * 1428], vec![8; 4 << 20], vec![9; 80]]);
+        let mut roots = Vec::new();
+        for seq in 0..12 {
+            let p = packet(&mut s, seq, 1449);
+            match read_frame(&p).unwrap().0 {
+                WireFrame::Fec { segment, id, .. } => roots.push(segment.map_or(id, |g| g.root)),
+                _ => panic!("expected source"),
+            }
+        }
+        assert_ne!(roots[0], roots[1], "giant must be the following stream, not serial");
+        for i in 0..roots.len() { assert_eq!(roots[i], roots[i % 2]); }
+        assert_eq!(s.queues[0].slipstream_eligible_heads, 1);
+        assert_eq!(s.queues[0].slipstream_follow_packets, 6);
+    }
+    fn scheduler() -> SendQueues {
+        let mut s = SendQueues::baseline_for_test(2, (0, 16 << 20, 16 << 20));
+        let mut a = crate::fec_adapt::FecAdaptiveState::baseline_for_test(crate::ship::FEC, 0);
+        a.policy = crate::fec_adapt::RepairPolicy::MessageBound;
+        a.p = 0.1;
+        s.fec_adaptive = Some(a);
+        s
+    }
+    fn ready(s: &mut SendQueues) {
+        for q in &mut s.queues {
+            if let Some(f) = &mut q.fec_send_slot {
+                if matches!(f.encoder, FecEncoderState::Pending(_)) {
+                    f.encoder = FecEncoderState::Ready(crate::fec::encode_message(f.message.clone(), f.block_bytes).unwrap());
+                }
+            }
+        }
+    }
+    #[test]
+    fn interleave_w1_checked_baseline() {
+        let mut s = scheduler();
+        s.submit_messages(0, vec![vec![7; 28560], vec![8; 80], vec![9; 42840]]);
+        s.submit_messages(1, vec![vec![6; 1000]; 30]);
+        let mut h = blake3::Hasher::new();
+        let mut seq = 0u64;
+        while s.has_unsent_data() {
+            assert!(seq < 300);
+            ready(&mut s);
+            s.fec_prepare_packet(seq);
+            let mut p = vec![0; 1449];
+            assert_eq!(s.fill_packet(&mut p), 1449);
+            h.update(&p);
+            for q in &s.queues {
+                h.update(&q.send_package_id.to_le_bytes());
+                h.update(&[q.p4_open as u8, q.p4_closing as u8, q.p4_tail_refreshed as u8]);
+                if let Some(f) = &q.fec_send_slot {
+                    for x in [f.k, f.n, f.n_planned, f.next_id] { h.update(&x.to_le_bytes()); }
+                }
+            }
+            if seq >= 6 { s.fec_on_packet_finalized(seq - 6, (seq - 6) % 11 == 0); }
+            seq += 1;
+        }
+        // Captured before scheduler changes, at c30614e (baseline.log).
+        assert_eq!(seq, 83);
+        assert_eq!(h.finalize().to_hex().as_str(), "6150da0b14f6b2ddf5f5094051ff43c581dd473564387c66a19f79b5f3480f74");
+    }
+    #[test]
+    fn interleave_single_baseline() {
+        for width in [1, 2, 4, 0] {
+        let mut s = scheduler();
+        s.queues[0].interleave_width = width.max(1);
+        if width == 0 {
+            s.queues[0].slipstream = true;
+            s.set_time(1, 20_000_000);
+            s.set_rate(1_449_000);
+        }
+        s.submit_messages(0, vec![vec![7; 28560]]);
+        let mut h = blake3::Hasher::new();
+        let mut seq = 0;
+        while s.has_unsent_data() {
+            ready(&mut s);
+            s.fec_prepare_packet(seq);
+            let mut p = vec![0; 1449];
+            assert_eq!(s.fill_packet(&mut p), 1449);
+            h.update(&p);
+            let q = &s.queues[0];
+            h.update(&[q.p4_open as u8, q.p4_closing as u8, q.p4_tail_refreshed as u8]);
+            if let Some(f) = &q.fec_send_slot {
+                for x in [f.k, f.n, f.n_planned, f.next_id] { h.update(&x.to_le_bytes()); }
+            }
+            if seq >= 6 { s.fec_on_packet_finalized(seq - 6, true); }
+            seq += 1;
+        }
+        assert_eq!(seq, 40);
+        assert_eq!(h.finalize().to_hex().as_str(), "25a92d6b2ea029354c3d5ea4af528db6aa9424e66126db6e57ea027ea7701b3b");
+        if width == 0 { assert_eq!(s.queues[0].slipstream_info.heads_eligible, 1); }
+        }
+    }
+    fn packet(s: &mut SendQueues, seq: u64, size: usize) -> Vec<u8> {
+        ready(s);
+        s.fec_prepare_packet(seq);
+        let mut p = vec![0; size];
+        assert_eq!(s.fill_packet(&mut p), size, "seq {seq}");
+        p
+    }
+    #[test]
+    fn interleave_fifo_starts_rr_and_non_fifo_completion() {
+        for width in [2, 4] {
+            let mut s = scheduler();
+            s.queues[0].interleave_width = width;
+            s.submit_messages(0, vec![vec![7; 28560], vec![8; 5712], vec![9; 8568], vec![10; 11424], vec![11; 5712]]);
+            let mut starts = Vec::new();
+            let mut last = HashMap::new();
+            let mut order = Vec::new();
+            for seq in 0..200 {
+                if !s.has_unsent_data() { break; }
+                let p = packet(&mut s, seq, 1449);
+                if let Some((WireFrame::Fec { id, block_id, data, .. }, _)) = read_frame(&p) {
+                    if block_id == 0 { starts.push((id, data[0])); }
+                    order.push(id);
+                    last.insert(id, seq);
+                }
+                assert!(s.queues[0].interleave_parked.len() < width);
+                assert!(s.queues[0].interleave_source_bytes() <= 16 << 20);
+                assert!(s.queues.iter().all(|q| q.fec_packet_tags.is_none() && q.fec_adaptive.is_none()));
+            }
+            assert_eq!(starts.iter().map(|x| x.1).collect::<Vec<_>>(), vec![7,8,9,10,11]);
+            assert!(order.windows(3).any(|p| p[0] == p[2] && p[0] != p[1]));
+            assert!(last[&starts[1].0] < last[&starts[0].0]);
+            assert!(s.fec_packet_tags.is_some()); // exactly one shared 4 MiB ring
+            assert!(!s.has_unsent_data());
+            assert!(s.queues[0].interleave_parked.is_empty());
+        }
+    }
+    #[test]
+    fn interleave_outcomes_follow_parked_owner_and_seal_is_exact() {
+        let mut s = scheduler();
+        s.queues[0].interleave_width = 2;
+        s.submit_messages(0, vec![vec![7; 28560], vec![8; 5712]]);
+        for seq in 0..3 { packet(&mut s, seq, 1449); }
+        let q = &s.queues[0];
+        assert_eq!(q.send_package_id, 1);
+        assert_eq!(q.interleave_parked[0].send_package_id, 0);
+        s.fec_on_packet_finalized(0, true);
+        s.fec_on_packet_finalized(1, false);
+        let f = s.queues[0].interleave_parked[0].fec_send_slot.as_ref().unwrap();
+        assert_eq!((f.lost, f.finalized_symbols, f.repair_accounting.planned_topup), (1, 2, 1));
+        assert_eq!(s.queues[0].fec_send_slot.as_ref().unwrap().lost, 0);
+        // A late ACK of an already finalized loss cannot double-finalize or
+        // reinterpret a consumed outcome tag (production spurious path unchanged).
+        s.fec_on_packet_finalized(0, false);
+        assert_eq!(s.queues[0].interleave_parked[0].fec_send_slot.as_ref().unwrap().finalized_symbols, 2);
+        let mut seals = Vec::new();
+        for seq in 3..150 {
+            if !s.has_unsent_data() { break; }
+            // The outer packet filler immediately reclaims a just-sealed slot.
+            // Exercise the same production next_fragment path without that final
+            // can_emit, injecting feedback at the stricter pre-reclaim boundary.
+            s.fec_prepare_packet(seq);
+            s.select_packet_owner(0);
+            let q = &mut s.queues[0];
+            q.next_packet_seq = seq;
+            q.packet_dscp = None;
+            q.fec_adaptive = s.fec_adaptive.take();
+            q.fec_packet_tags = s.fec_packet_tags.take();
+            q.fec_extra_packet_tags = std::mem::take(&mut s.fec_extra_packet_tags);
+            assert!(q.next_fragment(1449, 1449).is_some());
+            s.fec_adaptive = q.fec_adaptive.take();
+            s.fec_packet_tags = q.fec_packet_tags.take();
+            s.fec_extra_packet_tags = std::mem::take(&mut q.fec_extra_packet_tags);
+            let q = &s.queues[0];
+            if q.p4_closing {
+                let f = q.fec_send_slot.as_ref().unwrap();
+                let before = (f.n, f.lost, f.finalized_symbols);
+                seals.push(q.send_package_id);
+                // Feedback immediately after last planned symbol, BEFORE ordinary
+                // reclaim, must have no effect on this sealed logical message.
+                s.fec_on_packet_finalized(seq, true);
+                let f = s.queues[0].fec_send_slot.as_ref().unwrap();
+                assert_eq!((f.n, f.lost, f.finalized_symbols), before);
+            }
+        }
+        assert_eq!(seals, vec![1,0]);
+        assert!(!s.has_unsent_data());
+        for seq in 0..150 { s.fec_on_packet_finalized(seq, true); }
+        assert!(!s.has_unsent_data());
+        let q = &mut s.queues[0];
+        q.reclaim_finished_partial();
+        assert!(q.interleave_parked.is_empty() && !q.p4_open && !q.p4_closing);
+        assert_eq!(*q.package_allocator.as_ref().unwrap().live.lock().unwrap(), 0);
+    }
+    #[test]
+    fn interleave_blocked_selected_encoder_does_not_hide_ready_peer() {
+        let mut s = scheduler();
+        s.queues[0].interleave_width = 2;
+        s.submit_messages(0, vec![vec![7; 5712], vec![8; 5712]]);
+        for seq in 0..3 { packet(&mut s, seq, 1449); }
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let f = s.queues[0].fec_send_slot.as_mut().unwrap();
+        f.next_id = f.k;
+        f.encoder = FecEncoderState::Pending(rx);
+        assert!(s.queues[0].can_emit(), "ready parked source must remain eligible");
+        let p = packet(&mut s, 3, 1449);
+        assert!(matches!(read_frame(&p), Some((WireFrame::Fec { id: 0, .. }, _))));
+        drop(tx);
+    }
+    #[test]
+    fn interleave_tiny_heads_do_not_pass_unstarted_contexts() {
+        let mut s = scheduler();
+        s.queues[0].interleave_width = 4;
+        s.submit_messages(0, vec![vec![7; 28560], vec![8; 80], vec![9; 5712], vec![10; 80], vec![11; 80]]);
+        let mut starts = Vec::new();
+        for seq in 0..100 {
+            if !s.has_unsent_data() { break; }
+            let p = packet(&mut s, seq, 1449);
+            let mut cursor = 0;
+            while let Some((frame, used)) = read_frame(&p[cursor..]) {
+                match frame {
+                    WireFrame::Whole(data) | WireFrame::Plain { offset: 0, data, .. } => starts.push(data[0]),
+                    WireFrame::Fec { block_id: 0, data, .. } => starts.push(data[0]),
+                    _ => {},
+                }
+                cursor += used;
+            }
+        }
+        assert_eq!(starts, vec![7,8,9,10,11]);
+    }
+    #[test]
+    fn interleave_tu_restart_keeps_one_source_owner_and_other_context() {
+        let mut s = scheduler();
+        s.queues[0].interleave_width = 2;
+        s.submit_messages(0, vec![vec![7; 28560], vec![8; 5712]]);
+        for seq in 0..3 { packet(&mut s, seq, 1449); }
+        let original = s.queues[0].interleave_parked[0].fec_send_slot.as_ref().unwrap().message.clone();
+        let before = s.queues[0].interleave_source_bytes();
+        packet(&mut s, 3, 1162);
+        let q = &s.queues[0];
+        assert_eq!(q.send_package_id, 2);
+        assert!(std::sync::Arc::ptr_eq(&original, &q.fec_send_slot.as_ref().unwrap().message), "restart must not copy a shared source Vec");
+        assert_eq!(q.interleave_source_bytes(), before);
+        let other = &q.interleave_parked[0];
+        assert_eq!(other.send_package_id, 1);
+        assert_eq!(other.fec_send_slot.as_ref().unwrap().block_bytes, 1428);
+        assert!(!other.p4_tail_refreshed && !other.p4_closing);
+        s.fec_on_packet_finalized(0, true); // abandoned unit's outcome can't charge its replacement
+        assert_eq!(s.queues[0].fec_send_slot.as_ref().unwrap().lost, 0);
+    }
+    #[test]
+    fn interleave_capacity_and_identity_pressure_continue_existing_work() {
+        for pressure in [false, true] {
+            let mut s = scheduler();
+            s.queues[0].interleave_width = 4;
+            s.submit_messages(0, vec![vec![7; 28560], vec![8; 5712]]);
+            packet(&mut s, 0, 1449);
+            let ids = s.queues[0].package_allocator.as_ref().unwrap().clone();
+            let mut leases = Vec::new();
+            if pressure {
+                while let Some(lease) = ids.allocate() { leases.push(lease); }
+                assert_eq!(leases.len(), 1023);
+            } else {
+                s.queues[0].min_queue_size_bytes = 28560;
+                s.queues[0].max_queue_size_bytes = 28560;
+            }
+            for seq in 1..5 {
+                let p = packet(&mut s, seq, 1449);
+                assert!(matches!(read_frame(&p), Some((WireFrame::Fec { id: 0, .. }, _))));
+                assert_eq!(s.queues[0].message_queue.len(), 1);
+                assert!(s.queues[0].interleave_parked.is_empty());
+                assert_eq!(s.queues[0].interleave_source_bytes(), 28560);
+            }
+            drop(leases);
+            for seq in 5..100 {
+                if !s.has_unsent_data() { break; }
+                packet(&mut s, seq, 1449);
+            }
+            assert!(!s.has_unsent_data());
+            assert_eq!(*ids.live.lock().unwrap(), 0);
+        }
+    }
+    #[test]
+    fn interleave_all_blocked_failed_worker_and_disconnect_release_sources() {
+        let mut s = scheduler();
+        s.queues[0].interleave_width = 2;
+        s.submit_messages(0, vec![vec![7; 5712], vec![8; 5712]]);
+        for seq in 0..3 { packet(&mut s, seq, 1449); }
+        let mut senders = Vec::new();
+        let mut sources = Vec::new();
+        let q = &mut s.queues[0];
+        for f in q.fec_send_slot.iter_mut().chain(q.interleave_parked.iter_mut().filter_map(|c| c.fec_send_slot.as_mut())) {
+            sources.push(std::sync::Arc::downgrade(&f.message));
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            senders.push(tx);
+            f.encoder = FecEncoderState::Pending(rx);
+            f.next_id = f.k;
+        }
+        assert!(!q.can_emit());
+        s.fec_prepare_packet(3);
+        assert_eq!(s.fill_packet(&mut [0;1449]), 0);
+        assert_eq!(s.queues[0].interleave_parked.len(), 1);
+        assert_eq!(s.queues[0].interleave_source_bytes(), 11424);
+        assert_eq!(s.queues[0].queue_bytes_filled, 11424);
+        drop(senders); // disconnected worker channels become Failed, not stuck
+        s.fec_prepare_packet(4);
+        assert_eq!(s.fill_packet(&mut [0;1449]), 0);
+        // Failure reclamation may select the other failed context on a later
+        // packet. It must terminate without waiting for outcome feedback.
+        for seq in 5..9 { s.fec_prepare_packet(seq); s.fill_packet(&mut [0;1449]); }
+        assert!(!s.has_unsent_data());
+        assert_eq!(s.queues[0].queue_bytes_filled, 0);
+        assert!(sources.iter().all(|w| w.upgrade().is_none()));
+        let ids = s.queues[0].package_allocator.as_ref().unwrap().clone();
+        assert_eq!(*ids.live.lock().unwrap(), 0);
+        // Normal disconnect/drop releases both selected and parked contexts.
+        let mut s = scheduler();
+        s.queues[0].interleave_width = 4;
+        s.submit_messages(0, vec![vec![7; 5712]; 4]);
+        for seq in 0..5 { packet(&mut s, seq, 1449); }
+        let ids = s.queues[0].package_allocator.as_ref().unwrap().clone();
+        let sources = s.queues[0].interleave_parked.iter().map(|c|
+            std::sync::Arc::downgrade(&c.fec_send_slot.as_ref().unwrap().message)).collect::<Vec<_>>();
+        drop(s);
+        assert!(sources.iter().all(|w| w.upgrade().is_none()));
+        assert_eq!(*ids.live.lock().unwrap(), 0);
+    }
+    #[test]
+    fn interleave_giant_fifo_head_stays_serial_despite_future_tinies() {
+        let mut s = scheduler();
+        s.queues[0].interleave_width = 4;
+        s.submit_messages(0, vec![vec![7; 28560], vec![8; FEC_SEGMENT_BYTES + 100], vec![9; 80], vec![10; 28560]]);
+        let mut starts = Vec::new();
+        let mut giant_seen = false;
+        let mut later_seen = false;
+        for seq in 0..500 {
+            if !s.has_unsent_data() { break; }
+            if seq < 50 { assert!(s.submit_messages(0, vec![vec![11; 80]]).is_empty()); }
+            let p = packet(&mut s, seq, 9194); // inline giant codecs; deterministic, no sockets
+            let mut cursor = 0;
+            while let Some((frame, used)) = read_frame(&p[cursor..]) {
+                match frame {
+                    WireFrame::Fec { segment: Some(seg), .. } => {
+                        assert!(!later_seen);
+                        if !giant_seen { starts.push(8); giant_seen = true; }
+                        assert!(s.queues[0].interleave_parked.is_empty());
+                        assert_eq!(seg.total as usize, FEC_SEGMENT_BYTES + 100);
+                    },
+                    WireFrame::Fec { segment: None, block_id: 0, data, .. } => starts.push(data[0]),
+                    WireFrame::Whole(data) if data[0] == 9 => { starts.push(9); later_seen = true; },
+                    _ => {},
+                }
+                cursor += used;
+            }
+        }
+        assert_eq!(starts, vec![7,8,9,10]);
+        assert!(!s.has_unsent_data());
+    }
+    #[test]
+    fn interleave_outer_byte_fairness_is_independent_of_width() {
+        let mut s = scheduler();
+        s.queues[0].interleave_width = 4;
+        s.submit_messages(0, vec![vec![7; 28560]; 30]);
+        s.submit_messages(1, vec![vec![8; 28560]; 30]);
+        for seq in 0..200 {
+            packet(&mut s, seq, 1449);
+            assert!(s.scheduled_bytes[0].abs_diff(s.scheduled_bytes[1]) <= 1449);
+        }
+    }
+    #[test]
+    fn interleave_dscp_and_plain_fillers_remain_packet_local_send_once() {
+        let mut s = scheduler();
+        s.queues[0].interleave_width = 4;
+        s.submit_classified_messages(0, vec![(Dscp::BestEffort, vec![7; 28560]),
+            (Dscp::Ef, vec![8; 80]), (Dscp::Ef, vec![9; 5712]), (Dscp::BestEffort, vec![10; 5712])]);
+        s.submit_messages(1, vec![vec![6; 1000]; 30]);
+        let mut unit_classes = HashMap::new();
+        let mut small_parts = HashMap::<u64, usize>::new();
+        let mut wholes = 0;
+        let mut tiny = 0;
+        for seq in 0..200 {
+            if !s.has_unsent_data() { break; }
+            let p = packet(&mut s, seq, 1449);
+            let class = s.last_dscp;
+            let mut cursor = 0;
+            while let Some((frame, used)) = read_frame(&p[cursor..]) {
+                match frame {
+                    WireFrame::Fec { id, block_id, data, .. } => {
+                        if block_id == 0 { unit_classes.insert(id, if data[0] == 9 { Dscp::Ef } else { Dscp::BestEffort }); }
+                        assert_eq!(unit_classes[&id], class);
+                    },
+                    WireFrame::Whole(data) if data[0] == 8 => { tiny += 1; assert_eq!(class, Dscp::Ef); },
+                    WireFrame::Whole(data) if data[0] == 6 => { wholes += 1; assert_eq!(class, Dscp::BestEffort); },
+                    WireFrame::Plain { id, data, .. } if data[0] == 6 => { *small_parts.entry(id).or_default() += 1; assert_eq!(class, Dscp::BestEffort); },
+                    _ => {},
+                }
+                cursor += used;
+            }
+        }
+        assert_eq!(tiny, 1);
+        assert_eq!(wholes + small_parts.len(), 30);
+        assert!(small_parts.values().all(|&n| n <= 2));
+        assert_eq!(unit_classes.len(), 3); // neither 80B nor 1000B promoted to FEC
+    }
+    #[test]
+    fn interleave_counts_source_allocation_capacity_not_only_len() {
+        let mut s = scheduler();
+        s.queues[0].interleave_width = 4;
+        let mut m = Vec::with_capacity(50000);
+        m.resize(5712, 7);
+        s.submit_messages(0, vec![m, vec![8; 5712]]);
+        s.queues[0].min_queue_size_bytes = 50000;
+        s.queues[0].max_queue_size_bytes = 50000;
+        packet(&mut s, 0, 1449);
+        packet(&mut s, 1, 1449);
+        assert_eq!(s.queues[0].interleave_source_bytes(), 50000);
+        assert!(s.queues[0].interleave_parked.is_empty());
+        assert_eq!(s.queues[0].message_queue.len(), 1);
+    }
+    #[test]
+    fn interleave_env_child() {
+        if std::env::var_os("STP_INTERLEAVE_TEST_CHILD").is_none() { return; }
+        let width = std::env::var("STP_P4_INTERLEAVE_WIDTH").unwrap();
+        let initialized = crate::fec_adapt::initialize_research_policy();
+        if ["0", "3", "8"].contains(&width.as_str()) {
+            assert!(initialized.unwrap_err().contains("must be 1, 2, or 4"));
+            return;
+        }
+        initialized.unwrap();
+        let policy = std::env::var("STP_RACE_POLICY").unwrap();
+        let mut s = SendQueues::baseline_for_test(2, (0, 16 << 20, 16 << 20));
+        assert_eq!(s.queues[0].interleave_width, if policy == "P4" { width.parse().unwrap() } else { 1 });
+        let mut a = crate::fec_adapt::FecAdaptiveState::baseline_for_test(crate::ship::FEC, 0);
+        a.p = 0.1;
+        s.fec_adaptive = Some(a);
+        s.submit_messages(0, vec![vec![7; 28560], vec![8; 80], vec![9; 42840]]);
+        s.submit_messages(1, vec![vec![6; 1000]; 30]);
+        let mut h = blake3::Hasher::new();
+        let mut seq = 0;
+        while s.has_unsent_data() {
+            assert!(seq < 300);
+            let p = packet(&mut s, seq, 1449);
+            h.update(&p);
+            for q in &s.queues {
+                h.update(&q.send_package_id.to_le_bytes());
+                h.update(&[q.p4_open as u8, q.p4_closing as u8, q.p4_tail_refreshed as u8]);
+                if let Some(f) = &q.fec_send_slot {
+                    for x in [f.k, f.n, f.n_planned, f.next_id] { h.update(&x.to_le_bytes()); }
+                }
+            }
+            if seq >= 6 { s.fec_on_packet_finalized(seq - 6, (seq - 6) % 11 == 0); }
+            seq += 1;
+        }
+        println!("ENV_TRANSCRIPT {seq} {}", h.finalize());
+    }
+    // Legacy policy startup is exercised by the four predecessor-feature full gates.
+    // This feature intentionally refuses those non-isolated policies before transport starts.
+    #[cfg(feature="research_target_validation")]
+    #[ignore = "historical predecessor-feature configuration, not frozen RC defaults"]
+    #[test]
+    fn interleave_benchmark_environment_validates_and_leaves_p0_p3_serial_exact() {
+        let run = |policy: &str, width: &str| {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "stp::p4_interleave_tests::interleave_env_child", "--nocapture", "--test-threads=2"])
+                .env("STP_INTERLEAVE_TEST_CHILD", "1")
+                .env("STP_RACE_POLICY", policy).env("STP_P4_INTERLEAVE_WIDTH", width)
+                .output().unwrap();
+            assert!(output.status.success(), "{} {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            String::from_utf8(output.stdout).unwrap().lines().find(|l| l.starts_with("ENV_TRANSCRIPT")).unwrap_or("").to_owned()
+        };
+        for policy in ["P0", "P1", "P2", "P3"] {
+            let baseline = run(policy, "1");
+            assert!(!baseline.is_empty());
+            assert_eq!(run(policy, "2"), baseline);
+            assert_eq!(run(policy, "4"), baseline);
+        }
+        assert_eq!(run("P4", "1"), "ENV_TRANSCRIPT 83 6150da0b14f6b2ddf5f5094051ff43c581dd473564387c66a19f79b5f3480f74");
+        for width in ["0", "3", "8"] { assert!(run("P4", width).is_empty()); }
+    }
+    #[test]
+    fn interleave_pending_restart_skips_to_peer_without_abandoning_worker_source() {
+        let mut s = scheduler();
+        s.queues[0].interleave_width = 2;
+        s.submit_messages(0, vec![vec![7; 28560], vec![8; 5712]]);
+        for seq in 0..3 { packet(&mut s, seq, 1449); }
+        let f = s.queues[0].interleave_parked[0].fec_send_slot.as_mut().unwrap();
+        let source = f.message.clone();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        f.encoder = FecEncoderState::Pending(rx);
+        s.fec_prepare_packet(3);
+        assert_eq!(s.fill_packet(&mut [0;1162]), 1162);
+        // Context 0 cannot restart until its old worker resolves, so context 1
+        // gets service/restarts alone. No extra job or copied source is created.
+        assert_eq!(s.queues[0].send_package_id, 2);
+        assert_eq!(s.queues[0].fec_send_slot.as_ref().unwrap().message[0], 8);
+        assert_eq!(s.queues[0].interleave_parked[0].send_package_id, 0);
+        assert!(std::sync::Arc::ptr_eq(&source, &s.queues[0].interleave_parked[0].fec_send_slot.as_ref().unwrap().message));
+        tx.send(crate::fec::encode_message(source.clone(), 1428)).unwrap();
+        s.fec_prepare_packet(4);
+        assert_eq!(s.fill_packet(&mut [0;1162]), 1162);
+        assert_eq!(s.queues[0].send_package_id, 3);
+        assert!(std::sync::Arc::ptr_eq(&source, &s.queues[0].fec_send_slot.as_ref().unwrap().message));
+        assert_eq!(s.queues[0].interleave_source_bytes(), 34272);
+    }
+    #[test]
+    fn interleave_sixty_four_queues_keep_one_connection_budget_and_ring() {
+        let mut s = SendQueues::baseline_for_test(64, (0, 65536, 65536));
+        let mut a = crate::fec_adapt::FecAdaptiveState::baseline_for_test(crate::ship::FEC, 0);
+        a.policy = crate::fec_adapt::RepairPolicy::MessageBound;
+        s.fec_adaptive = Some(a);
+        for q in 0..64 {
+            s.queues[q].interleave_width = 4;
+            assert!(s.submit_messages(q, vec![vec![7; 5712]; 4]).is_empty());
+        }
+        let ids = s.queues[0].package_allocator.as_ref().unwrap().clone();
+        for seq in 0..2500 {
+            if !s.has_unsent_data() { break; }
+            packet(&mut s, seq, 1449);
+            assert!(*ids.live.lock().unwrap() <= 256);
+            for q in &s.queues {
+                assert!(q.interleave_parked.len() < 4);
+                assert!(q.interleave_source_bytes() <= 65536);
+                assert!(q.fec_packet_tags.is_none() && q.fec_adaptive.is_none());
+            }
+        }
+        assert!(!s.has_unsent_data());
+        assert_eq!(*ids.live.lock().unwrap(), 0);
+    }
+    #[test]
+    fn interleave_legacy_tail_and_failed_recursion_cannot_bypass_admission() {
+        for giant in [false, true] {
+            let mut s = scheduler();
+            s.queues[0].interleave_width = 2;
+            let mut tail = Vec::with_capacity(if giant { FEC_SEGMENT_BYTES + 100 } else { 50000 });
+            tail.resize(if giant { FEC_SEGMENT_BYTES + 100 } else { 80 }, 9);
+            s.submit_messages(0, vec![vec![7;28560], vec![8;5712], tail]);
+            for seq in 0..3 { packet(&mut s, seq, 1449); }
+            let q = &mut s.queues[0];
+            q.min_queue_size_bytes = 50000; q.max_queue_size_bytes = 50000;
+            if giant {
+                q.fec_adaptive = s.fec_adaptive.take();
+                let f = q.fec_send_slot.as_mut().unwrap();
+                f.next_id = f.k;
+                f.encoder = FecEncoderState::Failed;
+                // Same-packet recursion after failure must not start the giant
+                // concurrently with the older still-live ordinary context.
+                assert!(q.next_fragment(9194, 9194).is_none());
+                assert!(q.segmented_send.is_none());
+            } else {
+                q.fec_send_slot.as_mut().unwrap().next_id = q.fec_send_slot.as_ref().unwrap().n;
+                q.reclaim_finished_partial();
+                // Tiny filler must respect actual allocation capacity too, not
+                // evade the rolling admission guard through the legacy tail path.
+                assert!(q.next_fragment(1449, 100).is_none());
+            }
+            assert_eq!(q.message_queue.len(), 1);
+            assert_eq!(q.interleave_parked.len(), 1);
+            assert_eq!(q.interleave_source_bytes(), 28560);
+        }
+    }
+    #[test]
+    fn interleave_failed_recursion_cannot_start_tiny_ahead_of_unstarted_peer() {
+        let mut s = scheduler();
+        s.queues[0].interleave_width = 4;
+        s.submit_messages(0, vec![vec![7;28560], vec![8;5712], vec![9;5712], vec![10;80]]);
+        for seq in 0..3 { packet(&mut s, seq, 1449); }
+        let q = &mut s.queues[0];
+        assert!(q.interleave_parked.iter().any(|c| c.fec_send_slot.as_ref().is_some_and(|f| f.next_id == 0)));
+        q.fec_adaptive = s.fec_adaptive.take();
+        let f = q.fec_send_slot.as_mut().unwrap();
+        f.next_id = f.k;
+        f.encoder = FecEncoderState::Failed;
+        assert!(q.next_fragment(9194, 9194).is_none());
+        assert_eq!(q.message_queue.front().unwrap().1[0], 10);
+    }
+    #[test]
+    fn independent_review_pending_tu_shrink_must_preserve_first_symbol_fifo() {
+        let mut s = scheduler();
+        s.queues[0].interleave_width = 4;
+        s.submit_messages(0, vec![vec![7; 28560], vec![8; 5712], vec![9; 5712]]);
+        for seq in 0..2 { packet(&mut s, seq, 1449); }
+        let q = &mut s.queues[0];
+        let f = q.interleave_parked[0].fec_send_slot.as_mut().unwrap();
+        assert_eq!(f.message[0], 8);
+        assert_eq!(f.next_id, 0);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        f.encoder = FecEncoderState::Pending(rx);
+        let mut starts = Vec::new();
+        for seq in 2..5 {
+            s.fec_prepare_packet(seq);
+            let mut p = vec![0; 1162];
+            if s.fill_packet(&mut p) != 0 {
+                if let Some((WireFrame::Fec { block_id: 0, data, .. }, _)) = read_frame(&p) {
+                    starts.push(data[0]);
+                }
+            }
+        }
+        let older = s.queues[0].interleave_parked.iter().filter_map(|c| c.fec_send_slot.as_ref())
+            .chain(s.queues[0].fec_send_slot.iter()).find(|f| f.message[0] == 8).unwrap();
+        assert_eq!(older.next_id, 0);
+        assert!(!starts.contains(&9), "newer message first symbol bypassed pending unstarted FIFO head: {starts:?}");
+        drop(tx);
+    }
+    #[test]
+    fn independent_review_ready_peer_after_empty_fill_same_nonce() {
+        let mut s = scheduler();
+        s.queues[0].interleave_width = 2;
+        s.submit_messages(0, vec![vec![7; 28560], vec![8; 5712]]);
+        for seq in 0..3 { packet(&mut s, seq, 1449); }
+        let mut txs = HashMap::new();
+        let q = &mut s.queues[0];
+        for f in q.fec_send_slot.iter_mut().chain(q.interleave_parked.iter_mut().filter_map(|c| c.fec_send_slot.as_mut())) {
+            assert!(f.next_id > 0 && f.next_id < f.k);
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            txs.insert(f.message[0], tx);
+            f.encoder = FecEncoderState::Pending(rx);
+        }
+        s.fec_prepare_packet(3);
+        assert_eq!(s.fill_packet(&mut [0; 1162]), 0);
+        let parked = s.queues[0].interleave_parked[0].fec_send_slot.as_ref().unwrap();
+        let tag = parked.message[0];
+        txs.remove(&tag).unwrap().send(crate::fec::encode_message(parked.message.clone(), parked.block_bytes)).unwrap();
+        assert!(s.queues[0].can_emit(), "ready parked peer is eligible");
+        // A zero-byte fill seals nothing and consumes no nonce in production.
+        s.fec_prepare_packet(3);
+        assert_eq!(s.fill_packet(&mut [0; 1162]), 1162,
+            "same-nonce empty-fill retry must revisit newly ready parked peer instead of waiting for selected worker");
+    }
+    #[test]
+    fn interleave_unstarted_barrier_allows_started_peers_other_queues_and_resumes() {
+        for tiny in [false, true] {
+            let mut s = scheduler();
+            s.queues[0].interleave_width = 4;
+            s.submit_messages(0, vec![vec![7;28560], vec![8;5712], vec![9; if tiny {80} else {5712}]]);
+            for seq in 0..2 { packet(&mut s, seq, 1449); }
+            let f = s.queues[0].interleave_parked[0].fec_send_slot.as_mut().unwrap();
+            assert_eq!((f.message[0], f.next_id), (8,0));
+            let source = f.message.clone();
+            let block_bytes = f.block_bytes;
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            f.encoder = FecEncoderState::Pending(rx);
+            s.submit_messages(1, vec![vec![6;28560]]);
+            let mut starts = Vec::new();
+            let scan = |p: &[u8], starts: &mut Vec<u8>| {
+                let mut cursor = 0;
+                while let Some((frame, used)) = read_frame(&p[cursor..]) {
+                    match frame {
+                        WireFrame::Fec { block_id: 0, data, .. } if data[0] == 8 || data[0] == 9 => starts.push(data[0]),
+                        WireFrame::Whole(data) if data[0] == 9 => starts.push(9),
+                        _ => {},
+                    }
+                    cursor += used;
+                }
+            };
+            let mut served = [0;2];
+            for seq in 2..20 {
+                s.fec_prepare_packet(seq);
+                let mut p = [0;1162];
+                assert_eq!(s.fill_packet(&mut p), 1162);
+                served[s.last_queue] += 1;
+                scan(&p, &mut starts);
+                assert!(starts.is_empty(), "unstarted newer medium/tiny passed pending FIFO barrier: {starts:?}");
+            }
+            assert!(served.iter().all(|&n| n > 0), "started peer and other app queue must both progress");
+            let f = s.queues[0].interleave_parked.iter().filter_map(|c| c.fec_send_slot.as_ref())
+                .chain(s.queues[0].fec_send_slot.iter()).find(|f| f.message[0] == 8).unwrap();
+            assert_eq!(f.next_id, 0);
+            tx.send(crate::fec::encode_message(source, block_bytes)).unwrap();
+            for seq in 20..200 {
+                if !s.has_unsent_data() { break; }
+                s.fec_prepare_packet(seq);
+                let mut p = [0;1162];
+                assert_eq!(s.fill_packet(&mut p), 1162);
+                scan(&p, &mut starts);
+            }
+            assert_eq!(starts, vec![8,9]);
+            assert!(!s.has_unsent_data());
+        }
+    }
+    #[test]
+    fn independent_review_cross_queue_plain_fillers_route_to_parked_owner_and_release() {
+        let mut s = scheduler();
+        s.queues[0].interleave_width = 2;
+        s.submit_messages(0, vec![vec![7; 57120], vec![8; 57120]]);
+        for seq in 0..3 { packet(&mut s, seq, 1162); }
+        let sources = s.queues[0].fec_send_slot.iter().chain(s.queues[0].interleave_parked.iter().filter_map(|c| c.fec_send_slot.as_ref()))
+            .map(|f| std::sync::Arc::downgrade(&f.message)).collect::<Vec<_>>();
+        let bytes = s.queues[0].interleave_source_bytes();
+        s.submit_messages(1, vec![vec![6; 80]; 4]);
+        s.scheduled_bytes[1] = s.scheduled_bytes[0] + 1;
+        s.queue_active[1] = true;
+        let p = packet(&mut s, 3, 9194);
+        let mut cursor = 0;
+        let mut fec = None;
+        let mut plain = 0;
+        while let Some((frame, n)) = read_frame(&p[cursor..]) {
+            match frame {
+                WireFrame::Fec { id, .. } => { assert!(fec.replace(id).is_none()); },
+                WireFrame::Whole(data) => { assert_eq!(data[0], 6); plain += 1; },
+                _ => panic!("unexpected frame"),
+            }
+            cursor += n;
+        }
+        let owner = fec.unwrap();
+        assert_eq!(plain, 4);
+        assert!(s.fec_owner_tags.get(&3).unwrap().iter().any(|&(q, tag)| q == 0 && (tag >> 64) as u64 == owner));
+        packet(&mut s, 4, 9194); // switches q0 away from the owner of packet 3
+        let q = &s.queues[0];
+        assert_ne!(q.send_package_id, owner);
+        assert_eq!(q.interleave_parked[0].send_package_id, owner);
+        let selected_before = q.fec_send_slot.as_ref().map(|f| (f.lost, f.finalized_symbols, f.n, f.repair_accounting.planned_topup));
+        s.fec_on_packet_finalized(3, true);
+        let q = &s.queues[0];
+        let f = q.interleave_parked[0].fec_send_slot.as_ref().unwrap();
+        assert_eq!((f.lost, f.finalized_symbols, f.repair_accounting.planned_topup), (1, 1, 1));
+        assert_eq!(q.fec_send_slot.as_ref().map(|f| (f.lost, f.finalized_symbols, f.n, f.repair_accounting.planned_topup)), selected_before);
+        assert_eq!(q.interleave_source_bytes(), bytes);
+        assert_eq!(q.queue_bytes_filled, 114240);
+        assert!(sources.iter().all(|w| w.strong_count() >= 1));
+        s.fec_on_packet_finalized(3, false);
+        assert_eq!(s.queues[0].interleave_parked[0].fec_send_slot.as_ref().unwrap().finalized_symbols, 1);
+        for seq in 5..500 { if !s.has_unsent_data() { break; } packet(&mut s, seq, 9194); }
+        assert!(!s.has_unsent_data());
+        assert_eq!(s.queues[0].queue_bytes_filled, 0);
+        assert_eq!(s.queues[0].interleave_source_bytes(), 0);
+        assert!(sources.iter().all(|w| w.upgrade().is_none()));
+        assert_eq!(*s.queues[0].package_allocator.as_ref().unwrap().live.lock().unwrap(), 0);
+        for seq in 0..500 { s.fec_on_packet_finalized(seq, true); }
+        assert!(!s.has_unsent_data());
+    }
+}
+
+// RESEARCH-ONLY: tests of the observation-only `research_cohort_observer` feature (socket-free).
+#[cfg(all(test, feature = "research_cohort_observer"))]
+mod cohort_observer_tests {
+    use super::*;
+    use crate::cohort_observe::{self as co, QueueObservation, ThreadSendCounters, KIND_DATA};
+    const MTU_PROBE: usize = 3;
+    fn state() -> ConnectionStateConnected {
+        let ConnectionState::Connected(s) = new_connection_state_connected(None, 0, 1, 1_000_000_000) else { unreachable!() }; s
+    }
+    fn delta(a: &ThreadSendCounters, b: &ThreadSendCounters) -> ([u64; 5], [u64; 5], [u64; 5]) {
+        (std::array::from_fn(|i| b.commit_kernel_full[i] - a.commit_kernel_full[i]),
+         std::array::from_fn(|i| b.commit_tolerated_error[i] - a.commit_tolerated_error[i]),
+         std::array::from_fn(|i| b.commit_unmatched[i] - a.commit_unmatched[i]))
+    }
+    fn observe(b: &SendQueues, c: Option<&ConnectionStateConnected>) -> co::CohortObservation {
+        cohort_observation_parts(b, c, &[0x5a; 64], false)
+    }
+    fn message_bound() -> SendQueues {
+        let mut s = SendQueues::baseline_for_test(1, (0, 64 << 20, 64 << 20));
+        let mut a = crate::fec_adapt::FecAdaptiveState::baseline_for_test(crate::ship::FEC, 0);
+        a.policy = crate::fec_adapt::RepairPolicy::MessageBound;
+        a.p = 0.1;
+        s.fec_adaptive = Some(a);
+        s
+    }
+    fn ready(s: &mut SendQueues) {
+        for q in &mut s.queues {
+            if let Some(f) = &mut q.fec_send_slot {
+                if matches!(f.encoder, FecEncoderState::Pending(_)) {
+                    f.encoder = FecEncoderState::Ready(crate::fec::encode_message(f.message.clone(), f.block_bytes).unwrap());
+                }
+            }
+        }
+    }
+    /// Emit one data packet (inline encoder); false when the queues produced nothing.
+    fn emit(s: &mut SendQueues, seq: &mut u64) -> bool {
+        ready(s);
+        s.fec_prepare_packet(*seq);
+        let mut p = vec![0; 1449];
+        if s.fill_packet(&mut p) == 0 { return false; }
+        *seq += 1;
+        true
+    }
+
+    #[test]
+    fn commit_classification_distinguishes_data_success_tolerated_synthetic_and_stale() {
+        let a = ThreadSendCounters::read();
+        let pkt = |b: u8, n: usize| vec![b; n];
+        // Actual full kernel send then its Data commit.
+        co::udp_send_full(&pkt(1, 1200)); co::observe_commit(KIND_DATA, &pkt(1, 1200));
+        // Same attempt committed twice: the second is stale -> unmatched.
+        co::observe_commit(KIND_DATA, &pkt(1, 1200));
+        // Synthetic commit without any native attempt (as STP_TEST_DROP does) -> unmatched.
+        co::observe_commit(KIND_DATA, &pkt(2, 1200));
+        // Legitimate oversized MTU probe EMSGSIZE: tolerated, counted for the probe kind only.
+        co::udp_send_tolerated(&pkt(3, 9000), libc::EMSGSIZE); co::observe_commit(MTU_PROBE, &pkt(3, 9000));
+        // Invalid: a Data packet whose send failed with a tolerated errno.
+        co::udp_send_tolerated(&pkt(4, 1200), libc::EMSGSIZE); co::observe_commit(KIND_DATA, &pkt(4, 1200));
+        // Different bytes / length than the attempt -> unmatched.
+        co::udp_send_full(&pkt(5, 1200)); co::observe_commit(KIND_DATA, &pkt(6, 1200));
+        co::udp_send_full(&pkt(7, 1200)); co::observe_commit(KIND_DATA, &pkt(7, 1199));
+        // Backpressure attempt never yields success; the exact pending retry that succeeds does.
+        co::udp_send_backpressure(&pkt(8, 1200)); co::observe_commit(KIND_DATA, &pkt(8, 1200));
+        co::udp_send_backpressure(&pkt(9, 1200)); co::udp_send_full(&pkt(9, 1200)); co::observe_commit(KIND_DATA, &pkt(9, 1200));
+        let b = ThreadSendCounters::read();
+        let (full, tol, un) = delta(&a, &b);
+        assert_eq!(full, [0, 2, 0, 0, 0]);
+        assert_eq!(tol, [0, 1, 0, 1, 0]);
+        assert_eq!(un, [0, 5, 0, 0, 0]);
+        assert_eq!(b.udp_send_full - a.udp_send_full, 4);
+        assert_eq!(b.udp_send_full_bytes - a.udp_send_full_bytes, 4 * 1200);
+        assert_eq!(b.udp_send_backpressure - a.udp_send_backpressure, 2);
+        assert_eq!(b.udp_send_tolerated_by_errno[0] - a.udp_send_tolerated_by_errno[0], 2);
+        assert_eq!(b.udp_send_tolerated_total() - a.udp_send_tolerated_total(), 2);
+        assert!(!b.counter_overflow);
+        assert_eq!(co::TOLERATED_ERRNO_NAMES[co::tolerated_index(libc::EAFNOSUPPORT)], "EAFNOSUPPORT");
+        assert_eq!(co::TOLERATED_ERRNO_NAMES[co::tolerated_index(libc::ECONNREFUSED)], "ECONNREFUSED");
+    }
+
+    #[test]
+    fn finish_connected_send_wiring_and_pending_ciphertext_blocks_idle() {
+        let mut s = state();
+        let mut b = SendQueues::baseline_for_test(1, (1_000_000, 8 << 20, 8 << 20));
+        assert!(observe(&b, Some(&s)).all_idle());
+        assert!(!observe(&b, None).all_idle(), "a disconnected observation is never idle");
+        let plain = vec![0u8; 1162];
+        let a = ThreadSendCounters::read();
+        // Kernel-confirmed Data commit through the real commit path.
+        let bytes = vec![0x11u8; 1184];
+        co::udp_send_full(&bytes);
+        finish_connected_send(&mut s, &mut b, PendingSendKind::Data, Some(2_000_000_000), 2_000_000_000, &bytes, &plain, Dscp::BestEffort, 0, None);
+        // Synthetic success (no sendmsg) through the same path: unmatched.
+        finish_connected_send(&mut s, &mut b, PendingSendKind::Data, Some(2_000_000_001), 2_000_000_001, &[0x22; 1184], &plain, Dscp::BestEffort, 0, None);
+        let (full, tol, un) = delta(&a, &ThreadSendCounters::read());
+        assert_eq!((full[KIND_DATA], tol[KIND_DATA], un[KIND_DATA]), (1, 0, 1));
+        // Refused send: pending ciphertext held -> not idle, kind Data reported.
+        co::udp_send_backpressure(&[0x33; 1184]);
+        assert!(!finish_connected_send(&mut s, &mut b, PendingSendKind::Data, None, 3_000_000_000, &[0x33; 1184], &plain, Dscp::BestEffort, 0, None));
+        freeze_local_send(&mut s, 3_000_000_001);
+        let o = observe(&b, Some(&s));
+        assert!(o.pending_send && o.pending_send_kind == Some(KIND_DATA as u8) && !o.all_idle());
+        assert!(o.queues.iter().all(|q| q.idle()), "only the pending datagram blocks idle here");
+        // Observation reads, never consumes: still pending afterwards.
+        assert!(s.pending_send.is_some());
+        s.pending_send = None;
+        assert!(observe(&b, Some(&s)).all_idle());
+    }
+
+    #[test]
+    fn every_queue_component_blocks_idle() {
+        assert!(QueueObservation::default().idle());
+        let flips: Vec<fn(&mut QueueObservation)> = vec![
+            |q| q.queue_bytes_filled = 1, |q| q.message_queue_len = 1, |q| q.partial_send_slot = true, |q| q.fec_send_slot = true,
+            |q| q.fec_suspended = true, |q| q.segmented_send = true, |q| q.interleave_parked_len = 1, |q| q.rescue_ready_count = 1,
+            |q| q.rescue_ready_len = 1, |q| q.p4_open = true, |q| q.p4_closing = true, |q| q.p4_tail_refreshed = true,
+            |q| q.fec_rescue_package = true, |q| q.fec_retained_len = 1];
+        for (i, f) in flips.iter().enumerate() {
+            let mut q = QueueObservation::default(); f(&mut q);
+            assert!(!q.idle(), "component {i} must block idle");
+        }
+    }
+
+    #[test]
+    fn coded_message_is_busy_until_sent_and_finalized() {
+        let s0 = state();
+        let mut b = message_bound();
+        b.submit_messages(0, vec![vec![7; 40_000]]);
+        let o = observe(&b, Some(&s0));
+        assert!(!o.all_idle() && o.queues[0].queue_bytes_filled > 0 && o.queues[0].message_queue_len == 1);
+        let mut seq = 0;
+        let mut saw_slot = false;
+        for _ in 0..1000 {
+            if !emit(&mut b, &mut seq) { break; }
+            let o = observe(&b, Some(&s0));
+            saw_slot |= o.queues[0].fec_send_slot;
+            assert!(!o.all_idle() || !b.queues[0].has_unsent_data());
+        }
+        assert!(saw_slot && seq > 0);
+        assert!(!b.queues[0].has_unsent_data());
+        b.free_bytes();
+        // MessageBound plans every repair up front and retains nothing: idle once all is framed.
+        assert!(b.queues[0].fec_retained.is_empty());
+        let o = observe(&b, Some(&s0));
+        assert!(o.all_idle(), "{:?}", o.queues[0]);
+    }
+
+    #[test]
+    fn retained_codec_awaiting_feedback_blocks_idle_until_finalized() {
+        let s0 = state();
+        for lost in [false, true] {
+            let mut b = UnreliableSendBuffer::new(1000000, 100000, 100000);
+            b.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::reliability_for_test(crate::ship::FEC, 0));
+            b.submit_messages(vec![vec![7; 3000]]);
+            let mut seq = 0;
+            loop {
+                b.fec_prepare_packet(seq); b.next_fragment(1449, 1449).unwrap(); seq += 1;
+                let f = b.fec_send_slot.as_ref().unwrap();
+                if f.next_id == f.n { break; }
+            }
+            b.fec_prepare_packet(seq);
+            assert!(b.next_fragment(1449, 1449).is_none());
+            let mut q = SendQueues::baseline_for_test(1, (1000000, 100000, 100000));
+            q.queues[0] = b;
+            q.free_bytes();
+            let o = observe(&q, Some(&s0));
+            assert!(o.queues[0].fec_retained_len > 0 && !o.all_idle(), "{:?}", o.queues[0]);
+            for old in 0..seq { q.queues[0].fec_on_packet_finalized(old, lost); }
+            q.free_bytes();
+            let o = observe(&q, Some(&s0));
+            if lost {
+                // Loss feedback schedules rescue repairs: more planned work, never idle.
+                assert!(o.queues[0].rescue_ready_count > 0 && !o.all_idle(), "{:?}", o.queues[0]);
+            } else {
+                assert!(o.all_idle(), "{:?}", o.queues[0]);
+            }
+        }
+    }
+
+    #[test]
+    fn giant_segmented_message_is_observed_busy() {
+        let s0 = state();
+        let mut b = message_bound();
+        b.submit_messages(0, vec![vec![3; 20_000_000]]);
+        let mut seq = 0;
+        let mut saw_segment = false;
+        for _ in 0..64 {
+            assert!(emit(&mut b, &mut seq));
+            let o = observe(&b, Some(&s0));
+            saw_segment |= o.queues[0].segmented_send;
+            assert!(!o.all_idle());
+        }
+        assert!(saw_segment, "a 20 MB message must be observed in its segmented send state");
+    }
+
+    #[test]
+    fn parked_interleave_contexts_block_idle() {
+        let s0 = state();
+        let mut b = message_bound();
+        b.queues[0].interleave_width = 4;
+        b.submit_messages(0, vec![vec![7; 28560], vec![8; 5712], vec![9; 5712]]);
+        let mut seq = 0;
+        let mut saw_parked = false;
+        for _ in 0..3 {
+            assert!(emit(&mut b, &mut seq));
+            let o = observe(&b, Some(&s0));
+            saw_parked |= o.queues[0].interleave_parked_len > 0;
+            assert!(!o.all_idle());
+        }
+        assert!(saw_parked);
+    }
+
+    #[test]
+    fn suspended_rescue_blocks_idle() {
+        let s0 = state();
+        let mut b = UnreliableSendBuffer::new(1000000, 100000, 100000);
+        b.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::reliability_for_test(crate::ship::FEC, 0));
+        b.submit_messages(vec![vec![7; 3000], vec![8; 6000]]);
+        let mut seq = 0;
+        loop {
+            b.fec_prepare_packet(seq); b.next_fragment(1449, 1449).unwrap(); seq += 1;
+            let f = b.fec_send_slot.as_ref().unwrap();
+            if f.next_id == f.n { break; }
+        }
+        let first_end = seq;
+        b.fec_prepare_packet(seq); b.next_fragment(1449, 1449).unwrap(); seq += 1;
+        for old in 0..first_end { b.fec_on_packet_finalized(old, true); }
+        b.fec_prepare_packet(seq); b.next_fragment(1449, 1449).unwrap();
+        assert!(b.fec_suspended.is_some());
+        let mut q = SendQueues::baseline_for_test(1, (1000000, 100000, 100000));
+        q.queues[0] = b;
+        let o = observe(&q, Some(&s0));
+        assert!(o.queues[0].fec_suspended && !o.all_idle());
+    }
+
+    #[test]
+    fn encoder_failure_and_skipped_repairs_are_counted() {
+        let a = ThreadSendCounters::read();
+        let mut s = message_bound();
+        s.queues[0].interleave_width = 4;
+        s.submit_messages(0, vec![vec![7; 28560], vec![8; 5712], vec![9; 5712], vec![10; 80]]);
+        let mut seq = 0;
+        for _ in 0..3 { assert!(emit(&mut s, &mut seq)); }
+        let q = &mut s.queues[0];
+        q.fec_adaptive = s.fec_adaptive.take();
+        let f = q.fec_send_slot.as_mut().unwrap();
+        assert!(f.n > f.k, "MessageBound at p=0.1 plans repairs");
+        f.next_id = f.k;
+        // A worker that disconnected without delivering an encoder: Pending -> Failed.
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(tx);
+        f.encoder = FecEncoderState::Pending(rx);
+        let _ = q.next_fragment(9194, 9194);
+        let b = ThreadSendCounters::read();
+        // Exactly one count per actual failure: polling the Failed slot again adds nothing.
+        let _ = q.next_fragment(9194, 9194);
+        assert_eq!(ThreadSendCounters::read().fec_encoder_failed, b.fec_encoder_failed);
+        assert_eq!(b.fec_encoder_failed - a.fec_encoder_failed, 1);
+        assert_eq!(b.fec_repair_skip_events - a.fec_repair_skip_events, 1);
+        // The plan may be refreshed before the skip; at least the repair at next_id=k was abandoned.
+        assert!(b.fec_repair_skipped_symbols - a.fec_repair_skipped_symbols >= 1);
+        let q = &s.queues[0];
+        assert!(q.fec_send_slot.as_ref().is_none_or(|f| f.next_id == f.n));
+    }
+
+    #[test]
+    fn counter_saturation_latches_overflow_instead_of_wrapping() {
+        // Each test runs on its own thread: the preload affects only this thread's counters.
+        assert!(!ThreadSendCounters::read().counter_overflow);
+        co::preload_near_max_for_test();
+        co::udp_send_full(&[1; 100]);
+        assert!(!ThreadSendCounters::read().counter_overflow);
+        co::udp_send_full(&[1; 100]);
+        let c = ThreadSendCounters::read();
+        assert!(c.counter_overflow && c.udp_send_full == u64::MAX);
+        let s0 = state();
+        let b = SendQueues::baseline_for_test(1, (1_000_000, 8 << 20, 8 << 20));
+        let x = observe(&b, Some(&s0));
+        let y = observe(&b, Some(&s0));
+        assert_eq!((x.service_seq, y.service_seq), (u64::MAX, u64::MAX), "saturated sequence repeats (stale), never wraps");
+        assert!(y.thread.counter_overflow);
+    }
+
+    #[test]
+    fn readiness_path_encoder_failure_counted_once() {
+        let mut s = message_bound();
+        s.submit_messages(0, vec![vec![7; 28560]]);
+        let mut seq = 0;
+        assert!(emit(&mut s, &mut seq));
+        let a = ThreadSendCounters::read();
+        let f = s.queues[0].fec_send_slot.as_mut().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(tx);
+        f.encoder = FecEncoderState::Pending(rx);
+        assert!(UnreliableSendBuffer::encoder_initialized(f));
+        assert!(matches!(f.encoder, FecEncoderState::Failed));
+        assert!(UnreliableSendBuffer::encoder_initialized(f));
+        assert!(UnreliableSendBuffer::encoder_ready(f));
+        assert_eq!(ThreadSendCounters::read().fec_encoder_failed - a.fec_encoder_failed, 1);
+        // A worker that reports "no encoder" (Ok(None)) is the same actual failure.
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(None).unwrap();
+        f.encoder = FecEncoderState::Pending(rx);
+        assert!(UnreliableSendBuffer::encoder_initialized(f));
+        assert_eq!(ThreadSendCounters::read().fec_encoder_failed - a.fec_encoder_failed, 2);
+    }
+
+    #[test]
+    fn identity_sequence_and_test_drop_fields() {
+        let s0 = state();
+        let b = SendQueues::baseline_for_test(1, (1_000_000, 8 << 20, 8 << 20));
+        let x = cohort_observation_parts(&b, Some(&s0), &[1; 64], false);
+        let y = cohort_observation_parts(&b, Some(&s0), &[2; 64], true);
+        assert_ne!(x.handshake_prefix, y.handshake_prefix, "a new handshake (restart) is visible");
+        assert!(y.service_seq > x.service_seq && y.observed_ns >= x.observed_ns);
+        assert!(!x.test_drop_configured && y.test_drop_configured);
+        assert_eq!(x.send_sequence_number, s0.send_sequence_number);
+        assert_eq!(x.last_sent_data_packet, s0.last_sent_data_packet);
+    }
+}
+
+// ---- p4-burst-base (RESEARCH) ----
+#[cfg(test)]
+mod burst_base_slot_tests {
+    use super::*;
+    use crate::fec_adapt::{base_group_eps, FecAdaptiveState, RepairPolicy};
+    const BLOCK: usize = 1449 - STP_FEC_FRAGMENT_HEADER_SIZE;
+    const T: u64 = 1_000 * 0x400000;
+
+    fn state(on: bool) -> FecAdaptiveState {
+        let mut a = FecAdaptiveState::baseline_for_test(crate::ship::FEC, 0);
+        a.policy = RepairPolicy::MessageBound;
+        a.p = 0.05;
+        a.set_base_parity_for_test(on);
+        a.set_base_context(1, 500 * 1_000_000, Some(200_000_000)); // H = 100 packets
+        a
+    }
+    fn buffer(on: bool) -> UnreliableSendBuffer {
+        let mut b = UnreliableSendBuffer::new(0, 16 << 20, 16 << 20);
+        b.fec_adaptive = Some(state(on));
+        b
+    }
+    fn emit(b: &mut UnreliableSendBuffer, seq: &mut u64) -> bool {
+        b.fec_prepare_packet(*seq);
+        if let Some(f) = &mut b.fec_send_slot {
+            if matches!(f.encoder, FecEncoderState::Pending(_)) {
+                f.encoder = FecEncoderState::Ready(crate::fec::encode_message(f.message.clone(), f.block_bytes).unwrap());
+            }
+        }
+        let some = b.next_fragment(1449, 1449).is_some();
+        if some { b.fec_commit_marks(*seq, T + *seq * 0x400000 + 1); *seq += 1; }
+        some
+    }
+    fn plan(f: &FecSendSlot) -> (u32, u32, u32) { (f.k, f.n, f.next_id) }
+
+    #[test]
+    fn b0_slot_is_baseline_plan() {
+        let mut b = buffer(false);
+        b.submit_messages(vec![vec![7; BLOCK * 300]]);
+        let mut seq = 0;
+        assert!(emit(&mut b, &mut seq));
+        let f = b.fec_send_slot.as_ref().unwrap();
+        assert!(f.repair_accounting.base_b.is_empty());
+        assert_eq!((f.k, f.n), (300, 302), "baseline P4: two decoder repairs");
+    }
+
+    #[test]
+    fn b1_slot_base_known_loss_one_for_one_tail_and_no_compounding() {
+        let mut b = buffer(true);
+        b.submit_messages(vec![vec![7; BLOCK * 300]]);
+        let mut seq = 0;
+        assert!(emit(&mut b, &mut seq));
+        let a = b.fec_adaptive.clone().unwrap();
+        let (base, capped) = a.base_initial_repairs(300, base_group_eps(1));
+        assert!(!capped && base > 2 && base < 30, "absolute base from H=100, got {base}");
+        {
+            let f = b.fec_send_slot.as_ref().unwrap();
+            assert_eq!(f.repair_accounting.base_b, vec![base as u32]);
+            assert_eq!(f.repair_accounting.base_r, base as u32);
+            assert_eq!(plan(f), (300, 300 + base as u32, 1));
+        }
+        for _ in 0..49 { assert!(emit(&mut b, &mut seq)); }
+        // Five own losses while sources are still sending: exactly +5 (coefficient 1).
+        for s in [3u64, 9, 17, 30, 44] { b.fec_on_packet_finalized(s, true); }
+        for s in [0u64, 1, 2] { b.fec_on_packet_finalized(s, false); }
+        let a = b.fec_adaptive.clone().unwrap();
+        let f = b.fec_send_slot.as_mut().unwrap();
+        assert_eq!(f.group_lost, vec![5]);
+        assert_eq!(f.n, 300 + 5 + base as u32);
+        let before = f.repair_accounting.planned_topup;
+        for _ in 0..30 { f.refresh_plan(&a); assert_eq!(f.n, 305 + base as u32, "repeated refresh does not compound"); }
+        assert_eq!(f.repair_accounting.planned_topup, before);
+        assert_eq!(f.repair_accounting.base_b, vec![base as u32], "immutable base");
+        // ECN/early/timeout events grant nothing (event repair is 0 under B1).
+        for kind in [CC_EVENT_EARLY, CC_EVENT_TIMEOUT, CC_EVENT_CE] {
+            b.p4_event_repair(&AcceptedCcEvent { kind, evidence_seq: 10, evidence_sent_ns: send_history_time_ns(T + 10 * 0x400000 + 1), feedback_ns: T + 40 * 0x400000 });
+        }
+        assert_eq!(b.fec_send_slot.as_ref().unwrap().n, 305 + base as u32);
+        // Source completion: tail fixed point over own unresolved symbols and planned repairs.
+        while b.fec_send_slot.as_ref().unwrap().next_id < 300 { assert!(emit(&mut b, &mut seq)); }
+        let a = b.fec_adaptive.clone().unwrap();
+        let f = b.fec_send_slot.as_mut().unwrap();
+        let r = f.repair_accounting.base_r as u64;
+        assert!(r >= 5 + base, "never refunds: {r}");
+        let pending = (f.next_id - f.finalized_symbols) as u64;
+        assert_eq!(a.base_tail_repairs(300, r, 5, 0, pending, base_group_eps(1)).0, r, "plan is the fixed point");
+        assert_eq!(f.n as u64, 300 + r);
+        let n = f.n;
+        for _ in 0..30 { f.refresh_plan(&a); assert_eq!(f.n, n); }
+        // A late own loss after completion is again replaced 1:1 on top of the fixed point.
+        let d6 = a.base_tail_repairs(300, r, 6, 0, pending, base_group_eps(1)).0;
+        f.group_lost[0] = 6; f.refresh_plan(&a);
+        assert_eq!(f.n as u64, 300 + d6);
+        assert!(d6 >= r, "old plan is a lower bound");
+        let need = |d| a.base_tail_repairs(300, 0, d, 1000, pending, base_group_eps(1)).0;
+        assert_eq!(need(6), need(5) + 1, "known loss above the requirement is replaced 1:1");
+    }
+
+    #[test]
+    fn b1_cold_horizon_is_kg_and_caps_like_baseline() {
+        let mut b = buffer(true);
+        b.fec_adaptive.as_mut().unwrap().set_base_context(1, 0, None);
+        b.submit_messages(vec![vec![7; BLOCK * 300], vec![8; BLOCK * 3]]);
+        let mut seq = 0;
+        assert!(emit(&mut b, &mut seq));
+        let a = b.fec_adaptive.clone().unwrap();
+        let f = b.fec_send_slot.as_mut().unwrap();
+        let cold = a.base_initial_repairs(300, base_group_eps(1)).0;
+        assert_eq!(f.repair_accounting.base_b, vec![cold as u32]);
+        let mut warm = state(true);
+        assert!(cold > warm.base_initial_repairs(300, base_group_eps(1)).0, "unknown H uses h = Kg");
+        warm.set_base_context(2, 0, Some(1));
+        assert_eq!(warm.base_horizon(), None);
+        // Heavy known loss: capped at Kg, i.e. the baseline's 2K limit.
+        f.group_lost[0] = 1000; f.refresh_plan(&a);
+        assert_eq!(f.n, 600);
+        assert!(f.repair_accounting.base_cap_bound);
+        // Tiny message: base capped at K.
+        while emit(&mut b, &mut seq) { if b.fec_send_slot.as_ref().map_or(false, |f| f.k == 3) { break; } }
+        let f = b.fec_send_slot.as_ref().unwrap();
+        assert_eq!((f.k, f.repair_accounting.base_b.clone(), f.n), (3, vec![3], 6));
+    }
+
+    #[test]
+    fn b1_segmented_root_splits_target_over_all_codecs() {
+        let mut b = buffer(true);
+        b.submit_messages(vec![vec![9; 5 << 20]]);
+        let mut seq = 0;
+        assert!(emit(&mut b, &mut seq));
+        let a = b.fec_adaptive.clone().unwrap();
+        let f = b.fec_send_slot.as_ref().unwrap();
+        let s = f.segment.expect("segmented");
+        let layout = crate::fec::MessageLayout::new(f.message.len(), f.block_bytes).unwrap();
+        let codecs = (s.total as usize).div_ceil(FEC_SEGMENT_BYTES) * layout.groups;
+        assert_eq!(codecs, 3 * layout.groups);
+        let want: Vec<u32> = (0..layout.groups).map(|g| a.base_initial_repairs(layout.group(g).1 as u64, base_group_eps(codecs)).0 as u32).collect();
+        assert_eq!(f.repair_accounting.base_b, want);
+        assert!(want[0] as u64 >= a.base_initial_repairs(layout.group(0).1 as u64, base_group_eps(1)).0);
+    }
+
+    fn queues(on: bool) -> SendQueues {
+        let mut s = SendQueues::baseline_for_test(2, (0, 16 << 20, 16 << 20));
+        s.fec_adaptive = Some(state(on));
+        s
+    }
+    fn ready(s: &mut SendQueues) {
+        for q in &mut s.queues {
+            if let Some(f) = &mut q.fec_send_slot {
+                if matches!(f.encoder, FecEncoderState::Pending(_)) {
+                    f.encoder = FecEncoderState::Ready(crate::fec::encode_message(f.message.clone(), f.block_bytes).unwrap());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn b0_queues_reproduce_checked_baseline_hash() {
+        // Same script and hash as p4_interleave_tests::interleave_w1_checked_baseline (captured at c30614e),
+        // here with the B1 flag present but off and the B1 context set.
+        let mut s = queues(false);
+        s.fec_adaptive.as_mut().unwrap().p = 0.1;
+        s.submit_messages(0, vec![vec![7; 28560], vec![8; 80], vec![9; 42840]]);
+        s.submit_messages(1, vec![vec![6; 1000]; 30]);
+        let mut h = blake3::Hasher::new();
+        let mut seq = 0u64;
+        while s.has_unsent_data() {
+            ready(&mut s);
+            s.fec_prepare_packet(seq);
+            let mut p = vec![0; 1449];
+            assert_eq!(s.fill_packet(&mut p), 1449);
+            h.update(&p);
+            for q in &s.queues {
+                h.update(&q.send_package_id.to_le_bytes());
+                h.update(&[q.p4_open as u8, q.p4_closing as u8, q.p4_tail_refreshed as u8]);
+                if let Some(f) = &q.fec_send_slot { for x in [f.k, f.n, f.n_planned, f.next_id] { h.update(&x.to_le_bytes()); } }
+            }
+            if seq >= 6 { s.fec_on_packet_finalized(seq - 6, (seq - 6) % 11 == 0); }
+            seq += 1;
+        }
+        assert_eq!(seq, 83);
+        assert_eq!(h.finalize().to_hex().as_str(), "6150da0b14f6b2ddf5f5094051ff43c581dd473564387c66a19f79b5f3480f74");
+    }
+
+    #[test]
+    fn b1_multi_queue_sparse_own_subset_uses_global_pending() {
+        let run = || {
+            let mut s = queues(true);
+            {   // Clustered history: 32-packet loss bursts every 3200 DATA packets (1% average).
+                let a = s.fec_adaptive.as_mut().unwrap();
+                for x in 0..65536u64 { a.on_data_sent(x); a.on_sequence_finalized(x, x % 3200 < 32, 1); }
+            }
+            s.submit_messages(0, vec![vec![7; BLOCK * 200]]);
+            s.submit_messages(1, vec![vec![6; BLOCK * 200]]);
+            let (mut seq, mut seen_complete, mut trace) = (65536u64, false, Vec::new());
+            while s.has_unsent_data() {
+                assert!(seq < 65536 + 2000);
+                ready(&mut s);
+                s.fec_prepare_packet(seq);
+                let mut p = vec![0; 1449];
+                assert_eq!(s.fill_packet(&mut p), 1449);
+                s.fec_adaptive.as_mut().unwrap().on_data_sent(seq);
+                if seq >= 65536 + 120 {
+                    let x = seq - 120;
+                    let lost = x % 61 == 0;
+                    s.fec_on_packet_finalized(x, lost);
+                    s.fec_adaptive.as_mut().unwrap().on_sequence_finalized(x, lost, 2);
+                }
+                if !seen_complete {
+                    if let Some(f) = s.queues[0].fec_send_slot.as_ref().filter(|f| f.next_id >= f.k) {
+                        seen_complete = true;
+                        let a = s.fec_adaptive.as_ref().unwrap();
+                        let own = (f.next_id - f.finalized_symbols) as u64;
+                        let global = a.base_tail_repairs(200, 0, 0, 1000, own, base_group_eps(1));
+                        let uc = 120u64;
+                        assert!(own < uc, "own symbols are a sparse subset of in-flight DATA: {own} of {uc}");
+                        let r = f.repair_accounting.base_r as u64;
+                        let rs = (f.next_id - f.k) as u64;
+                        assert_eq!(a.base_tail_repairs(200, r, f.group_lost[0] as u64, rs, own, base_group_eps(1)).0, r);
+                        assert!(global.0 >= 2 + own.min(a.base_count_quantile(uc, base_group_eps(1))));
+                        assert!(f.n <= 400, "uniform-round cap Kg as baseline");
+                        trace.push((f.n, r));
+                    }
+                }
+                for q in &s.queues { if let Some(f) = &q.fec_send_slot { trace.push((f.n, f.next_id as u64)); assert!(f.n <= 2 * f.k); } }
+                seq += 1;
+            }
+            assert!(seen_complete);
+            trace
+        };
+        assert_eq!(run(), run(), "deterministic");
+    }
+}
+
+#[cfg(test)]
+mod budget_base_slot_tests {
+    use super::*;
+    use crate::fec_adapt::{FecAdaptiveState, RepairPolicy};
+    const PAYLOAD: usize = 1449;
+    const BLOCK: usize = PAYLOAD - STP_FEC_FRAGMENT_HEADER_SIZE;
+    fn adaptive(on: bool) -> FecAdaptiveState {
+        let mut a = FecAdaptiveState::baseline_for_test(crate::ship::FEC, 0);
+        a.policy = RepairPolicy::MessageBound;
+        a.set_base_parity_for_test(false);
+        a.set_budget_base_for_test(on);
+
+        if let Ok(arm)=std::env::var("STP_EMPIRICAL_SLOT_ARM") {assert!(arm=="0"||arm=="1");a.set_empirical_for_test(arm=="1");}
+        a.set_base_context(1, 500_000_000, Some(200_000_000));
+        a
+    }
+    fn buffer(on: bool) -> UnreliableSendBuffer {
+        let mut b = UnreliableSendBuffer::new(0, 16 << 20, 16 << 20);
+        b.fec_adaptive = Some(adaptive(on)); b
+    }
+    fn info(b: &UnreliableSendBuffer) -> BudgetBaseInfo { *b.budget_sink.lock().unwrap() }
+    fn info_slot_budget(f: &FecSendSlot) -> BudgetBaseInfo {
+        *f.repair_accounting.budget.as_ref().unwrap().lock().unwrap().root.lock().unwrap().sink.lock().unwrap()
+    }
+    fn ready(b: &mut UnreliableSendBuffer) {
+        if let Some(f) = &mut b.fec_send_slot {
+            if matches!(f.encoder, FecEncoderState::Pending(_)) {
+                f.encoder = FecEncoderState::Ready(crate::fec::encode_message(f.message.clone(), f.block_bytes).unwrap());
+            }
+        }
+    }
+    fn emit(b: &mut UnreliableSendBuffer, seq: &mut u64, payload: usize) -> bool {
+        ready(b); b.fec_prepare_packet(*seq);
+        if b.next_fragment(payload, payload).is_none() { return false; }
+        b.fec_commit_marks(*seq, 2_000_000_000 + *seq * 0x400000);
+        b.fec_adaptive.as_mut().unwrap().on_data_sent(*seq);
+        *seq += 1;
+        let i = info(b);
+        assert!(i.repairs_emitted <= i.planned_repairs && i.planned_repairs <= i.repair_limit);
+        let cap=b.budget_root.as_ref().map_or_else(||b.fec_adaptive.as_ref().unwrap().repair_cap_percent(),|r|r.lock().unwrap().cap_percent);
+        if cap!=0 {assert!(i.repair_limit <= cap as u64 * i.source_symbols / 100);}
+        if let Some(f)=&b.fec_send_slot {if let Some(segment)=&f.repair_accounting.budget {
+            let g=segment.lock().unwrap();assert!(g.emitted<=g.reserved as u64&&g.reserved<=g.limit);assert!(f.n-f.k<=g.reserved);
+        }}
+        assert_eq!(i.counter_overflow, 0);
+        true
+    }
+    fn drain(b: &mut UnreliableSendBuffer, seq: &mut u64, payload: usize, lost: bool) {
+        let end = *seq + 20_000;
+        while emit(b, seq, payload) {
+            assert!(*seq < end);
+            // Real once-only packet ownership plus ordered DATA retirement; every repair can be lost too.
+            let x = *seq - 1;
+            b.fec_on_packet_finalized(x, lost);
+            b.fec_adaptive.as_mut().unwrap().on_sequence_finalized(x, lost, 3_000_000_000);
+        }
+        assert!(!b.has_unsent_data());
+    }
+
+    fn cost_buffer()->UnreliableSendBuffer {
+        let mut b=buffer(true);b.fec_adaptive.as_mut().unwrap().set_cost_smooth_for_test();b
+    }
+
+    #[test]
+    fn cost_smooth_k2_repair_k15_uncapped_known_unit_cost_and_sealed_no_growth() {
+        let mut b=cost_buffer();b.submit_messages(vec![vec![7;BLOCK*2]]);
+        let mut seq=0;drain(&mut b,&mut seq,PAYLOAD,false);
+        assert!(info(&b).repairs_emitted>=1);
+        assert_eq!(info(&b).repair_limit,u32::MAX as u64-2);
+        let old=info(&b);
+        for x in 0..seq {b.fec_on_packet_finalized(x,true);}
+        assert_eq!(info(&b),old);assert!(!b.p4_open && b.fec_retained.is_empty());
+        let mut b=cost_buffer();b.submit_messages(vec![vec![7;BLOCK*2]]);
+        let mut seq=0;for _ in 0..2 {assert!(emit(&mut b,&mut seq,PAYLOAD));}
+        for x in 0..2 {b.fec_on_packet_finalized(x,true);}
+        drain(&mut b,&mut seq,PAYLOAD,false);
+        assert!(info(&b).repairs_emitted>2,"allocator and emission must allow >100% parity");
+        let mut b=cost_buffer();b.submit_messages(vec![vec![7;BLOCK*15]]);
+        let mut seq=0;for _ in 0..10 {assert!(emit(&mut b,&mut seq,PAYLOAD));}
+        let initial=b.fec_send_slot.as_ref().unwrap().n;
+        for x in [0,2,4,6,8] {b.fec_on_packet_finalized(x,true);}
+        assert_eq!(b.fec_send_slot.as_ref().unwrap().n,initial+5);
+        assert!(b.fec_send_slot.as_ref().unwrap().n-15>3);
+        drain(&mut b,&mut seq,PAYLOAD,false);
+        assert!(info(&b).repairs_emitted>3);
+    }
+
+    #[test]
+    fn cost_smooth_retry_credit_persistent_and_monotone() {
+        let mut b=cost_buffer();b.submit_messages(vec![vec![7;BLOCK*80]]);
+        let mut seq=0;for _ in 0..81 {assert!(emit(&mut b,&mut seq,PAYLOAD));}
+        let budget=b.fec_send_slot.as_ref().unwrap().repair_accounting.budget.clone().unwrap();
+        let reserved=budget.lock().unwrap().reserved;
+        let limit=budget.lock().unwrap().limit;
+        let before=info(&b);
+        assert!(emit(&mut b,&mut seq,PAYLOAD-100));
+        let new=b.fec_send_slot.as_ref().unwrap().repair_accounting.budget.clone().unwrap();
+        assert!(std::sync::Arc::ptr_eq(&budget,&new));
+        assert_eq!(new.lock().unwrap().limit,limit);
+        assert!(new.lock().unwrap().reserved>=reserved);
+        assert_eq!(info(&b).roots,1);assert_eq!(info(&b).repair_limit,before.repair_limit);
+        let a=b.fec_adaptive.clone().unwrap();let f=b.fec_send_slot.as_mut().unwrap();let n=f.n;
+        for _ in 0..5 {f.refresh_plan(&a);assert!(f.n>=n);}
+        drain(&mut b,&mut seq,PAYLOAD,false);
+    }
+
+    #[test]
+    fn target_validation_risk_tail_last_source_accounting() {
+        // Run separately with risk/tail env enabled; no shared-global mutations in baseline suites.
+        if std::env::var_os("STP_TV_RISK_TAIL").is_none() {return;}
+        let mut b=target_buffer(2);
+        crate::target_validation::risk_rate(&b.target_state,80_000_000,100_000_000,'G',1_000_000_000);b.submit_messages(vec![vec![7;BLOCK*80]]);let mut seq=0;
+        for _ in 0..79 {assert!(emit(&mut b,&mut seq,PAYLOAD));}
+        let budget=b.fec_send_slot.as_ref().unwrap().repair_accounting.budget.clone().unwrap();
+        let owner=budget.lock().unwrap().target_owner.clone().unwrap();
+        assert_eq!(owner.lock().unwrap().tail_added,0);
+        let before=info(&b);let old_n=b.fec_send_slot.as_ref().unwrap().n;
+        crate::target_validation::risk_rate(&b.target_state,200_000_000,100_000_000,'G',1_000_000_000);
+        let expected=crate::target_validation::tail_plan(&b.target_state,80,old_n-80,2,owner.lock().unwrap().mix_draw,0.).unwrap();
+        assert!(expected.added>0);
+        assert!(emit(&mut b,&mut seq,PAYLOAD));
+        let row=*owner.lock().unwrap();
+        assert_eq!((row.tail_risk,row.tail_k,row.tail_added),(expected.risk,expected.k,expected.added));
+        assert_eq!(info(&b).planned_repairs-before.planned_repairs,expected.added as u64);
+        let f=b.fec_send_slot.as_mut().unwrap();let n=f.n;f.target_tail_complete(2);assert_eq!(f.n,n,"once per root");
+        b.fec_on_packet_finalized(0,true);
+        assert_eq!(b.fec_send_slot.as_ref().unwrap().n,n+1,"1:1 loss replacement preserved after tail grant");
+        drain(&mut b,&mut seq,PAYLOAD,false);
+        let row=*owner.lock().unwrap();assert!(row.sealed);assert_eq!(row.planned_repairs as u64,row.repairs_emitted);
+    }
+
+    fn target_buffer(selector:u32)->UnreliableSendBuffer {
+        crate::target_validation::initialize(selector,Some("g4"),1,0,1).unwrap();
+        let mut b=buffer(true);b.fec_adaptive.as_mut().unwrap().set_target_for_test(selector);b
+    }
+
+    #[test]
+    fn target_validation_native_smooth12_layout_matches_frozen_pooled_k() {
+        assert_eq!(FEC_SEGMENT_BYTES,2097152);assert_eq!(crate::fec::GROUP_MAX_BLOCKS,32000);
+        let payload=1472-total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).unwrap();
+        assert_eq!(payload,1442);let block=payload-STP_FEC_FRAGMENT_HEADER_SIZE;assert_eq!(block,1421);
+        for (size,k) in [(2000,2),(5000,4),(10000,8),(20000,15),(40000,29),(100000,71),(200000,141),(500000,352),(1000000,704),(2000000,1408)] {
+            let l=crate::fec::MessageLayout::new(size,block).unwrap();assert_eq!((l.k,l.groups),(k,1));assert!(size<FEC_SEGMENT_BYTES);
+        }
+        let b=target_buffer(1);for size in [100,1000] {assert!(b.fec_block_bytes(size,payload).is_none());}
+    }
+
+    #[test]
+    fn target_validation_zero_reserve_final_source_seal_and_known_unit_loss() {
+        let mut b=target_buffer(2);
+        // Freeze the calm admission context explicitly: an unknown connection now
+        // conservatively starts at full risk, rather than the old process-global zero.
+        crate::target_validation::risk_rate(&b.target_state,80_000_000,100_000_000,'G',100_000_000);
+        // Predeclared independent stream outcome selecting the lower K2 reserve (zero).
+        let ordinal=(1..100).find(|&i|crate::target_validation::draw(i)>=crate::target_validation::frozen_plan(2,2,"g4",0).unwrap().mix_threshold).unwrap();
+        b.target_root_sequence=ordinal-1;b.submit_messages(vec![vec![7;BLOCK*2]]);
+        let mut seq=0;assert!(emit(&mut b,&mut seq,PAYLOAD));
+        assert_eq!(b.fec_send_slot.as_ref().unwrap().n,2);
+        let budget=b.fec_send_slot.as_ref().unwrap().repair_accounting.budget.clone().unwrap();
+        let owner=budget.lock().unwrap().target_owner.clone().unwrap();
+        b.fec_on_packet_finalized(0,true);assert_eq!(b.fec_send_slot.as_ref().unwrap().n,3);
+        assert_eq!(owner.lock().unwrap().known_losses,1);
+        b.fec_adaptive.as_mut().unwrap().p=0.9;
+        for _ in 0..4 {let a=b.fec_adaptive.clone().unwrap();b.fec_send_slot.as_mut().unwrap().refresh_plan(&a);}
+        assert_eq!(b.fec_send_slot.as_ref().unwrap().n,3,"no adaptive speculative refresh");
+        drain(&mut b,&mut seq,PAYLOAD,false);
+        let row=*owner.lock().unwrap();assert_eq!((row.proactive,row.known_losses,row.planned_repairs,row.repairs_emitted),(0,1,1,1));assert!(row.sealed);
+        let old=info(&b);for x in 0..seq {b.fec_on_packet_finalized(x,true);}assert_eq!(info(&b),old);assert!(!b.p4_open);
+        let mut b=target_buffer(2);crate::target_validation::risk_rate(&b.target_state,80_000_000,100_000_000,'G',100_000_000);b.target_root_sequence=ordinal-1;b.submit_messages(vec![vec![7;BLOCK*2]]);
+        let mut seq=0;drain(&mut b,&mut seq,PAYLOAD,false);assert_eq!(info(&b).repairs_emitted,0,"no dummy first repair");assert_eq!(seq,2);
+    }
+
+    #[test]
+    fn target_validation_frozen_retry_root_draw_and_repair_loss_unit() {
+        let mut b=target_buffer(1);b.submit_messages(vec![vec![7;BLOCK*80]]);let mut seq=0;
+        for _ in 0..81 {assert!(emit(&mut b,&mut seq,PAYLOAD));}
+        let budget=b.fec_send_slot.as_ref().unwrap().repair_accounting.budget.clone().unwrap();
+        let original=budget.lock().unwrap().target_plans.clone();let owner=budget.lock().unwrap().target_owner.clone().unwrap();
+        let before=*owner.lock().unwrap();let allowance=budget.lock().unwrap().limit;
+        b.fec_on_packet_finalized(80,true);assert_eq!(owner.lock().unwrap().known_losses,1,"repair loss replaced1:1 while open");
+        assert!(emit(&mut b,&mut seq,PAYLOAD-100));
+        let new=b.fec_send_slot.as_ref().unwrap().repair_accounting.budget.clone().unwrap();assert!(std::sync::Arc::ptr_eq(&budget,&new));
+        assert_eq!(new.lock().unwrap().limit,allowance);assert_eq!(new.lock().unwrap().target_plans[0].proactive,original[0].proactive);
+        assert_eq!(owner.lock().unwrap().mix_draw,before.mix_draw);assert_eq!(owner.lock().unwrap().root_ordinal,before.root_ordinal);assert_eq!(owner.lock().unwrap().restarts,1);
+        let a=b.fec_adaptive.clone().unwrap();b.fec_send_slot.as_mut().unwrap().refresh_plan(&a);assert_eq!(owner.lock().unwrap().known_losses,1);
+        drain(&mut b,&mut seq,PAYLOAD-100,false);assert!(owner.lock().unwrap().sealed);assert_eq!(info(&b).roots,1);
+    }
+    #[test]
+    fn budget_base_small_integer_caps_plain_and_seal_all_losses() {
+        for k in [0usize, 1, 2, 6, 7, 8, 13, 14, 19, 20, 21, 100] {
+            for lost in [false, true] {
+                let mut b = buffer(true);
+                b.submit_messages(vec![vec![7; BLOCK * k]]);
+                let mut seq = 0;
+                drain(&mut b, &mut seq, PAYLOAD, lost);
+                let i = info(&b);
+                if k <= 1 { assert_eq!(i, BudgetBaseInfo::default(), "plain K={k}"); }
+                else {
+                    assert_eq!(i.roots, 1); assert_eq!(i.source_symbols, k as u64);
+                    assert_eq!(i.repair_limit, (15 * k / 100) as u64);
+                    assert_eq!(i.sources_emitted, k as u64);
+                    assert!(i.repairs_emitted <= (15 * k / 100) as u64);
+                    if k <= 14 { assert_eq!(i.repairs_emitted, (15 * k / 100) as u64); }
+                    if !lost { assert_eq!(i.known_loss_shortfall, 0, "rank/model cap shortage is not a known loss"); }
+                    if k <= 14 || lost { assert!(i.cap_limited_roots > 0 && i.cap_limited_slots > 0 && i.cap_shortfall > 0); }
+                }
+                let old = i;
+                for x in 0..seq { b.fec_on_packet_finalized(x, true); }
+                assert_eq!(info(&b), old, "sealed root must not reopen or keep charging shortfalls");
+                assert!(!b.p4_open && b.fec_retained.is_empty());
+            }
+        }
+    }
+    #[test]
+    fn budget_base_known_losses_one_for_one_then_flat_and_no_counter_compounding() {
+        let mut b = buffer(true); b.submit_messages(vec![vec![7; BLOCK * 300]]);
+        let mut seq = 0;
+        for _ in 0..50 { assert!(emit(&mut b, &mut seq, PAYLOAD)); }
+        let initial = b.fec_send_slot.as_ref().unwrap().n;
+        for x in [3, 9, 17, 30, 44] { b.fec_on_packet_finalized(x, true); }
+        assert_eq!(b.fec_send_slot.as_ref().unwrap().n, initial + 5);
+        let a = b.fec_adaptive.clone().unwrap();
+        let f = b.fec_send_slot.as_mut().unwrap();
+        f.group_lost[0] = 200; f.refresh_plan(&a);
+        assert_eq!(f.n, 345, "floor cap includes base and all known-loss replacements");
+        let clipped = info(&b);
+        assert_eq!(clipped.known_loss_shortfall, 200 - 45);
+        assert!(clipped.cap_shortfall > 0);
+        for _ in 0..30 { b.fec_send_slot.as_mut().unwrap().refresh_plan(&a); }
+        assert_eq!(info(&b), clipped);
+        for kind in [CC_EVENT_EARLY, CC_EVENT_TIMEOUT, CC_EVENT_CE] {
+            b.p4_event_repair(&AcceptedCcEvent { kind, evidence_seq: 10, evidence_sent_ns: 2_000_000_000, feedback_ns: 3_000_000_000 });
+        }
+        assert_eq!(info(&b), clipped, "CC events cannot grant any C1 budget");
+        assert_eq!(b.event_repair.roots_granted, 0);
+        drain(&mut b, &mut seq, PAYLOAD, true);
+        assert_eq!(info(&b).repairs_emitted, 45);
+    }
+    #[test]
+    fn budget_base_lost_repair_replacement_consumes_same_allowance() {
+        let mut b = buffer(true); b.submit_messages(vec![vec![7; BLOCK * 100]]);
+        let mut seq = 0;
+        while seq < 100 {
+            assert!(emit(&mut b, &mut seq, PAYLOAD));
+            let x = seq - 1; b.fec_on_packet_finalized(x, false);
+            b.fec_adaptive.as_mut().unwrap().on_sequence_finalized(x, false, 1);
+        }
+        let before = b.fec_send_slot.as_ref().unwrap().n;
+        assert_eq!(before, 102, "deferred admission: rank only before the first-repair tail refresh");
+        assert!(emit(&mut b, &mut seq, PAYLOAD)); // first repair committed
+        let a = b.fec_adaptive.clone().unwrap();
+        let f = b.fec_send_slot.as_mut().unwrap();
+        // Force the current rank requirement to the plan boundary; then one newly lost REPAIR
+        // raises the fixed-point requirement by exactly one while capacity remains.
+        f.group_lost[0] = before - 100 - 2;
+        f.refresh_plan(&a);
+        let n0 = f.n;
+        b.fec_on_packet_finalized(seq - 1, true);
+        assert_eq!(b.fec_send_slot.as_ref().unwrap().n, n0 + 1);
+        drain(&mut b, &mut seq, PAYLOAD, true);
+        assert_eq!(info(&b).repairs_emitted, 15);
+        // Deferred: d starts at 0, so at most 14 lost repairs are known before the final repair
+        // seals; all are covered by the 15 allocated ordinals (no known-loss shortfall).
+        assert_eq!(info(&b).known_loss_shortfall, 0);
+    }
+    #[test]
+    fn budget_base_tu_restart_never_regrants_and_pending_old_repair_remains_charged() {
+        let mut b = buffer(true); b.submit_messages(vec![vec![7; BLOCK * 80]]);
+        let mut seq = 0;
+        while seq < 82 { assert!(emit(&mut b, &mut seq, PAYLOAD)); }
+        let old = info(&b);
+        assert!(old.repairs_emitted > 0 && b.fec_send_slot.is_some());
+        let budget = b.fec_send_slot.as_ref().unwrap().repair_accounting.budget.clone().unwrap();
+        let old_package = b.send_package_id;
+        // Smaller TU abandons this codec but preserves all its used AND planned allowance.
+        assert!(emit(&mut b, &mut seq, 1162));
+        assert_ne!(b.send_package_id, old_package);
+        assert!(std::sync::Arc::ptr_eq(&budget, b.fec_send_slot.as_ref().unwrap().repair_accounting.budget.as_ref().unwrap()));
+        assert_eq!(info(&b).roots, 1); assert_eq!(info(&b).source_symbols, 80);
+        assert_eq!(info(&b).repair_limit, 12);
+        assert!(info(&b).planned_repairs >= old.planned_repairs);
+        drain(&mut b, &mut seq, 1162, true);
+        assert!(info(&b).sources_emitted > 80, "restarted source frames are physical cost, not new budget credits");
+        assert!(info(&b).repairs_emitted <= 12);
+    }
+    #[test]
+    fn budget_base_segmented_root_survives_segment_completion_and_restart() {
+        let mut b = buffer(true); b.submit_messages(vec![vec![7; 3 << 20]]);
+        let mut seq = 0;
+        assert!(emit(&mut b, &mut seq, PAYLOAD));
+        let root = b.budget_root.clone().unwrap();
+        let first_package = b.send_package_id;
+        while b.send_package_id == first_package { assert!(emit(&mut b, &mut seq, PAYLOAD)); }
+        assert!(std::sync::Arc::ptr_eq(&root, b.budget_root.as_ref().unwrap()));
+        assert_eq!(info(&b).roots, 1);
+        assert_eq!(info(&b).source_symbols, 2 * (3u64 << 19).div_ceil((PAYLOAD - STP_SEGMENT_FEC_HEADER_SIZE) as u64));
+        assert!(!b.fec_retained.is_empty(), "first segment is retained only within the open root");
+        let credits = info(&b).source_symbols;
+        assert!(emit(&mut b, &mut seq, 1162)); // restart second segment; must not regrant root/segment
+        assert_eq!(info(&b).source_symbols, credits);
+        drain(&mut b, &mut seq, 1162, true);
+        assert_eq!(info(&b).roots, 1); assert!(b.budget_root.is_none());
+        assert!(b.fec_retained.is_empty());
+        assert!(info(&b).repairs_emitted <= 15 * credits / 100);
+    }
+    #[test]
+    fn budget_base_multigroup_uneven_prefix_never_rounds_above_floor() {
+        let mut b = buffer(true);
+        // Production segments have one codec at legal TU; exercise the generic layout path too.
+        let k = 64_001usize;
+        b.start_fec(std::sync::Arc::new(vec![7; k * 16]), 16);
+        let a = b.fec_adaptive.clone().unwrap();
+        let f = b.fec_send_slot.as_mut().unwrap();
+        let layout = crate::fec::MessageLayout::new(f.message.len(), f.block_bytes).unwrap();
+        assert_eq!(layout.groups, 3);
+        let limit: usize = (0..layout.groups).map(|g| 15 * layout.group(g).1 / 100).sum();
+        f.group_lost = vec![1, 0, 0]; f.refresh_plan(&a);
+        assert_eq!(info_slot_budget(f).known_loss_shortfall, 0, "existing parity covers the one known loss despite clipped rank/model reserve");
+        f.group_lost = vec![4000, 0, 0]; f.refresh_plan(&a);
+        let allocated0 = limit as u32 / 3 + u32::from(limit % 3 > 0);
+        assert_eq!(info_slot_budget(f).known_loss_shortfall, (4000 - allocated0) as u64, "do not multiply max loss by group count");
+        f.group_lost = vec![64_000; layout.groups]; f.refresh_plan(&a);
+        assert_eq!(f.n, f.k + limit as u32);
+        assert!(f.n as usize <= k + 15 * k / 100);
+        assert_eq!(info(&b).repair_limit, limit as u64);
+        assert!(info(&b).cap_shortfall > 0);
+    }
+    #[test]
+    fn budget_base_invalid_generation_forces_cap_once_and_remains_invalid() {
+        let mut b = buffer(true); b.submit_messages(vec![vec![7; BLOCK * 300]]);
+        let mut seq = 0; assert!(emit(&mut b, &mut seq, PAYLOAD));
+        let fresh = adaptive(true);
+        for _ in 0..30 { b.fec_send_slot.as_mut().unwrap().refresh_plan(&fresh); }
+        assert_eq!(b.fec_send_slot.as_ref().unwrap().n, 345);
+        assert_eq!(info(&b).invalid_anchor_fallbacks, 1);
+        assert_eq!(info(&b).cap_limited_slots, 1); assert_eq!(info(&b).cap_limited_roots, 1);
+    }
+    #[test]
+    fn budget_base_actual_only_pending_immutable_and_no_data_ordinal_advance() {
+        let ConnectionState::Connected(mut state) = new_connection_state_connected(None, 0, 1, 1_000_000_000) else { unreachable!() };
+        let mut b = SendQueues::baseline_for_test(1, (0, 16 << 20, 16 << 20));
+        b.fec_adaptive = Some(adaptive(true));
+        b.submit_messages(0, vec![vec![7; BLOCK * 80]]);
+        b.fec_prepare_packet(0);
+        let mut plain = vec![0; PAYLOAD]; assert!(b.fill_packet(&mut plain) > 0);
+        let anchor = b.fec_adaptive.as_ref().unwrap().data_anchor();
+        let bytes = vec![0x44; 1472];
+        assert!(!finish_connected_send(&mut state, &mut b, PendingSendKind::Data, None, 2_000_000_000, &bytes, &plain, Dscp::BestEffort, 0, None));
+        assert_eq!(info(&b.queues[0]).sources_emitted, 0);
+        assert_eq!(b.fec_adaptive.as_ref().unwrap().data_anchor(), anchor);
+        b.queues[0].fec_send_slot.as_mut().unwrap().group_lost[0] = 100;
+        let a = b.fec_adaptive.clone().unwrap(); b.queues[0].fec_send_slot.as_mut().unwrap().refresh_plan(&a);
+        freeze_local_send(&mut state, 3_000_000_000);
+        let pending = state.pending_send.take().unwrap();
+        assert_eq!(pending.bytes, bytes); assert_eq!(pending.plaintext, plain);
+        commit_connected_send(&mut state, &mut b, pending.kind, 3_000_000_001, pending.bytes.len(), &pending.plaintext, 0, None);
+        assert_eq!(info(&b.queues[0]).sources_emitted, 1);
+        assert_eq!(b.fec_adaptive.as_ref().unwrap().data_anchor().1, anchor.1 + 1);
+        assert_eq!(info(&b.queues[0]).repairs_emitted, 0);
+    }
+    #[test]
+    fn budget_base_pending_final_repair_counts_only_after_commit_even_after_root_reclaimed() {
+        let ConnectionState::Connected(mut state) = new_connection_state_connected(None, 0, 1, 1_000_000_000) else { unreachable!() };
+        let mut b = SendQueues::baseline_for_test(1, (0, 16 << 20, 16 << 20));
+        b.fec_adaptive = Some(adaptive(true)); b.submit_messages(0, vec![vec![7; BLOCK * 8]]);
+        for seq in 0..8 {
+            b.fec_prepare_packet(seq);
+            let mut plain = vec![0; PAYLOAD]; assert!(b.fill_packet(&mut plain) > 0);
+            commit_connected_send(&mut state, &mut b, PendingSendKind::Data, 2_000_000_000 + seq * 0x400000, 1472, &plain, 0, None);
+        }
+        b.fec_prepare_packet(8);
+        let mut plain = vec![0; PAYLOAD]; assert!(b.fill_packet(&mut plain) > 0);
+        let before = info(&b.queues[0]);
+        assert_eq!((before.repair_limit, before.planned_repairs, before.repairs_emitted), (1,1,0));
+        let anchor = b.fec_adaptive.as_ref().unwrap().data_anchor();
+        let bytes = vec![0x55; 1472];
+        assert!(!finish_connected_send(&mut state, &mut b, PendingSendKind::Data, None, 3_000_000_000, &bytes, &plain, Dscp::BestEffort, 0, None));
+        for seq in 0..8 { b.fec_on_packet_finalized(seq, true); }
+        b.free_bytes();
+        assert!(!b.queues[0].p4_open && b.queues[0].fec_send_slot.is_none());
+        assert_eq!(info(&b.queues[0]), before);
+        assert_eq!(b.fec_adaptive.as_ref().unwrap().data_anchor(), anchor);
+        let pending = state.pending_send.take().unwrap();
+        assert_eq!(pending.bytes, bytes); assert_eq!(pending.plaintext, plain);
+        commit_connected_send(&mut state, &mut b, pending.kind, 3_000_000_001, pending.bytes.len(), &pending.plaintext, 0, None);
+        assert_eq!(info(&b.queues[0]).repairs_emitted, 1);
+        assert_eq!(b.queues[0].event_repair.repairs_emitted, 1);
+        assert_eq!(info(&b.queues[0]).counter_overflow, 0);
+        assert_eq!(b.fec_adaptive.as_ref().unwrap().data_anchor().1, anchor.1 + 1);
+    }
+    #[test]
+    fn budget_base_stats_checked_overflow_is_sticky_and_c0_is_allzero() {
+        let mut i = BudgetBaseInfo { planned_repairs: u64::MAX, ..Default::default() };
+        i.merge(BudgetBaseInfo { planned_repairs: 1, ..Default::default() });
+        assert_eq!(i.planned_repairs, u64::MAX); assert_eq!(i.counter_overflow, 1);
+        i.merge(BudgetBaseInfo::default()); assert_eq!(i.counter_overflow, 1);
+        let mut b = buffer(false); b.submit_messages(vec![vec![7; BLOCK * 8]]);
+        let mut seq = 0; drain(&mut b, &mut seq, PAYLOAD, false);
+        assert_eq!(info(&b), BudgetBaseInfo::default());
+        assert!(b.event_repair.repairs_emitted > 1, "C0 preserves E0, including >15% repair on small K");
+    }
+    /// Unknown H: the old C1 admission used the most pessimistic cold blind horizon h = Kg.
+    fn cold_buffer() -> UnreliableSendBuffer {
+        let mut b = buffer(true);
+        b.fec_adaptive.as_mut().unwrap().set_base_context(1, 500_000_000, None);
+        b
+    }
+    fn old_c1_initial(b: &UnreliableSendBuffer, k: u64) -> u64 {
+        b.fec_adaptive.as_ref().unwrap().base_initial_repairs(k, crate::fec_adapt::base_group_eps(1)).0
+            .min(crate::fec_adapt::budget_repair_limit(k))
+    }
+    fn emit_clean_sources(b: &mut UnreliableSendBuffer, seq: &mut u64, k: u64, retire: bool) {
+        while *seq < k {
+            assert!(emit(b, seq, PAYLOAD));
+            if retire {
+                let x = *seq - 1; b.fec_on_packet_finalized(x, false);
+                b.fec_adaptive.as_mut().unwrap().on_sequence_finalized(x, false, 1);
+            }
+        }
+        let f = b.fec_send_slot.as_ref().unwrap();
+        assert_eq!((f.next_id, f.n - f.k), (k as u32, 2), "no statistical demand appears during clean sources");
+    }
+    #[test]
+    fn deferred_admission_rank_only_then_actual_span_tail_before_first_repair() {
+        let mut b = cold_buffer();
+        let old = old_c1_initial(&b, 300);
+        assert!(old > 10, "fixture forces a large pessimistic old admission reserve ({old})");
+        b.submit_messages(vec![vec![7; BLOCK * 300]]);
+        let mut seq = 0;
+        assert!(emit(&mut b, &mut seq, PAYLOAD));
+        {
+            let f = b.fec_send_slot.as_ref().unwrap();
+            let acc = &f.repair_accounting;
+            assert_eq!((f.n, f.n_planned, acc.base_r, acc.unbonused_n, acc.base_b.clone()), (302, 302, 2, 302, vec![2]),
+                "no hidden statistical Q in base_r/n_planned/unbonused_n");
+            assert!(!acc.base_cap_bound);
+        }
+        let i = info(&b);
+        assert_eq!((i.demand_repairs, i.planned_repairs, i.cap_shortfall, i.cap_limited_slots, i.repair_limit), (2, 2, 0, 0, 45));
+        emit_clean_sources(&mut b, &mut seq, 300, true);
+        // Full tail refresh happens while constructing the FIRST repair, over the actual span.
+        assert!(emit(&mut b, &mut seq, PAYLOAD));
+        let a = b.fec_adaptive.clone().unwrap();
+        let f = b.fec_send_slot.as_ref().unwrap();
+        let want = a.budget_tail_repairs(300, 2, 0, 0, 0, crate::fec_adapt::base_group_eps(1), 1).0 as u32;
+        assert_eq!(f.n - f.k, want.min(45));
+        assert!(((f.n - f.k) as u64) < old, "actual-span plan {} below old C1 admission {old}", f.n - f.k);
+        assert_eq!(info(&b).planned_repairs, (f.n - f.k) as u64, "rank reservation reused, never refunded");
+        drain(&mut b, &mut seq, PAYLOAD, false);
+        assert!(info(&b).repairs_emitted <= 45);
+    }
+    #[test]
+    fn deferred_without_feedback_full_unresolved_tail_forces_proper_q_or_cap() {
+        let mut b = cold_buffer();
+        let old = old_c1_initial(&b, 300);
+        b.submit_messages(vec![vec![7; BLOCK * 300]]);
+        let mut seq = 0;
+        emit_clean_sources(&mut b, &mut seq, 300, false);
+        assert!(emit(&mut b, &mut seq, PAYLOAD));
+        let a = b.fec_adaptive.clone().unwrap();
+        let f = b.fec_send_slot.as_ref().unwrap();
+        // Own 300 unresolved sources; enclosing span S - max(F, A) + 1 = 301.
+        let want = a.budget_tail_repairs(300, 2, 0, 0, 300, crate::fec_adapt::base_group_eps(1), 301).0 as u32;
+        assert_eq!(f.n - f.k, want.min(45));
+        assert!((f.n - f.k) as u64 >= old, "blind tail is not under-protected relative to the old admission");
+        let i = info(&b);
+        assert_eq!(i.planned_repairs, (f.n - f.k) as u64);
+        if want > 45 { assert!(i.cap_limited_slots == 1 && i.cap_shortfall == (want - 45) as u64); }
+    }
+    #[test]
+    fn deferred_known_source_losses_coefficient_one_until_cap_then_flat() {
+        let mut b = buffer(true); b.submit_messages(vec![vec![7; BLOCK * 300]]);
+        let mut seq = 0;
+        for _ in 0..60 { assert!(emit(&mut b, &mut seq, PAYLOAD)); }
+        assert_eq!(b.fec_send_slot.as_ref().unwrap().n, 302);
+        for x in 0..50u32 {
+            b.fec_on_packet_finalized(x as u64, true);
+            let d = x + 1;
+            assert_eq!(b.fec_send_slot.as_ref().unwrap().n, 300 + (2 + d).min(45), "d={d}");
+            assert_eq!(info(&b).planned_repairs, (2 + d).min(45) as u64);
+        }
+        let i = info(&b);
+        assert_eq!(i.known_loss_shortfall, 50 - 45);
+        assert_eq!(i.cap_limited_slots, 1);
+        drain(&mut b, &mut seq, PAYLOAD, true);
+        assert_eq!(info(&b).repairs_emitted, 45);
+    }
+    #[test]
+    fn deferred_pending_last_source_immutable_while_plan_grows_and_counts_only_on_commit() {
+        let ConnectionState::Connected(mut state) = new_connection_state_connected(None, 0, 1, 1_000_000_000) else { unreachable!() };
+        let mut b = SendQueues::baseline_for_test(1, (0, 16 << 20, 16 << 20));
+        b.fec_adaptive = Some(adaptive(true));
+        b.submit_messages(0, vec![vec![7; BLOCK * 100]]);
+        for seq in 0..99 {
+            b.fec_prepare_packet(seq);
+            let mut plain = vec![0; PAYLOAD]; assert!(b.fill_packet(&mut plain) > 0);
+            commit_connected_send(&mut state, &mut b, PendingSendKind::Data, 2_000_000_000 + seq * 0x400000, 1472, &plain, 0, None);
+        }
+        b.fec_prepare_packet(99);
+        let mut plain = vec![0; PAYLOAD]; assert!(b.fill_packet(&mut plain) > 0);
+        assert_eq!(b.queues[0].fec_send_slot.as_ref().unwrap().next_id, 100, "last source constructed");
+        let i = info(&b.queues[0]);
+        assert_eq!((i.sources_emitted, i.planned_repairs, i.repairs_emitted, i.repair_limit), (99, 2, 0, 15));
+        let anchor = b.fec_adaptive.as_ref().unwrap().data_anchor();
+        let bytes = vec![0x66; 1472];
+        assert!(!finish_connected_send(&mut state, &mut b, PendingSendKind::Data, None, 3_000_000_000, &bytes, &plain, Dscp::BestEffort, 0, None));
+        for x in 0..11 { b.fec_on_packet_finalized(x, true); }
+        let grown = info(&b.queues[0]);
+        assert!(grown.planned_repairs >= 13 && grown.planned_repairs <= 15, "known losses extend the plan while the last source is pending");
+        assert_eq!((grown.sources_emitted, grown.repairs_emitted), (99, 0));
+        assert_eq!(b.fec_adaptive.as_ref().unwrap().data_anchor(), anchor);
+        freeze_local_send(&mut state, 3_000_000_000);
+        let pending = state.pending_send.take().unwrap();
+        assert_eq!(pending.bytes, bytes); assert_eq!(pending.plaintext, plain, "pending ciphertext/plaintext immutable");
+        commit_connected_send(&mut state, &mut b, pending.kind, 3_000_000_001, pending.bytes.len(), &pending.plaintext, 0, None);
+        assert_eq!((info(&b.queues[0]).sources_emitted, info(&b.queues[0]).repairs_emitted), (100, 0));
+        assert_eq!(b.fec_adaptive.as_ref().unwrap().data_anchor().1, anchor.1 + 1);
+        b.fec_prepare_packet(100);
+        let mut plain = vec![0; PAYLOAD]; assert!(b.fill_packet(&mut plain) > 0);
+        assert_eq!(info(&b.queues[0]).repairs_emitted, 0, "constructed repair is not yet emitted");
+        commit_connected_send(&mut state, &mut b, PendingSendKind::Data, 3_100_000_000, 1472, &plain, 0, None);
+        let i = info(&b.queues[0]);
+        assert_eq!((i.repairs_emitted, b.queues[0].event_repair.repairs_emitted), (1, 1));
+        assert!(i.planned_repairs >= grown.planned_repairs && i.planned_repairs <= 15);
+        assert_eq!(i.counter_overflow, 0);
+    }
+    #[test]
+    fn deferred_segmented_tu_restart_reserves_rank_again_within_same_hard_cap() {
+        let mut b = buffer(true); b.submit_messages(vec![vec![7; 3 << 20]]);
+        let mut seq = 0;
+        assert!(emit(&mut b, &mut seq, PAYLOAD));
+        let seg = |b: &UnreliableSendBuffer| { let s = b.fec_send_slot.as_ref().unwrap().repair_accounting.budget.clone().unwrap(); let g = s.lock().unwrap(); (g.limit, g.reserved) };
+        let k1 = b.fec_send_slot.as_ref().unwrap().k;
+        assert_eq!(seg(&b), (k1 * 15 / 100, 2));
+        let first_package = b.send_package_id;
+        while b.send_package_id == first_package { assert!(emit(&mut b, &mut seq, PAYLOAD)); }
+        let k2 = b.fec_send_slot.as_ref().unwrap().k;
+        let second = b.fec_send_slot.as_ref().unwrap().repair_accounting.budget.clone().unwrap();
+        assert_eq!(seg(&b), (k2 * 15 / 100, 2), "each segment admits rank only");
+        let credits = info(&b).source_symbols;
+        assert!(emit(&mut b, &mut seq, 1162));
+        assert!(std::sync::Arc::ptr_eq(&second, b.fec_send_slot.as_ref().unwrap().repair_accounting.budget.as_ref().unwrap()));
+        assert_eq!(seg(&b), (k2 * 15 / 100, 4), "restart re-reserves rank in the SAME allowance; abandoned rank is never refunded");
+        assert_eq!(b.fec_send_slot.as_ref().unwrap().n - b.fec_send_slot.as_ref().unwrap().k, 2);
+        assert_eq!(info(&b).source_symbols, credits);
+        drain(&mut b, &mut seq, 1162, true);
+        assert!(second.lock().unwrap().reserved <= k2 * 15 / 100);
+        assert!(info(&b).repairs_emitted <= 15 * credits / 100);
+        assert_eq!(info(&b).roots, 1);
+    }
+    #[test]
+    fn deferred_zero_allowance_k_up_to_six_reserves_nothing_and_seals_at_last_source() {
+        for k in 2usize..=6 {
+            let mut b = cold_buffer(); b.submit_messages(vec![vec![7; BLOCK * k]]);
+            let mut seq = 0;
+            assert!(emit(&mut b, &mut seq, PAYLOAD));
+            let f = b.fec_send_slot.as_ref().unwrap();
+            assert_eq!((f.n, f.n_planned, f.repair_accounting.base_b.clone(), f.repair_accounting.base_r), (k as u32, k as u32, vec![0], 0));
+            let i = info(&b);
+            assert_eq!((i.repair_limit, i.planned_repairs, i.demand_repairs, i.cap_shortfall, i.cap_limited_slots), (0, 0, 2, 2, 1));
+            drain(&mut b, &mut seq, PAYLOAD, true);
+            assert_eq!(seq, k as u64);
+            let old = info(&b);
+            assert_eq!((old.repairs_emitted, old.sources_emitted), (0, k as u64));
+            for x in 0..seq { b.fec_on_packet_finalized(x, true); }
+            assert_eq!(info(&b), old);
+            assert!(!b.p4_open && b.fec_retained.is_empty() && b.fec_send_slot.is_none());
+        }
+    }
+
+    fn cap_buffer(cap:u32) -> UnreliableSendBuffer {
+        let mut b=buffer(true);b.fec_adaptive.as_mut().unwrap().set_repair_cap_for_test(cap);b
+    }
+
+    #[test] fn budget25_own_plan_emitted_reserved_limits_and_late_postseal_both_caps() {
+        for cap in [15,25] {for k in [2usize,4,8,71,704] {
+            let mut b=cap_buffer(cap);b.submit_messages(vec![vec![7;BLOCK*k]]);let mut seq=0;
+            assert!(emit(&mut b,&mut seq,PAYLOAD));
+            let segment=b.fec_send_slot.as_ref().unwrap().repair_accounting.budget.clone().unwrap();
+            let limit=crate::fec_adapt::budget_repair_limit_for_cap(k as u64,cap);
+            assert_eq!(segment.lock().unwrap().limit as u64,limit);
+            drain(&mut b,&mut seq,PAYLOAD,true);let before=info(&b);
+            assert_eq!((before.source_symbols,before.repair_limit),(k as u64,limit));
+            let g=segment.lock().unwrap();assert!(g.emitted<=g.reserved as u64&&g.reserved<=g.limit);drop(g);
+            for x in 0..seq {b.fec_on_packet_finalized(x,true);}assert_eq!(info(&b),before);
+            assert!(!b.p4_open&&b.fec_retained.is_empty()&&b.budget_root.is_none());
+        }}
+    }
+
+    #[test] fn budget25_low_demand_identical_not_a_spend_target_and_known_loss_coefficient_one() {
+        let run=|cap| {
+            let mut b=cap_buffer(cap);b.submit_messages(vec![vec![7;BLOCK*300]]);let mut seq=0;
+            for _ in 0..60 {assert!(emit(&mut b,&mut seq,PAYLOAD));}
+            assert_eq!(b.fec_send_slot.as_ref().unwrap().n,302);
+            for (d,x) in [3,9,17].into_iter().enumerate() {
+                b.fec_on_packet_finalized(x,true);assert_eq!(b.fec_send_slot.as_ref().unwrap().n,303+d as u32);
+            }
+            // Timely ordered feedback leaves a short tail, irrespective of the available ceiling.
+            for x in 0..seq {b.fec_adaptive.as_mut().unwrap().on_sequence_finalized(x,false,1);}
+            while emit(&mut b,&mut seq,PAYLOAD) {
+                let x=seq-1;b.fec_on_packet_finalized(x,false);b.fec_adaptive.as_mut().unwrap().on_sequence_finalized(x,false,1);
+            }
+            let i=info(&b);assert!(i.demand_repairs<45&&i.planned_repairs<45);assert_eq!(i.cap_shortfall,0);
+            assert_eq!(i.repairs_emitted,i.planned_repairs);
+            eprintln!("budget25 low-demand cap={cap} requested={} planned={} emitted={} limit={}",i.demand_repairs,i.planned_repairs,i.repairs_emitted,i.repair_limit);
+            (i.demand_repairs,i.planned_repairs,i.repairs_emitted,i.known_loss_shortfall,seq)
+        };
+        assert_eq!(run(15),run(25));
+    }
+
+    #[cfg(feature="research_budget_diagnostic")]
+    #[test] fn budget25_root_cap_segment_and_tu_retry_never_fresh_credit_and_capture_keeps_limit() {
+        for cap in [15,25] {
+            diag::enable(true);diag::context([1;64],&[2;32],&[3;32]);
+            let mut b=cap_buffer(cap);b.submit_messages(vec![vec![7;3<<20]]);let mut seq=0;
+            assert!(emit(&mut b,&mut seq,PAYLOAD));
+            let first_package=b.send_package_id;
+            let root=b.budget_root.clone().unwrap();assert_eq!(root.lock().unwrap().cap_percent,cap);
+            b.fec_adaptive.as_mut().unwrap().set_repair_cap_for_test(if cap==15 {25}else{15});
+            while b.send_package_id==first_package {assert!(emit(&mut b,&mut seq,PAYLOAD));}
+            let f=b.fec_send_slot.as_ref().unwrap();let k=f.k;
+            let second=f.repair_accounting.budget.clone().unwrap();let limit=second.lock().unwrap().limit;
+            assert_eq!(limit as u64,crate::fec_adapt::budget_repair_limit_for_cap(k as u64,cap));
+            assert!(std::sync::Arc::ptr_eq(&root,b.budget_root.as_ref().unwrap()));
+            let credits=info(&b).source_symbols;let before=second.lock().unwrap().reserved;
+            assert!(emit(&mut b,&mut seq,1162));
+            assert!(std::sync::Arc::ptr_eq(&second,b.fec_send_slot.as_ref().unwrap().repair_accounting.budget.as_ref().unwrap()));
+            assert_eq!(info(&b).source_symbols,credits);assert_eq!(second.lock().unwrap().limit,limit);assert!(second.lock().unwrap().reserved>=before);
+            let c=diag::take(99).unwrap();assert!(!c.overflow&&!c.unknown_identity);
+            let layouts:Vec<_>=c.layouts.iter().filter(|l|l.event==0).collect();assert_eq!(layouts.len(),3);
+            assert_eq!(layouts[1].limit,Some(limit));assert_eq!(layouts[2].limit,Some(limit));assert_ne!(layouts[1].k,layouts[2].k);
+            b.fec_adaptive.as_mut().unwrap().set_repair_cap_for_test(cap);
+            drain(&mut b,&mut seq,1162,true);assert_eq!(info(&b).roots,1);assert_eq!(info(&b).source_symbols,credits);
+            let g=second.lock().unwrap();assert!(g.emitted<=g.reserved as u64&&g.reserved<=g.limit);diag::enable(false);
+        }
+    }
+
+    #[test] fn budget25_pending_final_repair_charged_after_seal_both_caps() {
+        for cap in [15,25] {
+            let ConnectionState::Connected(mut state)=new_connection_state_connected(None,0,1,1_000_000_000) else {unreachable!()};
+            let mut b=SendQueues::baseline_for_test(1,(0,16<<20,16<<20));let mut a=adaptive(true);a.set_repair_cap_for_test(cap);b.fec_adaptive=Some(a);
+            b.submit_messages(0,vec![vec![7;BLOCK*8]]);let limit=crate::fec_adapt::budget_repair_limit_for_cap(8,cap);
+            for seq in 0..8+limit-1 {
+                b.fec_prepare_packet(seq);let mut plain=vec![0;PAYLOAD];assert!(b.fill_packet(&mut plain)>0);
+                commit_connected_send(&mut state,&mut b,PendingSendKind::Data,2_000_000_000+seq*0x400000,1472,&plain,0,None);
+            }
+            let segment=b.queues[0].fec_send_slot.as_ref().unwrap().repair_accounting.budget.clone().unwrap();
+            b.fec_prepare_packet(8+limit-1);let mut plain=vec![0;PAYLOAD];assert!(b.fill_packet(&mut plain)>0);
+            let before=info(&b.queues[0]);assert_eq!((before.repair_limit,before.planned_repairs,before.repairs_emitted),(limit,limit,limit-1));
+            let bytes=vec![0x55;1472];assert!(!finish_connected_send(&mut state,&mut b,PendingSendKind::Data,None,3_000_000_000,&bytes,&plain,Dscp::BestEffort,0,None));
+            for seq in 0..8 {b.fec_on_packet_finalized(seq,true);}b.free_bytes();
+            assert!(!b.queues[0].p4_open&&b.queues[0].fec_send_slot.is_none());assert_eq!(info(&b.queues[0]),before);
+            let pending=state.pending_send.take().unwrap();assert_eq!(pending.bytes,bytes);assert_eq!(pending.plaintext,plain);
+            commit_connected_send(&mut state,&mut b,pending.kind,3_000_000_001,pending.bytes.len(),&pending.plaintext,0,None);
+            let after=info(&b.queues[0]);assert_eq!(after.repairs_emitted,limit);assert_eq!(after.counter_overflow,0);
+            let g=segment.lock().unwrap();assert!(g.emitted<=g.reserved as u64&&g.reserved<=g.limit);
+        }
+    }
+
+    #[cfg(feature="research_budget_diagnostic")]
+    #[test] fn empirical_committed_counter_u32_boundary_tu_and_checked_u64_both_arms() {
+        for arm in [false,true] {
+            diag::enable(true);diag::context([1;64],&[2;32],&[3;32]);
+            let mut b=cap_buffer(25);b.fec_adaptive.as_mut().unwrap().set_empirical_for_test(arm);
+            b.submit_messages(vec![vec![7;BLOCK*71]]);let mut seq=0;
+            assert!(emit(&mut b,&mut seq,PAYLOAD));
+            let segment=b.fec_send_slot.as_ref().unwrap().repair_accounting.budget.clone().unwrap();
+            // Diagnostic-only injection: the next 70 actual source commits reach u32::MAX exactly.
+            segment.lock().unwrap().diagnostic_sources_committed=u32::MAX as u64-70;
+            for _ in 1..71 {assert!(emit(&mut b,&mut seq,PAYLOAD));}
+            assert_eq!(segment.lock().unwrap().diagnostic_sources_committed,u32::MAX as u64);
+            assert!(emit(&mut b,&mut seq,PAYLOAD));
+            let before=diag::take(99_000_000_000).unwrap();
+            let h=&before.demands.last().unwrap().header;assert_eq!(h.sources_committed,u32::MAX);assert_eq!(h.flags&32,0);
+            let owner=h.owner_generation;
+            // A TU restart must keep the SAME segment and its source-attempt count, not renew it.
+            assert!(emit(&mut b,&mut seq,1162));
+            assert!(std::sync::Arc::ptr_eq(&segment,b.fec_send_slot.as_ref().unwrap().repair_accounting.budget.as_ref().unwrap()));
+            assert_eq!(segment.lock().unwrap().diagnostic_sources_committed,u32::MAX as u64+1);
+            while b.fec_send_slot.as_ref().is_some_and(|f|f.next_id<f.k) {assert!(emit(&mut b,&mut seq,1162));}
+            assert!(emit(&mut b,&mut seq,1162));
+            let after=diag::take(100_000_000_000).unwrap();assert!(after.demand_overflow);
+            let h=&after.demands.last().unwrap().header;assert_eq!(h.owner_generation,owner);assert_eq!(h.flags&(16|32),16|32);
+            // Internal u64 exhaustion is checked and observational only; the next real commit proceeds.
+            {let mut g=segment.lock().unwrap();g.diagnostic_sources_committed=u64::MAX;g.diagnostic_counter_overflow=false;}
+            let old_seq=seq;assert!(emit(&mut b,&mut seq,1000));assert_eq!(seq,old_seq+1);
+            assert!(segment.lock().unwrap().diagnostic_counter_overflow);assert_eq!(info(&b).counter_overflow,0);
+            drain(&mut b,&mut seq,1000,false);assert!(info(&b).repairs_emitted<=17);diag::enable(false);
+        }
+    }
+
+    #[cfg(feature="research_budget_diagnostic")]
+    #[test] fn empirical_enable_late_tu_owner_unknown_both_arms() {
+        for arm in [false,true] {
+            diag::enable(false);let mut b=cap_buffer(25);b.fec_adaptive.as_mut().unwrap().set_empirical_for_test(arm);
+            b.submit_messages(vec![vec![7;BLOCK*71]]);let mut seq=0;assert!(emit(&mut b,&mut seq,PAYLOAD));
+            let segment=b.fec_send_slot.as_ref().unwrap().repair_accounting.budget.clone().unwrap();
+            assert_eq!(segment.lock().unwrap().diagnostic_owner_generation,u64::MAX);
+            diag::enable(true);diag::context([1;64],&[2;32],&[3;32]);
+            assert!(emit(&mut b,&mut seq,1162));
+            assert!(std::sync::Arc::ptr_eq(&segment,b.fec_send_slot.as_ref().unwrap().repair_accounting.budget.as_ref().unwrap()));
+            assert_eq!(segment.lock().unwrap().diagnostic_owner_generation,u64::MAX);
+            drain(&mut b,&mut seq,1162,false);
+            let c=diag::take(100_000_000_000).unwrap();assert!(!c.demands.is_empty());assert!(c.demand_overflow);
+            for d in &c.demands {assert_eq!(d.header.owner_generation,u64::MAX);assert_ne!(d.header.flags&16,0);assert_eq!(d.header.original_k,71);assert_eq!(d.header.limit,17);}
+            assert!(info(&b).repairs_emitted<=17);assert_eq!(info(&b).counter_overflow,0);diag::enable(false);
+        }
+    }
+
+}
+
+#[cfg(test)]
+mod systematic_rx_tests {
+    use super::*;
+    use crate::fec::{MessageLayout, SourceOnly};
+    use crate::receive_memory::{ReceiveMemoryBudget, Reservation};
+    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+
+    struct Rx {
+        slot: FecRecvSlot,
+        budget: Arc<ReceiveMemoryBudget>,
+        tx: std::sync::mpsc::Sender<FecCompletion>,
+        workers: Arc<AtomicUsize>,
+    }
+    impl Rx {
+        fn new(limit: usize) -> Self {
+            let (tx, _) = std::sync::mpsc::channel();
+            Self { slot: FecRecvSlot::default(), budget: ReceiveMemoryBudget::new(limit), tx, workers: Arc::new(AtomicUsize::new(0)) }
+        }
+        fn add(&mut self, layout: MessageLayout, id: u32, data: &[u8]) -> Option<(Vec<u8>, Reservation)> {
+            fec_receive_block(&mut self.slot, ConnectionKey::default(), 1, layout.len, layout.block_bytes,
+                id, data, &self.tx, &self.workers, &self.budget)
+        }
+    }
+    fn payload(len: usize) -> Arc<Vec<u8>> { Arc::new((0..len).map(|i| (i.wrapping_mul(73) ^ (i >> 7)) as u8).collect()) }
+    fn source(message: &[u8], layout: MessageLayout, id: usize) -> &[u8] {
+        &message[id * layout.block_bytes..((id + 1) * layout.block_bytes).min(layout.len)]
+    }
+
+    #[test]
+    fn systematic_rx_all_sources_exact_tail_out_of_order_and_duplicate_validation() {
+        assert!(std::mem::size_of::<SourceOnly>() + 128 < 4096);
+        for k in [2, 4, 64, 256] {
+            let layout = MessageLayout::new(k * 1136 - 17, 1136).unwrap();
+            assert_eq!((layout.k, layout.groups), (k, 1));
+            let message = payload(layout.len);
+            let mut rx = Rx::new(SourceOnly::charge(layout).unwrap());
+            // A padded final source is invalid before admission/allocation.
+            assert!(rx.add(layout, (k - 1) as u32, &[0; 1136]).is_none());
+            assert_eq!(rx.budget.used(), 0); assert!(!rx.slot.in_use());
+            let tail = source(&message, layout, k - 1);
+            assert!(rx.add(layout, (k - 1) as u32, tail).is_none());
+            assert!(matches!(rx.slot.state, FecRecvState::SourceOnly(_)));
+            if let FecRecvState::SourceOnly(s) = &rx.slot.state { assert_eq!(s.output.capacity(), layout.len); }
+            let active = rx.slot.last_block_ns; let used = rx.budget.used();
+            assert!(rx.add(layout, (k - 1) as u32, tail).is_none());
+            let mut bad = tail.to_vec(); bad[0] ^= 1;
+            assert!(rx.add(layout, (k - 1) as u32, &bad).is_none());
+            assert!(rx.add(layout, 0, &[]).is_none());
+            // Huge IDs are repairs, never bitmap offsets; their short payload
+            // fails validation before admission or native allocation.
+            assert!(rx.add(layout, u32::MAX, &[1]).is_none());
+            let changed = MessageLayout::new(layout.len - 1, 1136).unwrap();
+            assert!(rx.add(changed, 0, source(&message, layout, 0)).is_none());
+            assert_eq!((rx.slot.last_block_ns, rx.budget.used()), (active, used));
+            for id in (1..k - 1).rev() { assert!(rx.add(layout, id as u32, source(&message, layout, id)).is_none()); }
+            let (out, lease) = rx.add(layout, 0, source(&message, layout, 0)).unwrap();
+            assert_eq!(&out, message.as_ref()); assert!(matches!(rx.slot.state, FecRecvState::Done));
+            assert!(rx.add(layout, 0, source(&message, layout, 0)).is_none());
+            assert_eq!(rx.workers.load(Ordering::Acquire), 0);
+            drop(lease); assert_eq!(rx.budget.used(), 0);
+        }
+    }
+
+    #[test]
+    fn systematic_rx_refused_upgrade_preserves_sources_activity_and_packet_taint() {
+        let layout = MessageLayout::new(5000, 1424).unwrap();
+        let message = payload(layout.len);
+        let small = SourceOnly::charge(layout).unwrap();
+        let full = crate::fec::receive_memory_charge(layout, false, 0).unwrap();
+        let process = ReceiveMemoryBudget::new(small + full);
+        let budget = ReceiveMemoryBudget::connection_with_limit(&process, small + full - 1);
+        let mut rx = Rx::new(1); rx.budget = budget.clone();
+        assert!(rx.add(layout, 0, source(&message, layout, 0)).is_none());
+        rx.slot.last_block_ns = 17; rx.slot.recovery_resume_ns = Some(23);
+        let mut enc = crate::fec::encode(message.clone(), layout.block_bytes).unwrap();
+        let repair = enc.block(layout.k as u32).unwrap();
+        for id in [layout.k as u32, u32::MAX] {
+            let before = rx.slot.ingress_dropped;
+            assert!(rx.add(layout, id, &repair).is_none());
+            // Exactly the transport's per-packet taint predicate: a successful
+            // sibling frame cannot ACK a memory-erased repair in this packet.
+            let mut memory_erased = rx.slot.ingress_dropped != before;
+            assert!(rx.add(layout, 1, source(&message, layout, 1)).is_none());
+            memory_erased |= rx.slot.ingress_dropped != before;
+            let mut ack = crate::ack::AckReceiver::default(); let mut timer = u64::MAX;
+            if !memory_erased { ack.receive(55, 1, false, &mut timer); }
+            assert!(!ack.ack(2).acknowledged().any(|n| n == 55));
+            assert!(rx.slot.admission_refused);
+            assert!(matches!(rx.slot.state, FecRecvState::SourceOnly(_)));
+            assert_eq!(rx.slot.recovery_resume_ns, Some(23));
+            assert_eq!(budget.used(), small); assert_eq!(process.used(), small);
+        }
+        // Refusal itself did not rearm activity. A genuinely admitted sibling
+        // source above did, so isolate one final refused symbol's timestamps.
+        let active = rx.slot.last_block_ns;
+        assert!(rx.add(layout, layout.k as u32, &repair).is_none());
+        assert_eq!(rx.slot.last_block_ns, active);
+        assert!(rx.add(layout, 2, source(&message, layout, 2)).is_none());
+        let (out, lease) = rx.add(layout, 3, source(&message, layout, 3)).unwrap();
+        assert_eq!(&out, message.as_ref());
+        assert!(budget.peak() <= budget.limit()); assert!(process.peak() <= process.limit());
+        drop(lease); assert_eq!(budget.used(), 0); assert_eq!(process.used(), 0);
+    }
+
+    #[test]
+    fn systematic_rx_upgrade_peak_replays_short_tail_and_completes_with_repair() {
+        let layout = MessageLayout::new(5000, 1424).unwrap();
+        let message = payload(layout.len);
+        let small = SourceOnly::charge(layout).unwrap();
+        let full = crate::fec::receive_memory_charge(layout, false, 0).unwrap();
+        let mut rx = Rx::new(small + full);
+        let mut enc = crate::fec::encode(message.clone(), layout.block_bytes).unwrap();
+        assert!(rx.add(layout, 3, source(&message, layout, 3)).is_none());
+        assert!(rx.add(layout, layout.k as u32, &enc.block(layout.k as u32).unwrap()).is_none());
+        assert!(matches!(rx.slot.state, FecRecvState::Inline(_)));
+        assert_eq!(rx.budget.peak(), small + full); assert_eq!(rx.budget.used(), full);
+        assert!(rx.add(layout, 0, source(&message, layout, 0)).is_none());
+        let (out, lease) = rx.add(layout, 1, source(&message, layout, 1)).unwrap();
+        assert_eq!(&out, message.as_ref()); assert!(matches!(rx.slot.state, FecRecvState::Done));
+        assert_eq!(rx.budget.used(), full); drop(lease); assert_eq!(rx.budget.used(), 0);
+    }
+
+    #[test]
+    fn systematic_rx_exact_k_dependent_equations_remain_native_until_done() {
+        let layout = MessageLayout::new(71 * 1424 - 17, 1424).unwrap();
+        let message = payload(layout.len);
+        let mut enc = crate::fec::encode(message.clone(), layout.block_bytes).unwrap();
+        let mut dependent = None;
+        // Deterministic bounded search of K71/R10 burst erasures. The byte count
+        // is K but equation rank is not guaranteed; all-source direct completion
+        // must not turn into a generic "K received" shortcut on the native path.
+        for start in 0..=71 {
+            let mut dec = crate::fec::MessageDecoder::with_layout(layout).unwrap();
+            let mut done = false;
+            for id in 0..81u32 {
+                if (start..start + 10).contains(&(id as usize)) { continue; }
+                done |= dec.add(id, &enc.block(id).unwrap()).unwrap() == crate::fec::DecodeStatus::Done;
+            }
+            if !done { dependent = Some(start); break; }
+        }
+        let start = dependent.expect("vendored K71/R10 has a dependent exactly-K burst pattern");
+        let mut rx = Rx::new(8 << 20);
+        for id in 0..81u32 {
+            if (start..start + 10).contains(&(id as usize)) { continue; }
+            assert!(rx.add(layout, id, &enc.block(id).unwrap()).is_none());
+        }
+        assert_eq!(rx.slot.blocks_received, 71);
+        assert!(matches!(rx.slot.state, FecRecvState::Inline(_)));
+        let mut completed = None;
+        for id in 81..90 { if let Some(out) = rx.add(layout, id, &enc.block(id).unwrap()) { completed = Some(out); break; } }
+        let (out, lease) = completed.expect("additional independent repair completes");
+        assert_eq!(&out, message.as_ref()); drop(lease); assert_eq!(rx.budget.used(), 0);
+    }
+
+    #[test]
+    fn systematic_rx_native_error_latch_preserves_direct_source_fallback() {
+        let layout = MessageLayout::new(2272, 1136).unwrap();
+        let mut rx = Rx::new(2 << 20);
+        assert!(rx.add(layout, 0, &[3; 1136]).is_none());
+        // Inject the post-error latch without changing native code or limits.
+        if let FecRecvState::SourceOnly(s) = &mut rx.slot.state { s.native_failed = true; } else { panic!("source state"); }
+        let before = (rx.budget.used(), rx.budget.peak(), rx.slot.last_block_ns);
+        for id in 2..100 { assert!(rx.add(layout, id, &[0; 1136]).is_none()); }
+        assert_eq!((rx.budget.used(), rx.budget.peak(), rx.slot.last_block_ns), before);
+        assert_eq!(rx.slot.ingress_dropped, 98);
+        let (out, lease) = rx.add(layout, 1, &[4; 1136]).unwrap();
+        assert_eq!(&out[..1136], &[3; 1136]); assert_eq!(&out[1136..], &[4; 1136]);
+        drop(lease); assert_eq!(rx.budget.used(), 0);
+    }
+
+    #[test]
+    fn systematic_rx_130_partial_k2_do_not_lock_out_id131() {
+        let cap = receive_connection_memory_limit(20_000_000, 1).unwrap();
+        assert_eq!(cap, 136_979_696);
+        let process = crate::receive_memory::ReceiveMemoryBudget::new(cap);
+        let budget = crate::receive_memory::ReceiveMemoryBudget::connection_with_limit(&process, cap);
+        let workers = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut index = ReceiveIndex::default();
+        let mut plain = ReassemblySlot::new_ring(1024);
+        let mut fec = FecRecvSlot::new_ring(1024);
+        let started = std::time::Instant::now();
+        for id in 1..=131 {
+            let i = index.admit(id, &mut plain, &mut fec).unwrap();
+            assert!(index.claim(id, ReceiveRole::Fec { message_len: 2000, block_bytes: 1000, segment: None }));
+            fec[i].package_id = id;
+            assert!(fec_receive_block(&mut fec[i], ConnectionKey::default(), id,
+                2000, 1000, 0, &[7; 1000], &tx, &workers, &budget).is_none());
+        }
+        let i = index.get(131).unwrap();
+        let completed = fec_receive_block(&mut fec[i], ConnectionKey::default(), 131,
+            2000, 1000, 1, &[8; 1000], &tx, &workers, &budget);
+        let refusals = fec.iter().filter(|s| s.admission_refused).count();
+        eprintln!("systematic_rx RED/GREEN: cap={cap} refusals={refusals} used={} peak={} completed={}",
+            budget.used(), budget.peak(), completed.is_some());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(refusals, 0);
+        let (message, reservation) = completed.expect("ID131 all sources must complete before 2-second retirement");
+        assert_eq!(&message[..1000], &[7; 1000]);
+        assert_eq!(&message[1000..], &[8; 1000]);
+        assert!(budget.peak() <= cap && process.peak() <= cap);
+        assert_eq!(workers.load(std::sync::atomic::Ordering::Acquire), 0);
+        drop(reservation); drop(fec); assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn systematic_rx_source_index_pressure_expiry_and_stale_tombstone() {
+        let mut index = ReceiveIndex::default();
+        let mut plain = ReassemblySlot::new_ring(2); let mut fec = FecRecvSlot::new_ring(2);
+        let layout = MessageLayout::new(2272, 1136).unwrap();
+        let mut rx = Rx::new(2 * SourceOnly::charge(layout).unwrap());
+        for id in 1..=2 {
+            let i = index.admit(id, &mut plain, &mut fec).unwrap();
+            assert!(index.claim(id, ReceiveRole::Fec { message_len: layout.len, block_bytes: layout.block_bytes, segment: None }));
+            fec[i].package_id = id;
+            assert!(fec_receive_block(&mut fec[i], ConnectionKey::default(), id, layout.len, layout.block_bytes,
+                0, &[9; 1136], &rx.tx, &rx.workers, &rx.budget).is_none());
+            fec[i].last_block_ns = 10;
+        }
+        let grace = fec_inactive_grace_ns(0, false);
+        assert!(index.admit_at(3, &mut plain, &mut fec, grace + 10, grace).is_none());
+        // Worker pressure never retires inline sources, even when old enough.
+        assert_eq!(retire_inactive_fec_workers(&mut fec, grace + 11, grace, true), 0);
+        // Keep the existing outage grace: neither inline nor staged source
+        // state expires at the normal two-second deadline during an outage.
+        assert_eq!(retire_inactive_fec_workers(&mut fec, grace + 11, OUTAGE_TIMEOUT_NS, false), 0);
+        let i = index.get(1).unwrap(); let dropped = fec[i].ingress_dropped;
+        assert!(fec_receive_block(&mut fec[i], ConnectionKey::default(), 1, layout.len, layout.block_bytes,
+            2, &[0; 1136], &rx.tx, &rx.workers, &rx.budget).is_none());
+        assert_eq!(fec[i].ingress_dropped, dropped + 1); assert_eq!(fec[i].last_block_ns, 10);
+        assert_eq!(retire_inactive_fec_workers(&mut fec, 11 + OUTAGE_TIMEOUT_NS, OUTAGE_TIMEOUT_NS, false), 2);
+        assert_eq!(rx.budget.used(), 0);
+        assert!(index.admit_at(3, &mut plain, &mut fec, 11 + OUTAGE_TIMEOUT_NS, grace).is_some());
+        assert!(index.admit(1, &mut plain, &mut fec).is_none());
+        assert!(index.frame_is_stale(&WireFrame::Fec { kind: STP_EXT_KIND_FEC, id: 1, block_id: 0,
+            message_len: layout.len, block_bytes: layout.block_bytes, segment: None, data: &[9; 1136] }));
+        // A tombstoned but retained ID still owns its immutable metadata.
+        assert!(!index.claim(2, ReceiveRole::Plain));
+        // A new source state cannot reopen completed/expired state in-place.
+        rx.slot = std::mem::take(&mut fec[index.get(2).unwrap()]);
+        assert!(rx.add(layout, 1, &[9; 1136]).is_none()); assert_eq!(rx.budget.used(), 0);
+    }
+
+    #[test]
+    fn systematic_rx_malformed_admission_inline_boundary_and_large_worker_refusal() {
+        let layout = MessageLayout::new(256 * 1136, 1136).unwrap();
+        let small = SourceOnly::charge(layout).unwrap();
+        let mut rx = Rx::new(small - 1);
+        for (id, bytes) in [(0, &[][..]), (u32::MAX, &[1][..]), (255, &[0; 1137][..])] {
+            assert!(rx.add(layout, id, bytes).is_none());
+            assert!(!rx.slot.in_use()); assert_eq!(rx.budget.used(), 0);
+        }
+        assert!(rx.add(layout, 0, &[0; 1136]).is_none());
+        assert!(rx.slot.admission_refused); assert!(!rx.slot.in_use()); assert_eq!(rx.budget.peak(), 0);
+        rx.budget = ReceiveMemoryBudget::new(small);
+        rx.workers.store(MAX_FEC_DECODE_WORKERS, Ordering::Release);
+        assert!(rx.add(layout, 0, &[0; 1136]).is_none());
+        assert!(matches!(rx.slot.state, FecRecvState::SourceOnly(_)));
+        assert_eq!(rx.budget.used(), small); drop(rx.slot); assert_eq!(rx.budget.used(), 0);
+        rx.slot = FecRecvSlot::default(); rx.budget = ReceiveMemoryBudget::new(32 << 20);
+        let large = MessageLayout::new(257 * 1136, 1136).unwrap();
+        assert!(SourceOnly::charge(large).is_none());
+        assert!(rx.add(large, 0, &[0; 1136]).is_none());
+        assert!(rx.slot.worker_limit_refused && rx.slot.admission_refused);
+        assert!(!rx.slot.in_use()); assert_eq!(rx.budget.used(), 0);
+    }
+
+    #[test]
+    fn systematic_rx_inline_segments_keep_root_and_decoder_shared_charges() {
+        // High supported TU widths can make a valid segmented unit inline.
+        let total = (2 << 20) + 2;
+        let len = total / 2;
+        let layout = wire_fec_layout(len, 8192).unwrap();
+        assert!(layout.k <= FEC_INLINE_MAX_BLOCKS);
+        let message = payload(total);
+        let cap = receive_connection_memory_limit(total, 1).unwrap();
+        let process = ReceiveMemoryBudget::new(cap);
+        let budget = ReceiveMemoryBudget::connection_with_limit(&process, cap);
+        let mut rx = Rx::new(1); rx.budget = budget.clone();
+        let mut root = ReassemblySlot::new();
+        let mut result = None;
+        for offset in [len, 0] {
+            let segment = FecSegment { root: 5, total: total as u32, offset: offset as u32 };
+            assert!(segment.valid(len)); rx.slot = FecRecvSlot { segment: Some(segment), ..Default::default() };
+            for id in (0..layout.k).rev() {
+                let data = source(&message[offset..offset + len], layout, id);
+                assert!(root.admit_segment(segment, layout, id as u32, data.len(), 100, &budget));
+                if let Some((decoded, mut lease)) = rx.add(layout, id as u32, data) {
+                    assert_eq!(&decoded, &message[offset..offset + len]);
+                    assert!(budget.used() >= decoded.capacity() + root.bytes_received() as usize);
+                    // The real transport retains the unit lease through copying
+                    // into the separately charged root; no uncharged handoff.
+                    lease.shrink(decoded.capacity());
+                    result = root.finish_segment(segment, &decoded);
+                    drop(lease);
+                }
+            }
+        }
+        let (out, lease) = result.unwrap(); assert_eq!(&out, message.as_ref());
+        assert!(budget.peak() <= cap && process.peak() <= cap);
+        drop(lease); drop(root); drop(rx); assert_eq!(budget.used(), 0); assert_eq!(process.used(), 0);
+    }
+}
+
+#[cfg(all(test, feature="research_budget_diagnostic"))]
+mod budget_diagnostic_tests {
+    use super::*;
+    use crate::cohort_observe as co;
+    fn connected() -> ConnectionStateConnected { let ConnectionState::Connected(c)=new_connection_state_connected(None,0,1,1_000_000_000) else {unreachable!()};c }
+    fn setup(on:bool) {diag::enable(on);diag::context([0x5a;64],&[2;32],&[4;32]);}
+    #[test]
+    fn diagnostic_pending_rejected_tolerated_synthetic_and_full_commits() {
+        setup(true);let mut s=connected();let mut b=SendQueues::baseline_for_test(1,(0,1<<20,1<<20));
+        let bytes=vec![7;1200];let plain=vec![255;1100];
+        co::udp_send_backpressure(&bytes);
+        assert!(!finish_connected_send(&mut s,&mut b,PendingSendKind::Data,None,2_000_000_000,&bytes,&plain,Dscp::BestEffort,0,None));
+        assert!(diag::take(2).unwrap().tx.is_empty());assert_eq!(s.send_sequence_number,0);
+        let p=s.pending_send.take().unwrap();assert_eq!(p.bytes,bytes);assert_eq!(p.plaintext,plain);
+        co::udp_send_full(&p.bytes);co::observe_commit(1,&p.bytes);
+        commit_connected_send(&mut s,&mut b,p.kind,3_000_000_000,p.bytes.len(),&p.plaintext,0,None);
+        co::udp_send_tolerated(&bytes,libc::EMSGSIZE);co::observe_commit(1,&bytes);
+        commit_connected_send(&mut s,&mut b,PendingSendKind::Data,4_000_000_000,bytes.len(),&plain,0,None);
+        co::observe_commit(1,&bytes); // consumed token: synthetic/stale, never native-full
+        commit_connected_send(&mut s,&mut b,PendingSendKind::Data,5_000_000_000,bytes.len(),&plain,0,None);
+        let c=diag::take(6).unwrap();assert_eq!(c.tx.iter().map(|r|(r.seq,r.ordinal,r.outcome)).collect::<Vec<_>>(),vec![(0,1,1),(1,2,2),(2,3,3)]);
+        assert_eq!(c.tx[0].ns,3_000_000_000);diag::enable(false);
+    }
+    fn arrival(slot:&mut FecRecvSlot,budget:&std::sync::Arc<crate::receive_memory::ReceiveMemoryBudget>,id:u32,data:&[u8],len:usize,width:usize,seq:u64) -> Option<Vec<u8>> {
+        let f=WireFrame::Fec{kind:STP_EXT_KIND_FEC,id:7,block_id:id,message_len:len,block_bytes:width,segment:None,data};
+        let ns=if true&&std::env::var_os("STP_EMPIRICAL_VALID_CLOCKS").is_some(){monotonic_clock_ns()}else{100+seq};
+        let _g=diag::RxGuard::new(&f,seq,ns);
+        let (tx,_)=std::sync::mpsc::channel();let workers=std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        fec_receive_block(slot,ConnectionKey::default(),7,len,width,id,data,&tx,&workers,budget).map(|(m,_)|m)
+    }
+    #[test]
+    fn diagnostic_rx_distinct_duplicate_resource_and_native_paths() {
+        setup(true);let m=std::sync::Arc::new(vec![9;5000]);let w=1000;let l=crate::fec::MessageLayout::new(m.len(),w).unwrap();
+        let b=crate::receive_memory::ReceiveMemoryBudget::new(m.len()+4096);let mut slot=FecRecvSlot::default();
+        arrival(&mut slot,&b,0,&m[..w],m.len(),w,0);arrival(&mut slot,&b,0,&m[..w],m.len(),w,1);
+        let mut e=crate::fec::encode(m.clone(),w).unwrap();let repair=e.block(l.k as u32).unwrap();
+        arrival(&mut slot,&b,l.k as u32,&repair,m.len(),w,2); // refused native upgrade
+        let c=diag::take(3).unwrap();assert_eq!(c.rx.iter().map(|r|r.outcome).collect::<Vec<_>>(),vec![1,9,5]);
+        assert_eq!(c.rx.iter().map(|r|r.symbol).collect::<Vec<_>>(),vec![0,0,5]);assert_eq!(slot.ingress_dropped,1);assert_eq!(b.used(),9096);
+        drop(slot);assert_eq!(b.used(),0);
+        let b=crate::receive_memory::ReceiveMemoryBudget::new(8<<20);let mut slot=FecRecvSlot::default();
+        arrival(&mut slot,&b,0,&m[..w],m.len(),w,3);
+        arrival(&mut slot,&b,l.k as u32,&repair,m.len(),w,4);
+        let mut delivered=None;for id in 1..l.k { if let Some(out)=arrival(&mut slot,&b,id as u32,&m[id*w..(id+1)*w],m.len(),w,id as u64+5){delivered=Some(out);} }
+        assert_eq!(delivered.unwrap(),*m);let c=diag::take(20).unwrap();assert!(c.rx.iter().any(|r|r.outcome==6));assert!(c.rx.iter().any(|r|r.outcome==7));
+        // Same symbol after decoder completion is an arrival, but not a new admission.
+        arrival(&mut slot,&b,0,&m[..w],m.len(),w,21);assert_eq!(diag::take(22).unwrap().rx[0].outcome,3);
+        diag::enable(false);
+    }
+    #[test] fn diagnostic_overflow_keeps_real_commit_state_advancing() {
+        setup(true);let mut state=connected();let mut b=SendQueues::baseline_for_test(1,(0,1<<20,1<<20));
+        let plain=[255u8;517];let bytes=[42u8;547];
+        for seq in 0..diag::PACKET_LIMIT+2 {
+            co::udp_send_full(&bytes);
+            assert!(finish_connected_send(&mut state,&mut b,PendingSendKind::Data,Some(2_000_000_000+seq as u64),2_000_000_000+seq as u64,&bytes,&plain,Dscp::BestEffort,0,None));
+        }
+        let c=diag::take(3_000_000_000).unwrap();assert!(c.overflow);assert_eq!(c.tx.len(),diag::PACKET_LIMIT);
+        assert_eq!(state.send_sequence_number,(diag::PACKET_LIMIT+2) as u64);assert_eq!(state.stats.packets_sent,(diag::PACKET_LIMIT+2) as u64);
+        assert!(state.pending_send.is_none());diag::enable(false);
+    }
+    #[test] fn diagnostic_dump_is_noclobber_and_bounded_schema() {
+        setup(true);let c=diag::take(123).unwrap();
+        let path=std::env::temp_dir().join(format!("stp-budget-diagnostic-{}-capture.json",std::process::id()));
+        c.write_new(&path,&"a".repeat(64),&"b".repeat(64),"sender",1).unwrap();
+        let text=std::fs::read_to_string(&path).unwrap();assert!(text.contains(diag::SCHEMA));assert!(text.contains("\"limits\":[65536,65536,131072,8192,8]"));
+        assert_eq!(c.write_new(&path,&"c".repeat(64),&"d".repeat(64),"sender",1).unwrap_err().kind(),std::io::ErrorKind::AlreadyExists);
+        assert_eq!(text,std::fs::read_to_string(&path).unwrap());std::fs::remove_file(path).unwrap();diag::enable(false);
+    }
+    /// Deterministic sender+receiver fixture. `c1` selects the arm explicitly on the adaptive state
+    /// (P4 MessageBound, budget_base 0|1) instead of trusting process env/OnceLock policy.
+    #[derive(Debug, PartialEq)]
+    struct Run { digest: String, memory: Vec<usize>, ack: Vec<u8>, packets: u64, bytes: u64, delivered: Vec<Vec<u8>>,
+        /// (seq, wire block id, delivered-a-message) per arrival call; NOT the native admission outcome.
+        arrival_completions: Vec<(u64,u32,bool)>, ingress_dropped: u64, send_sequence: u64, pending: bool, budget: BudgetBaseInfo }
+    fn fixture(on:bool,c1:bool) -> Run {
+        setup(on);let mut s=connected();let mut b=SendQueues::baseline_for_test(1,(0,8<<20,8<<20));
+        let valid_clocks=true&&std::env::var_os("STP_EMPIRICAL_VALID_CLOCKS").is_some();
+        let mut a=crate::fec_adapt::FecAdaptiveState::baseline_for_test(crate::ship::FEC,if valid_clocks{monotonic_clock_ns()}else{1_000_000_000});
+        a.policy=crate::fec_adapt::RepairPolicy::MessageBound;a.set_budget_base_for_test(c1);assert_eq!(a.budget_base_active(),c1);
+        b.fec_adaptive=Some(a);
+        let mut msg=vec![0;100000];for(i,v)in msg.iter_mut().enumerate(){*v=(i.wrapping_mul(73)^(i>>7))as u8;}
+        // Real cohort application header: d5, phase byte, little-endian app id.
+        msg[..6].copy_from_slice(&[0xd5,1,0x04,0x03,0x02,0x01]);
+        b.submit_messages(0,vec![msg]);let mut h=blake3::Hasher::new();let mut memory=Vec::new();let mut outputs=Vec::new();
+        let mut rx=FecRecvSlot::default();let budget=crate::receive_memory::ReceiveMemoryBudget::new(16<<20);
+        let mut ack=crate::ack::AckReceiver::default();let mut timer=u64::MAX;let mut arrival_completions=Vec::new();
+        for _ in 0..2000 {
+            if valid_clocks {let now=monotonic_clock_ns();b.set_time(now,0);b.fec_adaptive.as_mut().unwrap().on_tick(now);}
+            let seq=s.send_sequence_number;b.fec_prepare_packet(seq);let mut p=vec![0;1449];if b.fill_packet(&mut p)==0 {break;}
+            let mut bytes=seq.to_le_bytes().to_vec();bytes.extend_from_slice(&p);h.update(&bytes);
+            let commit_ns=if valid_clocks{monotonic_clock_ns()}else{2_000_000_000+seq*10_000_000};
+            co::udp_send_full(&bytes);assert!(finish_connected_send(&mut s,&mut b,PendingSendKind::Data,Some(commit_ns),commit_ns,&bytes,&p,Dscp::BestEffort,0,None));
+            // One deterministic path erasure, one duplicate symbol, otherwise native receive fixture.
+            if seq==3 {continue;}let mut rest=&p[..];let before=rx.ingress_dropped;
+            while let Some((f,n))=read_frame(rest){rest=&rest[n..];if let WireFrame::Fec{block_id,message_len,block_bytes,data,..}=f {
+                let r=arrival(&mut rx,&budget,block_id,data,message_len,block_bytes,seq);arrival_completions.push((seq,block_id,r.is_some()));if let Some(m)=r {outputs.push(m);}
+                if seq==5 {let r=arrival(&mut rx,&budget,block_id,data,message_len,block_bytes,seq+10000);arrival_completions.push((seq+10000,block_id,r.is_some()));}
+            }}
+            if before==rx.ingress_dropped {ack.receive(seq,3_000_000_000+seq*10_000_000,false,&mut timer);}
+            memory.push(budget.used());
+        }
+        assert_eq!(outputs.len(),1);let ack_bytes=ack.ack(9_000_000_000).encode().to_vec();
+        let info=*b.queues[0].budget_sink.lock().unwrap();
+        let run=Run{digest:h.finalize().to_hex().to_string(),memory,ack:ack_bytes,packets:s.stats.packets_sent,bytes:s.stats.bytes_sent,delivered:outputs,
+            arrival_completions,ingress_dropped:rx.ingress_dropped,send_sequence:s.send_sequence_number,pending:s.pending_send.is_some(),budget:info};
+        let cap=crate::fec_adapt::research_p4_repair_cap_percent();
+        let limit=crate::fec_adapt::budget_repair_limit_for_cap(71,cap);
+        if on {
+            let drain=if valid_clocks{monotonic_clock_ns()}else{10_000_000_000};
+            let c=diag::take(drain).unwrap();assert!(!c.overflow);assert!(!c.unknown_identity);assert_eq!(c.end_ordinal,s.stats.packets_sent);
+            assert_eq!(c.tx.len() as u64,c.tx.iter().filter(|x|x.len!=0).count() as u64);assert!(c.tx.iter().all(|x|x.outcome==1&&x.k==71&&x.group==0));
+            let starts:Vec<_>=c.layouts.iter().filter(|x|x.event==0).collect();assert!(!starts.is_empty());
+            for l in &c.layouts {
+                assert_eq!((l.k,l.groups,l.len,l.phase,l.app_id),(71,1,100000,Some(1),Some(0x01020304)));
+                assert_eq!(l.limit,if c1 {Some(limit as u32)} else {None});
+            }
+            assert!(c.layouts.iter().any(|x|x.event==2));
+            let repairs=c.tx.iter().filter(|x|!x.source).count() as u64;
+            if c1 {assert_eq!(repairs,run.budget.repairs_emitted);assert!(repairs<=limit);}
+
+            if c1 {
+                assert!(!c.demands.is_empty());assert!(!c.demand_overflow);
+                for d in &c.demands {
+                    let h=&d.header;assert!(h.iterations_count>0);assert!(h.ug<=h.uc);assert_eq!(h.sources_committed,71);
+                    assert_eq!(h.old_planned+(h.requested.saturating_sub(h.old_planned)).min(h.limit-h.reserved),h.plan_after);
+                    assert_eq!(h.owner_generation,c.layouts[0].generation);
+                    let mut r=h.start as u64;
+                    for t in &d.iterations[..h.iterations_count as usize] {
+                        assert_eq!(t.r,r);let e=r.saturating_sub(h.rs as u64);assert_eq!(e,t.e);assert_eq!(h.uc.saturating_add(e),t.n);
+                        let want=r.max((h.d as u64).saturating_add(2).saturating_add(h.ug.saturating_add(e).min(t.selected)));
+                        r=want.min(h.k as u64);assert_eq!(r,t.next_r as u64);
+                    }
+                    assert_eq!(r,h.result_r as u64);
+                }
+                if let Some(path)=std::env::var_os("STP_EMPIRICAL_FIXTURE_OUT") {
+                    c.write_new_empirical_calibration(std::path::Path::new(&path),&"a".repeat(64),&"b".repeat(64),&"c".repeat(64),&"d".repeat(64),"sender",1,cap,crate::fec_adapt::research_p4_empirical_tail_calibration()).unwrap();
+                }
+            }
+            let next=diag::take(if valid_clocks{monotonic_clock_ns()}else{11_000_000_000}).unwrap();
+            assert_eq!((next.start_ordinal,next.end_ordinal),(c.end_ordinal,c.end_ordinal));
+            assert!(!next.overflow&&!next.unknown_identity);assert_eq!(next.connections.len(),c.connections.len());
+            {
+                static FILE_ID:std::sync::atomic::AtomicU64=std::sync::atomic::AtomicU64::new(0);
+                let id=FILE_ID.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+                let path=std::env::temp_dir().join(format!("stp-budget25-{}-{id}.json",std::process::id()));
+                c.write_new_budget25(&path,&"a".repeat(64),&"b".repeat(64),&"c".repeat(64),"sender",1,cap).unwrap();
+                let text=std::fs::read_to_string(&path).unwrap();
+                assert!(text.contains(diag::BUDGET25_SCHEMA));assert!(text.contains(&format!("\"cap_percent\":{cap}")));
+                assert!(text.contains(&format!("\"budget25_diff_sha256\":\"{}\"","c".repeat(64))));
+                for field in ["\"overflow\":false","\"unknown_identity\":false","\"late_feedback_censored_after_drain\":true","\"native_worker_outcomes\":\"unknown\""] {assert!(text.contains(field));}
+                assert_eq!(c.write_new_budget25(&path,"a","b","c","sender",1,cap).unwrap_err().kind(),std::io::ErrorKind::AlreadyExists);
+                std::fs::remove_file(&path).unwrap();
+                assert_eq!(c.write_new_budget25(&path,"a","b","c","sender",1,17).unwrap_err().kind(),std::io::ErrorKind::InvalidInput);assert!(!path.exists());
+                let other=if cap==15 {25}else{15};assert_eq!(c.write_new_budget25(&path,"a","b","c","sender",1,other).unwrap_err().kind(),std::io::ErrorKind::InvalidInput);assert!(!path.exists());
+            }
+        } else {assert!(diag::take(10_000_000_000).is_none());}
+        if c1 {assert_eq!((info.roots,info.source_symbols,info.repair_limit),(1,71,limit));assert!(info.repairs_emitted<=limit);}
+        else {assert_eq!(info,BudgetBaseInfo::default());}
+        assert!(!run.pending);diag::enable(false);run
+    }
+    #[test] fn diagnostic_off_on_identical_c0_packet_digest_memory_ack_ingress_and_delivery() {
+        let off=fixture(false,false);let on=fixture(true,false);assert_eq!(off,on);
+        eprintln!("diagnostic C0 fixture digest={} packets={} bytes={} memory_samples={} arrival_calls={} delivered={} budget={:?}",on.digest,on.packets,on.bytes,on.memory.len(),on.arrival_completions.len(),on.delivered.len(),on.budget);
+    }
+    #[test] fn diagnostic_off_on_identical_c1_packet_digest_memory_ack_ingress_and_delivery() {
+        let off=fixture(false,true);let on=fixture(true,true);assert_eq!(off,on);
+        let c0=fixture(false,false);assert_eq!(c0.delivered,on.delivered); // same message either arm
+        eprintln!("diagnostic C1 fixture digest={} packets={} bytes={} memory_samples={} arrival_calls={} delivered={} budget={:?}",on.digest,on.packets,on.bytes,on.memory.len(),on.arrival_completions.len(),on.delivered.len(),on.budget);
+    }
+
+    #[test] fn budget25_diagnostic_initialized_child() {
+        if std::env::var_os("STP_BUDGET25_EQUIVALENCE").is_none(){return;}
+        crate::fec_adapt::initialize_research_policy().unwrap();
+        let cap=crate::fec_adapt::research_p4_repair_cap_percent();
+        assert_eq!(crate::fec_adapt::research_p4_configuration(),("P4",1,false,0));
+        assert_eq!(crate::fec_adapt::research_p4_budget_base(),1);
+        let off=fixture(false,true);let on=fixture(true,true);assert_eq!(off,on);
+        eprintln!("budget25 initialized cap={cap} K=71 limit={} digest={} packets={} repairs={}",on.budget.repair_limit,on.digest,on.packets,on.budget.repairs_emitted);
+    }
+
+    #[test] fn budget25_diagnostic_initialized_both_caps_off_on_equivalent() {
+        for cap in ["15","25"] {
+            if true && cap=="15" {continue;}
+            let mut c=std::process::Command::new(std::env::current_exe().unwrap());
+            c.args(["--exact","stp::budget_diagnostic_tests::budget25_diagnostic_initialized_child","--nocapture"]);
+            for (k,_) in std::env::vars_os(){if k.to_string_lossy().starts_with("STP_"){c.env_remove(k);}}
+
+            c.env("STP_P4_TARGET_VALIDATION","0").env("STP_COHORT_PROFILE","g4").env("STP_P4_EMPIRICAL_TAIL_CALIBRATION","1");
+            c.env("STP_BUDGET25_EQUIVALENCE","1").env("STP_RACE_POLICY","P4").env("STP_P4_BUDGET_BASE","1").env("STP_P4_REPAIR_CAP_PERCENT",cap);
+            let out=c.output().unwrap();eprintln!("{}{}",String::from_utf8_lossy(&out.stdout),String::from_utf8_lossy(&out.stderr));assert!(out.status.success());
+            assert!(String::from_utf8_lossy(&out.stderr).contains(&format!("budget25 initialized cap={cap} K=71")));
+        }
+    }
+
+    #[test] fn empirical_diagnostic_initialized_child() {
+        if std::env::var_os("STP_EMPIRICAL_EQUIVALENCE").is_none(){return;}
+        crate::fec_adapt::initialize_research_policy().unwrap();
+        let off=fixture(false,true);let on=fixture(true,true);assert_eq!(off,on);
+        if crate::fec_adapt::research_p4_empirical_tail_calibration()==0 {
+            assert_eq!(on.digest,"9af834e64d39aaa5b79527dab2c16d53e1c6db899304380ebd0dedeb00380a7e");
+            assert_eq!((on.packets,on.budget.demand_repairs,on.budget.planned_repairs,on.budget.repairs_emitted),(78,7,7,7));
+        }
+        eprintln!("empirical initialized selector={} digest={} packets={} demand={} planned={} repairs={}",crate::fec_adapt::research_p4_empirical_tail_calibration(),on.digest,on.packets,on.budget.demand_repairs,on.budget.planned_repairs,on.budget.repairs_emitted);
+    }
+
+    #[test] fn empirical_diagnostic_initialized_both_arms_on_off_equal() {
+        for arm in ["0","1"] {
+            if true && arm=="0" {continue;}
+            let mut c=std::process::Command::new(std::env::current_exe().unwrap());
+            c.args(["--exact","stp::budget_diagnostic_tests::empirical_diagnostic_initialized_child","--nocapture"]);
+            for(k,_)in std::env::vars_os(){if k.to_string_lossy().starts_with("STP_"){c.env_remove(k);}}
+
+            c.env("STP_P4_TARGET_VALIDATION","0").env("STP_COHORT_PROFILE","g4");
+            c.env("STP_EMPIRICAL_EQUIVALENCE","1").env("STP_EMPIRICAL_VALID_CLOCKS","1").env("STP_RACE_POLICY","P4").env("STP_P4_BUDGET_BASE","1").env("STP_P4_REPAIR_CAP_PERCENT","25").env("STP_P4_EMPIRICAL_TAIL_CALIBRATION",arm);
+            let out=c.output().unwrap();eprintln!("{}{}",String::from_utf8_lossy(&out.stdout),String::from_utf8_lossy(&out.stderr));assert!(out.status.success());
+            assert!(String::from_utf8_lossy(&out.stderr).contains(&format!("empirical initialized selector={arm}")));
+        }
+    }
+
+    #[test] fn empirical_all_budget_lifecycles_both_arms() {
+        for arm in ["0","1"] {
+            let mut c=std::process::Command::new(std::env::current_exe().unwrap());
+            c.args(["stp::budget_base_slot_tests::","--test-threads=1","--nocapture"]);
+            for(k,_)in std::env::vars_os(){if k.to_string_lossy().starts_with("STP_"){c.env_remove(k);}}
+            c.env("STP_EMPIRICAL_SLOT_ARM",arm);
+            let out=c.output().unwrap();eprintln!("SLOT ARM {arm}\n{}{}",String::from_utf8_lossy(&out.stdout),String::from_utf8_lossy(&out.stderr));assert!(out.status.success());
+            assert!(!String::from_utf8_lossy(&out.stdout).contains("running 0 tests"));
+        }
+    }
+
+}
+
+#[cfg(test)]
+mod target_dup_tests {
+    use super::*;
+    /// Fresh process with RAND enabled; no sockets, no sleeps, no env mutation.
+    #[test] fn rand_send_commit_flags_and_physical_resolution() {
+        if !crate::target_validation::rand_enabled() {return;}
+        let mut q=queues();q.submit_messages(0,vec![vec![1;100]]);
+        let ConnectionState::Connected(mut state)=new_connection_state_connected(None,CONNECT_MAGIC1_PLAIN_TEXT,1,1) else {unreachable!()};
+        prepare_connected_send_tick(&mut state,&mut q,1);
+        crate::target_validation::risk_rate(&state.target_state,80,100,'G',100_000_000);
+        let before=crate::target_validation::rand_counters(&state.target_state);
+        let p=packet(&mut q,0,false);
+        assert!(!finish_connected_send(&mut state,&mut q,PendingSendKind::Data,None,2,&p,&p,Dscp::BestEffort,42,None));
+        assert!(state.rand_background_bits.is_none(),"refusal is not sent DATA");
+        commit_connected_send(&mut state,&mut q,PendingSendKind::Data,3,p.len(),&p,42,None);
+        crate::target_validation::risk_rate(&state.target_state,120,100,'G',100_000_000);
+        rand_finalize_packet(&mut state,0,true);
+        assert_eq!(crate::target_validation::rand_counters(&state.target_state).0,before.0+1,"eligibility frozen at commit, not resolution");
+        assert_eq!(crate::target_validation::rand_counters(&state.target_state).1,before.1+1);
+        let counted=crate::target_validation::rand_counters(&state.target_state);
+        rand_finalize_packet(&mut state,0,true);assert_eq!(crate::target_validation::rand_counters(&state.target_state),counted,"one outcome only");
+        commit_connected_send(&mut state,&mut q,PendingSendKind::Data,4,p.len(),&p,42,None);
+        crate::target_validation::risk_rate(&state.target_state,80,100,'G',100_000_000);
+        rand_finalize_packet(&mut state,1,true);
+        assert_eq!(crate::target_validation::rand_counters(&state.target_state),counted,"congested send must not feed estimate after risk falls");
+        commit_connected_send(&mut state,&mut q,PendingSendKind::Keepalive,5,1,&[255],42,None);
+        rand_finalize_packet(&mut state,2,true);
+        assert_eq!(crate::target_validation::rand_counters(&state.target_state),counted,"non-DATA excluded");
+        crate::target_validation::risk_congestion(&state.target_state,100,100_000_000,0.5,9,false);
+        crate::target_validation::risk_rate(&state.target_state,80,100,'G',100_000_000);
+        assert!(crate::target_validation::rand_background(&state.target_state,false),"loss-only cut must not create guard");
+        crate::target_validation::risk_congestion(&state.target_state,100,100_000_000,0.5,9,true);
+        crate::target_validation::risk_rate(&state.target_state,80,100,'G',100_000_000);
+        assert!(!crate::target_validation::rand_background(&state.target_state,false),"accepted queue-event recovery guards calm raw risk");
+    }
+
+    fn queues()->SendQueues {SendQueues::baseline_for_test(1,(1_000_000,1_000_000,4_000_000))}
+    fn packet(q:&mut SendQueues,seq:u64,dup:bool)->Vec<u8> {
+        q.fec_prepare_packet(seq);let mut p=vec![0;1442];
+        assert_eq!(q.fill_packet_with_dup(&mut p,dup),p.len());p
+    }
+    fn deliver(h:&mut Option<Box<crate::sequence::ReceiveSequences>>,seq:u64,p:&[u8],out:&mut Vec<Vec<u8>>) {
+        if !target_dup_receive(h,seq,p) {return;}
+        let mut rest=p;
+        while let Some((f,n))=read_frame(rest) {if let WireFrame::Whole(m)=f {out.push(m.to_vec());}rest=&rest[n..];}
+    }
+    #[test] fn whole_packed_off_low_high_and_no_chop() {
+        for dup in [false,true] {
+            let mut q=queues();q.submit_messages(0,vec![vec![1;1000],vec![2;1000],vec![3;100]]);
+            let original=packet(&mut q,10,dup);
+            assert_eq!(original[0],if dup {1|TARGET_DUP_ORIGINAL}else{1});
+            assert_eq!(target_dup_counts(&original).0,1);
+            if dup {
+                assert!(q.target_copy_pending());let copy=packet(&mut q,11,false);
+                assert_eq!(copy[0],1|TARGET_DUP_COPY);assert_eq!(&copy[1..],&original[1..]);
+                assert!(!q.target_copy_pending());
+                let next=packet(&mut q,12,true);assert_eq!(target_dup_counts(&next).0,2,"no high-risk small-message chop");
+            } else {assert!(q.target_duplicate.is_none());}
+        }
+        for kind in 1..=6 {assert_eq!(kind&0x30,0);assert_eq!(target_dup_kind(kind|TARGET_DUP_ORIGINAL),Some((kind,false)));}
+        for kind in [0,7,15,0x30,0xff] {assert!(target_dup_kind(kind).is_none());}
+        let mut q=queues();q.submit_messages(0,vec![vec![9;1439]]);
+        let p=packet(&mut q,100,true);assert_eq!(target_dup_counts(&p).0,1);
+        let c=packet(&mut q,101,false);assert_eq!(&c[1..],&p[1..]);assert_eq!(q.target_dup_fallbacks,0);
+        let mut q=queues();q.submit_messages(0,vec![vec![9;100]]);
+        let p=packet(&mut q,crate::sequence::ACK_SPACE-2,true);assert_eq!(p[0],1);assert_eq!(q.target_dup_fallbacks,1);
+    }
+    #[test] fn packed_exactly_once_either_copy_lost_reordered_and_stale() {
+        let mut q=queues();let messages=vec![vec![1;100],vec![2;100],vec![3;1000]];
+        q.submit_messages(0,messages.clone());let original=packet(&mut q,20,true);let copy=packet(&mut q,21,false);
+        for order in [vec![20],vec![21],vec![20,21],vec![21,20],vec![21,20,21,20],vec![]] {
+            let mut h=None;let mut out=Vec::new();
+            for seq in &order {deliver(&mut h,*seq,if *seq==20 {&original}else{&copy},&mut out);}
+            assert_eq!(out,if order.is_empty(){vec![]}else{messages.clone()});
+        }
+        let mut h=None;let mut out=Vec::new();deliver(&mut h,21,&copy,&mut out);
+        assert!(h.as_mut().unwrap().commit(1_000_000));
+        deliver(&mut h,20,&original,&mut out);assert_eq!(out,messages);
+    }
+    #[test] fn fresh_nonce_commit_refusal_accounting_and_pending_outage_copy() {
+        let mut q=queues();q.submit_messages(0,vec![vec![4;100],vec![5;1000]]);
+        let ConnectionState::Connected(mut state)=new_connection_state_connected(None,CONNECT_MAGIC1_PLAIN_TEXT,1,1) else {unreachable!()};
+        let p=packet(&mut q,0,true);let mut bytes=vec![0;1600];
+        let n=seal_connected_packet(&mut state.cipher,42,0,&p,&mut bytes,2).unwrap();
+        assert!(finish_connected_send(&mut state,&mut q,PendingSendKind::Data,Some(2),2,&bytes[..n],&p,Dscp::BestEffort,42,None));
+        assert_eq!(state.send_sequence_number,1);assert_eq!(state.stats.dup_datagrams,0);
+        #[cfg(feature="research_cohort_observer")]
+        {
+            let obs=cohort_observation_parts(&q,Some(&state),&[0;64],false);
+            assert!(obs.pending_send && !obs.all_idle());assert_eq!(obs.pending_send_kind,Some(PendingSendKind::Data as u8));
+        }
+        let c=packet(&mut q,1,false);let m=seal_connected_packet(&mut state.cipher,42,1,&c,&mut bytes,3).unwrap();
+        assert_eq!(load_u64(&bytes[2..10]),1);
+        assert!(!finish_connected_send(&mut state,&mut q,PendingSendKind::Data,None,3,&bytes[..m],&c,Dscp::BestEffort,42,None));
+        assert_eq!(state.stats.dup_datagrams,0);assert_eq!(state.send_sequence_number,1);
+        let pending=state.pending_send.take().unwrap();assert_eq!(pending.plaintext,c);
+        commit_connected_send(&mut state,&mut q,pending.kind,4,pending.bytes.len(),&pending.plaintext,42,None);
+        assert_eq!((state.send_sequence_number,state.packets_in_flight,state.stats.packets_sent),(2,2,2));
+        assert_eq!((state.stats.dup_datagrams,state.stats.dup_messages,state.stats.dup_bytes),(1,2,m as u64));
+        assert_eq!(state.stats.bytes_sent,(n+m) as u64);
+        q.submit_messages(0,vec![vec![6;100]]);let p=packet(&mut q,2,true);
+        commit_connected_send(&mut state,&mut q,PendingSendKind::Data,5,p.len()+14,&p,42,None);
+        q.fec_prepare_packet(3);let mut copy=vec![0;1442];assert_eq!(q.take_target_copy(&mut copy),1442);
+        commit_connected_send(&mut state,&mut q,PendingSendKind::Outage,6,copy.len()+14,&copy,42,None);
+        assert_eq!(state.outage.probes[3],(3,6));assert_eq!(state.stats.dup_datagrams,2);
+    }
+    #[test] fn encrypted_nonce_and_physical_ack_ce_are_independent_of_whole_dedup() {
+        let mut q=queues();q.submit_messages(0,vec![vec![4;100],vec![5;1000]]);
+        let original=packet(&mut q,50,true);let copy=packet(&mut q,51,false);
+        let (sender,mut receiver)=super::wire_v2_tests::ciphers();let mut sender=Some(sender);
+        let mut enc=vec![0;1600];let mut packets=Vec::new();
+        for (nonce,p) in [(50,&original),(51,&copy)] {
+            let n=seal_connected_packet(&mut sender,42,nonce,p,&mut enc,10).unwrap();packets.push(enc[..n].to_vec());
+        }
+        assert_ne!(&packets[0][14..],&packets[1][14..]);
+        let mut physical=crate::sequence::ReceiveSequences::default();let mut h=None;let mut out=Vec::new();
+        let mut acks=crate::ack::AckReceiver::default();let mut timer=u64::MAX;
+        for i in [1,0] {
+            let packet=&packets[i];let nonce=load_u64(&packet[2..10]);let mut dec=vec![0;1600];
+            let n=receiver.open(nonce,load_u32(&packet[10..14]),&packet[..14],&packet[14..],&mut dec,20+i as u64).unwrap();
+            assert!(physical.commit(nonce));deliver(&mut h,nonce,&dec[..n],&mut out);
+            acks.receive_with_rtt(nonce,30+i as u64,true,&mut timer,1000,packet.len());
+        }
+        assert_eq!(out,vec![vec![4;100],vec![5;1000]]);
+        let ack=acks.ack(100);assert_eq!(ack.ce_count,2);assert!(ack.contains(50)&&ack.contains(51));
+    }
+    #[test] fn memory_erased_original_does_not_poison_copy_and_seen_copy_needs_no_memory() {
+        let mut q=queues();q.submit_messages(0,vec![vec![4;100],vec![5;1000]]);
+        let original=packet(&mut q,50,true);let copy=packet(&mut q,51,false);
+        let mut h=None;let budget=crate::receive_memory::ReceiveMemoryBudget::new(10_000);
+        let pressure=budget.reserve(9000).unwrap();
+        let (skip,res,erased)=target_dup_prepare(&mut h,50,&original,&budget);
+        assert!(skip && erased);assert!(res.is_empty());assert!(h.is_none());assert_eq!(budget.used(),9000);
+        drop(pressure);
+        let (skip,res,erased)=target_dup_prepare(&mut h,51,&copy,&budget);
+        assert!(!skip && !erased);assert_eq!(res.len(),2);drop(res);assert_eq!(budget.used(),0);
+        let pressure=budget.reserve(10_000).unwrap();
+        let (skip,res,erased)=target_dup_prepare(&mut h,50,&original,&budget);
+        assert!(skip && !erased);assert!(res.is_empty());drop(pressure);
+    }
+    #[test] fn mixed_fec_pair_only_logically_lost_if_both_lost() {
+        for losses in [[true,false],[false,true],[false,false],[true,true]] {
+            let mut q=SendQueues::baseline_for_test(2,(1_000_000,1_000_000,4_000_000));
+            q.fec_adaptive=Some(crate::fec_adapt::FecAdaptiveState::reliability_for_test(crate::ship::FEC,0));
+            q.submit_messages(0,vec![vec![7;2000]]);
+            let _=packet(&mut q,0,true);
+            q.submit_messages(1,vec![vec![8;100]]);
+            // Arrange a bulk-first packet whose short final source permits a
+            // whole filler from another queue (same mechanism as real packing).
+            q.queue_active[1]=true;q.scheduled_bytes[1]=1_000_000;
+            let original=packet(&mut q,1,true);
+            assert_eq!(target_dup_counts(&original),(1,true));assert!(q.target_dup_pairs.contains_key(&1));
+            let _=packet(&mut q,2,false);
+            q.fec_on_packet_finalized(1,losses[0]);assert!(q.target_dup_pairs.contains_key(&1));
+            q.fec_on_packet_finalized(2,losses[1]);assert!(!q.target_dup_pairs.contains_key(&1));
+            let f=q.queues[0].fec_send_slot.as_ref().unwrap();
+            assert_eq!(f.group_lost.iter().copied().sum::<u32>(),u32::from(losses[0]&&losses[1]));
+            assert_eq!(f.finalized_symbols,1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod frozen_candidate_transport_tests {
+    use super::*;
+    fn connected()->ConnectionStateConnected {
+        let ConnectionState::Connected(s)=new_connection_state_connected(None,CONNECT_MAGIC1_PLAIN_TEXT,1,1) else {unreachable!()};s
+    }
+    #[test]
+    fn default_build_applies_target_mix_to_k71() {
+        let mut q=SendQueues::new(1,(1_000_000,1_000_000,4_000_000));
+        let mut state=connected();prepare_connected_send_tick(&mut state,&mut q,1);
+        crate::target_validation::risk_rate(&state.target_state,80_000_000,100_000_000,'G',100_000_000);
+        let a=crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC,1);
+        assert_eq!(a.target_selector(),2);assert!(a.cost_smooth_active());
+        let admission=crate::target_validation::risk_admission(&state.target_state);
+        let expected=crate::target_validation::plan_at_admission(71,2,"b20r20",crate::target_validation::draw(1),admission).unwrap();
+        assert!(expected.proactive>0);
+        q.fec_adaptive=Some(a);
+        let mut payload=vec![0;1449];let block=payload.len()-STP_FEC_FRAGMENT_HEADER_SIZE;
+        q.submit_messages(0,vec![vec![7;block*71]]);
+        q.fec_prepare_packet(0);assert_eq!(q.fill_packet(&mut payload),payload.len());
+        let f=q.queues[0].fec_send_slot.as_ref().unwrap();
+        assert_eq!(f.k,71);assert_eq!(f.n-f.k,expected.proactive);
+        assert_eq!(q.queues[0].budget_sink.lock().unwrap().planned_repairs,expected.proactive as u64);
+    }
+    #[test]
+    fn reconnect_rebinds_live_roots_and_does_not_inherit_peer_risk() {
+        let mut q=SendQueues::new(1,(1_000_000,1_000_000,4_000_000));
+        let mut first=connected();prepare_connected_send_tick(&mut first,&mut q,1);
+        crate::target_validation::risk_rate(&first.target_state,120_000_000,100_000_000,'G',100_000_000);
+        crate::target_validation::risk_congestion(&first.target_state,100_000_000,100_000_000,0.5,9,true);
+        let old=first.target_state.clone();assert!(crate::target_validation::duplicate_now(&old));
+        q.fec_adaptive=Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC,1));
+        q.submit_messages(0,vec![vec![7;100_000]]);q.fec_prepare_packet(0);
+        assert!(q.fill_packet_with_dup(&mut vec![0;1449],false)>0);
+        let root=q.queues[0].budget_root.clone().unwrap();
+        assert!(root.lock().unwrap().target_state.same_connection(&old));
+        drop(first); // Same peer's application send queues can outlive its transport session.
+        let mut next=connected();prepare_connected_send_tick(&mut next,&mut q,2);
+        assert!(!next.target_state.same_connection(&old));
+        assert!(q.target_state.same_connection(&next.target_state));
+        assert!(q.queues[0].target_state.same_connection(&next.target_state));
+        assert!(root.lock().unwrap().target_state.same_connection(&next.target_state));
+        crate::target_validation::risk_rate(&next.target_state,80_000_000,100_000_000,'G',100_000_000);
+        assert!(!crate::target_validation::duplicate_now(&next.target_state));
+        assert_eq!(crate::target_validation::rand_counters(&next.target_state),(0,0,0,0));
+        assert!(crate::target_validation::duplicate_now(&old),"old context was not mutated into the new peer");
+        let a=crate::target_validation::risk_admission(&next.target_state);
+        assert_eq!((a.risk,a.p_base),(0.,0.001));
     }
 }

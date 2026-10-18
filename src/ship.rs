@@ -6,22 +6,22 @@
 //! not a universal reliability guarantee. The public API deliberately has no tuning knobs.
 
 pub(crate) const CC: crate::stp::CongestionPolicy = crate::stp::CongestionPolicy {
-    beta: 0.67,
+    beta: 0.8,
     recovery_rtts: 9,
-    rate_rp: 0.98,
-    rate_pg: 1.05,
-    rate_gs: 4.0,
-    time_pg: 2.0,
-    time_gs: 8.0,
+    rate_rp: 0.92,
+    rate_pg: 1.02,
+    rate_gs: 2.0,
+    time_pg: 6.0,
+    time_gs: 10.0,
     loss_threshold: 2,
     loss_timeout_rtts: 2.0,
     event_guard_rtts: 0.5,
     rate_floor_upps: 100_000_000,
     initial_rate_upps: 100_000_000,
     min_growth_uppsps: 25_000_000.0,
-    max_growth_uppsps: 500_000_000.0,
-    relative_growth_per_rtt: 0.02,
-    startup_multiplier: 1.1,
+    max_growth_uppsps: 1_000_000_000.0,
+    relative_growth_per_rtt: 0.015,
+    startup_multiplier: 1.05,
     startup_backoff_rtts: 1.0,
 };
 
@@ -43,23 +43,107 @@ pub(crate) const ACK: crate::ack::AckPolicy = crate::ack::AckPolicy {
     max_delay_us: 10_000,
 };
 
-/// P4 only: fixed extra initial parity, in percentage points of source K, for a
-/// logical message whose whole planned train spans [RTT/2, 2 RTT] at its queue's
-/// fair-share rate. Classified once at first plan; not an application setting.
-pub(crate) const P4_CATEGORY_BONUS_PERCENT: u32 = 10;
-
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
+    fn policy_environment_child() {
+        if std::env::var_os("STP_RC_POLICY_PROBE").is_none() { return; }
+        for (key, _) in FROZEN_POLICY {
+            let expected = if cfg!(feature="research_target_validation") { "0" }
+                else { FROZEN_POLICY.iter().find(|(k,_)|k==key).unwrap().1 };
+            assert_eq!(policy_var(key).unwrap(), expected, "{key}");
+        }
+        assert_eq!(policy_var("STP_CC_LOSS_GATE").is_ok(),cfg!(feature="research_target_validation"));
+        if cfg!(feature="research_target_validation") {
+            assert!(!crate::target_validation::rand_enabled());
+            assert!(!crate::target_validation::duplicate_now(&Default::default()));
+        }
+    }
+    #[test]
+    fn production_ignores_policy_environment_research_accepts_explicit_zero() {
+        let mut child=std::process::Command::new(std::env::current_exe().unwrap());
+        child.args(["--exact","ship::tests::policy_environment_child","--nocapture"])
+            .env("STP_RC_POLICY_PROBE","1").env("STP_CC_LOSS_GATE","1");
+        for (key,_) in FROZEN_POLICY {child.env(key,"0");}
+        let output=child.output().unwrap();
+        assert!(output.status.success(),"{}{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+    }
+    #[test]
     fn ship_policy_is_the_only_configuration() {
         assert_eq!(CC.initial_rate_upps, 100_000_000);
-        assert_eq!(CC.max_growth_uppsps, 500e6);
-        assert_eq!(CC.relative_growth_per_rtt, 0.02);
-        assert_eq!(CC.startup_multiplier, 1.1);
+        assert_eq!(CC.max_growth_uppsps, 1000e6);
+        assert_eq!(CC.relative_growth_per_rtt, 0.015);
+        assert_eq!(CC.startup_multiplier, 1.05);
         assert_eq!(CC.loss_threshold, 2);
         assert_eq!(FEC.eps, 0.5);
         assert_eq!((ACK.every_packets, ACK.max_delay_us), (8, 10_000));
-        assert_eq!(P4_CATEGORY_BONUS_PERCENT, 10);
     }
+}
+
+/// Frozen c4rand release-candidate design. H = 100/3 is the real-path-tested
+/// exposure scale (not the older g4 emulator's 1000/3). Applications do not
+/// configure transport policy. Only the research feature permits overrides.
+pub(crate) const FROZEN_POLICY: &[(&str, &str)] = &[
+    ("STP_CC_DELAY_BETA", "0.95"),
+    ("STP_CC_DELAY_EVENT", "1"),
+    ("STP_CC_DELAY_GIVEUP", "3"),
+    ("STP_CC_DELAY_HOLD_MAX_RTTS", "256"),
+    ("STP_CC_DELAY_HOLD_RTTS", "16"),
+    ("STP_CC_DELAY_INTERVAL_RTTS", "1"),
+    ("STP_CC_DELAY_K", "0.5"),
+    ("STP_CC_DELAY_MAX_MS", "50"),
+    ("STP_CC_DELAY_MIN_MS", "5"),
+    ("STP_P4_BASE_PARITY_MODEL", "0"),
+    ("STP_P4_BUDGET_BASE", "1"),
+    ("STP_P4_COST_SMOOTH", "1"),
+    ("STP_P4_EMPIRICAL_TAIL_CALIBRATION", "1"),
+    ("STP_P4_EVENT_REPAIR", "0"),
+    ("STP_P4_INTERLEAVE_WIDTH", "1"),
+    ("STP_P4_MEDIUM_BONUS_PERCENT", "0"),
+    ("STP_P4_REPAIR_CAP_PERCENT", "0"),
+    ("STP_P4_SLIPSTREAM", "0"),
+    ("STP_P4_TARGET_VALIDATION", "2"),
+    ("STP_RACE_POLICY", "P4"),
+    ("STP_TV_ALIVE", "1"),
+    ("STP_TV_DUP", "1"),
+    ("STP_TV_E", "1"),
+    ("STP_TV_H", "33.333333333333336"),
+    ("STP_TV_P", "0.001"),
+    ("STP_TV_RAND", "1"),
+    ("STP_TV_RAND_HALF_PKTS", "4000"),
+    ("STP_TV_RAND_MAX", "0.05"),
+    ("STP_TV_RAND_MULT", "2"),
+    ("STP_TV_RISK_EPS", "0.002"),
+    ("STP_TV_RISK_HI", "1.02"),
+    ("STP_TV_RISK_HI2", "0.7"),
+    ("STP_TV_RISK_HOLD_MAX_RTTS", "10"),
+    ("STP_TV_RISK_HOLD_RTTS", "1"),
+    ("STP_TV_RISK_LO", "0.98"),
+    ("STP_TV_RISK_LO2", "0.5"),
+    ("STP_TV_RISK_PHI", "0.1"),
+    ("STP_TV_RISK_SRC", "4"),
+    ("STP_TV_RISK_STEP", "2"),
+    ("STP_TV_RISK_TAIL", "3.0"),
+    ("STP_COHORT_PROFILE", "b20r20"),
+];
+pub(crate) fn policy_var(name: &str) -> Result<String, std::env::VarError> {
+    #[cfg(feature = "research_target_validation")]
+    {
+        // Opt out as a whole for predecessor experiments: dependent frozen
+        // knobs (TAIL/HOLD/EPS, for example) must not leak into an off arm.
+        if std::env::var("STP_POLICY_FROZEN").as_deref() == Ok("0") {
+            return std::env::var(name);
+        }
+        match std::env::var(name) {
+            Ok(value) => return Ok(value),
+            Err(std::env::VarError::NotPresent) => {},
+            Err(error) => return Err(error),
+        }
+    }
+    FROZEN_POLICY.iter().find(|(key, _)| *key == name)
+        .map(|(_, value)| (*value).to_owned()).ok_or(std::env::VarError::NotPresent)
+}
+pub(crate) fn policy_var_os(name: &str) -> Option<std::ffi::OsString> {
+    policy_var(name).ok().map(Into::into)
 }
