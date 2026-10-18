@@ -49,6 +49,11 @@
 //! one lost UDP fragment loses the whole message, so a drained queue plus silence means lost. Control messages that are lost are
 //! simply asked for again.
 
+extern crate shielded_transport_pigeon as stp_core;
+#[path = "../../tests/support/pump_thread.rs"]
+mod pump_thread;
+use pump_thread::*;
+
 use shielded_transport_pigeon::stp::*;
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};

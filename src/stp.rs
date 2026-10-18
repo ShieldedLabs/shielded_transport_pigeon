@@ -124,43 +124,6 @@ pub fn ack_test() {
     println!("Order:      {:?}", receive_order);
 }
 
-pub fn do_the_test_program3(port: u16, my_keypair: IdentityKeyPair, beam_to: Option<STPAddress>, max_pps: Option<u64>, send_buffer_params: (u32, u32, u32), max_message_size: usize) {
-    socket_setup();
-    monotonic_clock_setup();
-
-    let network_thread_handle2 = new_network_thread(vec![my_keypair], port, max_pps, send_buffer_params, max_message_size);
-
-    if let Some(other) = beam_to {
-        let initiate_connections = vec![other];
-
-        let ret = service_connections(&network_thread_handle2, NetworkThreadPush { initiate_connections, ..Default::default() }).unwrap_or_default();
-        let mut wanted_connections = ret.current_connections;
-
-        let mut i = 0;
-
-        loop {
-            let mut send_unreliable = Vec::new();
-            if wanted_connections.len() > 0 {
-                for _ in 0..50000 {
-                    send_unreliable.push((wanted_connections[0].0.to_connection_key(), 0, Dscp::BestEffort, Vec::from(b"Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...")));
-                }
-                // the sends will be truncated anyway
-            }
-            let ret = service_connections(&network_thread_handle2, NetworkThreadPush { wanted_connections, send_unreliable, ..Default::default() }).unwrap_or_default();
-            wanted_connections = ret.current_connections;
-            std::thread::sleep(std::time::Duration::from_millis(3000));
-        }
-    }
-    else {
-        let mut wanted_connections = Vec::new();
-        loop {
-            let ret = service_connections(&network_thread_handle2, NetworkThreadPush { wanted_connections, ..Default::default() }).unwrap_or_default();
-            wanted_connections = ret.current_connections;
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-    }
-}
-
 // LSB of this 48 bit value must be 1 for this to be recognized as an incoming connect handshake.
 pub const CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s: u64 = 0x7193_c304_f8d5;
 pub const CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b: u64 = 0xbe53_b364_1ce1;
@@ -4826,158 +4789,39 @@ pub struct NetworkThreadPull {
     pub thread_stats: NetworkThreadStats,
 }
 
-/// A coalescing edge between the core and its application driver. This never
-/// runs user code: only the adapter wakes application Wakers/handlers.
-#[derive(Debug)]
-pub(crate) struct CoreReady {
-    generation: std::sync::Mutex<u64>,
-    changed: std::sync::Condvar,
-    enabled: std::sync::atomic::AtomicBool,
-    pub(crate) send_space: std::sync::atomic::AtomicBool,
-}
-impl Default for CoreReady {
-    fn default() -> Self {
-        Self { generation: std::sync::Mutex::new(1), changed: std::sync::Condvar::new(),
-            enabled: std::sync::atomic::AtomicBool::new(false), send_space: std::sync::atomic::AtomicBool::new(false) }
-    }
-}
-impl CoreReady {
-    pub(crate) fn notify(&self) {
-        let mut generation = self.generation.lock().unwrap();
-        *generation = generation.wrapping_add(1);
-        self.changed.notify_one();
-    }
-    pub(crate) fn wait(&self, observed: &mut u64) {
-        let generation = self.generation.lock().unwrap();
-        let generation = self.changed.wait_while(generation, |g| *g == *observed).unwrap();
-        *observed = *generation;
-    }
-}
-
+pub use crate::pump::{Pump, Endpoint};
 #[cfg(test)]
-mod readiness_notification_tests {
-    use super::*;
-    #[test]
-    fn network_unwind_wakes_parked_driver_and_fails_exchange_immediately() {
-        let inner = std::sync::Arc::new(NetworkThreadInner {
-            state: std::sync::atomic::AtomicUsize::new(1),
-            stop: std::sync::atomic::AtomicBool::new(false),
-            exited: std::sync::atomic::AtomicBool::new(false),
-            wake: std::sync::Arc::new(NetworkWake::new().unwrap()),
-            exchange: std::sync::Mutex::new(()), completed: std::sync::Condvar::new(),
-            ready: std::sync::Arc::new(CoreReady::default()),
-            push: std::cell::UnsafeCell::new(NetworkThreadPush::default()),
-            pull: std::cell::UnsafeCell::new(NetworkThreadPull::default()),
-        });
-        let ready = inner.ready.clone();
-        let mut observed = 0;
-        ready.wait(&mut observed);
-        let worker_inner = inner.clone();
-        let thread = std::thread::spawn(move || {
-            let _exit = NetworkExit(worker_inner);
-            panic!("test socket-owner unwind");
-        });
-        let core = NetworkThreadHandle { inner, thread: Some(thread), join_on_drop: false };
-        ready.wait(&mut observed);
-        assert!(core.is_finished());
-        let start = std::time::Instant::now();
-        assert!(service_connections(&core, NetworkThreadPush::default()).is_none());
-        assert!(start.elapsed() < std::time::Duration::from_secs(1));
-        core.shutdown();
-    }
-    #[test]
-    fn generation_retains_edges_before_wait_and_during_service() {
-        let ready = std::sync::Arc::new(CoreReady::default());
-        let mut seen = 0;
-        ready.wait(&mut seen); // Initial snapshot, without a command.
-        ready.notify();
-        ready.notify(); // Coalesced before the driver starts waiting.
-        ready.wait(&mut seen);
-        assert_eq!(seen, 3);
-        let other = ready.clone();
-        let worker = std::thread::spawn(move || { other.notify(); });
-        ready.wait(&mut seen); // Either side of condvar registration is safe.
-        worker.join().unwrap();
-        assert_eq!(seen, 4);
-    }
-}
+#[path = "../tests/support/pump_thread.rs"]
+mod pump_thread;
+#[cfg(test)]
+use pump_thread::*;
+use crate::pump::port::{Port, Ready as CoreReady};
 
-struct NetworkThreadInner {
-    state: std::sync::atomic::AtomicUsize, // 0 empty, 1 full
-    stop: std::sync::atomic::AtomicBool,
-    exited: std::sync::atomic::AtomicBool,
-    wake: std::sync::Arc<NetworkWake>,
-    exchange: std::sync::Mutex<()>,
-    completed: std::sync::Condvar,
-    ready: std::sync::Arc<CoreReady>,
-    push: std::cell::UnsafeCell<NetworkThreadPush>,
-    pull: std::cell::UnsafeCell<NetworkThreadPull>,
-}
-
-#[allow(unsafe_code)]
-unsafe impl std::marker::Sync for NetworkThreadInner {}
-
-// Publish death before waking either waiter, including when the socket owner unwinds.
-struct NetworkExit(std::sync::Arc<NetworkThreadInner>);
+// Publish death on normal drop AND unwind, even if Pump was never run.
+struct NetworkExit(std::sync::Arc<Port>);
 impl Drop for NetworkExit {
     fn drop(&mut self) {
-        let _guard = self.0.exchange.lock().unwrap_or_else(|e| e.into_inner());
         self.0.exited.store(true, std::sync::atomic::Ordering::Release);
-        self.0.completed.notify_all();
         self.0.ready.notify();
     }
 }
 
-// Note(Sam): Using this handle from two threads at once is UB. Only one thread may call service_connections at any given time.
-pub struct NetworkThreadHandle {
-    inner: std::sync::Arc<NetworkThreadInner>,
-    thread: Option<std::thread::JoinHandle<()>>,
-    join_on_drop: bool,
+/// All setup is synchronous; no threads are started. `max_message_size` is
+/// required application configuration, and has the existing 1 GiB upper bound.
+pub struct PumpConfig {
+    pub keypairs: Vec<IdentityKeyPair>,
+    pub port: u16,
+    pub max_pps: Option<u64>,
+    pub send_buffer_params: (u32, u32, u32),
+    pub max_message_size: usize,
+    pub options: NetworkThreadOptions,
 }
-
-impl NetworkThreadHandle {
-    pub(crate) fn is_finished(&self) -> bool {
-        self.inner.exited.load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    pub(crate) fn readiness(&self) -> std::sync::Arc<CoreReady> {
-        self.inner.ready.enabled.store(true, std::sync::atomic::Ordering::Release);
-        self.inner.wake.notify();
-        self.inner.ready.clone()
-    }
-
-    /// Stop and join the socket-owning thread. Like Drop, this sends no close
-    /// packet and does not drain queued sends; peers observe the existing timeout.
-    /// Application API adapters use this to make endpoint shutdown deterministic.
-    pub fn shutdown(mut self) {
-        self.inner.stop.store(true, std::sync::atomic::Ordering::Release);
-        self.inner.wake.notify();
-        if let Some(t) = self.thread.take() { t.thread().unpark(); let _ = t.join(); }
-    }
+pub fn new(config: PumpConfig) -> (Pump, Endpoint) {
+    new_pump_with_options(config.keypairs, config.port, config.max_pps,
+        config.send_buffer_params, config.max_message_size, config.options)
 }
-
-// The network thread owns the socket, so it has to end for the port to close and for peers to
-// see this node go quiet. Nothing is sent to them: they time the connection out.
-impl Drop for NetworkThreadHandle {
-    fn drop(&mut self) {
-        self.inner.stop.store(true, std::sync::atomic::Ordering::Release);
-        self.inner.wake.notify();
-        if let Some(t) = &self.thread { t.thread().unpark(); }
-        // A traced run must flush the final buffered events before the process exits.
-        if self.join_on_drop { if let Some(t) = self.thread.take() { let _ = t.join(); } }
-    }
-}
-
-pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_pps: Option<u64>, send_buffer_params: (u32, u32, u32), max_message_size: usize) -> NetworkThreadHandle {
-    new_network_thread_with_bind(my_keypairs, my_port, max_pps, send_buffer_params, max_message_size, None)
-}
-
-/// Like `new_network_thread`, but `bind_ip: Some(ip)` binds the UDP socket to that one local
-/// address instead of the dual-stack wildcard, so replies leave from it (Fly.io UDP needs the
-/// `fly-global-services` IPv4 address). An IPv4 bind only reaches IPv4 peers, an IPv6 bind only
-/// IPv6 peers. Linux only; elsewhere a specific bind fails. `None` is `new_network_thread`.
-pub fn new_network_thread_with_bind(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_pps: Option<u64>, send_buffer_params: (u32, u32, u32), max_message_size: usize, bind_ip: Option<std::net::IpAddr>) -> NetworkThreadHandle {
-    new_network_thread_with_options(my_keypairs, my_port, max_pps, send_buffer_params, max_message_size, NetworkThreadOptions { bind_ip, ..Default::default() })
+pub fn new_pump(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_pps: Option<u64>, send_buffer_params: (u32, u32, u32), max_message_size: usize) -> (Pump, Endpoint) {
+    new_pump_with_options(my_keypairs, my_port, max_pps, send_buffer_params, max_message_size, NetworkThreadOptions::default())
 }
 
 /// Internal loss/ECN-driven packet-rate policy. Values are fixed in ship.rs.
@@ -5057,7 +4901,7 @@ impl Default for NetworkThreadOptions {
 /// clamped to 1 GiB. Oversized submissions return in `send_unreliable_oversized`.
 /// Both applications must configure compatible limits; no negotiation is added.
 /// Panics synchronously if its receive cap plus bookkeeping cannot fit the budget.
-pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_pps: Option<u64>, send_buffer_params: (u32, u32, u32), max_message_size: usize, options: NetworkThreadOptions) -> NetworkThreadHandle {
+pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_pps: Option<u64>, send_buffer_params: (u32, u32, u32), max_message_size: usize, options: NetworkThreadOptions) -> (Pump, Endpoint) {
     let bind_ip = options.bind_ip;
     let send_queue_count = options.send_queue_count;
     assert!((1..=64).contains(&send_queue_count), "send_queue_count must be 1..=64");
@@ -5079,17 +4923,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
 
     let socket = setup_and_bind_udp_socket_on(my_port, bind_ip).expect("Failed to bind socket, try again.");
 
-    let inner = std::sync::Arc::new(NetworkThreadInner {
-        state: std::sync::atomic::AtomicUsize::new(0),
-        stop: std::sync::atomic::AtomicBool::new(false),
-        exited: std::sync::atomic::AtomicBool::new(false),
-        wake: std::sync::Arc::new(NetworkWake::new().expect("create network command wakeup")),
-        exchange: std::sync::Mutex::new(()),
-        completed: std::sync::Condvar::new(),
-        ready: std::sync::Arc::new(CoreReady::default()),
-        push: std::cell::UnsafeCell::new(NetworkThreadPush::default()),
-        pull: std::cell::UnsafeCell::new(NetworkThreadPull::default()),
-    });
+    let inner = Port::new();
     let record_fec_messages = options.record_fec_messages;
     let record_loss_episodes = options.record_loss_episodes;
     let mut loss_trace = options.loss_trace.as_deref().map(|p| crate::loss_trace::LossTrace::open(p).expect("open loss trace"));
@@ -5106,38 +4940,15 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
     let encrypted_payload_log = options.encrypted_payload_log;
     #[cfg(feature="research_budget_diagnostic")]
     let diagnostic_enabled = options.budget_diagnostic;
-    let thread = std::thread::spawn(move || {
-        let _exit = NetworkExit(thread_inner.clone());
+    {
+        let exit = NetworkExit(thread_inner.clone());
         #[cfg(feature = "research_budget_diagnostic")]
         diag::enable(diagnostic_enabled);
         // SockHandle is Copy, not RAII. This thread is the sole socket owner;
         // release the descriptor on normal shutdown AND unwinding.
         struct SocketOwner(SockHandle);
         impl Drop for SocketOwner { fn drop(&mut self) { unsafe { self.0.close(); } } }
-        let _socket_owner = SocketOwner(socket);
-        #[cfg(test)]
-        let datagram_expectation = std::cell::Cell::new(("handshake", None::<usize>));
-        // Test builds observe EVERY actual native send, including handshakes. The
-        // UDP relay test cross-checks these exact bytes against socket reception.
-        #[cfg(test)]
-        let udp_send_with_congestion_and_dscp = |socket, ip, port, bytes: &[u8], dscp, ecn| {
-            let (kind, expected) = datagram_expectation.replace(("handshake", None));
-            if let Some(hook) = &send_failure {
-                let mut hook = hook.lock().unwrap();
-                if hook.kind.is_none_or(|k| k == kind) && (hook.remaining > 0 ||
-                    hook.blocked.as_ref().is_some_and(|b| b.load(std::sync::atomic::Ordering::Acquire))) {
-                    hook.remaining = hook.remaining.saturating_sub(1);
-                    hook.attempts.push(bytes.to_vec());
-                    return None;
-                }
-            }
-            let sent = crate::native_sockets::udp_send_with_congestion_and_dscp(socket, ip, port, bytes, dscp, ecn);
-            if sent.is_some() {
-                if let Some(log) = &datagram_log { log.lock().unwrap().push(SentDatagram { kind, expected, bytes: bytes.to_vec() }); }
-            }
-            sent
-        };
-
+        let socket_owner = SocketOwner(socket);
         let mut packet_memory_encrypted = new_packet_memory(); // Incoming Encrypted / Outgoing Encrypted
         let mut packet_memory_recv      = new_packet_memory(); // Incoming Decrypted
         let mut packet_memory_send      = new_packet_memory(); // Outgoing Decrypted
@@ -5179,9 +4990,38 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
         let mut receive_notified = false;
         let mut ready_used = 0usize;
 
+        let run = move |caller_deadline: std::time::Instant| {
+        // Capture owners explicitly: resources live even before the first call.
+        let _owners = (&exit, &socket_owner);
+        #[cfg(test)]
+        let datagram_expectation = std::cell::Cell::new(("handshake", None::<usize>));
+        // Test builds observe EVERY actual native send, including handshakes. The
+        // UDP relay test cross-checks these exact bytes against socket reception.
+        #[cfg(test)]
+        let udp_send_with_congestion_and_dscp = |socket, ip, port, bytes: &[u8], dscp, ecn| {
+            let (kind, expected) = datagram_expectation.replace(("handshake", None));
+            if let Some(hook) = &send_failure {
+                let mut hook = hook.lock().unwrap();
+                if hook.kind.is_none_or(|k| k == kind) && (hook.remaining > 0 ||
+                    hook.blocked.as_ref().is_some_and(|b| b.load(std::sync::atomic::Ordering::Acquire))) {
+                    hook.remaining = hook.remaining.saturating_sub(1);
+                    hook.attempts.push(bytes.to_vec());
+                    return None;
+                }
+            }
+            let sent = crate::native_sockets::udp_send_with_congestion_and_dscp(socket, ip, port, bytes, dscp, ecn);
+            if sent.is_some() {
+                if let Some(log) = &datagram_log { log.lock().unwrap().push(SentDatagram { kind, expected, bytes: bytes.to_vec() }); }
+            }
+            sent
+        };
+
+        #[cfg(feature = "research_budget_diagnostic")]
+        diag::enable(diagnostic_enabled);
         loop {
+            if std::time::Instant::now() >= caller_deadline { return Some(std::time::Instant::now()); }
             if thread_inner.stop.load(std::sync::atomic::Ordering::Acquire) {
-                break;
+                return None;
             }
             {
                 let t = monotonic_clock_ns();
@@ -5196,14 +5036,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                 thread_stats.loop_iterations += 1;
             }
             let test_drop_ppm = match &test_drop_schedule { Some(sch) => sch.ppm_at(monotonic_clock_ns().saturating_sub(test_drop_t0)), None => test_drop_ppm };
-            if thread_inner.state.load(std::sync::atomic::Ordering::Acquire) == 1 {
-                let mut req = NetworkThreadPush::default();
-
-                #[allow(unsafe_code)]
-                unsafe {
-                    std::mem::swap(&mut *thread_inner.push.get(), &mut req);
-                }
-
+            if let Some(mut req) = thread_inner.take_request() {
                 let current_time_now_ns = monotonic_clock_ns();
                 connections_map.retain(|key, value| {
                     let stp_address = value.address();
@@ -5345,14 +5178,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                 receive_notified = false;
                 ready_used = connections_map.values().flat_map(|c| &c.unreliable_send_buffer.queues).map(|q| q.queue_bytes_filled as usize).sum();
 
-                #[allow(unsafe_code)]
-                unsafe {
-                    std::mem::swap(&mut *thread_inner.pull.get(), &mut resp);
-                }
-
-                let _guard = thread_inner.exchange.lock().unwrap();
-                thread_inner.state.store(0, std::sync::atomic::Ordering::Release);
-                thread_inner.completed.notify_one();
+                thread_inner.publish(resp);
             } else {
 
                 /*  Note(Sam): Scheduling is very important for fairness and good performance under load
@@ -5368,6 +5194,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                 // Drain ACKs before sending again. Bound the batch so a busy peer cannot
                 // monopolize the thread; the socket is nonblocking, so stop as soon as empty.
                 for _recv_round in 0..MAX_RECV_PACKETS_PER_TICK { // `continue` skips this packet
+                    if std::time::Instant::now() >= caller_deadline { return Some(std::time::Instant::now()); }
                     let (buf_len, other_ip_addr, other_port, ecn_marked, ecn_enabled, service_class, timestamp_ns) =
                         match udp_recv_with_congestion_and_dscp(socket, &mut packet_memory_encrypted[..]) {
                             Ok(r) => r,
@@ -6103,7 +5930,9 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                     receive_queue.dropped_bytes = 0;
                     receive_queue_report_time_ns = current_time_now_ns;
                 }
-                connections_map.retain(|connection_key, connection_tracking_data| {match &mut connection_tracking_data.connection_state {
+                connections_map.retain(|connection_key, connection_tracking_data| {
+                    if std::time::Instant::now() >= caller_deadline { return true; }
+                    match &mut connection_tracking_data.connection_state {
                     ConnectionState::SendingClientHelloPlaintext { last_sent_time_ns, hello_packet_payload } => {
                         return retry_handshake(connection_tracking_data.creation_time_ns, last_sent_time_ns,
                             current_time_now_ns, 30_000_000_000, || udp_send_with_congestion_and_dscp(socket,
@@ -6637,21 +6466,19 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                         }
                     }
                     if active_retry {
-                        std::thread::sleep(std::time::Duration::from_nanos(150_000));
-                    } else if thread_inner.state.load(std::sync::atomic::Ordering::Acquire) == 0 {
-                        thread_inner.wake.wait(socket, std::time::Duration::from_nanos(deadline.saturating_sub(now)));
+                        std::thread::sleep(std::time::Duration::from_nanos(150_000).min(caller_deadline.saturating_duration_since(std::time::Instant::now())));
+                    } else if !thread_inner.has_request() {
+                        thread_inner.wake.wait(socket, std::time::Duration::from_nanos(deadline.saturating_sub(now))
+                            .min(caller_deadline.saturating_duration_since(std::time::Instant::now())));
                         let resumed = monotonic_clock_ns();
                         if waited_across_idle_quantum(now, deadline, resumed) { idle_resume_ns = resumed; }
                     }
                 }
             }
         }
-    });
-
-    NetworkThreadHandle {
-        inner,
-        thread: Some(thread),
-        join_on_drop: options.loss_trace.is_some(),
+        };
+        let pump = Pump { run: Box::new(run), wakeup: Some(std::time::Instant::now()) };
+        (pump, Endpoint { inner })
     }
 }
 
@@ -6744,51 +6571,28 @@ pub(crate) fn cubic_rate_with_options(t_ns: u64, r_max: u64, k_ns: u64, cc: &Con
 }
 
 
-/// Hands `req` to the network thread and returns what it last produced.
-///
-/// The network thread is a separate OS thread and `state` is the handshake: wait
-/// for it to be idle, hand it the push queue, mark it runnable, then wait for it
-/// to finish and mark itself idle again. If that thread died or wedged, waiting
-/// would block forever -- which is how Zebra's shutdown drain got stuck, keeping
-/// `zebrad.com` alive after its window was closed. So both waits are bounded:
-/// past the deadline the thread is treated as gone and `None` is returned,
-/// leaving the caller's view of the connections untouched.
-pub fn service_connections(network_thread_handle: &NetworkThreadHandle, mut req: NetworkThreadPush) -> Option<NetworkThreadPull> {
-    // The exchange normally takes microseconds; past this the network thread
-    // is not answering.
+/// Blocking reference exchange. Only transfers commands/observes results; the
+/// caller must run Pump elsewhere. The historic 25 us poll cadence is retained
+/// deliberately: replacing this with immediate handoff changes startup samples.
+/// Use Endpoint::submit/try_take when the pump is not running concurrently.
+pub fn service_connections(endpoint: &Endpoint, mut req: NetworkThreadPush) -> Option<NetworkThreadPull> {
+    let _exchange = endpoint.inner.exchange.lock().unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-
-    let inner = &network_thread_handle.inner;
-    // API handoff timing also feeds RTT/ACK-pace samples. Keep the original
-    // exchange polling cadence; the API driver itself still parks when quiet.
-    let wait_idle = || {
-        loop {
-            if inner.exited.load(std::sync::atomic::Ordering::Acquire) { return None; }
-            if inner.state.load(std::sync::atomic::Ordering::Acquire) == 0 { return Some(()); }
-            if std::time::Instant::now() >= deadline { return None; }
-            std::thread::sleep(std::time::Duration::from_micros(25));
+    loop {
+        if endpoint.is_finished() || endpoint.inner.stop.load(std::sync::atomic::Ordering::Acquire) { return None; }
+        match endpoint.submit(req) {
+            Ok(()) => break,
+            Err(returned) => req = returned,
         }
-    };
-    wait_idle()?;
-
-    #[allow(unsafe_code)]
-    unsafe {
-        std::mem::swap(&mut *network_thread_handle.inner.push.get(), &mut req);
+        if std::time::Instant::now() >= deadline { return None; }
+        std::thread::sleep(std::time::Duration::from_micros(25));
     }
-
-    inner.state.store(1, std::sync::atomic::Ordering::Release);
-    inner.wake.notify();
-    if let Some(thread) = &network_thread_handle.thread { thread.thread().unpark(); }
-    wait_idle()?;
-
-    let mut resp = NetworkThreadPull::default();
-
-    #[allow(unsafe_code)]
-    unsafe {
-        std::mem::swap(&mut *network_thread_handle.inner.pull.get(), &mut resp);
+    loop {
+        if endpoint.is_finished() { return None; }
+        if let Some(response) = endpoint.try_take() { return Some(response); }
+        if std::time::Instant::now() >= deadline { return None; }
+        std::thread::sleep(std::time::Duration::from_micros(25));
     }
-
-    Some(resp)
 }
 
 pub fn get_handshake_hash(handshake: &snow::HandshakeState) -> [u8; 64] {
@@ -11837,7 +11641,6 @@ mod uniform_udp_capture_tests {
         let refused = Arc::new(Mutex::new(TestSendFailure { kind: Some("data"), remaining: 8, ..Default::default() }));
         let client_options = NetworkThreadOptions { send_failure: Some(refused.clone()), ..options() };
         let mut client = new_network_thread_with_options(vec![new_keypair_from_connect_magic1(address.magic1).unwrap()], 0, Some(1000), (1_000_000, 16<<20, 16<<20), 16 << 20, client_options);
-        server.join_on_drop = true; client.join_on_drop = true;
         let mut cw = service_connections(&client, NetworkThreadPush { initiate_connections: vec![address], ..Default::default() }).unwrap().current_connections;
         let mut sw = Vec::new(); let mut received = Vec::new();
         let last_stats = std::cell::Cell::new(ConnectionStats::default());
@@ -12361,7 +12164,6 @@ mod lazy_fec_segment_tests {
     fn oversized_submission_is_a_permanent_distinct_error() {
         let mut network = new_network_thread_with_options(Vec::new(), 0, None, (1_000_000, 1024, 1024), 32,
             NetworkThreadOptions::default());
-        network.join_on_drop = true;
         let response = service_connections(&network, NetworkThreadPush {
             send_unreliable: vec![(ConnectionKey::default(), 0, Dscp::BestEffort, vec![7; 33])],
             ..Default::default()
@@ -12398,7 +12200,6 @@ mod lazy_fec_segment_tests {
             let mut server = new_network_thread_with_options(vec![keypair], port, Some(10000), (1_000_000, 8 << 20, 8 << 20), limit,
                 NetworkThreadOptions { receive_memory: Some(process.clone()), ..Default::default() });
             let mut client = new_network_thread(vec![new_keypair_from_connect_magic1(magic).unwrap()], 0, Some(10000), (1_000_000, 8 << 20, 8 << 20), size);
-            server.join_on_drop = true; client.join_on_drop = true;
             let mut cw = service_connections(&client, NetworkThreadPush { initiate_connections: vec![address.clone()], ..Default::default() }).unwrap().current_connections;
             let mut sw = Vec::new();
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -12911,7 +12712,6 @@ mod local_backpressure_tests {
         let refused = Arc::new(AtomicBool::new(true));
         let mut server = new_network_thread_with_options(vec![remote], port, Some(100), (100000,1000000,1000000), 1 << 20, NetworkThreadOptions { send_failure: Some(Arc::new(std::sync::Mutex::new(TestSendFailure { kind: Some("ack"), blocked: Some(refused.clone()), ..Default::default() }))), ..Default::default() });
         let mut client = new_network_thread_with_options(vec![new_keypair_from_connect_magic1(magic).unwrap()], 0, Some(100), (100000,1000000,1000000), 1 << 20, Default::default());
-        server.join_on_drop = true; client.join_on_drop = true;
         let mut cw = service_connections(&client, NetworkThreadPush { initiate_connections: vec![address], ..Default::default() }).unwrap().current_connections;
         let mut sw = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(5);

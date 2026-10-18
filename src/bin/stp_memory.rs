@@ -1,6 +1,11 @@
 //! Authenticated adversarial receive-memory probes. Each invocation is a fresh process.
 //! stp_memory sparse|inline|workers|pending|complete COUNT SIZE [CONNECTIONS]
 //! SIZE is bytes (plain end offset / FEC message length). Never sends outside loopback.
+extern crate shielded_transport_pigeon as stp_core;
+#[path = "../../tests/support/pump_thread.rs"]
+mod pump_thread;
+use pump_thread::*;
+
 use shielded_transport_pigeon::stp::*;
 use std::{net::UdpSocket, time::Duration};
 

@@ -1,4 +1,8 @@
-//! Regression for the minimal core hook needed by all application facades.
+extern crate shielded_transport_pigeon as stp_core;
+#[path = "support/pump_thread.rs"]
+mod pump_thread;
+use pump_thread::*;
+// Regression for the minimal core hook needed by all application facades.
 #[cfg(target_os = "linux")]
 #[test]
 fn shutdown_releases_bound_udp_port() {
