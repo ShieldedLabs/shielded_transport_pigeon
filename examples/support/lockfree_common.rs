@@ -33,7 +33,7 @@ impl Worker {
         let join = std::thread::spawn(move || {
             // run_for parks on socket/command readiness internally; no busy loop.
             while !stop.load(Ordering::Acquire) {
-                pump.run_for(Duration::from_millis(20));
+                pump.run_for(Duration::from_millis(100));
             }
         });
         Self {

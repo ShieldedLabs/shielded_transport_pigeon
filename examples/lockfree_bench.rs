@@ -68,7 +68,9 @@ fn main() {
             send(&mut a, peer, bytes);
             sent += 1;
         }
-        for (_, payload) in drain(&mut b) {
+        // Match the sibling benchmarks: block for at least one message, then
+        // drain the ready batch. A timed polling sleep caps small-message rate.
+        for (_, payload) in receive(&mut b, 1) {
             assert_eq!(payload.len(), 100);
             let id = u64::from_le_bytes(payload[..8].try_into().unwrap()) as usize;
             assert!(id < 4096 && !seen[id]);
@@ -77,9 +79,6 @@ fn main() {
         }
         drain(&mut a);
         assert!(start.elapsed() < Duration::from_secs(30));
-        if received < sent {
-            std::thread::sleep(Duration::from_micros(25));
-        }
     }
     let msgps = 4096.0 / start.elapsed().as_secs_f64();
     // Let congestion/ACK work settle before measuring two connected idle pumps.

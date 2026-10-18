@@ -83,7 +83,8 @@ pub(super) struct NativePort {
     commands: Ring<Command>,
     events: Ring<Event>,
     dirty: AtomicBool,
-    yield_network: AtomicBool,
+    /// Pump-owned count of exchanges since the last forced protocol pass.
+    exchanges: AtomicU8,
     active: AtomicU8,
     max_payload: usize,
 }
@@ -149,8 +150,11 @@ impl Port {
         let Some(n) = self.native.get() else {
             return unsafe { self.requests.pop() }.map(|r| (r, None));
         };
-        // Interleave a protocol round even under continuously refilled commands.
-        if n.yield_network.swap(false, Ordering::Relaxed) {
+        // Admit a bounded burst so queued tiny sends can share the next protocol
+        // pass. Forcing a pass after every Send defeats transport aggregation.
+        // The pump still checks its deadline before every command exchange.
+        if n.exchanges.load(Ordering::Relaxed) == 32 {
+            n.exchanges.store(0, Ordering::Relaxed);
             return None;
         }
         // Only Pump produces events. Reserving room by observing it is enough:
@@ -232,7 +236,7 @@ impl Port {
                 unsafe { n.events.push(event) }.is_ok(),
                 "reserved event slot"
             );
-            n.yield_network.store(true, Ordering::Relaxed);
+            n.exchanges.fetch_add(1, Ordering::Relaxed);
         } else {
             assert!(
                 unsafe { self.responses.push(response) }.is_ok(),
@@ -286,7 +290,7 @@ impl Endpoint {
                     commands: Ring::new(capacity),
                     events: Ring::new(capacity),
                     dirty: AtomicBool::new(true),
-                    yield_network: AtomicBool::new(false),
+                    exchanges: AtomicU8::new(0),
                     active: AtomicU8::new(0),
                     max_payload: self.inner.max_payload
                 })
@@ -391,6 +395,58 @@ mod tests {
         assert_eq!(woke.unwrap(), true);
     }
     #[test]
+    fn command_bursts_coalesce_but_force_a_protocol_pass_within_32_exchanges() {
+        let port = Port::new(100);
+        let mut endpoint = Endpoint {
+            inner: port.clone(),
+        }
+        .into_lockfree(64);
+        // Drain initial connection snapshot before measuring the send burst.
+        assert!(port.take_request().is_some());
+        port.publish(NetworkThreadPull::default());
+        endpoint.try_recv();
+        assert!(port.take_request().is_none());
+        for sequence in 0..64u8 {
+            assert!(
+                endpoint
+                    .try_send(Command::Send {
+                        peer: ConnectionKey::default(),
+                        queue: 0,
+                        class: Dscp::BestEffort,
+                        payload: vec![sequence],
+                    })
+                    .is_ok()
+            );
+        }
+        let mut admitted = 0usize;
+        let mut rounds = 0;
+        let mut burst = 0;
+        while admitted < 64 {
+            if let Some((request, _)) = port.take_request() {
+                assert_eq!(request.send_unreliable[0].3, vec![admitted as u8]);
+                admitted += 1;
+                burst += 1;
+                assert!(burst <= 32, "command stream starved protocol work");
+                port.publish(NetworkThreadPull::default());
+                assert!(matches!(endpoint.try_recv(), Some(Event::Submitted { .. })));
+            } else {
+                assert!(
+                    burst >= 31,
+                    "single-command protocol passes prevent aggregation"
+                );
+                rounds += 1;
+                burst = 0;
+                // Even a pending receive must not delay the protocol round. Once
+                // yielded, its update takes precedence over the next send burst.
+                port.transport_ready();
+                assert!(port.take_request().unwrap().0.send_unreliable.is_empty());
+                port.publish(NetworkThreadPull::default());
+                assert!(matches!(endpoint.try_recv(), Some(Event::Update(_))));
+            }
+        }
+        assert_eq!(rounds, 2);
+    }
+    #[test]
     fn pending_receive_and_commands_alternate_without_starvation() {
         let port = Port::new(100);
         let mut endpoint = Endpoint {
@@ -415,12 +471,10 @@ mod tests {
         port.publish(NetworkThreadPull::default());
         endpoint.try_recv();
         for _ in 0..8 {
-            assert!(port.take_request().is_none()); // bounded protocol round
             port.transport_ready();
             assert_eq!(port.take_request().unwrap().0.send_unreliable.len(), 1);
             port.publish(NetworkThreadPull::default());
             endpoint.try_recv();
-            assert!(port.take_request().is_none()); // bounded protocol round
             port.transport_ready();
             assert!(port.take_request().unwrap().0.send_unreliable.is_empty());
             port.publish(NetworkThreadPull::default());
