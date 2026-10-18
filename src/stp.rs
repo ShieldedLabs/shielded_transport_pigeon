@@ -4764,6 +4764,16 @@ pub struct NetworkThreadHandle {
     join_on_drop: bool,
 }
 
+impl NetworkThreadHandle {
+    /// Stop and join the socket-owning thread. Like Drop, this sends no close
+    /// packet and does not drain queued sends; peers observe the existing timeout.
+    /// Application API adapters use this to make endpoint shutdown deterministic.
+    pub fn shutdown(mut self) {
+        self.inner.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(t) = self.thread.take() { t.thread().unpark(); let _ = t.join(); }
+    }
+}
+
 // The network thread owns the socket, so it has to end for the port to close and for peers to
 // see this node go quiet. Nothing is sent to them: they time the connection out.
 impl Drop for NetworkThreadHandle {
@@ -4910,6 +4920,11 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
     let thread = std::thread::spawn(move || {
         #[cfg(feature = "research_budget_diagnostic")]
         diag::enable(diagnostic_enabled);
+        // SockHandle is Copy, not RAII. This thread is the sole socket owner;
+        // release the descriptor on normal shutdown AND unwinding.
+        struct SocketOwner(SockHandle);
+        impl Drop for SocketOwner { fn drop(&mut self) { unsafe { self.0.close(); } } }
+        let _socket_owner = SocketOwner(socket);
         #[cfg(test)]
         let datagram_expectation = std::cell::Cell::new(("handshake", None::<usize>));
         // Test builds observe EVERY actual native send, including handshakes. The

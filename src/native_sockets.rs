@@ -56,6 +56,10 @@ mod linux {
 
     #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
     pub struct SockHandle(libc::c_int, Option<Ipv6Addr>); // Linux
+    impl SockHandle {
+        /// Caller must own the socket and never use any copy after this call.
+        pub(crate) unsafe fn close(self) { unsafe { libc::close(self.0); } }
+    }
 
     /// Datagrams the kernel dropped on this socket (sk_drops: receive buffer full, etc.),
     /// cumulative. SO_MEMINFO (SK_MEMINFO_DROPS, Linux 4.6+), else the `drops` column of
@@ -891,6 +895,10 @@ mod windows {
 
     #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
     pub struct SockHandle(SOCKET, WsaRecvMsgFn); // Windows
+    impl SockHandle {
+        /// Caller must own the socket and never use any copy after this call.
+        pub(crate) unsafe fn close(self) { unsafe { closesocket(self.0); } }
+    }
 
     #[inline]
     fn get_wsarecvmsg(sock: SOCKET) -> WsaRecvMsgFn {
@@ -1370,6 +1378,10 @@ mod macos {
 
     #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
     pub struct SockHandle(libc::c_int); // Mac
+    impl SockHandle {
+        /// Caller must own the socket and never use any copy after this call.
+        pub(crate) unsafe fn close(self) { unsafe { libc::close(self.0); } }
+    }
 
     #[inline]
     pub fn setup_and_bind_udp_socket(port: u16) -> Option<SockHandle> { // Mac
