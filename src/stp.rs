@@ -4806,9 +4806,11 @@ pub struct NetworkThreadPull {
     pub thread_stats: NetworkThreadStats,
 }
 
-pub use crate::pump::{Pump, Endpoint};
+pub use crate::pump::Pump;
+pub use crate::pump::port::lockfree::{LockfreeEndpoint, RingConfig};
+pub(crate) use crate::pump::port::Endpoint;
 #[cfg(test)]
-#[path = "../tests/support/pump_thread.rs"]
+#[path = "pump/test_thread.rs"]
 mod pump_thread;
 #[cfg(test)]
 use pump_thread::*;
@@ -4877,12 +4879,21 @@ pub struct PumpConfig {
     pub max_message_size: usize,
     pub options: NetworkThreadOptions,
 }
-pub fn new(config: PumpConfig) -> (Pump, Endpoint) {
+pub fn new(config: PumpConfig) -> (Pump, LockfreeEndpoint) {
     new_pump_with_options(config.keypairs, config.port, config.max_pps,
         config.send_buffer_params, config.max_message_size, config.options)
 }
-pub fn new_pump(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_pps: Option<u64>, send_buffer_params: (u32, u32, u32), max_message_size: usize) -> (Pump, Endpoint) {
-    new_pump_with_options(my_keypairs, my_port, max_pps, send_buffer_params, max_message_size, NetworkThreadOptions::default())
+/// Construct a caller-driven pump and its single-owner three-ring endpoint.
+pub fn new_pump(keys: Vec<IdentityKeyPair>, port: u16, max_pps: Option<u64>, bounds: (u32,u32,u32), maximum: usize) -> (Pump, LockfreeEndpoint) {
+    new_pump_with_options(keys, port, max_pps, bounds, maximum, Default::default())
+}
+pub fn new_pump_with_options(keys: Vec<IdentityKeyPair>, port: u16, max_pps: Option<u64>, bounds: (u32,u32,u32), maximum: usize, options: NetworkThreadOptions) -> (Pump, LockfreeEndpoint) {
+    let rings = options.rings;
+    let (pump, endpoint) = new_reference_pump_with_options(keys, port, max_pps, bounds, maximum, options);
+    (pump, endpoint.into_rings(rings))
+}
+pub(crate) fn new_reference_pump(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_pps: Option<u64>, send_buffer_params: (u32, u32, u32), max_message_size: usize) -> (Pump, Endpoint) {
+    new_reference_pump_with_options(my_keypairs, my_port, max_pps, send_buffer_params, max_message_size, NetworkThreadOptions::default())
 }
 
 /// Internal loss/ECN-driven packet-rate policy. Values are fixed in ship.rs.
@@ -4927,6 +4938,8 @@ struct TestSendFailure {
 /// Socket binding and optional measurement. The transport policy is fixed internally.
 #[derive(Debug, Clone)]
 pub struct NetworkThreadOptions {
+    /// Independent fixed application-ring capacities.
+    pub rings: RingConfig,
     #[cfg(test)]
     pub datagram_log: Option<std::sync::Arc<std::sync::Mutex<Vec<SentDatagram>>>>,
     #[cfg(test)]
@@ -4955,14 +4968,14 @@ pub struct NetworkThreadOptions {
 }
 
 impl Default for NetworkThreadOptions {
-    fn default() -> Self { Self { #[cfg(test)] datagram_log: None, #[cfg(test)] send_failure: None, #[cfg(test)] ordinary_started_peak: None, #[cfg(test)] encrypted_payload_log: None, send_queue_count: 1, receive_memory: None, bind_ip: None, record_fec_messages: false, record_loss_episodes: false, loss_trace: None, #[cfg(feature = "research_budget_diagnostic")] budget_diagnostic: false } }
+    fn default() -> Self { Self { rings: RingConfig::default(), #[cfg(test)] datagram_log: None, #[cfg(test)] send_failure: None, #[cfg(test)] ordinary_started_peak: None, #[cfg(test)] encrypted_payload_log: None, send_queue_count: 1, receive_memory: None, bind_ip: None, record_fec_messages: false, record_loss_episodes: false, loss_trace: None, #[cfg(feature = "research_budget_diagnostic")] budget_diagnostic: false } }
 }
 
 /// `max_message_size` is required local application configuration in both directions,
 /// clamped to 1 GiB. Oversized submissions return in `send_unreliable_oversized`.
 /// Both applications must configure compatible limits; no negotiation is added.
 /// Panics synchronously if its receive cap plus bookkeeping cannot fit the budget.
-pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_pps: Option<u64>, send_buffer_params: (u32, u32, u32), max_message_size: usize, options: NetworkThreadOptions) -> (Pump, Endpoint) {
+pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_pps: Option<u64>, send_buffer_params: (u32, u32, u32), max_message_size: usize, options: NetworkThreadOptions) -> (Pump, Endpoint) {
     let bind_ip = options.bind_ip;
     let send_queue_count = options.send_queue_count;
     assert!((1..=64).contains(&send_queue_count), "send_queue_count must be 1..=64");
@@ -5906,6 +5919,7 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
                                     if message_len > max_message_size || segment.is_some_and(|s| s.total as usize > max_message_size) {
                                         if VERBOSE { println!("Error, FEC message exceeds local max_message_size ({max_message_size}) from {connection_key:?}. Disconnecting..."); }
                                         connections_map.remove(&connection_key);
+                                        ring_state.disconnected(connection_key, DisconnectReason::TimedOut);
                                         break 'conn;
                                     }
                                     let Some(layout) = wire_fec_layout(message_len, block_bytes) else { continue; };
@@ -5999,11 +6013,13 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
                                 if frag_offset + frag_len > u32::MAX as u64 {
                                     if OVERLY_VERBOSE { println!("Error, frag_offset + frag_len overflows u32 from {connection_key:?}. Disconnecting..."); }
                                     connections_map.remove(&connection_key);
+                                        ring_state.disconnected(connection_key, DisconnectReason::TimedOut);
                                     break 'conn;
                                 }
                                 if frag_offset + frag_len > max_message_size as u64 {
                                     if VERBOSE { println!("Error, frag_offset + frag_len ({}) exceeds local max_message_size ({max_message_size}) from {connection_key:?}. Disconnecting...", frag_offset + frag_len); }
                                     connections_map.remove(&connection_key);
+                                        ring_state.disconnected(connection_key, DisconnectReason::TimedOut);
                                     break 'conn;
                                 }
 
@@ -6599,7 +6615,7 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
                     }
                 } true})();
                     budget.progressed();
-                    if !keep { connections_map.remove(connection_key); }
+                    if !keep { connections_map.remove(connection_key); ring_state.disconnected(*connection_key, DisconnectReason::TimedOut); }
                 }
                 receiving = true;
                 // A pass with no unit (idle) still completes the owed unit.
@@ -6798,7 +6814,7 @@ pub(crate) fn cubic_rate_with_options(t_ns: u64, r_max: u64, k_ns: u64, cc: &Con
 /// caller must run Pump elsewhere. The historic 25 us poll cadence is retained
 /// deliberately: replacing this with immediate handoff changes startup samples.
 /// Use Endpoint::submit/try_take when the pump is not running concurrently.
-pub fn service_connections(endpoint: &Endpoint, mut req: NetworkThreadPush) -> Option<NetworkThreadPull> {
+pub(crate) fn service_connections(endpoint: &Endpoint, mut req: NetworkThreadPush) -> Option<NetworkThreadPull> {
     let _exchange = endpoint.inner.exchange.lock().unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {

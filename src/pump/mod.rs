@@ -1,6 +1,7 @@
 //! Caller-scheduled STP core. No library-owned threads or executor are required.
 pub mod port;
-pub use port::Endpoint;
+pub(crate) use port::Endpoint;
+pub use port::lockfree::{LockfreeEndpoint, RingConfig, Control, Event, Stats, ConnectFailure, DisconnectReason};
 use std::time::{Duration, Instant};
 
 /// Exclusive socket/protocol owner. Move this value to a thread, or call it in
@@ -119,7 +120,7 @@ mod tests {
     #[test]
     fn call_whose_deadline_passes_after_entry_admits_queued_commands() {
         use crate::stp::*;
-        let (mut pump, endpoint) = new_pump(vec![new_keypair_from_connect_magic1(CONNECT_MAGIC1_PLAIN_TEXT).unwrap()], 0,
+        let (mut pump, endpoint) = new_reference_pump(vec![new_keypair_from_connect_magic1(CONNECT_MAGIC1_PLAIN_TEXT).unwrap()], 0,
             None, (1_000_000, 4 << 20, 4 << 20), 2_000_000);
         pump.run_for(Duration::from_millis(1)); // setup and first sweep
         // Two queued commands (one slot: the second waits for the first result).

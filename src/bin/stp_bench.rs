@@ -132,7 +132,7 @@ fn bench_receive_budget(max_message_size: usize, queues: usize) -> std::sync::Ar
 }
 
 fn service_connections(handle: &NetworkThreadHandle, request: NetworkThreadPush) -> Option<NetworkThreadPull> {
-    let response = shielded_transport_pigeon::stp::service_connections(handle, request)?;
+    let response = pump_thread::service_connections(handle, request)?;
     if let Some((_, _, _, message)) = response.send_unreliable_oversized.first() {
         die(&format!("{}-byte submission exceeds application max_message_size; increase --max-message-size", message.len()));
     }

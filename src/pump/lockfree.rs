@@ -57,6 +57,7 @@ impl LockfreeEndpoint {
             if !n.send.has_space() { return false; }
             n.send_full.store(false, Ordering::SeqCst);
         }
+        n.send_full.store(false, Ordering::SeqCst);
         let message = SendMessage { peer, queue, class, payload: std::mem::take(payload) };
         assert!(unsafe { n.send.push(message) }.is_ok());
         inner.wake.notify();
@@ -71,6 +72,7 @@ impl LockfreeEndpoint {
             if !n.control.has_space() { return false; }
             n.control_full.store(false, Ordering::SeqCst);
         }
+        n.control_full.store(false, Ordering::SeqCst);
         assert!(unsafe { n.control.push(control) }.is_ok());
         inner.wake.notify();
         true
@@ -106,6 +108,19 @@ impl LockfreeEndpoint {
         if self.is_finished() || self.owner.inner.stop.load(Ordering::Acquire) { return false; }
         ready.wait(&mut observed);
         n.events.has_value() || !(self.is_finished() || self.owner.inner.stop.load(Ordering::Acquire))
+    }
+    /// Explicit expensive frozen-core telemetry. Coalesces repeated requests;
+    /// the pump never waits for the application. Unlike stats(), collecting this
+    /// snapshot allocates and takes the protocol's existing budget_sink mutex.
+    pub fn request_protocol_stats(&self) {
+        self.owner.inner.native.get().unwrap().stats_requested.store(true, Ordering::Release);
+        self.owner.inner.wake.notify();
+    }
+    /// Ownership transfer of a requested telemetry snapshot. No application messages
+    /// or lifecycle state are carried here: those are exclusively receive-ring events.
+    pub fn try_protocol_stats(&self) -> Option<crate::stp::NetworkThreadPull> {
+        let ptr = self.owner.inner.native.get().unwrap().stats_result.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        if ptr.is_null() { None } else { Some(unsafe { *Box::from_raw(ptr) }) }
     }
     pub fn readiness(&self) -> Arc<Ready> { self.owner.readiness() }
     pub fn close(&self) { self.owner.close(); }

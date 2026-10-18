@@ -2,7 +2,7 @@
 //! for internal protocol regression/research adapters; applications use three rings.
 use crate::native_sockets::NetworkWake;
 use crate::stp::{NetworkThreadPull, NetworkThreadPush};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicPtr, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 #[path = "lockfree.rs"]
 pub mod lockfree;
@@ -43,6 +43,7 @@ impl Ready {
 pub(crate) struct NativePort {
     pub send: Ring<SendMessage>, pub control: Ring<Control>, pub events: Ring<Event>,
     pub counters: Counters, pub send_full: AtomicBool, pub control_full: AtomicBool,
+    pub stats_requested: AtomicBool, stats_active: AtomicBool, pub stats_result: AtomicPtr<NetworkThreadPull>,
 }
 impl NativePort {
     pub(crate) fn input_drained(&self, ready: &Ready, control: bool) {
@@ -58,8 +59,9 @@ impl NativePort {
         Ok(())
     }
 }
+struct ReferencePort { requests: Ring<NetworkThreadPush>, responses: Ring<NetworkThreadPull> }
 pub(crate) struct Port {
-    requests: Ring<NetworkThreadPush>, responses: Ring<NetworkThreadPull>, outstanding: AtomicBool,
+    reference: OnceLock<ReferencePort>, outstanding: AtomicBool,
     app: Mutex<()>, pub(crate) exchange: Mutex<()>,
     pub(crate) stop: AtomicBool, pub(crate) exited: AtomicBool,
     pub(crate) wake: Arc<NetworkWake>, pub(crate) ready: Arc<Ready>,
@@ -67,42 +69,54 @@ pub(crate) struct Port {
 }
 impl Port {
     pub(crate) fn new(max_payload: usize) -> Arc<Self> {
-        Arc::new(Self { requests: Ring::new(1), responses: Ring::new(1), outstanding: AtomicBool::new(false), app: Mutex::new(()), exchange: Mutex::new(()), stop: AtomicBool::new(false), exited: AtomicBool::new(false), wake: Arc::new(NetworkWake::new().expect("create pump command wakeup")), ready: Arc::new(Ready::default()), native: OnceLock::new(), max_payload })
+        Arc::new(Self { reference: OnceLock::new(), outstanding: AtomicBool::new(false), app: Mutex::new(()), exchange: Mutex::new(()), stop: AtomicBool::new(false), exited: AtomicBool::new(false), wake: Arc::new(NetworkWake::new().expect("create pump command wakeup")), ready: Arc::new(Ready::default()), native: OnceLock::new(), max_payload })
     }
     pub(crate) fn is_reference(&self) -> bool { self.native.get().is_none() }
     pub(crate) fn wants_snapshot(&self) -> bool { self.is_reference() }
-    pub(crate) fn wants_stats(&self) -> bool { self.is_reference() }
+    pub(crate) fn wants_stats(&self) -> bool { self.native.get().is_none_or(|n| n.stats_active.load(Ordering::Relaxed)) }
     pub(crate) fn send_space_ready(&self, used: usize, previous: usize) -> bool { used < previous && self.ready.send_space.swap(false, Ordering::AcqRel) }
     pub(crate) fn transport_ready(&self) { self.ready.notify(); }
     pub(crate) fn take_request(&self) -> Option<(NetworkThreadPush, Option<crate::stp::ConnectionKey>)> {
-        if self.is_reference() { unsafe { self.requests.pop() }.map(|r| (r, None)) } else { None }
+        if let Some(n) = self.native.get() {
+            if n.stats_result.load(Ordering::Acquire).is_null() && n.stats_requested.load(Ordering::Acquire) {
+                n.stats_active.store(true, Ordering::Relaxed);
+                n.stats_requested.store(false, Ordering::Release);
+                return Some((NetworkThreadPush::default(), None));
+            }
+            None
+        } else { self.reference.get().and_then(|r| unsafe { r.requests.pop() }.map(|r| (r, None))) }
     }
     pub(crate) fn has_request(&self) -> bool {
-        if let Some(n) = self.native.get() { n.send.has_value() || n.control.has_value() } else { self.requests.has_value() }
+        if let Some(n) = self.native.get() { n.send.has_value() || n.control.has_value() || n.stats_requested.load(Ordering::Acquire) } else { self.reference.get().is_some_and(|r| r.requests.has_value()) }
     }
     pub(crate) fn publish(&self, response: NetworkThreadPull) {
-        assert!(unsafe { self.responses.push(response) }.is_ok());
+        if let Some(n) = self.native.get() {
+            let response = Box::into_raw(Box::new(response));
+            assert!(n.stats_result.compare_exchange(std::ptr::null_mut(), response, Ordering::Release, Ordering::Relaxed).is_ok());
+            n.stats_active.store(false, Ordering::Release);
+        } else { assert!(unsafe { self.reference.get().unwrap().responses.push(response) }.is_ok()); }
         self.ready.notify();
     }
 }
 /// Setup handle; convert to the single-owner application API before running Pump.
-pub struct Endpoint { pub(crate) inner: Arc<Port> }
+pub(crate) struct Endpoint { pub(crate) inner: Arc<Port> }
 impl Endpoint {
-    pub fn submit(&self, request: NetworkThreadPush) -> Result<(), NetworkThreadPush> {
+    pub(crate) fn submit(&self, request: NetworkThreadPush) -> Result<(), NetworkThreadPush> {
         let _app = self.inner.app.lock().unwrap();
         if self.inner.outstanding.load(Ordering::Acquire) || self.is_finished() || self.inner.stop.load(Ordering::Acquire) { return Err(request); }
         self.inner.outstanding.store(true, Ordering::Release);
-        assert!(unsafe { self.inner.requests.push(request) }.is_ok());
+        let reference = self.inner.reference.get_or_init(|| ReferencePort { requests: Ring::new(1), responses: Ring::new(1) });
+        assert!(unsafe { reference.requests.push(request) }.is_ok());
         self.inner.wake.notify(); Ok(())
     }
-    pub fn try_take(&self) -> Option<NetworkThreadPull> {
+    pub(crate) fn try_take(&self) -> Option<NetworkThreadPull> {
         let _app = self.inner.app.lock().unwrap();
-        let response = unsafe { self.inner.responses.pop() }?;
+        let response = unsafe { self.inner.reference.get()?.responses.pop() }?;
         self.inner.outstanding.store(false, Ordering::Release); Some(response)
     }
     pub fn into_rings(self, config: RingConfig) -> LockfreeEndpoint {
         assert!(!self.inner.outstanding.load(Ordering::Acquire));
-        assert!(self.inner.native.set(NativePort { send: Ring::new(config.send), control: Ring::new(config.control), events: Ring::new(config.receive), counters: Counters::default(), send_full: AtomicBool::new(false), control_full: AtomicBool::new(false) }).is_ok());
+        assert!(self.inner.native.set(NativePort { send: Ring::new(config.send), control: Ring::new(config.control), events: Ring::new(config.receive), counters: Counters::default(), send_full: AtomicBool::new(false), control_full: AtomicBool::new(false), stats_requested: AtomicBool::new(false), stats_active: AtomicBool::new(false), stats_result: AtomicPtr::new(std::ptr::null_mut()) }).is_ok());
         self.inner.ready.enabled.store(true, Ordering::Release);
         self.inner.wake.notify(); LockfreeEndpoint::new(self)
     }
@@ -111,3 +125,10 @@ impl Endpoint {
     pub fn readiness(&self) -> Arc<Ready> { self.inner.ready.enabled.store(true, Ordering::Release); self.inner.wake.notify(); self.inner.ready.clone() }
 }
 impl Drop for Endpoint { fn drop(&mut self) { self.close(); } }
+
+impl Drop for NativePort {
+    fn drop(&mut self) {
+        let result = *self.stats_result.get_mut();
+        if !result.is_null() { unsafe { drop(Box::from_raw(result)); } }
+    }
+}

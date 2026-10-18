@@ -8,8 +8,8 @@ pub fn setup_with(rings: RingConfig, maximum: usize) -> (Pump, LockfreeEndpoint,
     let port = probe.local_addr().unwrap().port(); drop(probe);
     let key = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).unwrap();
     let address = STPAddress::from(std::net::Ipv6Addr::LOCALHOST, port, &key);
-    let (pump, endpoint) = new_pump(vec![key], port, None, (1_000_000, 32 << 20, 32 << 20), maximum);
-    (pump, endpoint.into_rings(rings), address)
+    let (pump, endpoint) = new_pump_with_options(vec![key], port, None, (1_000_000, 32 << 20, 32 << 20), maximum, NetworkThreadOptions { rings, ..Default::default() });
+    (pump, endpoint, address)
 }
 pub struct Worker { cancel: Arc<AtomicBool>, join: Option<std::thread::JoinHandle<()>> }
 impl Worker {
