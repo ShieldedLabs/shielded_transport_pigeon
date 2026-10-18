@@ -4938,6 +4938,8 @@ struct TestSendFailure {
 /// Socket binding and optional measurement. The transport policy is fixed internally.
 #[derive(Debug, Clone)]
 pub struct NetworkThreadOptions {
+    #[cfg(test)]
+    pub(crate) initial_active_wait: Option<std::time::Instant>,
     /// Independent fixed application-ring capacities.
     pub rings: RingConfig,
     #[cfg(test)]
@@ -4968,7 +4970,7 @@ pub struct NetworkThreadOptions {
 }
 
 impl Default for NetworkThreadOptions {
-    fn default() -> Self { Self { rings: RingConfig::default(), #[cfg(test)] datagram_log: None, #[cfg(test)] send_failure: None, #[cfg(test)] ordinary_started_peak: None, #[cfg(test)] encrypted_payload_log: None, send_queue_count: 1, receive_memory: None, bind_ip: None, record_fec_messages: false, record_loss_episodes: false, loss_trace: None, #[cfg(feature = "research_budget_diagnostic")] budget_diagnostic: false } }
+    fn default() -> Self { Self { rings: RingConfig::default(), #[cfg(test)] initial_active_wait: None, #[cfg(test)] datagram_log: None, #[cfg(test)] send_failure: None, #[cfg(test)] ordinary_started_peak: None, #[cfg(test)] encrypted_payload_log: None, send_queue_count: 1, receive_memory: None, bind_ip: None, record_fec_messages: false, record_loss_episodes: false, loss_trace: None, #[cfg(feature = "research_budget_diagnostic")] budget_diagnostic: false } }
 }
 
 /// `max_message_size` is required local application configuration in both directions,
@@ -5071,6 +5073,9 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
         let mut receiving = true;
         let mut send_keys = VecDeque::<ConnectionKey>::new();
         let mut fec_sweep_keys = VecDeque::<ConnectionKey>::new();
+        #[cfg(test)]
+        let mut active_wait = options.initial_active_wait;
+        #[cfg(not(test))]
         let mut active_wait = None::<std::time::Instant>;
         let mut wake_hint = Some(std::time::Instant::now());
         let mut pending_receive = None;
@@ -5141,7 +5146,7 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
             // deadline except the first owed admission (the forward-progress rule).
             if let Some(n) = thread_inner.native.get() {
                 ring_state.flush(&thread_inner);
-                for _ in 0..32 {
+                for _ in 0..if active_wait.is_some() { 1 } else { 32 } {
                     if !budget.command_owed() && std::time::Instant::now() >= caller_deadline { break; }
                     let mut ring_admitted = false;
                     if ring_state.pending.is_empty() {
@@ -5196,6 +5201,10 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                     }
                     if ring_admitted { budget.admitted(); } else { break; }
                 }
+                // A retained retry quantum permits only its owed admission, not
+                // protocol work. This also covers a FIFO head that could not be
+                // admitted: has_request alone must never shorten the quantum.
+                if let Some(until) = active_wait { return Some(until); }
             }
             if let Some((mut req, disconnect)) = thread_inner.take_request() {
                 budget.admitted();
@@ -18178,5 +18187,22 @@ mod frozen_candidate_transport_tests {
         assert!(crate::target_validation::duplicate_now(&old),"old context was not mutated into the new peer");
         let a=crate::target_validation::risk_admission(&next.target_state);
         assert_eq!((a.risk,a.p_base),(0.,0.001));
+    }
+}
+
+#[cfg(test)]
+mod ring_active_retry_regression {
+    use super::*;
+    #[test]
+    fn native_admits_only_owed_command_without_shortening_retained_retry_quantum() {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        let (mut pump, mut ep) = new_pump_with_options(
+            vec![new_keypair_from_connect_magic1(CONNECT_MAGIC1_PLAIN_TEXT).unwrap()], 0, None,
+            (1_000_000, 4 << 20, 4 << 20), 100,
+            NetworkThreadOptions { initial_active_wait: Some(until), ..Default::default() });
+        for _ in 0..2 { assert!(ep.try_send(ConnectionKey::default(), 0, Dscp::BestEffort, &mut vec![1])); }
+        pump.run_for(std::time::Duration::from_millis(50));
+        assert_eq!(ep.stats().send_dropped_unknown, 1, "only the owed command may run in a retained retry quantum");
+        assert_eq!(pump.next_wakeup(), Some(until), "native admission must not replace the retained quantum with protocol work");
     }
 }
