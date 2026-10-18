@@ -1563,10 +1563,15 @@ fn send_interval_ns(rate_upps: u64) -> u64 {
 
 // Synthetic idle ticks: the old 150 us loop consumed every unused grant.
 // Preserve its first-active-tick bound rather than banking a long parked wait.
-fn resume_idle_pacing(last: &mut u64, now: u64, interval_ns: u64) {
-    if now.saturating_add(1).saturating_sub(*last) >= interval_ns {
+fn resume_idle_pacing(last: &mut u64, acc_ns: &mut u64, now: u64, interval_ns: u64) {
+    if send_pacing_grant(now.saturating_add(1).saturating_sub(*last), interval_ns, *acc_ns).packets != 0 {
         *last = (*last).max(now.saturating_sub(interval_ns.max(150_000)));
+        *acc_ns = 0;
     }
+}
+
+fn waited_across_idle_quantum(now: u64, deadline: u64, resumed: u64) -> bool {
+    deadline.saturating_sub(now) > 150_000 && resumed.saturating_sub(now) > 150_000
 }
 
 // An action still overdue after this tick was gated or locally refused. Retry
@@ -6116,6 +6121,9 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                                 &hello_packet_payload, Dscp::Af21, false));
                     }
                     ConnectionState::Connected(state) => {
+                        // ACK completion can clear app-limited below; retain the pre-ACK idle state.
+                        let idle_across_wait = state.is_app_limited
+                            && state.last_sent_could_have_sent_data_packet < idle_resume_ns;
                         debug_assert!(state.magic2 != 0, "Connection entered Connected state without negotiating magic2");
                         if let Some(cipher) = &mut state.cipher { cipher.expire_previous(current_time_now_ns); }
                         if state.send_exhausted(&connection_tracking_data.unreliable_send_buffer) { return false; }
@@ -6385,9 +6393,9 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                         // 1 / (upps * 10^-6) = 10^6 / upps <- seconds
                         // ns = (10^6 / upps) * 10^9 = 10^15 / upps
                         let time_between_sends_ns = send_interval_ns(allowed_bandwidth_upps);
-                        if state.is_app_limited && state.last_sent_could_have_sent_data_packet < idle_resume_ns {
+                        if idle_across_wait {
                             resume_idle_pacing(&mut state.last_sent_could_have_sent_data_packet,
-                                current_time_now_ns, time_between_sends_ns);
+                                &mut state.send_pacer_acc_ns, current_time_now_ns, time_between_sends_ns);
                         }
                         // This is some Unity Game developer level crap approximation but it will have to do.
                         let elapsed_ns = current_time_now_ns + 1 - state.last_sent_could_have_sent_data_packet.max(state.last_ack_received_time.saturating_sub(ACK_BUFFER_TIME_NS));
@@ -6621,7 +6629,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                     if thread_inner.state.load(std::sync::atomic::Ordering::Acquire) == 0 {
                         thread_inner.wake.wait(socket, std::time::Duration::from_nanos(deadline.saturating_sub(now)));
                         let resumed = monotonic_clock_ns();
-                        if resumed.saturating_sub(now) > 150_000 { idle_resume_ns = resumed; }
+                        if waited_across_idle_quantum(now, deadline, resumed) { idle_resume_ns = resumed; }
                     }
                 }
             }
@@ -9883,16 +9891,54 @@ mod congestion_tests {
     fn post_idle_first_grant_matches_old_idle_tick_bound() {
         let now = 10_000_000_000;
         for interval in [1_000, 10_000, 150_000, 1_000_000, 10_000_000] {
-            let mut last = 1_000_000_000;
-            resume_idle_pacing(&mut last, now, interval);
-            let g = send_pacing_grant(now + 1 - last, interval, 0);
-            let old_bound = send_pacing_grant(interval.max(150_000) + 1, interval, 0);
-            assert_eq!(g.packets, old_bound.packets);
-            assert_eq!(g.carry_ns, old_bound.carry_ns);
+            for mut carry in [0, interval - 1, MAX_SEND_CATCHUP_NS] {
+                let mut last = 1_000_000_000;
+                resume_idle_pacing(&mut last, &mut carry, now, interval);
+                let g = send_pacing_grant(now + 1 - last, interval, carry);
+                let old_bound = send_pacing_grant(interval.max(150_000) + 1, interval, 0);
+                assert_eq!(g.packets, old_bound.packets);
+                assert_eq!(g.carry_ns, old_bound.carry_ns);
+                assert_eq!(carry, 0);
+            }
         }
         let mut last = now - 50_000;
-        resume_idle_pacing(&mut last, now, 1_000_000);
+        resume_idle_pacing(&mut last, &mut 0, now, 1_000_000);
         assert_eq!(last, now - 50_000); // no synthetic tick without a grant
+        let mut carry = 950_000;
+        resume_idle_pacing(&mut last, &mut carry, now, 1_000_000);
+        assert_eq!(carry, 0, "carry alone can make the unused idle grant due");
+    }
+
+    #[test]
+    fn idle_resume_requires_a_long_requested_wait_not_scheduler_slack() {
+        let now = 10_000_000_000;
+        assert!(!waited_across_idle_quantum(now, now + 150_000, now + 210_000));
+        assert!(!waited_across_idle_quantum(now, now + 100_000_000, now + 150_000));
+        assert!(waited_across_idle_quantum(now, now + 100_000_000, now + 210_000));
+    }
+
+    #[test]
+    fn idle_resume_snapshot_survives_ack_clearing_app_limited() {
+        let now = 10_000_000_000;
+        let ConnectionState::Connected(mut state) = new_connection_state_connected(None, 0, 1, 1_000_000_000) else { unreachable!() };
+        state.is_app_limited = true;
+        state.last_sent_could_have_sent_data_packet = 1_000_000_000;
+        state.send_pacer_acc_ns = 900_000;
+        let idle_across_wait = state.is_app_limited && state.last_sent_could_have_sent_data_packet < now;
+        let mut buf = SendQueues::baseline_for_test(1, (1_000_000, 8 << 20, 8 << 20));
+        buf.submit_messages(0, vec![vec![0x5a; 2000]]);
+        assert!(finish_connected_send(&mut state, &mut buf, PendingSendKind::Ack,
+            Some(now), now, &[0; 100], &[0; 78], Dscp::BestEffort, 0, None));
+        assert!(!state.is_app_limited, "ACK commit sees newly queued application data");
+        assert!(idle_across_wait);
+        if idle_across_wait {
+            resume_idle_pacing(&mut state.last_sent_could_have_sent_data_packet,
+                &mut state.send_pacer_acc_ns, now, 1_000_000);
+        }
+        let grant = send_pacing_grant(now + 1 - state.last_sent_could_have_sent_data_packet,
+            1_000_000, state.send_pacer_acc_ns);
+        assert_eq!(grant.packets, 1);
+        assert_eq!(state.send_pacer_acc_ns, 0);
     }
 
     #[test]
