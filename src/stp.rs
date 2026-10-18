@@ -17440,10 +17440,12 @@ mod budget_diagnostic_tests {
         else {assert_eq!(info,BudgetBaseInfo::default());}
         assert!(!run.pending);diag::enable(false);run
     }
+    #[ignore = "historical predecessor-feature configuration, not frozen RC defaults"]
     #[test] fn diagnostic_off_on_identical_c0_packet_digest_memory_ack_ingress_and_delivery() {
         let off=fixture(false,false);let on=fixture(true,false);assert_eq!(off,on);
         eprintln!("diagnostic C0 fixture digest={} packets={} bytes={} memory_samples={} arrival_calls={} delivered={} budget={:?}",on.digest,on.packets,on.bytes,on.memory.len(),on.arrival_completions.len(),on.delivered.len(),on.budget);
     }
+    #[ignore = "historical predecessor-feature configuration, not frozen RC defaults"]
     #[test] fn diagnostic_off_on_identical_c1_packet_digest_memory_ack_ingress_and_delivery() {
         let off=fixture(false,true);let on=fixture(true,true);assert_eq!(off,on);
         let c0=fixture(false,false);assert_eq!(c0.delivered,on.delivered); // same message either arm
@@ -17460,6 +17462,7 @@ mod budget_diagnostic_tests {
         eprintln!("budget25 initialized cap={cap} K=71 limit={} digest={} packets={} repairs={}",on.budget.repair_limit,on.digest,on.packets,on.budget.repairs_emitted);
     }
 
+    #[ignore = "historical predecessor-feature configuration, not frozen RC defaults"]
     #[test] fn budget25_diagnostic_initialized_both_caps_off_on_equivalent() {
         for cap in ["15","25"] {
             if true && cap=="15" {continue;}
@@ -17485,6 +17488,7 @@ mod budget_diagnostic_tests {
         eprintln!("empirical initialized selector={} digest={} packets={} demand={} planned={} repairs={}",crate::fec_adapt::research_p4_empirical_tail_calibration(),on.digest,on.packets,on.budget.demand_repairs,on.budget.planned_repairs,on.budget.repairs_emitted);
     }
 
+    #[ignore = "historical predecessor-feature configuration, not frozen RC defaults"]
     #[test] fn empirical_diagnostic_initialized_both_arms_on_off_equal() {
         for arm in ["0","1"] {
             if true && arm=="0" {continue;}

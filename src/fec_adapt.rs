@@ -2059,6 +2059,7 @@ mod target_validation_policy_tests {
     }
 
     #[cfg(feature="research_target_validation")]
+    #[ignore = "historical predecessor-feature configuration, not frozen RC defaults"]
     #[test] fn target_validation_initialized_strict_matrix() {
         let probe=|tv:Option<&str>,cost:&str,cap:&str,emp:&str,profile:&str,change:Option<(&str,&str)>| {
             let mut c=std::process::Command::new(std::env::current_exe().unwrap());

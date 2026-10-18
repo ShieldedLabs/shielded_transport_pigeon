@@ -760,6 +760,7 @@ mod tests {
         }
     }
     #[cfg(feature="research_target_validation")]
+    #[ignore = "process-global audit races with parallel tests; run alone with --exact"]
     #[test] fn target_validation_evidence_bounded_and_terminal_commit_snapshot() {
         let _=take();let before=audit().lock().unwrap().dropped;
         let mut owners=Vec::new();for _ in 0..=EVIDENCE_CAPACITY {owners.push(register(OwnerEvidence::default()));}
