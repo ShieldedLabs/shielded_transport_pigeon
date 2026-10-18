@@ -6759,15 +6759,17 @@ pub fn service_connections(network_thread_handle: &NetworkThreadHandle, mut req:
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
 
     let inner = &network_thread_handle.inner;
-    let wait_idle = |guard| {
-        let (guard, result) = inner.completed.wait_timeout_while(guard,
-            deadline.saturating_duration_since(std::time::Instant::now()),
-            |_| !inner.exited.load(std::sync::atomic::Ordering::Acquire)
-                && inner.state.load(std::sync::atomic::Ordering::Acquire) != 0).unwrap();
-        if inner.exited.load(std::sync::atomic::Ordering::Acquire)
-            || (result.timed_out() && inner.state.load(std::sync::atomic::Ordering::Acquire) != 0) { None } else { Some(guard) }
+    // API handoff timing also feeds RTT/ACK-pace samples. Keep the original
+    // exchange polling cadence; the API driver itself still parks when quiet.
+    let wait_idle = || {
+        loop {
+            if inner.exited.load(std::sync::atomic::Ordering::Acquire) { return None; }
+            if inner.state.load(std::sync::atomic::Ordering::Acquire) == 0 { return Some(()); }
+            if std::time::Instant::now() >= deadline { return None; }
+            std::thread::sleep(std::time::Duration::from_micros(25));
+        }
     };
-    let guard = wait_idle(inner.exchange.lock().unwrap())?;
+    wait_idle()?;
 
     #[allow(unsafe_code)]
     unsafe {
@@ -6777,7 +6779,7 @@ pub fn service_connections(network_thread_handle: &NetworkThreadHandle, mut req:
     inner.state.store(1, std::sync::atomic::Ordering::Release);
     inner.wake.notify();
     if let Some(thread) = &network_thread_handle.thread { thread.thread().unpark(); }
-    let _guard = wait_idle(guard)?;
+    wait_idle()?;
 
     let mut resp = NetworkThreadPull::default();
 
