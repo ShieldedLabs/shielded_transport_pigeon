@@ -1569,6 +1569,12 @@ fn resume_idle_pacing(last: &mut u64, now: u64, interval_ns: u64) {
     }
 }
 
+// An action still overdue after this tick was gated or locally refused. Retry
+// at the original loop quantum, never a zero-timeout readiness spin.
+fn next_service_deadline(now: u64, due: u64) -> u64 {
+    if due <= now { now.saturating_add(150_000) } else { due }
+}
+
 fn send_pacing_grant(elapsed_ns: u64, interval_ns: u64, credit_ns: u64) -> SendPacingGrant {
     let interval_ns = interval_ns.max(1);
     let budget = elapsed_ns.saturating_add(credit_ns);
@@ -6569,30 +6575,46 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                     // Preserve the original active retry quantum. Quiet sockets
                     // wait on readability/commands, bounded by existing timers.
                     let mut deadline = now.saturating_add(100_000_000);
-                    if fec_workers.load(std::sync::atomic::Ordering::Acquire) != 0 {
-                        deadline = deadline.min(now.saturating_add(150_000));
-                    }
+                    let mut include = |due| { deadline = deadline.min(next_service_deadline(now, due)); };
+                    include(fec_sweep_ns.saturating_add(100_000_000));
                     for conn in connections_map.values() {
+                        let cipher = match &conn.connection_state {
+                            ConnectionState::Connected(c) => c.cipher.as_ref(),
+                            ConnectionState::SendingServerHello { cipher, .. } => Some(cipher),
+                            _ => None,
+                        };
+                        if let Some(cipher) = cipher.filter(|c| c.old.is_some()) {
+                            include(cipher.previous_until_ns.saturating_add(1));
+                        }
                         match &conn.connection_state {
                             ConnectionState::Connected(c) => {
                                 if conn.unreliable_send_buffer.has_unsent_data() || c.pending_send.is_some()
                                     || c.send_sequence_number != c.packets_waiting_ack_tail || c.outage.since_ns.is_some() {
-                                    deadline = deadline.min(now.saturating_add(150_000));
+                                    include(now.saturating_add(150_000));
                                 }
-                                deadline = deadline.min(c.ack_timer.saturating_add(1));
-                                deadline = deadline.min(c.last_sent_data_packet.saturating_add(5_000_000_001));
+                                include(c.ack_timer.saturating_add(1));
+                                include(c.last_sent_data_packet.saturating_add(5_000_000_001));
+                                let last_activity = if authenticated_peer_liveness {
+                                    c.last_ack_received_time.max(c.last_peer_packet_received_time)
+                                } else { c.last_ack_received_time };
+                                include(last_activity.saturating_add(OUTAGE_TIMEOUT_NS));
                                 if c.current_tu != ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE as u64
                                     && c.tu_probe_sequence_number == u64::MAX {
-                                    let interval = send_interval_ns(c.stats.cc_rate_upps.max(cc.rate_floor_upps));
+                                    // Delivery growth may legitimately be below the rate floor.
+                                    let interval = send_interval_ns(c.stats.cc_rate_upps);
                                     let probe_delay = (c.tu_probe_failed_count.min(50).pow(2) * 250_000_000).max(interval);
-                                    deadline = deadline.min(c.last_sent_tu_probe_time_ns.saturating_add(probe_delay).saturating_add(1));
+                                    include(c.last_sent_tu_probe_time_ns.saturating_add(probe_delay).saturating_add(1));
                                 }
                             }
                             ConnectionState::SendingClientHelloPlaintext { last_sent_time_ns, .. }
-                            | ConnectionState::SendingClientHello { last_sent_time_ns, .. }
-                            | ConnectionState::SendingServerHelloPlaintext { last_sent_time_ns, .. }
+                            | ConnectionState::SendingClientHello { last_sent_time_ns, .. } => {
+                                include(last_sent_time_ns.saturating_add(2_500_000_001));
+                                include(conn.creation_time_ns.saturating_add(30_000_000_001));
+                            }
+                            ConnectionState::SendingServerHelloPlaintext { last_sent_time_ns, .. }
                             | ConnectionState::SendingServerHello { last_sent_time_ns, .. } => {
-                                deadline = deadline.min(last_sent_time_ns.saturating_add(2_500_000_001));
+                                include(last_sent_time_ns.saturating_add(2_500_000_001));
+                                include(conn.creation_time_ns.saturating_add(15_000_000_001));
                             }
                         }
                     }
@@ -9842,6 +9864,19 @@ mod congestion_tests {
         apply_loss_congestion(&mut state, 10*rtt, 12*rtt, &cc, None);
         assert_eq!(state.congestion_event_rate_upps, connection_rate(9*rtt, r, k, &cc, false).0);
         assert!(state.cc_startup_done);
+    }
+
+    #[test]
+    fn overdue_blocked_timers_retry_at_old_quantum_without_hiding_future_expiry() {
+        let now = 10_000_000_000;
+        for due in [0, now - 1, now] {
+            assert_eq!(next_service_deadline(now, due), now + 150_000);
+        }
+        for delta in [1, 50_000, 150_000, 100_000_000] {
+            assert_eq!(next_service_deadline(now, now + delta), now + delta);
+        }
+        // A future key/peer/handshake expiry still wins over blocked ACK/probe work.
+        assert_eq!(next_service_deadline(now, now - 1).min(next_service_deadline(now, now + 1)), now + 1);
     }
 
     #[test]
