@@ -1561,6 +1561,14 @@ fn send_interval_ns(rate_upps: u64) -> u64 {
     (1_000_000_000_000_000 / rate_upps.max(1)).max(1)
 }
 
+// Synthetic idle ticks: the old 150 us loop consumed every unused grant.
+// Preserve its first-active-tick bound rather than banking a long parked wait.
+fn resume_idle_pacing(last: &mut u64, now: u64, interval_ns: u64) {
+    if now.saturating_add(1).saturating_sub(*last) >= interval_ns {
+        *last = (*last).max(now.saturating_sub(interval_ns.max(150_000)));
+    }
+}
+
 fn send_pacing_grant(elapsed_ns: u64, interval_ns: u64, credit_ns: u64) -> SendPacingGrant {
     let interval_ns = interval_ns.max(1);
     let budget = elapsed_ns.saturating_add(credit_ns);
@@ -5118,6 +5126,7 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
         let (fec_done_tx, fec_done_rx) = std::sync::mpsc::channel::<FecCompletion>();
         let fec_workers = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut fec_sweep_ns = 0;
+        let mut idle_resume_ns = 0;
         // Frozen ALIVE policy: peer activity changes connection expiry
         // only; congestion/outage recovery still requires positive ACK progress.
 
@@ -6370,6 +6379,10 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                         // 1 / (upps * 10^-6) = 10^6 / upps <- seconds
                         // ns = (10^6 / upps) * 10^9 = 10^15 / upps
                         let time_between_sends_ns = send_interval_ns(allowed_bandwidth_upps);
+                        if state.is_app_limited && state.last_sent_could_have_sent_data_packet < idle_resume_ns {
+                            resume_idle_pacing(&mut state.last_sent_could_have_sent_data_packet,
+                                current_time_now_ns, time_between_sends_ns);
+                        }
                         // This is some Unity Game developer level crap approximation but it will have to do.
                         let elapsed_ns = current_time_now_ns + 1 - state.last_sent_could_have_sent_data_packet.max(state.last_ack_received_time.saturating_sub(ACK_BUFFER_TIME_NS));
                         let grant = send_pacing_grant(elapsed_ns, time_between_sends_ns, state.send_pacer_acc_ns);
@@ -6585,6 +6598,8 @@ pub fn new_network_thread_with_options(my_keypairs: Vec<IdentityKeyPair>, my_por
                     }
                     if thread_inner.state.load(std::sync::atomic::Ordering::Acquire) == 0 {
                         thread_inner.wake.wait(socket, std::time::Duration::from_nanos(deadline.saturating_sub(now)));
+                        let resumed = monotonic_clock_ns();
+                        if resumed.saturating_sub(now) > 150_000 { idle_resume_ns = resumed; }
                     }
                 }
             }
@@ -9827,6 +9842,22 @@ mod congestion_tests {
         apply_loss_congestion(&mut state, 10*rtt, 12*rtt, &cc, None);
         assert_eq!(state.congestion_event_rate_upps, connection_rate(9*rtt, r, k, &cc, false).0);
         assert!(state.cc_startup_done);
+    }
+
+    #[test]
+    fn post_idle_first_grant_matches_old_idle_tick_bound() {
+        let now = 10_000_000_000;
+        for interval in [1_000, 10_000, 150_000, 1_000_000, 10_000_000] {
+            let mut last = 1_000_000_000;
+            resume_idle_pacing(&mut last, now, interval);
+            let g = send_pacing_grant(now + 1 - last, interval, 0);
+            let old_bound = send_pacing_grant(interval.max(150_000) + 1, interval, 0);
+            assert_eq!(g.packets, old_bound.packets);
+            assert_eq!(g.carry_ns, old_bound.carry_ns);
+        }
+        let mut last = now - 50_000;
+        resume_idle_pacing(&mut last, now, 1_000_000);
+        assert_eq!(last, now - 50_000); // no synthetic tick without a grant
     }
 
     #[test]
