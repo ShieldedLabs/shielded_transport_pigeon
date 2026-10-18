@@ -117,9 +117,19 @@ nonce/epoch histories and message identities, resets pacing credit and RTT
 sampling, and resumes startup at no more than the pre-outage/initial rate.
 Local bounded FEC retention may pause over a real outage; it cannot resurrect
 already-expired sources or change identities. This is a recovery policy, not
-a reliability promise. After 120 seconds without new positive ACK progress
-the association closes, even if local sends have all been refused. A new
-association uses a fresh handshake, never reset transport keys/counters.
+a reliability promise.
+
+Peer expiry (release candidate): the association closes when 120 seconds
+have elapsed since the later of (a) the last new positive ACK progress and
+(b) the last *fresh authenticated peer packet*, even if local sends have all
+been refused. (b) is refreshed by any inbound packet that has passed AEAD,
+nonce-space/type, replay and minimum-size admission: a well-formed fresh
+ACK (even one that receipts nothing new and cannot end an outage) or any
+data-class packet. Local sends never refresh it. This changes only
+connection expiry: congestion control, outage resumption and RTT sampling
+still require positive ACK progress as described above. The initial deadline
+is 120 s after the connection's start timestamp. A new association uses a
+fresh handshake, never reset transport keys/counters.
 Other implementations may choose different local outage pacing/timeouts;
 they MUST maintain periodic ACK-eliciting traffic and MUST NOT treat mere
 inbound traffic or ACK-of-ACK as round-trip confirmation.
@@ -239,6 +249,58 @@ and frame position. Packet replay admission suffices for its duplicate
 suppression, so whole messages carry **zero identity bytes**. In particular a
 16383-byte whole message is valid framing; the old `length=16383,id=65535`
 all-ones collision does not exist.
+
+#### Whole-message duplication flags (release candidate)
+
+The **first** frame-kind byte of a data-class plaintext MAY carry one
+duplication flag in its high nibble: `0x10` marks an *original* datagram,
+`0x20` marks its *copy*. A flagged byte is valid only when its low nibble
+`kind & 0x0f` is a base kind 1..6 and its high nibble is exactly `0x10` or
+`0x20`; base kinds 1..6 use neither bit, so the flags cost zero bytes. The
+flag only appears on the first frame of the datagram; later frames are
+unflagged. The receiver parses the first frame as its base kind. Unflagged
+datagrams behave exactly as above and never touch the duplication history.
+
+Sender rules:
+
+- A datagram that carries at least one whole frame and is assembled while
+  the sender's duplication decision is high (see "Release candidate sender
+  policy") is sent twice. Every whole frame in it is protected; this is not
+  a random fraction. Packed wholes share one duplicated datagram, and a
+  high-risk small message is not split to fill the tail of a datagram.
+- The copy has the same plaintext apart from the flag nibble. It is sealed
+  under a fresh data-space nonce that MUST be exactly the original's nonce
+  + 1, and it uses the original's DSCP. It takes its own pacing, flight and
+  congestion-control slot. ACK-space nonces are unaffected.
+- A pending copy is sent before any other data-space packet (data, MTU probe,
+  keepalive). If an outage begins before it is sent, the copy itself is the
+  first outage probe. On local send refusal the exact ciphertext is retained.
+  If the nonce cannot be allocated, no copy is sent (the fallback is counted).
+
+Receiver rules:
+
+- The *canonical nonce* is the packet nonce for an original and the packet
+  nonce − 1 for a copy (a copy with nonce 0 has no canonical nonce and its
+  wholes are not delivered). Canonical nonces
+  are tracked in a second replay-style history with the same 262144-position
+  support as packet replay (allocated lazily, 64 KiB). Below its watermark
+  canonical identities are permanently stale, never reopened.
+- If the canonical nonce has already been committed, the whole frames of the
+  packet are skipped. Fragment and Wirehair frames in the packet are still
+  processed with their own identity deduplication, so the second arrival can
+  still supply a symbol.
+- Otherwise receive memory for all of the packet's whole frames is reserved
+  first. Only when all reservations succeed are the wholes delivered and the
+  canonical nonce committed. If memory is refused the packet counts as
+  memory-erased and the canonical nonce stays fresh, so the other copy can
+  still be delivered.
+- Each physical packet keeps its own nonce and its own ACK/CE accounting.
+  On the sender, a coded symbol carried in a duplicated pair counts as one
+  lost FEC symbol only when both copies are lost. Congestion control still
+  sees every physical loss.
+
+Both peers must implement these flags. This is an incompatible framing
+extension within version 2's frame-kind byte; it adds no header bytes.
 
 Plain fragmented messages and coded units have connection-direction-scoped
 u64 identities, allocated from one nonwrapping namespace across all sender
@@ -532,26 +594,191 @@ ACK batching cadence and native socket limits are implementation policies,
 not new identity widths or implicit wire generations. The declaration makes
 current support explicit and rejects incompatible interpretations.
 
-### Shipped sender FEC policy
+### Release candidate sender policy (frozen)
 
-The default sender uses P4 (message-bound repair), with a fixed conditional
-**10-percentage-point additive parity bonus**. At a logical message's first
-FEC plan, estimate its whole initial packet train, including all segments,
-at the queue's current equal fair-share packet rate. The message qualifies
-when that duration is in **[RTT/2, 2*RTT]**, including both endpoints. This is
-a duration category, not a fixed byte-size class; segmented messages can qualify.
-The classification uses the current RTT model and is frozen for that logical
-message, including later segment starts and transmission-unit replans.
+Nothing in this section is transmitted except the duplication flags above;
+it is sender policy. Peers need not agree on it. Rates are in packets per
+second (pps); internally micro-packets/s. "RTT" below is the smoothed CC RTT
+unless stated. A *delay-corrected RTT sample* is raw ACK RTT minus the
+peer-reported ACK delay, floored at 0.1 ms. The *connection min RTT* is the
+minimum of all such samples. Legacy P0–P3 initialization is rejected by this
+candidate; those experiment arms remain in the research tree. The
+`research_target_validation` feature permits policy overrides, with
+`STP_POLICY_FROZEN=0` restoring raw environment-only research configuration
+(no frozen-value fallback); production builds ignore all these overrides.
 
-Qualifying messages add 10% of their source-symbol count (rounded up across
-the logical message) to the adaptive base repair plan. Each bonused coded unit's
-planned train is capped at twice its source-symbol count. Refreshes apply the
-same bonus to the unbonused base; they do not
-compound it. This is neither a blanket parity floor nor post-send recovery.
-Small whole/plain messages remain send-once. P4 still seals and forgets at the
-end of its planned send work, and queue transmission remains serial FIFO:
-slipstream interleaving is not part of this shipped policy. The bonus is internal
-policy, not an application setting, and changes neither framing nor wire version.
+#### Congestion control
+
+Rate-based curve with the frozen parameters (`ship::CC`):
+
+| Parameter | Value | Parameter | Value |
+|---|---:|---|---:|
+| beta | 0.8 | recovery_rtts | 9 |
+| rate_rp | 0.92 | rate_pg | 1.02 |
+| rate_gs | 2.0 | time_pg | 6.0 |
+| time_gs | 10.0 | loss_threshold | 2 |
+| loss_timeout_rtts | 2.0 | event_guard_rtts | 0.5 |
+| rate_floor | 100 pps | initial_rate | 100 pps |
+| min_growth | 25 pps/s | max_growth | 1000 pps/s |
+| relative_growth_per_rtt | 0.015 | startup_multiplier | 1.05 |
+| startup_backoff_rtts | 1.0 | | |
+
+After a congestion event at anchor rate A (the *discovered* rate), with
+k = recovery_rtts × RTT: phase R recovers quadratically from beta·A to
+rate_rp·A over k; phase P rises linearly to rate_pg·A by time_pg·k; phase G
+rises quadratically to rate_gs·A by time_gs·k; phase S then ramps steeply.
+Every phase adds min_growth·t and is capped by the absolute envelope
+beta·A + (min_growth + max_growth)·t and the relative envelope
+beta·A·exp(relative_growth_per_rtt·t/RTT) + min_growth·t.
+
+Congestion events (all respect a guard: evidence must have been *sent* more
+than event_guard_rtts × RTT after the previous accepted event):
+
+- **Loss**: loss_threshold (2) eligible packet losses inside one 1-RTT
+  counting window.
+- **ECN CE** feedback.
+- **Delay** (below). An accepted delay event uses the CE path exactly
+  (same guard, anchor discovery, startup exit and accepted-event record).
+
+On a loss or ECN event the next recovery starts at beta = 0.8. On an accepted
+delay event the recovery starts at **beta_delay = 0.95** instead, and the
+R-phase end point is lifted to max(rate_rp, 0.95) = 0.95 so there is no
+backward step at R→P. Anchor, epoch and guard are unchanged; a later loss or
+ECN event restores beta = 0.8.
+
+#### Delay congestion event
+
+Constants (`STP_CC_DELAY_*`): K = 0.5, MIN = 5 ms, MAX = 50 ms,
+INTERVAL = 1 RTT, GIVEUP = 3, HOLD = 16 RTT, HOLD_MAX = 256 RTT,
+BETA = 0.95.
+
+- Threshold: `T = clamp(0.5 × min_rtt, 5 ms, 50 ms)`.
+- Window: the first sample opens a window with deadline
+  `now + max(1 × RTT, 20 ms)` (the first ever sample seeds RTT). The window
+  keeps the minimum delay-corrected sample and the latest sample's packet
+  number and send time as evidence. It closes at the first sample at/after the
+  deadline (before that sample is added, so the sample starts the next window)
+  or on a send tick at/after the deadline. A closed window immediately starts
+  the next deadline. Empty windows do nothing: no synthetic samples.
+- A closed non-empty window is **high** if `window_min − min_rtt > T`,
+  otherwise **low**. A high window raises a delay event (unless suspended).
+
+Give-up and suspension (CUBIC coexistence). State: `ineffective`,
+`suspended`, `pending` (time of the last accepted delay cut),
+`consecutive_suspensions`, `hold_until`, `clean_until`.
+
+1. On each close, if not suspended and `now ≥ clean_until`, reset
+   `consecutive_suspensions = 0`.
+2. **Low window**: if suspended and `now < hold_until`, the rearm is blocked
+   (nothing else changes). Otherwise, if suspended, it is a *rearm* and
+   `clean_until = now + 256 × RTT`; in all cases set `suspended = false`,
+   `pending = none`, `ineffective = 0`, `hold_until = none`.
+3. **High window**: if `pending` is set and `now > pending + 0.5 × RTT`,
+   clear `pending` and increment `ineffective` (the cut did not drain the
+   queue below T). When `ineffective ≥ 3` and not suspended: set
+   `suspended = true`, increment `consecutive_suspensions` to c, and set
+   `hold_until = now + min(16 × 2^(c−1), 256) × RTT`. While suspended, high
+   windows raise no event (loss and ECN events are unaffected).
+4. Otherwise the high window raises a delay event. If accepted (guard), set
+   beta_delay as above and `pending = now`. A delay event rejected by the
+   guard adds no strike.
+
+#### Proactive coded parity (P4 target policy)
+
+Race policy P4 (message-bound repair), interleave width 1, no slipstream,
+no event-triggered repair, no medium-duration bonus (0) and no repair after a
+message finishes sending: P4 seals and forgets an owner when its planned
+send work is done. Messages that fit in one datagram are whole frames and
+get no coded parity (only duplication, below).
+
+For a coded logical message with K source symbols (K ≤ 32000 per plan) the
+sender picks the smallest proactive repair count r with
+`1 − delivery(K, r, p_eff) ≤ ε`, where `delivery(K, r, p)` is the binomial
+probability of at most r losses among K + r packets at independent loss p.
+Target miss ε = **EPS = 0.002**. (Without EPS the target would be
+`p/(1 + (K/H)^E)` with P = 0.001, E = 1, H = 100/3. H and E are frozen
+configuration but are not used for planning while EPS is set.)
+
+Selector 2 mixes adjacent integers: with hi = r, lo = r − 1,
+`w = clamp((1 − ε − delivery(K,lo,p)) / (delivery(K,hi,p) − delivery(K,lo,p)), 0, 1)`,
+`threshold = floor(w × 2^64)`; use hi if `w = 1` or `draw < threshold`,
+else lo. `draw` is SplitMix64 of `MIX_SEED + seq × 0x9e3779b97f4a7c15`
+(MIX_SEED = 0x5354505f544d0001, seq = admission sequence of the root). It
+does not depend on timing or outcomes.
+
+The risk admission (p_eff, ε) is evaluated **once** at a logical root's first
+admission and frozen for all its groups, segments and replans.
+
+Loss top-up: while an owner is still sending, its planned repairs are
+`proactive + tail_added + one replacement per known lost own DATA packet`
+(exactly 1:1). Losses learned after the owner is sealed add nothing.
+
+#### Design loss and risk
+
+Base floor: `p_base = min(max(RAND_MULT × p̂, P), RAND_MAX)` with P = 0.001
+(see RAND). Effective design loss:
+
+    phi' = max(PHI, p_base),  PHI = 0.1
+    p_eff = p_base + (phi' − p_base) × risk
+
+Raw risk uses SRC = 4 (both signals must be high):
+
+    ramp(x, lo, hi) = clamp((x − lo)/(hi − lo), 0, 1)
+    cc    = ramp(rate / anchor, 0.98, 1.02)        (anchor unknown → 1)
+    queue = ramp(qd / qd_ref, 0.5, 0.7)            (qd_ref unknown → cc)
+    raw   = min(cc, queue)
+
+rate is the current CC rate and anchor the last discovered event rate.
+`qd = latest delay-corrected sample − connection min RTT`. `qd_ref` is the
+qd measured at the last accepted congestion event of any kind; an event that
+measures qd = 0 keeps the previous reference. Each event also updates the
+anchor. Before the first congestion event both are unknown, so raw risk is 1.
+
+STEP = 2: coded-parity admission and the tail use the continuous `raw`.
+Duplication uses a stepped value: 1 if `raw ≥ 1` or a latch is active,
+else 0. Latch (HOLD = 1 RTT, HOLD_MAX = 10 RTT): when no latch is active and
+`raw ≥ 1`, latch at now. An active latch expires, once smoothed RTT is
+known, at 1 × RTT after the latest accepted congestion event that came
+after the latch time, or, if there is none, at 10 × RTT after latching. Low
+raw risk cannot cut a latch short. A still-high raw risk re-latches at once.
+
+#### End-of-message tail parity
+
+TAIL = 3.0 RTTs. Once per logical root, when the last source symbol of the
+final segment is emitted (before sealing):
+
+    kt       = min(K, ceil(rate_pps × RTT_s × 3.0))
+    reserve  = proactive count for kt from the rule above, using a fresh
+               risk admission with phi' = max(PHI, root p_base) and draw
+               SplitMix64(root_draw XOR 0x5441494c5f525356)   ("TAIL_RSV")
+    added    = max(0, reserve − repairs still planned but not yet sent)
+
+`added` repairs are added to the owner's plan (kt = 0 gives 0). The 1:1
+loss top-up continues to apply afterwards.
+
+#### Whole-message duplication
+
+When the stepped risk is 1, every datagram containing whole frames is
+duplicated as described in "Whole-message duplication flags".
+
+#### RAND: background random-loss estimator
+
+Constants: RAND_MULT = 2, RAND_HALF = 4000 packets, RAND_MAX = 0.05.
+
+- Each DATA packet (including copies) is classified as *background* when
+  sent: not in outage, `now > guard_until`, and the estimator's raw risk is
+  exactly 0. Estimator risk is SRC 4 with missing signals treated as absent:
+  if one ramp is unknown the other is used, if both are unknown risk is 0.
+  The latch is ignored.
+- `guard_until = max(guard_until, now + RTT × max(0.5, 9))`, i.e. 9 RTT,
+  on every accepted queue-signal event (ECN CE or delay); with no RTT yet the
+  guard is unbounded. Loss-only events
+  set no guard.
+- When the outcome of a background packet is final (one sample per physical
+  packet): `p̂ += α × (lost − p̂)` with `α = 1 − exp(−ln 2 / 4000)`. Later
+  spurious-loss corrections are ignored.
+- `p_base` is computed at each root admission and frozen with it. On a clean
+  link it stays at P = 0.001.
 
 Tests cover every frame kind, unknown-kind skipping, the former all-ones
 padding collision, full nonces across enormous gaps, arbitrary ACK bases and
