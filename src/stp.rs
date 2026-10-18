@@ -5015,7 +5015,9 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
         let mut fec_sweep_keys = VecDeque::<ConnectionKey>::new();
         let mut active_wait = None::<std::time::Instant>;
         let mut wake_hint = Some(std::time::Instant::now());
-        let run = move |caller_deadline: std::time::Instant| {
+        let mut pending_receive = None;
+        let run = move |mut budget: crate::pump::Deadline| {
+        let caller_deadline = budget.instant;
         // Capture owners explicitly: resources live even before the first call.
         let _owners = (&exit, &socket_owner);
         #[cfg(test)]
@@ -5050,13 +5052,13 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
                 if std::time::Instant::now() >= caller_deadline { return Some(until); }
                 active_wait = None;
             }
-            if std::time::Instant::now() >= caller_deadline { return wake_hint; }
-            wake_hint = Some(std::time::Instant::now());
+            if budget.expired() { return wake_hint; }
             if thread_inner.stop.load(std::sync::atomic::Ordering::Acquire) {
                 return None;
             }
             {
                 let t = monotonic_clock_ns();
+                if budget.sampled(t) { return wake_hint; }
                 if last_loop_start_ns != 0 {
                     let gap = t.saturating_sub(last_loop_start_ns);
                     thread_stats.max_loop_gap_ns = thread_stats.max_loop_gap_ns.max(gap);
@@ -5068,6 +5070,8 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
                 thread_stats.loop_iterations += 1;
             }
             let test_drop_ppm = match &test_drop_schedule { Some(sch) => sch.ppm_at(monotonic_clock_ns().saturating_sub(test_drop_t0)), None => test_drop_ppm };
+            // Do not remove a request after its admission deadline.
+            if thread_inner.has_request() && std::time::Instant::now() >= caller_deadline { return wake_hint; }
             if let Some(mut req) = thread_inner.take_request() {
                 let exchange_started = std::time::Instant::now();
                 let current_time_now_ns = monotonic_clock_ns();
@@ -5228,13 +5232,23 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
                 // Drain ACKs before sending again. Bound the batch so a busy peer cannot
                 // monopolize the thread; the socket is nonblocking, so stop as soon as empty.
                 while receiving && receive_round < MAX_RECV_PACKETS_PER_TICK { // `continue` skips this packet
-                    if std::time::Instant::now() >= caller_deadline { return Some(std::time::Instant::now()); }
-                    receive_round += 1;
-                    let (buf_len, other_ip_addr, other_port, ecn_marked, ecn_enabled, service_class, timestamp_ns) =
+                    if budget.expired() { return Some(std::time::Instant::now()); }
+                    let packet = if let Some(packet) = pending_receive.take() { packet } else {
                         match udp_recv_with_congestion_and_dscp(socket, &mut packet_memory_encrypted[..]) {
-                            Ok(r) => r,
+                            Ok(packet) => {
+                                // recv already sampled RAW. Keep an unprocessed datagram
+                                // across calls if receiving it consumed the remaining budget.
+                                if budget.sampled(packet.6) {
+                                    pending_receive = Some(packet);
+                                    return Some(std::time::Instant::now());
+                                }
+                                packet
+                            },
                             Err(_) => break,
-                        };
+                        }
+                    };
+                    receive_round += 1;
+                    let (buf_len, other_ip_addr, other_port, ecn_marked, ecn_enabled, service_class, timestamp_ns) = packet;
                     if buf_len < 6 { continue; }
 
                     should_sleep = false;
@@ -5916,9 +5930,9 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
                     send_keys.extend(connections_map.keys().copied());
                 }
 
-                if std::time::Instant::now() >= caller_deadline { return Some(std::time::Instant::now()); }
+                if budget.expired() { return Some(std::time::Instant::now()); }
                 // Messages finished by persistent decoder slices.
-                while std::time::Instant::now() < caller_deadline {
+                while !budget.checkpoint() {
                     let Ok(completion) = fec_done_rx.try_recv() else { break; };
                     let key = completion.connection_key;
                     if let Some(conn) = connections_map.get_mut(&key) {
@@ -5946,6 +5960,7 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
 
 //////// BEGIN SEND ////////////////////////////////////////////////////////////////////////
                 let current_time_now_ns = monotonic_clock_ns();
+                if budget.sampled(current_time_now_ns) { return Some(std::time::Instant::now()); }
                 // Missing unreliable tails must not hold decoder admission forever.
                 // Scan at most ten times/second, not once per incoming packet.
                 if fec_sweep_keys.is_empty() && current_time_now_ns.saturating_sub(fec_sweep_ns) >= 100_000_000 {
@@ -5953,7 +5968,7 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
                     fec_sweep_ns = current_time_now_ns;
                 }
                 while let Some(key) = fec_sweep_keys.front().copied() {
-                    if std::time::Instant::now() >= caller_deadline { return Some(std::time::Instant::now()); }
+                    if budget.checkpoint() { return Some(std::time::Instant::now()); }
                     fec_sweep_keys.pop_front();
                     if let Some(conn) = connections_map.get_mut(&key) {
                         if let ConnectionState::Connected(c) = &mut conn.connection_state {
@@ -5978,7 +5993,7 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
                     receive_queue_report_time_ns = current_time_now_ns;
                 }
                 while let Some(connection_key) = send_keys.front().copied() {
-                    if std::time::Instant::now() >= caller_deadline { return Some(std::time::Instant::now()); }
+                    if budget.checkpoint() { return Some(std::time::Instant::now()); }
                     send_keys.pop_front();
                     let Some(connection_tracking_data) = connections_map.get_mut(&connection_key) else { continue; };
                     let connection_key = &connection_key;
@@ -6178,7 +6193,7 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
                         // every send site (data loop, tu probe, keepalive, both ack paths) gates on ring space, so head never laps tail
                         assert!(state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY);
                         while state.packets_waiting_ack_tail < state.send_sequence_number {
-                            if std::time::Instant::now() >= caller_deadline { return true; }
+                            if budget.checkpoint() { return true; }
                             let bit_index = state.packets_waiting_ack_tail % PACKETS_WAITING_ACK_CAPACITY;
                             // This slot now describes the tail packet (set below if declared lost).
                             state.declared_lost_field[(bit_index / 64) as usize] &= !(1u64 << (bit_index % 64));
@@ -6355,7 +6370,7 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
                         }
                         let mut unreliable_payload_size = 0;
                         drain_accepted_cc_events(state, &mut connection_tracking_data.unreliable_send_buffer);
-                        while std::time::Instant::now() < caller_deadline && state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY - 1 && packet_send_allowance_now > 0 && state.packets_in_flight < allowed_packets_in_flight && {
+                        while !budget.expired() && state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY - 1 && packet_send_allowance_now > 0 && state.packets_in_flight < allowed_packets_in_flight && {
                             connection_tracking_data.unreliable_send_buffer.fec_prepare_packet(state.send_sequence_number);
                             unreliable_payload_size = connection_tracking_data.unreliable_send_buffer.fill_packet(&mut packet_memory_send[0..payload_size]);
                             #[cfg(test)]
@@ -6392,6 +6407,7 @@ pub fn new_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, ma
                             datagram_expectation.set(("data", Some(state.current_tu as usize)));
                             let send_time_ns = if test_drop { Some(monotonic_clock_ns()) }
                             else { udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..packet_len], connection_tracking_data.unreliable_send_buffer.last_dscp, false) };
+                            if let Some(now) = send_time_ns { budget.sampled(now); }
                             let dscp = connection_tracking_data.unreliable_send_buffer.last_dscp;
                             if !finish_connected_send(state, &mut connection_tracking_data.unreliable_send_buffer,
                                 PendingSendKind::Data, send_time_ns, current_time_now_ns, &packet_memory_encrypted[..packet_len],
