@@ -4462,9 +4462,9 @@ enum FecRecvState {
     SourceOnly(Box<crate::fec::SourceOnly>),
     /// Small message with repair: decoded on the network thread.
     Inline(Box<crate::fec::MessageDecoder>),
-    /// Big message: a byte-bounded, nonblocking ingress queue feeds a decoder thread.
-    /// Dropping the sender (eviction, disconnect) ends it and frees the decoder.
-    Worker { tx: std::sync::mpsc::SyncSender<(u32, Vec<u8>)>, message_len: usize, block_bytes: usize, generation: std::sync::Arc<()> },
+    /// Big message: persistent decoder advanced one symbol per received packet.
+    /// The bounded ingress and admission accounting retain their existing limits.
+    Worker { tx: std::sync::mpsc::SyncSender<(u32, Vec<u8>)>, job: Option<Box<FecDecodeJob>>, message_len: usize, block_bytes: usize, generation: std::sync::Arc<()> },
     /// Delivered (or given up): late surplus blocks of this package are ignored.
     Done,
 }
@@ -4567,6 +4567,16 @@ impl FecCompletion {
     }
 }
 
+// A decoder is owned only by Pump and never shared between threads. Each
+// native add/recover is a single work unit; the next symbol can wait for another
+// caller budget. The old Worker name/counters remain for telemetry compatibility.
+struct FecDecodeJob {
+    rx: std::sync::mpsc::Receiver<(u32, Vec<u8>)>,
+    decoder: crate::fec::MessageDecoder,
+    reservation: Option<crate::receive_memory::Reservation>,
+    _guard: FecWorkerGuard,
+}
+
 struct FecWorkerGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>, std::sync::Arc<crate::receive_memory::ReceiveMemoryBudget>, Option<std::sync::Arc<NetworkWake>>);
 impl Drop for FecWorkerGuard {
     fn drop(&mut self) {
@@ -4626,27 +4636,14 @@ fn fec_receive_block_waking(
                 slot.admission_refused = true; #[cfg(feature = "research_budget_diagnostic")] diag::rx_status(5); slot.ingress_dropped += 1; return None;
             }
             let (tx, rx) = std::sync::mpsc::sync_channel::<(u32, Vec<u8>)>(ingress_slots(ingress_bytes, block_bytes));
-            let done_tx = done_tx.clone();
             workers.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-            let guard = FecWorkerGuard(workers.clone(), budget.clone(), wake);
+            let guard = FecWorkerGuard(workers.clone(), budget.clone(), None);
             let generation = std::sync::Arc::new(());
-            let decoder_generation = generation.clone();
-            // Each connection owns a freshly allocated budget. Retaining its Arc
-            // is a non-reusable connection-generation token across reconnects.
-            let connection_generation = budget.clone();
-            let r = std::thread::Builder::new().name("stp-fec-decode".into()).spawn(move || {
-                let _guard = guard;
-                // Move the capture into a later local: on decode failure its
-                // budget must be released before the worker count reaches zero.
-                let reservation = reservation;
-                if let Some(m) = decode_message_blocks(layout, rx, ingress_bytes) {
-                    // Keep the admission charge through the completion channel, including
-                    // when the network thread is stalled or this connection is evicted.
-                    let _ = done_tx.send(FecCompletion { connection_key, package_id, message: m, reservation, decoder_generation, connection_generation });
-                }
-            });
-            if r.is_ok() { slot.state = FecRecvState::Worker { tx, message_len, block_bytes, generation }; }
-            else { #[cfg(feature = "research_budget_diagnostic")] diag::rx_status(5); slot.ingress_dropped += 1; return None; }
+            let Some(decoder) = MessageDecoder::with_layout(layout) else {
+                drop(guard); slot.ingress_dropped += 1; return None;
+            };
+            let job = Box::new(FecDecodeJob { rx, decoder, reservation: Some(reservation), _guard: guard });
+            slot.state = FecRecvState::Worker { tx, job: Some(job), message_len, block_bytes, generation };
         } else if source_only {
             slot.reservation = Some(reservation);
             slot.state = FecRecvState::SourceOnly(Box::new(SourceOnly::new(layout)));
@@ -4719,7 +4716,7 @@ fn fec_receive_block_waking(
             }
             Err(DecodeError::Failed(_)) => { #[cfg(feature = "research_budget_diagnostic")] diag::rx_status(8); slot.state = FecRecvState::Done; slot.reservation = None; None }
         } },
-        FecRecvState::Worker { tx, .. } => {
+        FecRecvState::Worker { tx, job, generation, .. } => {
             match tx.try_send((block_id, data.to_vec())) {
                 Ok(()) => {
                     #[cfg(feature = "research_budget_diagnostic")] diag::rx_status(11);
@@ -4730,6 +4727,25 @@ fn fec_receive_block_waking(
                 // A successful completion may already be queued. Keep this
                 // exact Worker live until it is drained or explicitly retired.
                 Err(std::sync::mpsc::TrySendError::Disconnected(_)) => { #[cfg(feature = "research_budget_diagnostic")] diag::rx_status(13); },
+            }
+            // Exactly one queued symbol per packet work unit. Wirehair add and
+            // recover are native indivisible calls; decoder state persists across
+            // run_until calls, and eviction synchronously releases its admission.
+            if let Some(active) = job {
+                if let Ok((id, block)) = active.rx.try_recv() {
+                    match active.decoder.add(id, &block) {
+                        Ok(DecodeStatus::Done) => {
+                            if let Some(message) = active.decoder.recover() {
+                                let reservation = active.reservation.take().unwrap();
+                                let _ = done_tx.send(FecCompletion { connection_key, package_id, message, reservation,
+                                    decoder_generation: generation.clone(), connection_generation: budget.clone() });
+                            }
+                            *job = None;
+                        }
+                        Err(DecodeError::Failed(_)) => { *job = None; }
+                        _ => {}
+                    }
+                }
             }
             None
         }
@@ -11117,7 +11133,7 @@ mod outage_review_repros {
     fn receiver_decoder_has_full_grace_after_resume() {
         let mut s = state(); let mut b = buffer(); s.stats.cc_rate_upps = 100_000_000;
         let (tx, _rx) = std::sync::mpsc::sync_channel(1);
-        let mut slots = [FecRecvSlot { state: FecRecvState::Worker { tx, message_len: 1_000_000, block_bytes: 1000, generation: Default::default() }, blocks_received: 1, last_block_ns: 1_000_000_000, ..Default::default() }];
+        let mut slots = [FecRecvSlot { state: FecRecvState::Worker { tx, job: None, message_len: 1_000_000, block_bytes: 1000, generation: Default::default() }, blocks_received: 1, last_block_ns: 1_000_000_000, ..Default::default() }];
         s.account_send(6_000_000_000); s.packets_in_flight = 1;
         enter_outage(&mut s, &mut b, 6_001_000_000, 0, None);
         assert_eq!(retire_inactive_fec_workers(&mut slots, 25_000_000_000, OUTAGE_TIMEOUT_NS, false), 0);
@@ -11203,7 +11219,7 @@ mod outage_review_repros {
         for pressure in [false, true] {
             let mut s = state(); let mut b = buffer();
             let (tx, _rx) = std::sync::mpsc::sync_channel(1);
-            let mut slots = [FecRecvSlot { state: FecRecvState::Worker { tx,
+            let mut slots = [FecRecvSlot { state: FecRecvState::Worker { tx, job: None,
                 message_len: 300 * 32, block_bytes: 32, generation: Default::default() },
                 last_block_ns: 0, ..Default::default() }];
             let grace = fec_inactive_grace_ns(200, pressure);
@@ -11220,7 +11236,7 @@ mod outage_review_repros {
     fn receiver_recovery_grant_rearms_only_on_successful_ingress() {
         let mut s = state(); let mut b = buffer();
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        let mut slots = [FecRecvSlot { state: FecRecvState::Worker { tx,
+        let mut slots = [FecRecvSlot { state: FecRecvState::Worker { tx, job: None,
             message_len: 300 * 32, block_bytes: 32, generation: Default::default() },
             ..Default::default() }];
         let (done, _completions) = std::sync::mpsc::channel();
@@ -11284,7 +11300,7 @@ mod outage_review_repros {
         let mut slots = FecRecvSlot::new_ring(1);
         assert_eq!(index.admit(0, &mut plain, &mut slots), Some(0));
         let (tx, _rx) = std::sync::mpsc::sync_channel(1);
-        slots[0].state = FecRecvState::Worker { tx, message_len: 300 * 32,
+        slots[0].state = FecRecvState::Worker { tx, job: None, message_len: 300 * 32,
             block_bytes: 32, generation: Default::default() };
         let grace = fec_inactive_grace_ns(200, true);
         s.outage.enter(1, 100_000_000);
@@ -11309,7 +11325,7 @@ mod outage_review_repros {
         let mut roots = ReassemblySlot::new_ring(1);
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let mut slots = [FecRecvSlot { package_id: 5, segment: Some(segment),
-            state: FecRecvState::Worker { tx, message_len: layout.len,
+            state: FecRecvState::Worker { tx, job: None, message_len: layout.len,
                 block_bytes: layout.block_bytes, generation: Default::default() }, ..Default::default() }];
         let grace = fec_inactive_grace_ns(200, false);
         // Actual ingress on a long-lived, segmented 20 MB root; timestamps are

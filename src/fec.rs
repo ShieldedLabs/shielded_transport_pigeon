@@ -305,23 +305,12 @@ pub fn encode_message_layout(message: Arc<Vec<u8>>, layout: MessageLayout) -> Op
         let encoder = encode(message, layout.block_bytes)?;
         return Some(MessageEncoder { layout, encoders: vec![encoder] });
     }
-    // At most four helpers, independent of link bandwidth or packet count. They borrow
-    // disjoint ranges of the same Arc; no giant payload copies or packet-tracking vectors.
-    let encoders = std::thread::scope(|scope| {
-        let jobs: Vec<_> = (0..layout.groups.min(4)).map(|lane| {
-            let m = &message;
-            scope.spawn(move || {
-                (lane..layout.groups).step_by(layout.groups.min(4)).map(|group| {
-                    let (start, len) = layout.group_bytes(group);
-                    encode_range(m.clone(), start, len, layout.block_bytes).map(|e| (group, e))
-                }).collect::<Option<Vec<_>>>()
-            })
-        }).collect();
-        let mut all = Vec::with_capacity(layout.groups);
-        for job in jobs { all.extend(job.join().ok()??); }
-        all.sort_by_key(|x| x.0);
-        Some(all.into_iter().map(|x| x.1).collect())
-    })?;
+    // No library-owned helpers. Independent codec groups are constructed in
+    // wire order on the caller's pump thread.
+    let encoders = (0..layout.groups).map(|group| {
+        let (start, len) = layout.group_bytes(group);
+        encode_range(message.clone(), start, len, layout.block_bytes)
+    }).collect::<Option<Vec<_>>>()?;
     Some(MessageEncoder { layout, encoders })
 }
 
@@ -431,89 +420,19 @@ impl MessageDecoder {
     }
 }
 
-/// Incrementally decode independent groups on at most four helper lanes. Each lane
-/// owns disjoint slices of the final Vec, so recovery performs no giant concatenation
-/// or intermediate group-payload copy. Input and per-lane queues are byte bounded.
-pub fn decode_message_blocks(layout: MessageLayout, rx: std::sync::mpsc::Receiver<(u32, Vec<u8>)>, ingress_bytes: usize) -> Option<Vec<u8>> {
-    if layout.groups == 1 {
-        let mut dec = MessageDecoder::with_layout(layout)?;
-        while let Ok((id, block)) = rx.recv() {
-            match dec.add(id, &block) {
-                Ok(DecodeStatus::Done) => return dec.recover(),
-                Err(DecodeError::Failed(_)) => return None,
-                _ => {}
-            }
+/// Blocking convenience decoder for external block producers. STP Pump uses
+/// persistent MessageDecoder directly, one input symbol at a time; this helper
+/// never creates threads either.
+pub fn decode_message_blocks(layout: MessageLayout, rx: std::sync::mpsc::Receiver<(u32, Vec<u8>)>, _ingress_bytes: usize) -> Option<Vec<u8>> {
+    let mut decoder = MessageDecoder::with_layout(layout)?;
+    while let Ok((id, block)) = rx.recv() {
+        match decoder.add(id, &block) {
+            Ok(DecodeStatus::Done) => return decoder.recover(),
+            Err(DecodeError::Failed(_)) => return None,
+            _ => {}
         }
-        return None;
     }
-    let lanes = layout.groups.min(4);
-    let mut output = vec![0u8; layout.len];
-    let ok = std::thread::scope(|scope| {
-        let mut slices: Vec<Vec<&mut [u8]>> = (0..lanes).map(|_| Vec::new()).collect();
-        let mut rest = &mut output[..];
-        for group in 0..layout.groups {
-            let (_, len) = layout.group_bytes(group);
-            let (chunk, tail) = rest.split_at_mut(len);
-            slices[group % lanes].push(chunk);
-            rest = tail;
-        }
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let mut senders = Vec::new();
-        let mut jobs = Vec::new();
-        for chunks in slices {
-            let (tx, blocks) = std::sync::mpsc::sync_channel::<(u32, Vec<u8>)>(ingress_slots(ingress_bytes / lanes, layout.block_bytes));
-            senders.push(tx);
-            let done = done_tx.clone();
-            jobs.push(scope.spawn(move || {
-                let mut decoders: Vec<Option<Decoder>> = (0..chunks.len()).map(|_| None).collect();
-                let mut chunks = chunks;
-                let mut finished = vec![false; chunks.len()];
-                let mut remaining = chunks.len();
-                while let Ok((id, block)) = blocks.recv() {
-                    let (group, local) = layout.local_id(id);
-                    let index = group / lanes;
-                    if finished[index] { continue; }
-                    if decoders[index].is_none() { decoders[index] = Decoder::new(chunks[index].len(), layout.block_bytes); }
-                    let Some(decoder) = decoders[index].as_mut() else { let _ = done.send(false); return false; };
-                    match decoder.add(local, &block) {
-                        Ok(DecodeStatus::Done) => {
-                            if !decoder.recover_into(chunks[index]) { let _ = done.send(false); return false; }
-                            decoders[index] = None;
-                            finished[index] = true;
-                            remaining -= 1;
-                            if remaining == 0 { let _ = done.send(true); return true; }
-                        }
-                        Err(DecodeError::Failed(_)) => { let _ = done.send(false); return false; }
-                        _ => {}
-                    }
-                }
-                false
-            }));
-        }
-        drop(done_tx);
-        let mut remaining = lanes;
-        while remaining > 0 {
-            while let Ok(ok) = done_rx.try_recv() {
-                if !ok { remaining = 0; break; }
-                remaining -= 1;
-            }
-            if remaining == 0 { break; }
-            match rx.recv_timeout(std::time::Duration::from_millis(1)) {
-                Ok((id, block)) => {
-                    if block.len() != block_len(layout.len, layout.block_bytes, id) { continue; }
-                    let (group, _) = layout.local_id(id);
-                    // Blocking here only stalls the coordinator, never the network thread.
-                    // A lane that completed already has dropped its receiver: ignore surplus.
-                    let _ = senders[group % lanes].send((id, block));
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            }
-        }
-        drop(senders);
-        jobs.into_iter().map(|j| j.join().unwrap_or(false)).fold(true, |all, ok| all & ok)
-    });
-    ok.then_some(output)
+    None
 }
 
 #[cfg(test)]
