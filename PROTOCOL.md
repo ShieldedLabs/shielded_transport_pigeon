@@ -1,19 +1,20 @@
-# STP wire protocol, version 2
+# STP wire protocol, version 3
 
-This document specifies the incompatible version-2 transport implemented by
+This document specifies the incompatible version-3 transport implemented by
 `shielded_transport_pigeon`. It does not change the crate's package version.
 All STP framing integers are unsigned little-endian; offsets below are byte
 offsets. Public keys and Noise messages are byte strings with the encodings
 specified by Noise, not little-endian STP integers. One UDP payload is one STP
-packet. There is no compatibility with version 1.
+packet. There is no compatibility with versions 1 or 2.
 
 The words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** specify
 requirements for this interoperable wire profile. Statements explicitly labelled
 "this implementation", "local", or "sender policy" describe the shipped Rust
-implementation, not additional peer-negotiated requirements. Wire version 2 is
-independent of the crate version and the application API. This is the release
-candidate's version-2 profile, **including** the whole-duplication flags; an older
-version-2 implementation without those flags is not compatible.
+implementation, not additional peer-negotiated requirements. Wire version 3 is
+independent of the crate version and the application API. It retains version 2's
+bitmap ACK and whole-duplication framing but declares a 445-byte minimum FEC
+symbol instead of 1136, permitting 512-byte recovery datagrams. Both endpoints
+MUST reject a mismatched profile; they cannot silently reinterpret the old floor.
 
 An independent implementation needs this document, the Noise specification for
 the selected suite, and the exact vendored Wirehair codec pinned below. No Rust
@@ -168,8 +169,10 @@ policy, not a dependency of key or packet identity.
 
 Every Connected endpoint, including an application-idle or ACK-only endpoint,
 MUST emit an ACK-eliciting data-class packet at least once per five seconds
-when locally able to send; ordinary data substitutes for an idle keepalive.
-Keepalives are all-padding current-TU packets with fresh data-space nonces.
+when locally able to send; ordinary data or a periodic 512-byte reachability
+probe substitutes for an idle keepalive. Current-TU keepalives are all-padding
+packets with fresh data-space nonces; the default 250 ms reachability schedule
+normally supplies idle liveness before the five-second keepalive becomes due.
 A receiver sends normal fixed-size positive receipt feedback for them; ACKs
 themselves never elicit ACKs. This supplies round-trip liveness and confirms
 key updates in otherwise receive-only directions without an ACK-of-ACK.
@@ -183,7 +186,8 @@ an all-padding current-TU outage probe, then probes after 250 ms, 500 ms,
 subject to the same local-refusal and cryptographic-budget rules as data.
 Only an authenticated ACK positively receipting a still-outstanding recorded
 outage probe younger than max(4 s, twice the pre-outage RTT) resumes sending.
-Old withheld/replayed feedback cannot prove recovery. Recovery retains TU,
+Old withheld/replayed feedback cannot prove recovery. Outage resumption retains the
+current TU (which the independent size-recovery policy below may lower),
 nonce/epoch histories and message identities, resets pacing credit and RTT
 sampling, and resumes startup at no more than the pre-outage/initial rate.
 Local bounded FEC retention may pause over a real outage; it cannot resurrect
@@ -209,18 +213,18 @@ inbound traffic or ACK-of-ACK as round-trip confirmation.
 
 | Offset | Width | Field | This implementation sends |
 |---|---:|---|---|
-| 0 | 2 | protocol version | 2 |
+| 0 | 2 | protocol version | 3 |
 | 2 | 2 | declaration length, including these four bytes | 32 |
 | 4 | 4 | maximum coded unit / balanced segmentation layout | 2097152 (2 MiB) |
 | 8 | 4 | Wirehair grouped-codec maximum source blocks per group | 32000 |
-| 12 | 2 | minimum full repair-symbol bytes | 1136 |
+| 12 | 2 | minimum full repair-symbol bytes | 445 |
 | 14 | 2 | maximum Noise ciphertext record bytes | 65535 |
 | 16 | 4 | maximum scheduled ACK delay, microseconds | implementation ACK policy (10000) |
 | 20 | 4 | receiver maximum application-message bytes | required constructor argument, capped at 1 GiB |
 | 24 | 4 | maximum previous-key retention, microseconds | 10000000 |
 | 28 | 4 | per-space replay/receipt support capacity, packets | 262144 |
 
-Version 2 of this implementation requires exact agreement on every declared
+Version 3 of this implementation requires exact agreement on every declared
 field except maximum application-message size, which may differ and must be
 in 1..1073741824. In particular it rejects, rather than silently reinterprets,
 a different coded-unit or grouped-codec layout. These are declared profile
@@ -277,17 +281,21 @@ This is resource capacity, not a fundamental 262144-packet format horizon.
 ACK plaintext is recognized **only by its exact size, 152 bytes**. This
 classification must agree with the nonce's high bit; otherwise the packet is
 rejected. This implementation also rejects non-ACK plaintext shorter than
-517 bytes; conforming current-TU/probe packets are larger. Data/probe/keepalive
+482 bytes (= 512 minus the maximum 30-byte transport/AEAD overhead). Data/probe/keepalive
 plaintext must never be 152 bytes. No packet-type
 byte replaces the size test. Ordinary sender data packets and idle/outage
-keepalives fill exactly the current transmission unit (TU); MTU probes fill
-exactly their probed TU. Handshakes are the explicitly separate exception.
+keepalives fill exactly the current transmission unit (TU); upward MTU probes fill
+exactly their probed TU and periodic reachability probes are exactly 512 UDP bytes.
+Handshakes are the explicitly separate exception.
 TU is the effective sender transmission unit: if an MTU-probe ACK arrives
 while a locally refused current-TU ciphertext is pending, its discovered
 larger TU is recorded but promotion is deferred until that immutable datagram
-is accepted. Every retry is therefore still exactly the effective current TU.
-Promote before framing the next datagram; never reseal changed plaintext under
-the pending nonce. MTU probes retain their explicit probe-size exception.
+is accepted. Downshift is also deferred across a pending whole-duplication copy:
+accepting its original cannot shrink the TU before the planned copy is accepted.
+Apply the deferred TU before framing any subsequent packet, including within a
+multi-packet send pass; run normal pacing finalization when the prepared width
+becomes stale. Never reseal changed plaintext under the pending nonce. Explicit
+probe-size exceptions are preserved verbatim through local-refusal retries.
 
 ### Receive admission and rejection order
 
@@ -303,7 +311,7 @@ an atomic transaction and state changes are not rolled back.
 4. Commit packet replay admission. Duplicate/too-old packets stop here and do
    not regenerate ACK feedback. This replay commit precedes minimum-size,
    ACK semantic, frame and resource checks: a later rejected nonce stays spent.
-5. Reject data plaintext shorter than 517. For ACKs, decode the fixed format
+5. Reject data plaintext shorter than 482. For ACKs, decode the fixed format
    and validate that the highest positive receipt is below the next **sent**
    data nonce (locally pending data have not advanced that counter). Valid ACKs
    refresh peer activity and may confirm outgoing keys; only new positive
@@ -415,7 +423,7 @@ may send no flagged pairs at all. The frozen sender does the following.
   congestion-control slot. ACK-space nonces are unaffected. Copies need not
   share the original's key epoch if a permitted rotation occurs between them.
 - A pending copy is sent before any other data-space packet (data, MTU probe,
-  keepalive). If an outage begins before it is sent, the copy itself is the
+  keepalive, periodic reachability probe). If an outage begins before it is sent, the copy itself is the
   first outage probe. On local send refusal the exact ciphertext is retained.
   If the nonce cannot be allocated, no copy is sent (the fallback is counted).
 
@@ -444,7 +452,8 @@ Receiver rules:
   sees every physical loss.
 
 Both peers must implement these flags. This is an incompatible framing
-extension within version 2's frame-kind byte; it adds no header bytes.
+extension introduced within version 2's frame-kind byte and retained in version 3;
+it adds no header bytes.
 
 Plain fragmented messages and coded units have connection-direction-scoped
 u64 identities, allocated from one nonwrapping namespace across all sender
@@ -526,14 +535,14 @@ wrap to represent a different equation in the same unit. Repairs are full
 remaining source bytes. Invalid symbol lengths/IDs are discarded before
 creating any decoder or resource reservation.
 
-The receiving ordinary profile requires `block_bytes >= 1136`, a unit at most
-2 MiB, and a bounded source-block count (at most ceil(2 MiB/1136)). Thus grouped
+The receiving ordinary profile requires `block_bytes >= 445`, a unit at most
+2 MiB, and a bounded source-block count (at most ceil(2 MiB/445) = 4713). Thus grouped
 kind 5 is structurally parseable and round-trip tested, but cannot be needed
 by a valid current-profile production unit; tiny-symbol or oversized-unit
 uses are rejected. Kind 5 is therefore rejected by the current transport's
 layout/kind check, not an alternate way to encode an ordinary unit. Kind 6
 requires the unit itself to have one codec. For this profile K MUST be in
-2..1847 and `1136 <= block_bytes <= 65535`, additionally constrained by the
+2..4713 and `445 <= block_bytes <= 65535`, additionally constrained by the
 frame's u16 body length and the actual packet extent. All u32 block IDs are
 source or repair equation IDs according to the mapping; no separate repair
 flag is transmitted. Decoding may require more than K distinct equations:
@@ -550,7 +559,7 @@ but cannot rebind a retained ID to another role/layout. Deferred completion is
 delivered only for its exact still-live decoder instance and connection
 generation, once; a Done slot is not live.
 
-Version 2 declares the current balanced segmentation layout explicitly. For
+Version 3 declares the current balanced segmentation layout explicitly. For
 `total > max_unit`, let `groups = ceil(total / max_unit)` and
 `unit_span = ceil(total / groups)`. Unit offsets must be multiples of
 `unit_span`, below total; `unit_len = min(unit_span, total - unit_offset)`.
@@ -707,30 +716,61 @@ Invalid tags elicit neither ACKs nor frame allocation.
 
 ## Minimum TU and byte costs
 
-Minimum UDP TU is **1204 bytes**, raised from 1184. The largest symbol header
-leaves `1204 - 14 - 16 - 37 = 1137` bytes, satisfying the 1136-byte repair
-minimum with one byte spare. Current-TU data, fixed-size ACK, and explicit MTU
-probe sizes remain the only encrypted connected UDP sizes emitted. Raising
-the minimum TU is an intentional interoperability change; paths that cannot
-carry it are not supported by this profile.
+The minimum supported recovered UDP TU is **512 bytes**. Its largest symbol
+header leaves `512 - 14 - 16 - 37 = 445` bytes, exactly the declared repair
+minimum. At the unchanged initial TU of 1204, that width is 1137 bytes. Receiver
+source-block and memory admission bounds derive from the 445-byte floor, not
+from the initial TU; the maximum 2 MiB unit has at most 4713 source blocks.
 
 TU is directional and measured in **UDP payload bytes**, excluding UDP/IP
 headers. It starts at 1204; there is no explicit MTU frame or negotiated common
-TU. A probe is simply an all-`ff` padding plaintext in a larger authenticated
-data-space packet, receipted by the ordinary ACK. The sender remembers the
-probe nonce and size and promotes its TU on a positive receipt of that probe;
-the receiver need not recognize a probe or echo its size. All data receivers
-MUST accept ordinary current-profile packets independently of their own send
-TU. The implementation accepts smaller data plaintexts down to 517 bytes even
-though its sender never emits trimmed data. Its local discovery searches up to
-9216 bytes, doubles the step after success and divides it by five after loss;
-this search and its pacing are local policy, not required for decoding.
+TU. All data receivers MUST accept valid current-profile packets independently
+of their own send TU. The implementation admits non-ACK plaintext down to 482
+bytes and never emits trimmed ordinary data. Local upward discovery searches up
+to 9216 bytes using best-effort (BE) all-`ff` padding probes. Only an exact new
+positive receipt of the recorded probe, at most two seconds old, can promote
+TU. The search doubles its step after success and divides it by five after loss.
+
+Default-on local size-recovery policy:
+
+- Send a generic **512-byte BE** all-padding data-space probe every **250 ms**
+  when locally able. Its schedule depends on time and accepted generic probe
+  attempts, never on application availability or message length; ordinary
+  512-byte data does not move this clock. A pending ciphertext or whole-packet
+  copy takes priority; send-ring capacity still applies. Pump wake deadlines
+  include the generic probe and the upward hold. No library thread is created.
+- Feed only native authenticated, exact first-positive receipts into a bounded
+  4096-entry nonce/size/send-time history. A small proof must be at most two
+  seconds old. After at least one second without fresh positive receipt of
+  larger ordinary data, and with an aged (at least one second) unconfirmed larger
+  data record, a fresh exact 512-byte proof lowers the effective TU to 512.
+  Fresh larger progress anywhere in the same ACK vetoes the decision. ACK-highest,
+  aggregate counts, duplicate receipts and upward-probe failure alone do not
+  establish this proof. Overwritten records cannot supply proof.
+- Hold upward discovery/promotion for ten seconds after a decision. Pending
+  ciphertext and planned duplication copies retain their exact bytes and nonce;
+  effective shrink waits for their acceptance. Restart a still-active FEC unit
+  from its full shared source under a fresh unit ID if its symbol no longer fits;
+  preserve segmented root/offset, and never reopen a sealed root or mutate an
+  existing unit's layout. Already-forgotten messages are not made reliable.
+- During outage, a generic small probe also records an outage probe, so its fresh
+  positive receipt can satisfy the existing outage-resumption rule. Ordinary
+  current-TU outage probes and exponential outage backoff remain in place.
+
+This is a conservative classifier, not proof of a path failure: an older
+unconfirmed larger send can trigger fallback during idle/drain. A successful
+small proof does not guarantee future delivery. History overwrite and local
+backpressure may delay recovery; paths below 512 bytes are unsupported. The
+history uses 96 KiB per connected peer on Linux x64, charged in the 608 KiB
+connection-bookkeeping reservation separately from the derived receive-data cap.
+Packet-rate congestion control and FEC planning policy are unchanged. These
+schedules/search limits are local sender policy, not additional wire fields.
 
 The table excludes IP/UDP headers, padding and coding redundancy; these are
 encoding overhead bytes, not a claim about measured wire/app ratio. The
 packet overhead includes the AEAD tag. Whole headers are per packed message.
 
-| Item | Old bytes | Version 2 bytes | Change |
+| Item | Pre-version-2 bytes | Version 2/3 bytes | Change |
 |---|---:|---:|---:|
 | Data packet outer header + tag | 22 | 30 | +8 |
 | 80 B whole message frame | 4 | 3 | -1 (84 -> 83 with data) |
@@ -763,7 +803,7 @@ is not rate-limited. The initial 391-byte request/94-byte response is not
 large-response reflection; retransmitted responses before confirmation can
 exceed the original request cumulatively. Stateless return-routability retry
 cookies and an aggregate pre-confirmation response budget are **not** part of
-version 2. No current anti-spoofing/strict anti-amplification guarantee is
+version 3. No current anti-spoofing/strict anti-amplification guarantee is
 claimed; adding such a handshake exchange requires a separately specified
 compatible mechanism or a new profile/version.
 
@@ -774,7 +814,7 @@ counts, gaps and rate; the clear epoch reveals update cadence, including the
 cross-address correlation and leaks those key bits. ACKs are intentionally
 identifiable by their fixed size, and their cadence exposes receive timing.
 Probe sizes, handshake sizes, DSCP, outage/idle timing and IP/UDP endpoints
-are also observable. Version 2 does not provide traffic-flow confidentiality,
+are also observable. Version 3 does not provide traffic-flow confidentiality,
 constant-rate cover traffic, unlinkable connection identifiers or epoch-age
 jitter. These residual surfaces are deployment threat-model considerations,
 not removed by encrypting/padding message frames.

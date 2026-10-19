@@ -137,7 +137,7 @@ pub fn crypto_string_from_connect_magic1(magic: u64) -> Option<&'static str> {
     }
 }
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 pub const TRANSPORT_PARAMETERS_LEN: usize = 32;
 const MAGIC2_LIST_SIZE: usize = 1 + 32 * 8;
 pub const MAGIC2_BLOCK_SIZE: usize = MAGIC2_LIST_SIZE + TRANSPORT_PARAMETERS_LEN;
@@ -149,7 +149,7 @@ fn transport_parameters(max_message_size: usize) -> [u8; TRANSPORT_PARAMETERS_LE
     store_u16(&mut p[2..4], TRANSPORT_PARAMETERS_LEN as u16);
     store_u32(&mut p[4..8], FEC_SEGMENT_BYTES as u32);
     store_u32(&mut p[8..12], crate::fec::GROUP_MAX_BLOCKS as u32);
-    store_u16(&mut p[12..14], 1136);
+    store_u16(&mut p[12..14], FEC_MIN_BLOCK_BYTES as u16);
     store_u16(&mut p[14..16], 65535);
     store_u32(&mut p[16..20], crate::ship::ACK.max_delay_us);
     store_u32(&mut p[20..24], max_message_size as u32);
@@ -160,7 +160,7 @@ fn transport_parameters(max_message_size: usize) -> [u8; TRANSPORT_PARAMETERS_LE
 fn validate_transport_parameters(p: &[u8]) -> Option<usize> {
     if p.len() != TRANSPORT_PARAMETERS_LEN || load_u16(&p[..2]) != PROTOCOL_VERSION ||
         load_u16(&p[2..4]) as usize != p.len() || load_u32(&p[4..8]) as usize != FEC_SEGMENT_BYTES ||
-        load_u32(&p[8..12]) as usize != crate::fec::GROUP_MAX_BLOCKS || load_u16(&p[12..14]) != 1136 ||
+        load_u32(&p[8..12]) as usize != crate::fec::GROUP_MAX_BLOCKS || load_u16(&p[12..14]) as usize != FEC_MIN_BLOCK_BYTES ||
         load_u16(&p[14..16]) != 65535 || load_u32(&p[16..20]) != crate::ship::ACK.max_delay_us ||
         load_u32(&p[24..28]) != (PREVIOUS_KEY_NS / 1000) as u32 || load_u32(&p[28..32]) != 262144 { return None; }
     let max = load_u32(&p[20..24]) as usize;
@@ -1466,10 +1466,11 @@ pub const STP_EXT_KIND_FEC: u64 = 1;
 const STP_EXT_KIND_SEGMENT_FEC: u64 = 3;
 const STP_SEGMENT_FEC_HEADER_SIZE: usize = 37;
 const FEC_SEGMENT_BYTES: usize = 2 << 20;
-/// Minimum honest symbol width: guaranteed UDP TU minus the largest supported
-/// crypto overhead (14-byte header + 16-byte AEAD tag) and segment framing.
-/// Keep the declared 1136-byte symbol floor, with one byte spare at TU 1204.
-pub const FEC_MIN_BLOCK_BYTES: usize = 1136;
+/// Profile-3 minimum: 512-byte recovery TU minus the largest crypto overhead
+/// (14-byte header + 16-byte AEAD tag) and segmented FEC framing.
+pub const FEC_MIN_BLOCK_BYTES: usize = 445;
+/// Non-ACK plaintext admission floor; both cipher modes can carry recovery probes.
+const MIN_CONNECTED_PAYLOAD: usize = crate::mtu_recovery::SMALL as usize - 30;
 pub const FEC_MAX_SOURCE_BLOCKS: usize = FEC_SEGMENT_BYTES.div_ceil(FEC_MIN_BLOCK_BYTES);
 
 // Current senders segment every message above 2 MiB. Refuse legacy jumbo codecs
@@ -1556,10 +1557,35 @@ fn next_service_deadline(now: u64, due: u64) -> u64 {
 // Readability must not shorten the legacy active retry sleep: doing so changes
 // RTT/ACK-pace sampling and can strand startup at a one-packet flight allowance.
 // Pending ACK feedback is active work even on a receive-only connection.
+// A send performed earlier in this pass can have an actual socket timestamp
+// newer than the pass snapshot. Its elapsed age is zero, never a wrapped loss.
+fn send_age_ns(now: u64, sent: u64) -> u64 { now.saturating_sub(sent) }
+
 fn needs_active_retry(state: &ConnectionStateConnected, has_unsent_data: bool) -> bool {
-    has_unsent_data || state.pending_send.is_some()
-        || state.send_sequence_number != state.packets_waiting_ack_tail
-        || state.outage.since_ns.is_some() || state.ack_timer != u64::MAX
+    has_unsent_data || state.pending_send.is_some() || state.locally_blocked
+        || state.packets_waiting_ack_tail < state.active_send_frontier
+        || state.outage.since_ns.is_some()
+        || (state.ack_timer != u64::MAX && state.active_ack_feedback)
+}
+
+// Generic-only flight may park, but ACK loss must still retire the oldest
+// packet and enter outage at the same policy deadlines. The timeout grows with
+// ACK silence: this is a lower-bound wake, recomputed on each service pass.
+fn parked_send_deadline(state: &ConnectionStateConnected, now: u64, cc: &CongestionPolicy) -> u64 {
+    let mut deadline = u64::MAX;
+    if state.packets_waiting_ack_tail < state.send_sequence_number {
+        let sent = state.send_time(state.packets_waiting_ack_tail);
+        if state.RTT_mean != 0 {
+            let timeout = state.loss_timer.timeout_ns(state.RTT_mean as u64 * 100_000,
+                now.saturating_sub(state.last_ack_received_time), cc);
+            deadline = if sent == 0 { now } else { sent.saturating_add(timeout) };
+        }
+        if let Some(start) = state.outage.pending_since_ns {
+            deadline = deadline.min(start.max(state.last_ack_received_time).saturating_add(OUTAGE_ACK_SILENCE_NS));
+        }
+    }
+    if state.outage.since_ns.is_some() { deadline = deadline.min(state.outage.next_probe_ns); }
+    deadline
 }
 
 fn send_pacing_grant(elapsed_ns: u64, interval_ns: u64, credit_ns: u64) -> SendPacingGrant {
@@ -3245,7 +3271,8 @@ fn fill_packet_payload_with_unreliable_fragments(payload: &mut [u8], buf: &mut U
     payload.len()
 }
 
-const RECEIVE_CONNECTION_BYTES: usize = 512 << 10;
+// Retain the previous bookkeeping margin and explicitly charge the new history.
+const RECEIVE_CONNECTION_BYTES: usize = (512 << 10) + crate::mtu_recovery::HISTORY_BYTES;
 #[derive(Debug)]
 pub struct ConnectionTrackingData {
     receive_reservation: crate::receive_memory::Reservation,
@@ -3427,12 +3454,12 @@ pub enum ConnectionState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PendingSendKind { Ack, Data, Keepalive, MtuProbe, Outage }
+enum PendingSendKind { Ack, Data, Keepalive, MtuProbe, Outage, Reachability }
 impl PendingSendKind {
     #[cfg(test)]
     fn name(self) -> &'static str {
         match self { Self::Ack => "ack", Self::Data => "data", Self::Keepalive => "keepalive",
-            Self::MtuProbe => "mtu_probe", Self::Outage => "outage" }
+            Self::MtuProbe => "mtu_probe", Self::Outage => "outage", Self::Reachability => "reachability" }
     }
 }
 
@@ -3462,6 +3489,8 @@ pub struct ConnectionStateConnected {
     pub last_sent_data_packet: u64,
     pub last_sent_could_have_sent_data_packet: u64,
     pub last_ack_received_time: u64,
+    // Generic reachability receipts must not repeatedly erase ordinary pacing credit.
+    last_pacing_ack_received_time: u64,
     /// Fresh authenticated inbound activity; never a substitute for delivery/CC feedback.
     last_peer_packet_received_time: u64,
     pub last_status_print_time: u64,
@@ -3470,6 +3499,7 @@ pub struct ConnectionStateConnected {
     pub max_in_flight_since_last_print: u64,
 
     pub ack_timer: u64,
+    active_ack_feedback: bool,
     pub ack_receiver: crate::ack::AckReceiver,
     /// Highest positively acknowledged peer receipt; holes are NOT declarations of loss.
     pub highest_peer_acked: Option<u64>,
@@ -3503,8 +3533,12 @@ pub struct ConnectionStateConnected {
     rand_background_bits:Option<Box<[u64]>>,
     // head is the send_sequence_number
     pub packets_waiting_ack_tail: u64,
+    // Highest non-generic committed sequence + 1. An older generic hole keeps
+    // the ordinary flight active until the tail has passed this frontier.
+    active_send_frontier: u64,
 
     pub current_tu: u64,
+    recovery: crate::mtu_recovery::Recovery,
     // Effective TU cannot change while an immutable current-TU datagram retries.
     deferred_tu: Option<u64>,
     pub last_sent_tu_probe_time_ns: u64,
@@ -3556,12 +3590,14 @@ pub fn new_connection_state_connected(cipher: Option<ConnectionCipherTriplet>, m
         last_sent_data_packet: 0,
         last_sent_could_have_sent_data_packet: 0,
         last_ack_received_time: timestamp_ns,
+        last_pacing_ack_received_time: timestamp_ns,
         last_peer_packet_received_time: timestamp_ns,
         last_status_print_time: timestamp_ns,
         packet_since_last_print: 0,
         packet_lost_since_last_print: 0,
         max_in_flight_since_last_print: 0,
         ack_timer: u64::MAX,
+        active_ack_feedback: false,
         ack_receiver: Default::default(),
         highest_peer_acked: None,
         peer_ack_delay_us: 0,
@@ -3585,8 +3621,10 @@ pub fn new_connection_state_connected(cipher: Option<ConnectionCipherTriplet>, m
         packets_waiting_ack_field: [0; PACKETS_WAITING_ACK_WORDS],
         rand_background_bits:None,
         packets_waiting_ack_tail: 0,
+        active_send_frontier: 0,
 
         current_tu: ASSUMED_UDP_PAYLOAD_SIZE_WITH_GUARANTEED_DELIVERY as u64,
+        recovery: crate::mtu_recovery::Recovery::new(timestamp_ns),
         deferred_tu: None,
         last_sent_tu_probe_time_ns: 0,
         tu_probe_sequence_number: u64::MAX,
@@ -3971,9 +4009,21 @@ impl ConnectionStateConnected {
     }
     fn promote_tu(&mut self, tu: u64) {
         if self.pending_send.as_ref().is_some_and(|p| matches!(p.kind,
-            PendingSendKind::Data | PendingSendKind::Keepalive | PendingSendKind::Outage)) {
+            PendingSendKind::Data | PendingSendKind::Keepalive | PendingSendKind::Outage | PendingSendKind::Reachability)) {
             self.deferred_tu = Some(tu);
         } else { self.current_tu = tu; }
+    }
+    fn downshift_for_recovery(&mut self, copy_pending: bool) {
+        if copy_pending { self.deferred_tu = Some(crate::mtu_recovery::SMALL); }
+        else { self.promote_tu(crate::mtu_recovery::SMALL); }
+    }
+    // Only call after native exact first-positive admission. A missing metadata
+    // record defaults to ordinary, never suppressing real application's progress.
+    fn on_positive_receipt(&mut self, sequence: u64, now: u64) -> bool {
+        if !self.recovery.is_generic(sequence) { self.last_pacing_ack_received_time = now; }
+        self.last_ack_received_time = now;
+        self.outage.pending_since_ns = None;
+        self.recovery.acknowledged(sequence, now)
     }
     // The receive loop and socket-free tests share first-positive admission.
     // Clearing either ring bit here makes duplicate receipts ineligible.
@@ -4000,11 +4050,19 @@ impl ConnectionStateConnected {
     fn send_time(&self, sequence: u64) -> u64 {
         get_send_time_for_sequence_number(sequence, &self.send_time_band, self.send_time_band_head_index)
     }
+    fn observe_feedback_payload(&mut self, payload: &[u8]) {
+        self.active_ack_feedback |= payload.first() != Some(&0xff);
+    }
+    fn update_feedback_deadline(&mut self, now: u64) {
+        self.ack_timer = self.ack_receiver.feedback_deadline(now);
+        if self.ack_timer == u64::MAX { self.active_ack_feedback = false; }
+    }
     fn account_send(&mut self, actual_ns: u64) {
         self.outage.pending_since_ns.get_or_insert(actual_ns);
         if self.send_sequence_number >= crate::sequence::ACK_SPACE - 1 { return; }
         increment_sequence_number_and_account(actual_ns, &mut self.send_sequence_number,
             &mut self.send_time_band, &mut self.send_time_band_head_index, &mut self.packets_waiting_ack_field);
+        self.active_send_frontier = self.send_sequence_number;
     }
 }
 
@@ -4943,6 +5001,8 @@ pub struct NetworkThreadOptions {
     ordinary_started_peak: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
     #[cfg(test)]
     encrypted_payload_log: Option<std::sync::Arc<std::sync::Mutex<Vec<(Vec<u8>, Vec<u8>)>>>>,
+    #[cfg(test)]
+    recovery_copy_grant_fixture: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
     /// Fixed number of FIFO queues per connection (1..=64), also sizing the peer receive cap.
     /// Total app capacity is N x max_queue_size_bytes (plus the inherited oversized-alone
     /// exception). Rescue reservations are 64 MiB/N and 4096/N per magazine, no borrowing.
@@ -4963,7 +5023,7 @@ pub struct NetworkThreadOptions {
 }
 
 impl Default for NetworkThreadOptions {
-    fn default() -> Self { Self { rings: RingConfig::default(), #[cfg(test)] initial_active_wait: None, #[cfg(test)] datagram_log: None, #[cfg(test)] send_failure: None, #[cfg(test)] ordinary_started_peak: None, #[cfg(test)] encrypted_payload_log: None, send_queue_count: 1, receive_memory: None, bind_ip: None, record_fec_messages: false, record_loss_episodes: false, loss_trace: None, #[cfg(feature = "research_budget_diagnostic")] budget_diagnostic: false } }
+    fn default() -> Self { Self { rings: RingConfig::default(), #[cfg(test)] initial_active_wait: None, #[cfg(test)] datagram_log: None, #[cfg(test)] send_failure: None, #[cfg(test)] ordinary_started_peak: None, #[cfg(test)] encrypted_payload_log: None, #[cfg(test)] recovery_copy_grant_fixture: None, send_queue_count: 1, receive_memory: None, bind_ip: None, record_fec_messages: false, record_loss_episodes: false, loss_trace: None, #[cfg(feature = "research_budget_diagnostic")] budget_diagnostic: false } }
 }
 
 /// `max_message_size` is required local application configuration in both directions,
@@ -5007,6 +5067,8 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
     let ordinary_started_peak = options.ordinary_started_peak;
     #[cfg(test)]
     let encrypted_payload_log = options.encrypted_payload_log;
+    #[cfg(test)]
+    let recovery_copy_grant_fixture = options.recovery_copy_grant_fixture;
     #[cfg(feature="research_budget_diagnostic")]
     let diagnostic_enabled = options.budget_diagnostic;
     {
@@ -5647,7 +5709,7 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                             // ACK nonces are not holes in the dense data stream.
                             if !is_ack { state.rx_tracker.on_packet(nonce, &mut state.stats); }
 
-                            if payload.len() < 517 && payload.len() != crate::ack::ACK_PAYLOAD_LEN {
+                            if payload.len() < MIN_CONNECTED_PAYLOAD && payload.len() != crate::ack::ACK_PAYLOAD_LEN {
                                 break 'conn;
                             }
 
@@ -5687,13 +5749,13 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                 let mut oldest_newly_acked_seq: u64 = 0;
                                 let relevant_ack = bitmap_ack.as_ref().map(|a| a.relevant(&state.packets_waiting_ack_field, &state.declared_lost_field[..]));
                                 let indices = relevant_ack.iter().flat_map(crate::ack::BitmapAck::acknowledged);
+                                let mut small_recovery_proof = false;
                                 for index in indices {
                                     if index < state.send_sequence_number {
                                         state.highest_peer_acked = Some(state.highest_peer_acked.unwrap_or(index).max(index));
                                     }
                                     let Some(receipt) = state.take_positive_receipt(index) else { continue; };
-                                    state.last_ack_received_time = timestamp_ns;
-                                    state.outage.pending_since_ns = None;
+                                    small_recovery_proof |= state.on_positive_receipt(index, timestamp_ns);
                                     if let Some(t) = &mut loss_trace { t.outcome('A', existing_connection.two_byte_send_prefix, index, timestamp_ns); }
                                     #[cfg(feature = "research_budget_diagnostic")]
                                     diag::feedback(index,timestamp_ns,if receipt.is_pending(){1}else{2});
@@ -5706,7 +5768,9 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                         if receipt == PositiveReceipt::PendingProbe {
                                             state.tu_probe_sequence_number = u64::MAX;
                                             state.last_sent_tu_probe_time_ns = 0;
-                                            state.promote_tu(state.tu_probe_size);
+                                            if state.recovery.can_promote(sent_ns, timestamp_ns) {
+                                                state.promote_tu(state.tu_probe_size);
+                                            }
                                             state.tu_probe_size_advance *= 2;
                                             state.tu_probe_failed_count = 0;
                                         } else {
@@ -5752,6 +5816,11 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                             }
                                         }
                                     }
+                                }
+                                if small_recovery_proof && state.current_tu > crate::mtu_recovery::SMALL
+                                    && state.recovery.large_stalled(timestamp_ns) {
+                                    state.recovery.downshifted(timestamp_ns);
+                                    state.downshift_for_recovery(existing_connection.unreliable_send_buffer.target_copy_pending());
                                 }
                                 if ack_latency_ns != 0 { state.loss_timer.observe(ack_latency_ns); }
                                 state.delivery_growth.acknowledged_samples(timestamp_ns, (newly_acked_data, delivery_latency_ns),
@@ -6023,6 +6092,10 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                             }
 
                             if !memory_erased {
+                                // Use the original admitted plaintext, not the consumed parser tail.
+                                // Mixed/non-padding feedback retains the legacy active path until
+                                // every scheduled receipt-window repeat has been sent.
+                                state.observe_feedback_payload(payload);
                                 state.ack_receiver.receive_with_rtt(nonce, timestamp_ns, ecn_marked, &mut state.ack_timer, state.stats.rtt_us, buf_len);
                             }
 
@@ -6156,9 +6229,7 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                     cc_trace_context(state, current_time_now_ns, &cc, max_pps));
                             }
                             #[cfg(test)]
-                            datagram_expectation.set((pending.kind.name(), Some(if pending.kind == PendingSendKind::MtuProbe {
-                                state.tu_probe_size as usize
-                            } else { state.current_tu as usize })));
+                            datagram_expectation.set((pending.kind.name(), Some(pending.bytes.len())));
                             let sent = udp_send_with_congestion_and_dscp(socket,
                                 connection_tracking_data.other_ip, connection_tracking_data.other_port,
                                 &pending.bytes, pending.dscp, false);
@@ -6188,8 +6259,27 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                 if !finish_connected_send(state, &mut connection_tracking_data.unreliable_send_buffer,
                                     PendingSendKind::Ack, sent, current_time_now_ns, &packet_memory_send[..o], &[], Dscp::Af21,
                                     connection_tracking_data.two_byte_send_prefix, loss_trace.as_mut()) { return true; }
-                                state.ack_timer = state.ack_receiver.feedback_deadline(current_time_now_ns);
+                                state.update_feedback_deadline(current_time_now_ns);
                             }
+                        }
+
+                        // Generic time-driven reachability, independent of queued message lengths.
+                        // A pending ciphertext retry or planned whole-packet copy always goes first.
+                        if current_time_now_ns >= state.recovery.next_small
+                            && !connection_tracking_data.unreliable_send_buffer.target_copy_pending()
+                            && state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY - 1 {
+                            let payload_len = crate::mtu_recovery::SMALL as usize
+                                - total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(state.magic1).unwrap();
+                            packet_memory_send[..payload_len].fill(0xff);
+                            let Some(packet_len) = seal_connected_packet(&mut state.cipher, connection_tracking_data.two_byte_send_prefix,
+                                state.send_sequence_number, &packet_memory_send[..payload_len], &mut packet_memory_encrypted[..], current_time_now_ns) else { return false; };
+                            #[cfg(test)]
+                            datagram_expectation.set(("reachability", Some(crate::mtu_recovery::SMALL as usize)));
+                            let sent = udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip,
+                                connection_tracking_data.other_port, &packet_memory_encrypted[..packet_len], Dscp::BestEffort, false);
+                            if !finish_connected_send(state, &mut connection_tracking_data.unreliable_send_buffer,
+                                PendingSendKind::Reachability, sent, current_time_now_ns, &packet_memory_encrypted[..packet_len],
+                                &[], Dscp::BestEffort, connection_tracking_data.two_byte_send_prefix, loss_trace.as_mut()) { return true; }
                         }
 
                         if state.outage.since_ns.is_none() && state.send_sequence_number > state.packets_waiting_ack_tail
@@ -6309,7 +6399,7 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                             if state.packets_waiting_ack_field[(bit_index / 64) as usize] & (1u64 << (bit_index % 64)) != 0 {
                                 let mut send_time = state.send_time(state.packets_waiting_ack_tail);
                                 let original_send_time = send_time;
-                                if send_time != 0 && (state.RTT_mean == 0 || (current_time_now_ns - send_time) < time_to_considered_dropped) {
+                                if send_time != 0 && (state.RTT_mean == 0 || send_age_ns(current_time_now_ns, send_time) < time_to_considered_dropped) {
                                     break;
                                 }
                                 if send_time == 0 {
@@ -6411,9 +6501,25 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                 &mut state.send_pacer_acc_ns, current_time_now_ns, time_between_sends_ns);
                         }
                         // This is some Unity Game developer level crap approximation but it will have to do.
-                        let elapsed_ns = current_time_now_ns + 1 - state.last_sent_could_have_sent_data_packet.max(state.last_ack_received_time.saturating_sub(ACK_BUFFER_TIME_NS));
+                        let elapsed_ns = current_time_now_ns + 1 - state.last_sent_could_have_sent_data_packet.max(state.last_pacing_ack_received_time.saturating_sub(ACK_BUFFER_TIME_NS));
                         let grant = send_pacing_grant(elapsed_ns, time_between_sends_ns, state.send_pacer_acc_ns);
                         let mut packet_send_allowance_now = grant.packets;
+                        // Deterministic native-loop regression only: accept a whole/copy
+                        // pair with credit left, then check real-loop shrink/finalization.
+                        #[cfg(test)]
+                        if let Some(fixture) = &recovery_copy_grant_fixture {
+                            state.recovery.upward_after = u64::MAX;
+                            let phase = fixture.load(std::sync::atomic::Ordering::Acquire) & 255;
+                            if phase == 1 || phase == 2 {
+                                packet_send_allowance_now = 8;
+                                state.current_tu = 1204;
+                            } else if phase >= 4 { state.current_tu = 512; }
+                        }
+                        #[cfg(test)]
+                        let allowed_packets_in_flight = if recovery_copy_grant_fixture.as_ref().is_some_and(|f|
+                            matches!(f.load(std::sync::atomic::Ordering::Acquire) & 255, 1 | 2)) {
+                            allowed_packets_in_flight.max(64)
+                        } else { allowed_packets_in_flight };
                         let pacing_first_sequence = state.send_sequence_number;
                         state.stats.pacing_commanded_packets += packet_send_allowance_now;
                         let could_have_sent = packet_send_allowance_now != 0;
@@ -6421,7 +6527,7 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                         // ring space is checked live at each send site below so the head can never lap the tail within a tick
 
                         state.current_tu = state.current_tu.min(ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE as u64);
-                        if !connection_tracking_data.unreliable_send_buffer.target_copy_pending() && state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY - 1 && state.current_tu != ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE as u64 && state.tu_probe_sequence_number == u64::MAX && state.last_sent_tu_probe_time_ns + (state.tu_probe_failed_count.min(50)*state.tu_probe_failed_count.min(50)*250_000_000).max(time_between_sends_ns) < current_time_now_ns {
+                        if current_time_now_ns >= state.recovery.upward_after && !connection_tracking_data.unreliable_send_buffer.target_copy_pending() && state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY - 1 && state.current_tu != ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE as u64 && state.tu_probe_sequence_number == u64::MAX && state.last_sent_tu_probe_time_ns + (state.tu_probe_failed_count.min(50)*state.tu_probe_failed_count.min(50)*250_000_000).max(time_between_sends_ns) < current_time_now_ns {
                             state.tu_probe_size_advance = state.tu_probe_size_advance.max(1).min(ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE as u64);
                             state.tu_probe_size = (state.current_tu + state.tu_probe_size_advance).min(ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE as u64);
                             let payload_size = state.tu_probe_size as usize - total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(state.magic1).unwrap();
@@ -6434,10 +6540,10 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
 
                             #[cfg(test)]
                             datagram_expectation.set(("mtu_probe", Some(state.tu_probe_size as usize)));
-                            let send_time_ns = udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..packet_len], Dscp::Af21, false);
+                            let send_time_ns = udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..packet_len], Dscp::BestEffort, false);
                             if !finish_connected_send(state, &mut connection_tracking_data.unreliable_send_buffer,
                                 PendingSendKind::MtuProbe, send_time_ns, current_time_now_ns, &packet_memory_encrypted[..packet_len],
-                                &[], Dscp::Af21, connection_tracking_data.two_byte_send_prefix, loss_trace.as_mut()) { return true; }
+                                &[], Dscp::BestEffort, connection_tracking_data.two_byte_send_prefix, loss_trace.as_mut()) { return true; }
                         }
 
                         let payload_size = state.current_tu as usize - total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(state.magic1).unwrap();
@@ -6479,9 +6585,21 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                         }
                         let mut unreliable_payload_size = 0;
                         drain_accepted_cc_events(state, &mut connection_tracking_data.unreliable_send_buffer);
-                        while !budget.expired() && state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY - 1 && packet_send_allowance_now > 0 && state.packets_in_flight < allowed_packets_in_flight && {
+                        // A copy commit may apply a deferred shrink inside this loop. Stop
+                        // before any new framing with the stale prepared width, then run
+                        // the normal pacing finalizer below (no early-return credit leak).
+                        while state.current_tu as usize == payload_size + total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(state.magic1).unwrap()
+                            && !budget.expired() && state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY - 1 && packet_send_allowance_now > 0 && state.packets_in_flight < allowed_packets_in_flight && {
                             connection_tracking_data.unreliable_send_buffer.fec_prepare_packet(state.send_sequence_number);
-                            unreliable_payload_size = connection_tracking_data.unreliable_send_buffer.fill_packet(&mut packet_memory_send[0..payload_size]);
+                            #[cfg(test)]
+                            let force_pair = recovery_copy_grant_fixture.as_ref().is_some_and(|f|
+                                matches!(f.load(std::sync::atomic::Ordering::Acquire) & 255, 1 | 2));
+                            #[cfg(test)]
+                            { unreliable_payload_size = if force_pair {
+                                connection_tracking_data.unreliable_send_buffer.fill_packet_with_dup(&mut packet_memory_send[..payload_size], true)
+                            } else { connection_tracking_data.unreliable_send_buffer.fill_packet(&mut packet_memory_send[..payload_size]) }; }
+                            #[cfg(not(test))]
+                            { unreliable_payload_size = connection_tracking_data.unreliable_send_buffer.fill_packet(&mut packet_memory_send[..payload_size]); }
                             #[cfg(test)]
                             if let Some(peak) = &ordinary_started_peak {
                                 // Read-only observer: only actually started, ordinary
@@ -6524,6 +6642,20 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                 &packet_memory_send[..payload_size], dscp, connection_tracking_data.two_byte_send_prefix,
                                 loss_trace.as_mut()) { return true; }
                             packet_send_allowance_now = packet_send_allowance_now.saturating_sub(1);
+                            #[cfg(test)]
+                            if let Some(fixture) = &recovery_copy_grant_fixture {
+                                match fixture.load(std::sync::atomic::Ordering::Acquire) {
+                                    1 if connection_tracking_data.unreliable_send_buffer.target_copy_pending() => {
+                                        state.downshift_for_recovery(true);
+                                        fixture.store(2, std::sync::atomic::Ordering::Release);
+                                    }
+                                    2 if !connection_tracking_data.unreliable_send_buffer.target_copy_pending() => {
+                                        assert_eq!(state.current_tu, 512);
+                                        fixture.store(3, std::sync::atomic::Ordering::Release);
+                                    }
+                                    _ => {}
+                                }
+                            }
                         }
 
                         let pacing_burst = state.send_sequence_number - pacing_first_sequence;
@@ -6553,6 +6685,15 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                             }
                         }
 
+                        #[cfg(test)]
+                        if let Some(fixture) = &recovery_copy_grant_fixture {
+                            if fixture.load(std::sync::atomic::Ordering::Acquire) == 3 {
+                                assert_eq!(pacing_burst, 2);
+                                assert_eq!(packet_send_allowance_now, 6);
+                                assert_eq!(state.send_pacer_acc_ns, 0, "normal pacer finalization must run");
+                                fixture.store((packet_send_allowance_now as usize) << 8 | 4, std::sync::atomic::Ordering::Release);
+                            }
+                        }
                         // bonus status debug print
                         if state.last_status_print_time + 1_000_000_000 < current_time_now_ns {
                             state.last_status_print_time = current_time_now_ns;
@@ -6621,8 +6762,14 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                 if needs_active_retry(c, conn.unreliable_send_buffer.has_unsent_data()) {
                                     active_retry = true;
                                     include(now.saturating_add(150_000));
+                                } else {
+                                    include(parked_send_deadline(c, now, &cc));
                                 }
                                 include(c.ack_timer.saturating_add(1));
+                                if c.pending_send.is_none() && !conn.unreliable_send_buffer.target_copy_pending()
+                                    && c.send_sequence_number - c.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY - 1 {
+                                    include(c.recovery.next_small);
+                                }
                                 include(c.last_sent_data_packet.saturating_add(5_000_000_001));
                                 let last_activity = if authenticated_peer_liveness {
                                     c.last_ack_received_time.max(c.last_peer_packet_received_time)
@@ -6633,7 +6780,7 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                     // Delivery growth may legitimately be below the rate floor.
                                     let interval = send_interval_ns(c.stats.cc_rate_upps);
                                     let probe_delay = (c.tu_probe_failed_count.min(50).pow(2) * 250_000_000).max(interval);
-                                    include(c.last_sent_tu_probe_time_ns.saturating_add(probe_delay).saturating_add(1));
+                                    include(c.last_sent_tu_probe_time_ns.saturating_add(probe_delay).saturating_add(1).max(c.recovery.upward_after));
                                 }
                             }
                             ConnectionState::SendingClientHelloPlaintext { last_sent_time_ns, .. }
@@ -7150,7 +7297,11 @@ fn commit_connected_send(state: &mut ConnectionStateConnected, buf: &mut SendQue
         }
     }
     if kind != PendingSendKind::Data { buf.fec_prepare_packet(seq); }
+    let active_frontier = state.active_send_frontier;
     state.account_send(sent);
+    if kind == PendingSendKind::Reachability { state.active_send_frontier = active_frontier; }
+    state.recovery.sent(seq, len as u64, sent, kind == PendingSendKind::Data, kind == PendingSendKind::Reachability);
+    if kind == PendingSendKind::Reachability { state.recovery.scheduled_small_sent(sent); }
     state.packet_since_last_print += 1;
     if kind == PendingSendKind::MtuProbe {
         state.tu_probe_sequence_number = seq;
@@ -7163,9 +7314,11 @@ fn commit_connected_send(state: &mut ConnectionStateConnected, buf: &mut SendQue
         buf.fec_on_data_committed(seq, sent);
         if let Some(a) = &mut buf.fec_adaptive { a.on_data_sent(seq); }
     }
-    if kind == PendingSendKind::Outage {
+    if kind == PendingSendKind::Outage || (kind == PendingSendKind::Reachability && state.outage.since_ns.is_some()) {
         state.outage.probes[(seq % 8) as usize] = (seq, sent);
-        state.outage.probe_sent(sent);
+        // Generic small proofs can resume outage, but must not postpone the
+        // independently backed-off current-TU outage probe schedule.
+        if kind == PendingSendKind::Outage { state.outage.probe_sent(sent); }
     }
     if matches!(kind, PendingSendKind::Data | PendingSendKind::Outage) {
         if let Some(t) = trace { t.sent(prefix, seq, sent, plaintext); }
@@ -7176,7 +7329,9 @@ fn commit_connected_send(state: &mut ConnectionStateConnected, buf: &mut SendQue
     state.stats.bytes_sent += len as u64;
     // The accepted datagram used the old effective TU. Promote before framing
     // any later current-TU datagram, never by changing/resealing its ciphertext.
-    if let Some(tu) = state.deferred_tu.take() { state.current_tu = tu; }
+    if !buf.target_copy_pending() || state.deferred_tu.is_some_and(|tu| tu >= state.current_tu) {
+        if let Some(tu) = state.deferred_tu.take() { state.current_tu = tu; }
+    }
     state.max_in_flight_since_last_print = state.max_in_flight_since_last_print.max(state.packets_in_flight);
 }
 
@@ -9955,6 +10110,7 @@ mod congestion_tests {
         // A receive-only peer must use the same non-readiness-interruptible
         // retry as the sender, including all repeated receipt-window feedback.
         state.ack_receiver.receive(0, resume, false, &mut state.ack_timer);
+        state.active_ack_feedback = true;
         assert!(needs_active_retry(&state, false));
         for tick in 1..=3 {
             let now = resume + tick * 10_000_000;
@@ -11969,7 +12125,10 @@ mod uniform_udp_capture_tests {
         assert!(sent_packets==actual_packets,"native-send recording and actual UDP capture disagree");
         assert!(histogram.contains_key(&("data",1204)));
         assert!(histogram.iter().any(|((kind,size),_)| *kind=="data" && *size>1204));
-        for kind in ["ack","mtu_probe","keepalive","outage"] { assert!(histogram.keys().any(|&(k,_)| k==kind),"missing {kind} coverage"); }
+        // Generic reachability supplies idle liveness, so the five-second
+        // current-TU keepalive need not fire while these probes are accepted.
+        for kind in ["ack","mtu_probe","reachability","outage"] { assert!(histogram.keys().any(|&(k,_)| k==kind),"missing {kind} coverage"); }
+        assert!(histogram.iter().filter(|((k,_),_)| *k=="reachability").all(|((_,size),_)| *size==512));
         assert!(histogram.iter().filter(|((k,_),_)| *k=="ack").all(|((_,size),_)| *size==182));
         println!("UDP_SIZE_HISTOGRAM kind,udp_payload_bytes,count");
         for ((kind,size),count) in histogram { println!("UDP_SIZE_HISTOGRAM {kind},{size},{count}"); }
@@ -12288,7 +12447,7 @@ mod lazy_fec_segment_tests {
     #[test]
     fn default_peer_budget_fits_maximum_message_and_decoder_margin() {
         let process = Arc::new(crate::receive_memory::ReceiveMemoryBudget::default());
-        for (queues, expected) in [(1, 1_750_523_632), (2, 3_363_266_544)] {
+        for (queues, expected) in [(1, 1_763_730_160), (2, 3_376_473_072)] {
             let cap = receive_connection_memory_limit(MAX_JUMBOGRAM_LEN, queues).unwrap();
             assert_eq!(cap, expected);
             assert!(cap + RECEIVE_CONNECTION_BYTES <= process.limit());
@@ -12300,8 +12459,8 @@ mod lazy_fec_segment_tests {
         }
         assert!(receive_connection_memory_limit(MAX_JUMBOGRAM_LEN, 3).unwrap() > process.limit());
         assert_eq!(receive_connection_memory_limit(usize::MAX, 1), receive_connection_memory_limit(MAX_JUMBOGRAM_LEN, 1));
-        for (size, queues, expected) in [(65536, 1, 1_755_968), (65536, 2, 3_184_256),
-            (15_000_000, 1, 129_348_496), (15_000_000, 2, 153_946_416)] {
+        for (size, queues, expected) in [(65536, 1, 1_779_008), (65536, 2, 3_230_336),
+            (15_000_000, 1, 142_555_024), (15_000_000, 2, 167_152_944)] {
             assert_eq!(receive_connection_memory_limit(size, queues), Some(expected));
         }
         assert_eq!(receive_worker_limit(65536, 2), 0);
@@ -12364,14 +12523,14 @@ mod lazy_fec_segment_tests {
             assert_eq!(budget.used(), 0);
             assert!(root.segment_parts.is_none());
         }
-        assert_eq!(FEC_MIN_BLOCK_BYTES, 1136);
-        assert_eq!(FEC_MAX_SOURCE_BLOCKS, 1847);
+        assert_eq!(FEC_MIN_BLOCK_BYTES, 445);
+        assert_eq!(FEC_MAX_SOURCE_BLOCKS, 4713);
         assert!(wire_fec_layout(FEC_SEGMENT_BYTES + 1, FEC_MIN_BLOCK_BYTES).is_none());
         assert!(wire_fec_layout(FEC_SEGMENT_BYTES, FEC_MIN_BLOCK_BYTES).is_some());
         // Both supported cipher modes, both header sizes and the smallest coded
         // message respect the protocol floor even at the guaranteed minimum TU.
         for magic in [CONNECT_MAGIC1_PLAIN_TEXT, CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s] {
-            let payload = ASSUMED_UDP_PAYLOAD_SIZE_WITH_GUARANTEED_DELIVERY
+            let payload = 512
                 - total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(magic).unwrap();
             let mut sender = SendQueues::baseline_for_test(1, (1_000_000, 1 << 20, 1 << 20));
             sender.fec_adaptive = Some(crate::fec_adapt::FecAdaptiveState::baseline_for_test(crate::ship::FEC, 0));
@@ -13749,6 +13908,15 @@ mod wire_v2_tests {
     #[test]
     fn declared_version_layout_and_limits_are_checked() {
         let p = transport_parameters(65536); assert_eq!(validate_transport_parameters(&p), Some(65536));
+        assert_eq!(load_u16(&p[..2]), 3);
+        assert_eq!(load_u16(&p[12..14]), 445);
+        let mut legacy = p;
+        store_u16(&mut legacy[..2], 2);
+        store_u16(&mut legacy[12..14], 1136);
+        assert!(validate_transport_parameters(&legacy).is_none());
+        let mut hello = build_magic2_client_block_for_limit(65536);
+        hello[MAGIC2_LIST_SIZE..].copy_from_slice(&legacy);
+        assert!(negotiate_magic2(&hello).is_none());
         for i in [0,2,4,8,12,14,16,24,28] {
             let mut bad = p; bad[i] ^= 1;
             assert!(validate_transport_parameters(&bad).is_none(), "field at {i}");
@@ -17484,7 +17652,7 @@ mod systematic_rx_tests {
     #[test]
     fn systematic_rx_130_partial_k2_do_not_lock_out_id131() {
         let cap = receive_connection_memory_limit(20_000_000, 1).unwrap();
-        assert_eq!(cap, 136_979_696);
+        assert_eq!(cap, 150_186_224);
         let process = crate::receive_memory::ReceiveMemoryBudget::new(cap);
         let budget = crate::receive_memory::ReceiveMemoryBudget::connection_with_limit(&process, cap);
         let workers = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -18080,3 +18248,7 @@ mod ring_active_retry_regression {
         assert_eq!(pump.next_wakeup(), Some(until), "native admission must not replace the retained quantum with protocol work");
     }
 }
+
+#[cfg(test)]
+#[path = "mtu_recovery_tests.rs"]
+mod mtu_recovery_tests;

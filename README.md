@@ -39,10 +39,12 @@ platform branches exist but are not release-tested here.
 Version **0.3.0** replaces the 0.2 application API with a caller-driven pump and
 three SPSC rings. This is a breaking API release. The library does not start
 network or FEC threads. Move the pump to an application-owned thread if desired.
-The package version and the wire-profile version are separate: this release uses
-the version-2 profile, including the duplication flags specified in `PROTOCOL.md`.
-Do not assume interoperability with older implementations merely because they
-also call their wire profile version 2.
+The package version and wire-profile version are separate. Current main uses
+**wire profile 3**, incompatible with the published 0.3.0 version-2 profile.
+Both peers must be updated together: mismatched declarations are rejected during
+handshake. Profile 3 retains the bitmap ACK and duplication framing, but lowers
+the declared minimum FEC symbol to 445 bytes for 512-byte MTU recovery. This is
+not a new package release.
 
 ## Application API
 
@@ -113,7 +115,14 @@ implemented on the same public rings; it is not another library API.
 - Peer discovery, authorization and deciding which public keys to trust belong
   to the application. The supported authenticated profiles use Noise IK and
   require the responder's static public key. Developer plaintext is not secure.
-- IPv4/IPv6 UDP paths must support the profile's 1204-byte minimum UDP payload.
+- Directional UDP transmission units start at 1204 bytes. Default-on recovery
+  sends a generic 512-byte best-effort padding probe every 250 ms, independent
+  of application message sizes. Fresh positive small-packet proof plus stalled
+  larger data can lower the TU to 512, with a ten-second upward hold. Recovery
+  is conservative, can fall back on an older unconfirmed send during idle, and
+  does not promise delivery or support paths below 512 bytes. It adds a bounded
+  96 KiB packet-history allocation per connected peer on Linux x64. See
+  `PROTOCOL.md` for proof, retry and FEC identity rules.
 - Receive resources are bounded. Incoming data may be dropped under local
   memory or ring pressure, even when its network packet was acknowledged.
 - Cryptographic authentication is not a claim of a security audit, anonymity,
