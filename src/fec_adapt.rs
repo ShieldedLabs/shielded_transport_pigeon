@@ -66,32 +66,23 @@ static RESEARCH_TARGET_VALIDATION: std::sync::OnceLock<u32> = std::sync::OnceLoc
 #[doc(hidden)]
 pub fn research_p4_target_validation() -> u32 { RESEARCH_TARGET_VALIDATION.get().copied().unwrap_or(0) }
 fn parse_target_validation(value:Option<&str>) -> Result<u32,String> {
-    let v=match value {Some("0")=>0,Some("1")=>1,Some("2")=>2,None if !true=>0,
-        _=>return Err("STP_P4_TARGET_VALIDATION must be explicitly 0, 1 or 2".into())};
-    if v!=0 && !true {return Err("target validation requires feature research_target_validation".into());} Ok(v)
+    match value {Some("0")=>Ok(0),Some("1")=>Ok(1),Some("2")=>Ok(2),
+        _=>Err("STP_P4_TARGET_VALIDATION must be explicitly 0, 1 or 2".into())}
 }
 static RESEARCH_COST_SMOOTH: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
 /// Research-only policy selector; zero preserves empirical calibration exactly.
 #[doc(hidden)]
 pub fn research_p4_cost_smooth() -> u32 { RESEARCH_COST_SMOOTH.get().copied().unwrap_or(0) }
 fn parse_cost_smooth(value: Option<&str>) -> Result<u32, String> {
-    let v = match value.unwrap_or("0") { "0" => 0, "1" => 1,
-        _ => return Err("STP_P4_COST_SMOOTH must be 0 or 1".into()) };
-    if v == 1 && !true {
-        return Err("STP_P4_COST_SMOOTH=1 requires feature research_cost_smooth".into());
-    }
-    Ok(v)
+    match value.unwrap_or("0") { "0" => Ok(0), "1" => Ok(1), _ => Err("STP_P4_COST_SMOOTH must be 0 or 1".into()) }
 }
 static RESEARCH_REPAIR_CAP_PERCENT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
 /// Frozen process-start research ceiling; no environment reads in transport planning.
 #[doc(hidden)]
 pub fn research_p4_repair_cap_percent() -> u32 { RESEARCH_REPAIR_CAP_PERCENT.get().copied().unwrap_or(15) }
 pub(crate) fn parse_repair_cap_percent(value: Option<&str>, policy: RepairPolicy, width: usize, slipstream: bool, bonus: u32, event: u32, base: u32, budget: u32) -> Result<u32, String> {
-    let cap = match value.unwrap_or("15") { "15" => 15, "25" => 25, "0" if true => 0,
+    let cap = match value.unwrap_or("15") { "15" => 15, "25" => 25, "0" => 0,
         _ => return Err("STP_P4_REPAIR_CAP_PERCENT must be 15 or 25".to_string()) };
-    if cap != 15 && !true {
-        return Err("STP_P4_REPAIR_CAP_PERCENT=25 requires feature research_budget25".to_string());
-    }
     if cap != 15 && (policy != RepairPolicy::MessageBound || width != 1 || slipstream || bonus != 0 || event != 0 || base != 0 || budget != 1) {
         return Err("STP_P4_REPAIR_CAP_PERCENT=25 requires P4, STP_P4_INTERLEAVE_WIDTH=1, STP_P4_SLIPSTREAM=0, STP_P4_MEDIUM_BONUS_PERCENT=0, STP_P4_EVENT_REPAIR=0, STP_P4_BASE_PARITY_MODEL=0, STP_P4_BUDGET_BASE=1".to_string());
     }
@@ -104,11 +95,8 @@ pub fn research_p4_empirical_tail_calibration() -> u32 { RESEARCH_EMPIRICAL_TAIL
 pub(crate) fn parse_empirical_tail(value: Option<&str>, policy: RepairPolicy, width: usize, slipstream: bool, bonus: u32, event: u32, base: u32, budget: u32, cap: u32) -> Result<u32, String> {
     let q = match value.unwrap_or("0") { "0" => 0, "1" => 1,
         _ => return Err("STP_P4_EMPIRICAL_TAIL_CALIBRATION must be 0 or 1".into()) };
-    if q != 0 && !true {
-        return Err("STP_P4_EMPIRICAL_TAIL_CALIBRATION=1 requires feature research_empirical_calibration".into());
-    }
     // Compiling this experiment requires the same isolated policy for BOTH arms, even env=0.
-    if true && (policy != RepairPolicy::MessageBound || width != 1 || slipstream || bonus != 0 || event != 0 || base != 0 || budget != 1 || (cap != 25 && !(true && cap == 0))) {
+    if policy != RepairPolicy::MessageBound || width != 1 || slipstream || bonus != 0 || event != 0 || base != 0 || budget != 1 || (cap != 25 && cap != 0) {
         return Err("empirical calibration requires P4/W1/SS0/bonus0/event0/model0/budget_base1/cap25".into());
     }
     Ok(q)
@@ -161,72 +149,41 @@ impl RepairPolicy {
     }
     pub fn feedback(self) -> bool { self != Self::MeanOpen }
 }
+/// One process-start variable: absent parses as `None`; a non-Unicode value reports `invalid`.
+fn policy_choice<T>(name: &str, invalid: &str, parse: impl FnOnce(Option<&str>) -> Result<T, String>) -> Result<T, String> {
+    match crate::ship::policy_var(name) {
+        Ok(value) => parse(Some(&value)),
+        Err(std::env::VarError::NotPresent) => parse(None),
+        Err(_) => Err(invalid.to_string()),
+    }
+}
 /// Benchmark process-start hook; normal library applications retain the shipped policy.
 /// With no override, both this hook and normal library construction select P4.
 #[doc(hidden)]
 pub fn initialize_research_policy() -> Result<(), String> {
     if RESEARCH_POLICY.get().is_some() { return Ok(()); }
-    let value = match crate::ship::policy_var("STP_RACE_POLICY") {
-        Ok(value) => Some(value),
-        Err(std::env::VarError::NotPresent) => None,
-        Err(_) => return Err("STP_RACE_POLICY must be valid Unicode".to_string()),
-    };
-    let policy = RepairPolicy::parse(value.as_deref())?;
-    let width = match crate::ship::policy_var("STP_P4_INTERLEAVE_WIDTH") {
-        Ok(value) => parse_interleave_width(Some(&value))?,
-        Err(std::env::VarError::NotPresent) => 1,
-        Err(_) => return Err("STP_P4_INTERLEAVE_WIDTH must be valid Unicode".to_string()),
-    };
-    let slipstream = match crate::ship::policy_var("STP_P4_SLIPSTREAM") {
-        Ok(v) if v == "1" => true,
-        Ok(v) if v == "0" => false,
-        Err(std::env::VarError::NotPresent) => false,
-        _ => return Err("STP_P4_SLIPSTREAM must be 0 or 1".to_string()),
-    };
+    let policy = policy_choice("STP_RACE_POLICY", "STP_RACE_POLICY must be valid Unicode", RepairPolicy::parse)?;
+    let width = policy_choice("STP_P4_INTERLEAVE_WIDTH", "STP_P4_INTERLEAVE_WIDTH must be valid Unicode", parse_interleave_width)?;
+    let slipstream = policy_choice("STP_P4_SLIPSTREAM", "STP_P4_SLIPSTREAM must be 0 or 1", |v| match v {
+        Some("1") => Ok(true), None | Some("0") => Ok(false), _ => Err("STP_P4_SLIPSTREAM must be 0 or 1".to_string()) })?;
     if slipstream && width != 1 { return Err("slipstream requires STP_P4_INTERLEAVE_WIDTH=1".to_string()); }
-    let bonus = match crate::ship::policy_var("STP_P4_MEDIUM_BONUS_PERCENT") {
-        Ok(v) => parse_medium_bonus(Some(&v), policy)?,
-        Err(std::env::VarError::NotPresent) => 0,
-        Err(_) => return Err("STP_P4_MEDIUM_BONUS_PERCENT must be an integer 0..=100".to_string()),
-    };
-    let event = match crate::ship::policy_var("STP_P4_EVENT_REPAIR") {
-        Ok(v) => parse_event_repair(Some(&v), policy, width, slipstream, bonus)?,
-        Err(std::env::VarError::NotPresent) => 0,
-        Err(_) => return Err("STP_P4_EVENT_REPAIR must be 0, 5 or 10".to_string()),
-    };
-    let base = match crate::ship::policy_var("STP_P4_BASE_PARITY_MODEL") {
-        Ok(v) => parse_base_parity_model(Some(&v), policy, width, slipstream, bonus, event)?,
-        Err(std::env::VarError::NotPresent) => 0,
-        Err(_) => return Err("STP_P4_BASE_PARITY_MODEL must be 0 or 1".to_string()),
-    };
-    let budget = match crate::ship::policy_var("STP_P4_BUDGET_BASE") {
-        Ok(v) => parse_budget_base(Some(&v), policy, width, slipstream, bonus, event, base)?,
-        Err(std::env::VarError::NotPresent) => 0,
-        Err(_) => return Err("STP_P4_BUDGET_BASE must be 0 or 1".to_string()),
-    };
-    let cost = match crate::ship::policy_var("STP_P4_COST_SMOOTH") {
-        Ok(v) => parse_cost_smooth(Some(&v))?,
-        Err(std::env::VarError::NotPresent) => parse_cost_smooth(None)?,
-        Err(_) => return Err("STP_P4_COST_SMOOTH must be 0 or 1".into()),
-    };
-    let cap = match crate::ship::policy_var("STP_P4_REPAIR_CAP_PERCENT") {
-        Ok(v) => parse_repair_cap_percent(Some(&v), policy, width, slipstream, bonus, event, base, budget)?,
-        Err(std::env::VarError::NotPresent) => 15,
-        Err(_) => return Err("STP_P4_REPAIR_CAP_PERCENT must be 15 or 25".to_string()),
-    };
-    let empirical = match crate::ship::policy_var("STP_P4_EMPIRICAL_TAIL_CALIBRATION") {
-        Ok(v) => parse_empirical_tail(Some(&v), policy, width, slipstream, bonus, event, base, budget, cap)?,
-        Err(std::env::VarError::NotPresent) => parse_empirical_tail(None, policy, width, slipstream, bonus, event, base, budget, cap)?,
-        Err(_) => return Err("STP_P4_EMPIRICAL_TAIL_CALIBRATION must be 0 or 1".into()),
-    };
+    let bonus = policy_choice("STP_P4_MEDIUM_BONUS_PERCENT", "STP_P4_MEDIUM_BONUS_PERCENT must be an integer 0..=100",
+        |v| parse_medium_bonus(v, policy))?;
+    let event = policy_choice("STP_P4_EVENT_REPAIR", "STP_P4_EVENT_REPAIR must be 0, 5 or 10",
+        |v| parse_event_repair(v, policy, width, slipstream, bonus))?;
+    let base = policy_choice("STP_P4_BASE_PARITY_MODEL", "STP_P4_BASE_PARITY_MODEL must be 0 or 1",
+        |v| parse_base_parity_model(v, policy, width, slipstream, bonus, event))?;
+    let budget = policy_choice("STP_P4_BUDGET_BASE", "STP_P4_BUDGET_BASE must be 0 or 1",
+        |v| parse_budget_base(v, policy, width, slipstream, bonus, event, base))?;
+    let cost = policy_choice("STP_P4_COST_SMOOTH", "STP_P4_COST_SMOOTH must be 0 or 1", parse_cost_smooth)?;
+    let cap = policy_choice("STP_P4_REPAIR_CAP_PERCENT", "STP_P4_REPAIR_CAP_PERCENT must be 15 or 25",
+        |v| parse_repair_cap_percent(v, policy, width, slipstream, bonus, event, base, budget))?;
+    let empirical = policy_choice("STP_P4_EMPIRICAL_TAIL_CALIBRATION", "STP_P4_EMPIRICAL_TAIL_CALIBRATION must be 0 or 1",
+        |v| parse_empirical_tail(v, policy, width, slipstream, bonus, event, base, budget, cap))?;
     if (cost == 1 && (cap != 0 || empirical != 1)) || (cost == 0 && cap == 0) {
         return Err("cost smooth requires selector1/cap0/empirical1; cap0 is forbidden for selector0".into());
     }
-    let target=match crate::ship::policy_var("STP_P4_TARGET_VALIDATION") {
-        Ok(v)=>parse_target_validation(Some(&v))?,
-        Err(std::env::VarError::NotPresent)=>parse_target_validation(None)?,
-        Err(_)=>return Err("STP_P4_TARGET_VALIDATION must be explicitly 0, 1 or 2".into()),
-    };
+    let target = policy_choice("STP_P4_TARGET_VALIDATION", "STP_P4_TARGET_VALIDATION must be explicitly 0, 1 or 2", parse_target_validation)?;
 
     crate::target_validation::initialize(target,crate::ship::policy_var("STP_COHORT_PROFILE").ok().as_deref(),cost,cap,empirical)?;
     let _=RESEARCH_TARGET_VALIDATION.set(target);
@@ -558,16 +515,13 @@ impl SpanLossProfile {
     /// 65536, union bound the subspans conservatively; those long messages should use FEC groups.
     pub fn tail_losses(&self, n: u64, eps: f64) -> Option<u64> {
         let latest = self.epochs.iter().copied().filter(|x| *x != u64::MAX).max()?;
-        self.tail_losses_latest(n, eps, latest)
+        self.tail_losses_latest_details(n, eps, latest).0
     }
     /// p4-burst-base: the same quantile, but histograms expire relative to NOW, not to the newest
     /// observation epoch (a quiet period does not keep an old burst history alive).
     pub fn tail_losses_now(&self, n: u64, eps: f64, now_ns: u64, window_ns: u64) -> Option<u64> {
-        let now_epoch = now_ns / (window_ns / 2).max(1);
-        let latest = self.epochs.iter().copied().filter(|x| *x != u64::MAX).max()?.max(now_epoch);
-        self.tail_losses_latest(n, eps, latest)
+        self.tail_losses_now_details(n, eps, now_ns, window_ns).0
     }
-    fn tail_losses_latest(&self,n:u64,eps:f64,latest:u64)->Option<u64> { self.tail_losses_latest_details(n,eps,latest).0 }
     fn tail_losses_now_details(&self,n:u64,eps:f64,now_ns:u64,window_ns:u64)->(Option<u64>,u16,u64) {
         let Some(latest)=self.epochs.iter().copied().filter(|x|*x!=u64::MAX).max() else {return(None,0,0);};
         self.tail_losses_latest_details(n,eps,latest.max(now_ns/(window_ns/2).max(1)))
@@ -600,13 +554,7 @@ impl SpanLossProfile {
         cfg.eps.min(p * (64.0 / k.max(1) as f64).min(1.0).sqrt()).clamp(1e-9, 0.5)
     }
     fn repair_blocks(&self, k: u64, cfg: &AdaptiveFecConfig, _z: f64) -> u64 {
-        self.margin_blocks(k, k, cfg)
-    }
-    fn margin_blocks(&self, k: u64, whole_message_k: u64, cfg: &AdaptiveFecConfig) -> u64 {
-        self.margin_blocks_for_groups(k, whole_message_k, 1, cfg)
-    }
-    fn margin_blocks_for_groups(&self, k: u64, whole_message_k: u64, groups: usize, cfg: &AdaptiveFecConfig) -> u64 {
-        self.margin_blocks_for_groups_with_floor(k, whole_message_k, groups, cfg, true)
+        self.margin_blocks_for_groups_with_floor(k, k, 1, cfg, true)
     }
     fn margin_blocks_for_groups_with_floor(&self, k: u64, whole_message_k: u64, groups: usize, cfg: &AdaptiveFecConfig, burst_tail: bool) -> u64 {
         let cap = ((k as f64 * cfg.max_redundancy).ceil() as u64).max(1);
@@ -761,17 +709,11 @@ impl FecAdaptiveState {
     #[cfg(test)]
     pub(crate) fn set_empirical_for_test(&mut self,on:bool) {self.empirical_tail=on;}
     pub fn repair_cap_percent(&self) -> u32 { self.repair_cap_percent }
-    pub(crate) fn target_selector(&self)->u32 {
-        {self.target_validation}
-
-    }
+    pub(crate) fn target_selector(&self)->u32 { self.target_validation }
     #[cfg(test)]
     pub(crate) fn set_target_for_test(&mut self,selector:u32) { self.set_cost_smooth_for_test();self.target_validation=selector; }
 
-    pub(crate) fn cost_smooth_active(&self) -> bool {
-        { self.cost_smooth && self.budget_base_active() }
-
-    }
+    pub(crate) fn cost_smooth_active(&self) -> bool { self.cost_smooth && self.budget_base_active() }
     #[cfg(test)]
     pub(crate) fn set_cost_smooth_for_test(&mut self) { self.cost_smooth=true; self.budget_base=true; self.repair_cap_percent=0; }
 
@@ -789,9 +731,7 @@ impl FecAdaptiveState {
             _ => (self.span.unresolved_data_packets().max(own).saturating_add(1), true),
         }
     }
-    fn empirical_tail_active(&self)->bool {
-        {self.empirical_tail}
-    }
+    fn empirical_tail_active(&self)->bool { self.empirical_tail }
     pub fn budget_tail_repairs(&self,kg:u64,start:u64,d:u64,rs:u64,ug:u64,eps:f64,uc:u64)->(u64,bool) {
         self.budget_tail_impl(kg,start,d,rs,ug,if self.empirical_tail_active() {eps*10.0}else{eps},eps,uc,
             None)
@@ -935,13 +875,7 @@ impl FecAdaptiveState {
     pub fn base_horizon(&self) -> Option<u64> { self.base_horizon }
     /// Q(n, eps): loss COUNT not exceeded with probability 1-eps among n DATA packets: the larger of the
     /// NOW-expired empirical contiguous-span tail and the IID prior count quantile, clamped to 0..=n.
-    pub fn base_count_quantile(&self, n: u64, eps: f64) -> u64 {
-        if n == 0 { return 0; }
-        let c = &self.tracker.cfg;
-        let prior = if self.span.seen < 4096 { c.initial_loss } else { c.min_loss };
-        let empirical = self.span.tail_losses_now(n, eps, self.base_now_ns, c.window_ns).unwrap_or(0);
-        empirical.max(iid_count_quantile(n, prior, eps)).min(n)
-    }
+    pub fn base_count_quantile(&self, n: u64, eps: f64) -> u64 { self.budget_count_details(n, eps, eps).0 }
     /// Immutable initial base b for a codec of kg sources: least fixed point of
     /// b = min(kg, max(b, 2 + Q(h + b))) from min(2, kg), h = min(kg, H) (h = kg while H is unknown).
     /// Returns (b, cap_bound): cap_bound = the uncapped requirement exceeded kg (target infeasible),
@@ -961,23 +895,23 @@ impl FecAdaptiveState {
     /// start of R = min(kg, max(R, d + 2 + min(ug + E, Q(uc + E)))), E = R - rs (planned unsent repairs),
     /// d = own finalized losses (coefficient 1), ug = own unresolved symbols, uc = connection-wide
     /// unresolved DATA (all queues/segments, not divided). Nondecreasing; budget exhaustion => kg.
+    /// Same fixed point as the budget path with equal empirical/IID eps and no diagnostic capture.
     pub fn base_tail_repairs(&self, kg: u64, start: u64, d: u64, rs: u64, ug: u64, eps: f64) -> (u64, bool) {
-        let uc = self.span.unresolved_data_packets();
-        let mut r = start.min(kg);
-        for _ in 0..BASE_ITER_LIMIT {
-            let e = r.saturating_sub(rs);
-            let future = ug.saturating_add(e).min(self.base_count_quantile(uc.saturating_add(e), eps));
-            let want = r.max(d.saturating_add(2).saturating_add(future));
-            let next = want.min(kg);
-            if next == r { return (r, want > kg); }
-            r = next;
-        }
-        (kg, true)
+        self.budget_tail_impl(kg, start, d, rs, ug, eps, eps, self.span.unresolved_data_packets(), None)
     }
     /// Redundancy (ppm) of a ~1000-block message, for the send queue's byte capacity.
     pub fn representative_ppm(&self) -> u32 {
         (self.repair_blocks(1000) * 1000).clamp(1, 1_000_000) as u32
     }
+}
+
+/// Re-runs this test binary on one exact child test with every inherited STP_* variable removed.
+#[cfg(all(test, feature = "research_target_validation"))]
+fn probe_command(test: &str) -> std::process::Command {
+    let mut c = std::process::Command::new(std::env::current_exe().unwrap());
+    c.args(["--exact", test, "--nocapture", "--test-threads=1"]);
+    for (k, _) in std::env::vars_os() { if k.to_string_lossy().starts_with("STP_") { c.env_remove(k); } }
+    c
 }
 
 #[cfg(test)]
@@ -1608,9 +1542,7 @@ mod burst_base_tests {
     #[test]
     fn env_subprocess_default_valid_bad_and_incompatible() {
         let probe = |vars: &[(&str, &str)]| -> String {
-            let mut c = std::process::Command::new(std::env::current_exe().unwrap());
-            c.args(["--exact", "fec_adapt::burst_base_tests::env_probe_child", "--nocapture", "--test-threads=1"]);
-            for (k, _) in std::env::vars() { if k.starts_with("STP_") { c.env_remove(k); } }
+            let mut c = probe_command("fec_adapt::burst_base_tests::env_probe_child");
             c.env("STP_BASE_PROBE", "1");
             for (k, v) in vars { c.env(k, v); }
             let out = String::from_utf8(c.output().unwrap().stdout).unwrap();
@@ -1639,9 +1571,7 @@ mod burst_base_tests {
         assert_eq!(probe(&[("STP_P4_EVENT_REPAIR", "7"), ("STP_P4_BASE_PARITY_MODEL", "9")]), "Err(\"STP_P4_EVENT_REPAIR must be 0, 5 or 10\")|0");
         #[cfg(unix)] {
             use std::os::unix::ffi::OsStrExt;
-            let mut c = std::process::Command::new(std::env::current_exe().unwrap());
-            c.args(["--exact", "fec_adapt::burst_base_tests::env_probe_child", "--nocapture", "--test-threads=1"]);
-            for (k, _) in std::env::vars() { if k.starts_with("STP_") { c.env_remove(k); } }
+            let mut c = probe_command("fec_adapt::burst_base_tests::env_probe_child");
             c.env("STP_BASE_PROBE", "1").env("STP_P4_BASE_PARITY_MODEL", std::ffi::OsStr::from_bytes(b"\xff"));
             let out = String::from_utf8_lossy(&c.output().unwrap().stdout).to_string();
             assert!(out.contains(&format!("PROBE<{bad}>")), "{out}");
@@ -1722,9 +1652,7 @@ mod budget_base_tests {
     #[test]
     fn budget_base_env_subprocess() {
         let probe = |vars: &[(&str, &str)]| {
-            let mut c = std::process::Command::new(std::env::current_exe().unwrap());
-            c.args(["--exact", "fec_adapt::budget_base_tests::budget_base_env_child", "--nocapture"]);
-            for (k, _) in std::env::vars() { if k.starts_with("STP_") { c.env_remove(k); } }
+            let mut c = probe_command("fec_adapt::budget_base_tests::budget_base_env_child");
             c.env("STP_BUDGET_PROBE", "1");
             for (k,v) in vars { c.env(k,v); }
             let out = c.output().unwrap(); assert!(out.status.success());
@@ -1737,9 +1665,7 @@ mod budget_base_tests {
         assert!(probe(&[("STP_P4_BASE_PARITY_MODEL","9"),("STP_P4_BUDGET_BASE","9")]).contains("STP_P4_BASE_PARITY_MODEL must be 0 or 1"));
         #[cfg(unix)] {
             use std::os::unix::ffi::OsStrExt;
-            let mut c = std::process::Command::new(std::env::current_exe().unwrap());
-            c.args(["--exact", "fec_adapt::budget_base_tests::budget_base_env_child", "--nocapture"]);
-            for (k,_) in std::env::vars() { if k.starts_with("STP_") { c.env_remove(k); } }
+            let mut c = probe_command("fec_adapt::budget_base_tests::budget_base_env_child");
             c.env("STP_BUDGET_PROBE","1").env("STP_P4_BUDGET_BASE", std::ffi::OsStr::from_bytes(b"\xff"));
             assert!(String::from_utf8_lossy(&c.output().unwrap().stdout).contains("STP_P4_BUDGET_BASE must be 0 or 1"));
         }
@@ -1772,9 +1698,7 @@ mod budget25_tests {
     #[test]
     fn budget25_env_subprocess_feature_gate_and_exact_values() {
         let probe=|vars:&[(&str,&str)]| {
-            let mut c=std::process::Command::new(std::env::current_exe().unwrap());
-            c.args(["--exact","fec_adapt::budget25_tests::budget25_env_child","--nocapture"]);
-            for (k,_) in std::env::vars_os() { if k.to_string_lossy().starts_with("STP_") {c.env_remove(k);} }
+            let mut c = probe_command("fec_adapt::budget25_tests::budget25_env_child");
             c.env("STP_BUDGET25_PROBE","1");for (k,v) in vars {c.env(k,v);}
             let out=c.output().unwrap();assert!(out.status.success());String::from_utf8(out.stdout).unwrap()
         };
@@ -1784,8 +1708,8 @@ mod budget25_tests {
             assert!(probe(&[("STP_P4_REPAIR_CAP_PERCENT",v)]).contains("STP_P4_REPAIR_CAP_PERCENT must be 15 or 25"));
         }
         let selected=probe(&[("STP_P4_BUDGET_BASE","1"),("STP_P4_REPAIR_CAP_PERCENT","25")]);
-        assert!(selected.contains(if true {"CAP<Ok(())|25>"} else {"requires feature research_budget25"}));
-        assert!(probe(&[("STP_P4_REPAIR_CAP_PERCENT","25")]).contains(if true {"STP_P4_BUDGET_BASE=1"} else {"requires feature research_budget25"}));
+        assert!(selected.contains("CAP<Ok(())|25>"));
+        assert!(probe(&[("STP_P4_REPAIR_CAP_PERCENT","25")]).contains("STP_P4_BUDGET_BASE=1"));
         let p=RepairPolicy::MessageBound;
         for (p,w,ss,b,e,base,budget) in [(RepairPolicy::Streaming,1,false,0,0,0,1),(p,2,false,0,0,0,1),(p,1,true,0,0,0,1),(p,1,false,1,0,0,1),(p,1,false,0,5,0,1),(p,1,false,0,0,1,1),(p,1,false,0,0,0,0)] {
             assert!(parse_repair_cap_percent(Some("25"),p,w,ss,b,e,base,budget).is_err());
@@ -1793,9 +1717,7 @@ mod budget25_tests {
         }
         #[cfg(unix)] {
             use std::os::unix::ffi::OsStrExt;
-            let mut c=std::process::Command::new(std::env::current_exe().unwrap());
-            c.args(["--exact","fec_adapt::budget25_tests::budget25_env_child","--nocapture"]);
-            for (k,_) in std::env::vars_os() {if k.to_string_lossy().starts_with("STP_"){c.env_remove(k);}}
+            let mut c = probe_command("fec_adapt::budget25_tests::budget25_env_child");
             c.env("STP_BUDGET25_PROBE","1").env("STP_P4_REPAIR_CAP_PERCENT",std::ffi::OsStr::from_bytes(b"\xff"));
             let out=c.output().unwrap();assert!(out.status.success());assert!(String::from_utf8_lossy(&out.stdout).contains("STP_P4_REPAIR_CAP_PERCENT must be 15 or 25"));
         }
@@ -1805,11 +1727,11 @@ mod budget25_tests {
         assert_eq!(parse(None,RepairPolicy::MessageBound,1,false,0,0,0,1,25).unwrap(),0);
         for bad in ["", "01", "2", "true", " 1", "-1"] { assert!(parse(Some(bad),RepairPolicy::MessageBound,1,false,0,0,0,1,25).is_err()); }
         assert_eq!(parse(Some("1"),RepairPolicy::MessageBound,1,false,0,0,0,1,25).is_ok(),true);
-        if true { for v in ["0","1"] {
+        for v in ["0","1"] {
             for tuple in [(RepairPolicy::Reliability,1,false,0,0,0,1,25),(RepairPolicy::MessageBound,2,false,0,0,0,1,25),(RepairPolicy::MessageBound,1,true,0,0,0,1,25),(RepairPolicy::MessageBound,1,false,1,0,0,1,25),(RepairPolicy::MessageBound,1,false,0,1,0,1,25),(RepairPolicy::MessageBound,1,false,0,0,1,1,25),(RepairPolicy::MessageBound,1,false,0,0,0,0,25),(RepairPolicy::MessageBound,1,false,0,0,0,1,15)] {
                 assert!(parse(Some(v),tuple.0,tuple.1,tuple.2,tuple.3,tuple.4,tuple.5,tuple.6,tuple.7).is_err());
             }
-        }}
+        }
     }
     #[test] fn empirical_budget_only_split_targets_and_original_q001() {
         let mut a=FecAdaptiveState::baseline_for_test(crate::ship::FEC,1_000_000_000);
@@ -1841,9 +1763,7 @@ mod empirical_capture_tests {
     #[ignore = "historical predecessor-feature configuration, not frozen RC defaults"]
     #[test] fn empirical_initialized_process_selectors_and_forbidden_policies() {
         let probe=|arm:Option<&str>,change:Option<(&str,&std::ffi::OsStr)>| {
-            let mut c=std::process::Command::new(std::env::current_exe().unwrap());
-            c.args(["--exact","fec_adapt::empirical_capture_tests::empirical_initialized_policy_child","--nocapture","--test-threads=1"]);
-            for(k,_)in std::env::vars_os(){if k.to_string_lossy().starts_with("STP_"){c.env_remove(k);}}
+            let mut c = probe_command("fec_adapt::empirical_capture_tests::empirical_initialized_policy_child");
             c.env("STP_EMPIRICAL_POLICY_PROBE","1").env("STP_P4_BUDGET_BASE","1").env("STP_P4_REPAIR_CAP_PERCENT","25");
             if let Some(a)=arm {c.env("STP_P4_EMPIRICAL_TAIL_CALIBRATION",a);}
             if let Some((k,v))=change {c.env(k,v);}
@@ -1994,10 +1914,7 @@ mod cost_smooth_tests {
     #[test]
     fn cost_smooth_process_selector_contract() {
         for (selector,cap,empirical,ok) in [("0","25","1",true),("1","0","1",true),("0","0","1",false),("1","25","1",false),("1","0","0",false),("2","0","1",false)] {
-            let mut c=std::process::Command::new(std::env::current_exe().unwrap());
-            c.args(["--exact","fec_adapt::cost_smooth_tests::cost_smooth_policy_child","--nocapture"]);
-            for(k,_)in std::env::vars_os(){if k.to_string_lossy().starts_with("STP_"){c.env_remove(k);}}
-
+            let mut c = probe_command("fec_adapt::cost_smooth_tests::cost_smooth_policy_child");
             c.env("STP_P4_TARGET_VALIDATION",if selector=="1" {"1"}else{"0"}).env("STP_COHORT_PROFILE","g4");
             c.env("STP_COST_PROBE","1").env("STP_P4_BUDGET_BASE","1").env("STP_P4_COST_SMOOTH",selector).env("STP_P4_REPAIR_CAP_PERCENT",cap).env("STP_P4_EMPIRICAL_TAIL_CALIBRATION",empirical);
             let out=c.output().unwrap();assert!(out.status.success());let text=String::from_utf8_lossy(&out.stdout);
@@ -2062,9 +1979,7 @@ mod target_validation_policy_tests {
     #[ignore = "historical predecessor-feature configuration, not frozen RC defaults"]
     #[test] fn target_validation_initialized_strict_matrix() {
         let probe=|tv:Option<&str>,cost:&str,cap:&str,emp:&str,profile:&str,change:Option<(&str,&str)>| {
-            let mut c=std::process::Command::new(std::env::current_exe().unwrap());
-            c.args(["--exact","fec_adapt::target_validation_policy_tests::target_validation_initialized_child","--nocapture"]);
-            for(k,_)in std::env::vars_os(){if k.to_string_lossy().starts_with("STP_"){c.env_remove(k);}}
+            let mut c = probe_command("fec_adapt::target_validation_policy_tests::target_validation_initialized_child");
             c.env("STP_TARGET_PROBE","1").env("STP_P4_BUDGET_BASE","1").env("STP_P4_COST_SMOOTH",cost).env("STP_P4_REPAIR_CAP_PERCENT",cap).env("STP_P4_EMPIRICAL_TAIL_CALIBRATION",emp).env("STP_COHORT_PROFILE",profile);
             if let Some(tv)=tv {c.env("STP_P4_TARGET_VALIDATION",tv);}if let Some((k,v))=change{c.env(k,v);}
             let out=c.output().unwrap();assert!(out.status.success());String::from_utf8_lossy(&out.stdout).contains("TARGET<Ok")

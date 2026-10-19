@@ -8,28 +8,21 @@ pub const LAYOUT_LIMIT: usize = 8192;
 pub const CONNECTION_LIMIT: usize = 8;
 pub const SCHEMA: &str = "stp-budget-diagnostic-evidence/1";
 pub const BUDGET25_SCHEMA: &str = "stp-budget25-evidence/1";
-#[cfg(all())]
 pub const EMPIRICAL_SCHEMA: &str = "stp-empirical-calibration-evidence/1";
-#[cfg(all())]
 pub const DEMAND_LIMIT: usize = 4096;
-#[cfg(all())]
 pub const DEMAND_ITERATION_LIMIT: usize = 64;
-#[cfg(all())]
 pub const ADAPTIVE_GENERATION_LIMIT:usize=64;
 /// Lazy provenance for adaptive states which reach a tail query, not an exhaustive reset census.
-#[cfg(all())]
 #[derive(Debug,Clone,Copy,Default)]
 pub struct AdaptiveGeneration {pub generation:u64,pub conn:u32,pub created_ns:u64,pub first_observed_ns:u64}
 /// 64 bytes. flags: 1 empirical present, 2 converged, 4 want exceeded K, 8 model iteration limit.
 /// scale is the sketch index (0..15), serialized as the dyadic span (2..65536).
-#[cfg(all())]
 #[derive(Debug,Clone,Copy,Default)]
 pub struct DemandIteration { pub r:u64,pub e:u64,pub n:u64,pub samples:u64,pub empirical:u64,pub iid:u64,pub selected:u64,pub next_r:u32,pub scale:u16,pub flags:u16 }
 /// Fixed-width header <=256 bytes. Counts are ASSEMBLED model inputs unless named committed/emitted.
 /// committed/emitted and original_k/limit belong to the immutable segment across TU layouts.
 /// flags: 1 anchor present, 2 invalid anchor, 4 want_exceeded_k, 8 model iteration limit,
 /// 16 incomplete capture, 32 source count unknown, 64 repair count unknown. reason: bit1 first post-source, bit2 changed demand, bit4 changed plan.
-#[cfg(all())]
 #[derive(Debug,Clone,Copy,Default)]
 pub struct DemandHeader {
     pub index:u64,pub query_batch:u64,pub owner_generation:u64,pub query_now_ns:u64,pub ns:u64,pub generation:u64,pub package:u64,pub root:u64,pub adaptive_generation:u64,
@@ -41,12 +34,9 @@ pub struct DemandHeader {
     pub rs:u32,pub start:u32,pub result_r:u32,pub requested:u32,pub plan_after:u32,pub segment_offset:u32,
     pub flags:u32,pub reason:u8,pub iterations_count:u8,
 }
-#[cfg(all())]
 #[derive(Debug,Clone,Copy)]
 pub struct Demand { pub header:DemandHeader,pub iterations:[DemandIteration;DEMAND_ITERATION_LIMIT] }
-#[cfg(all())]
 impl Default for Demand { fn default()->Self { Self{header:DemandHeader::default(),iterations:[DemandIteration::default();DEMAND_ITERATION_LIMIT]} } }
-#[cfg(all())]
 impl Demand {
     fn write(&self,w:&mut impl Write)->io::Result<()> {
         let h=&self.header;
@@ -83,19 +73,19 @@ pub struct Layout { pub conn: usize, pub generation: u64, pub package: u64, pub 
     pub planned: u32, pub assembled: u32, pub phase: Option<u8>, pub app_id: Option<u32>, pub ns: u64, pub event: u8 }
 #[derive(Debug)]
 pub struct Capture {
-    #[cfg(all())] pub demands: Vec<Demand>,
-    #[cfg(all())] pub demand_overflow: bool,
-    #[cfg(all())] pub adaptive_generations: [AdaptiveGeneration;ADAPTIVE_GENERATION_LIMIT],
-    #[cfg(all())] pub adaptive_generations_count:usize,
+    pub demands: Vec<Demand>,
+    pub demand_overflow: bool,
+    pub adaptive_generations: [AdaptiveGeneration;ADAPTIVE_GENERATION_LIMIT],
+    pub adaptive_generations_count:usize,
     pub connections: Vec<Connection>, pub tx: Vec<Symbol>, pub rx: Vec<Symbol>,
     pub feedback: Vec<Feedback>, pub layouts: Vec<Layout>, pub overflow: bool, pub unknown_identity: bool,
     pub start_ordinal: u64, pub end_ordinal: u64, pub drain_ns: u64 }
 impl Capture {
     fn new(ordinal: u64) -> Self { Self {
-        #[cfg(all())] demands: Vec::new(),
-        #[cfg(all())] demand_overflow: false,
-        #[cfg(all())] adaptive_generations:[AdaptiveGeneration::default();ADAPTIVE_GENERATION_LIMIT],
-        #[cfg(all())] adaptive_generations_count:0,
+        demands: Vec::new(),
+        demand_overflow: false,
+        adaptive_generations:[AdaptiveGeneration::default();ADAPTIVE_GENERATION_LIMIT],
+        adaptive_generations_count:0,
         connections: Vec::with_capacity(CONNECTION_LIMIT),
         tx: Vec::with_capacity(PACKET_LIMIT), rx: Vec::with_capacity(PACKET_LIMIT),
         feedback: Vec::with_capacity(FEEDBACK_LIMIT), layouts: Vec::with_capacity(LAYOUT_LIMIT),
@@ -105,7 +95,6 @@ impl Capture {
         self.write_capture(path, source_tree, diff, role, phase, None)
     }
     /// Application-thread serializer for the matched ceiling experiment; no runtime hot-hook I/O.
-    #[cfg(all())]
     pub fn write_new_budget25(&self, path: &std::path::Path, source_tree: &str, diagnostic_diff: &str, budget25_diff: &str, role: &str, phase: usize, cap_percent: u32) -> io::Result<()> {
         if ![15, 25].contains(&cap_percent) || cap_percent != crate::fec_adapt::research_p4_repair_cap_percent() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "cap_percent must match initialized policy (15 or 25)"));
@@ -115,7 +104,6 @@ impl Capture {
     fn write_capture(&self, path: &std::path::Path, source_tree: &str, diff: &str, role: &str, phase: usize, budget25: Option<(&str, u32)>) -> io::Result<()> {
         self.write_capture_inner(path,source_tree,diff,role,phase,budget25,None)
     }
-    #[cfg(all())]
     pub fn write_new_empirical_calibration(&self,path:&std::path::Path,source_tree:&str,diagnostic_diff:&str,budget25_diff:&str,empirical_diff:&str,role:&str,phase:usize,cap_percent:u32,empirical_tail_calibration:u32)->io::Result<()> {
         if cap_percent!=25 || cap_percent!=crate::fec_adapt::research_p4_repair_cap_percent() || empirical_tail_calibration>1 || empirical_tail_calibration!=crate::fec_adapt::research_p4_empirical_tail_calibration() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput,"empirical arm must match initialized cap25 policy"));
@@ -150,7 +138,6 @@ impl Capture {
             write!(w,"[{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}]",l.conn,l.generation,l.package,l.root,l.len,l.width,l.k,l.groups,opt(l.limit.map(u64::from)),opt((l.event!=4).then_some(l.planned as u64)),opt((l.event!=4).then_some(l.assembled as u64)),opt(l.phase.map(u64::from)),opt(l.app_id.map(u64::from)),l.ns,l.event)?;
         }
         write!(w,"]")?;
-        #[cfg(all())]
         if empirical.is_some() {
             write!(w,",\"demand_limit\":{DEMAND_LIMIT},\"demand_iteration_limit\":{DEMAND_ITERATION_LIMIT},\"demand_overflow\":{},\"demand_record_bytes_bound\":{},\"demand_scope\":\"owning_network_thread_including_warmup\",\"demands\":[",self.demand_overflow,std::mem::size_of::<Demand>())?;
             for(i,d)in self.demands.iter().enumerate(){if i>0{write!(w,",")?;}d.write(&mut w)?;}
@@ -165,11 +152,10 @@ impl Capture {
     }
 }
 struct State {
-    #[cfg(all())] demand_count: u64,
-    #[cfg(all())] latest_ns:u64,
+    demand_count: u64,
+    latest_ns:u64,
     cap: Capture, context: usize, ordinal: u64, generation: u64, proof: u8, rx_current: Option<usize> }
 thread_local! { static STATE: RefCell<Option<State>> = const { RefCell::new(None) }; }
-#[cfg(all())]
 thread_local! {
     // Survive an explicit enable(false)/enable(true): reopening diagnostics cannot renew the
     // owning-thread capture allowance. This single-network-thread research endpoint enables once.
@@ -178,16 +164,15 @@ thread_local! {
 }
 pub fn enable(on: bool) { STATE.with(|s| {
     let mut b=s.borrow_mut();
-    #[cfg(all())]
     if let Some(old)=b.as_ref() {
         DEMANDS_USED.with(|n|n.set(old.demand_count+old.cap.demands.len()as u64));
         DEMANDS_INVALID.with(|v|v.set(v.get()||old.cap.demand_overflow));
     }
     *b=on.then(|| State {
-        #[cfg(all())] demand_count:DEMANDS_USED.with(|n|n.get()),
-        #[cfg(all())] latest_ns:0,
+        demand_count:DEMANDS_USED.with(|n|n.get()),
+        latest_ns:0,
         cap: {let c=Capture::new(0);
-            #[cfg(all())] let c={let mut c=c;
+            let c={let mut c=c;
                 let used=DEMANDS_USED.with(|n|n.get());c.demands=Vec::with_capacity(DEMAND_LIMIT.saturating_sub(used as usize));
                 // Re-enable loses old layout/connection context. Do not certify that discontinuity.
                 c.demand_overflow=DEMANDS_INVALID.with(|v|v.get())||used>0;c};c},
@@ -201,9 +186,7 @@ fn push<T>(v: &mut Vec<T>, x: T, limit: usize, overflow: &mut bool) -> Option<us
 }
 /// First/changed refreshes only. Temporary records are discarded when the aggregate request/plan
 /// did not change. Record bound is per owning network thread/TLS, not reset by take(), and includes warmup.
-#[cfg(all())]
 pub(crate) fn demand_checkpoint()->usize { STATE.with(|s|s.borrow().as_ref().map_or(0,|s|s.cap.demands.len())) }
-#[cfg(all())]
 pub(crate) fn demand_push(mut d:Demand) { with(|s| {
     d.header.conn=s.context as u32;
     d.header.ns=d.header.ns.max(s.latest_ns);
@@ -215,7 +198,6 @@ pub(crate) fn demand_push(mut d:Demand) { with(|s| {
     if d.header.flags&16!=0 {s.cap.demand_overflow=true;}
     s.cap.demands.push(d);
 }); }
-#[cfg(all())]
 pub(crate) fn demand_finish(checkpoint:usize,reason:u8,requested:u32,plan_after:u32,owner_generation:u64,original_k:u32,limit:u32,reserved:u32,emitted:u64,sources_committed:u64,source_counter_overflow:bool) { with(|s| {
     if reason==0 {s.cap.demands.truncate(checkpoint);return;}
     for d in &mut s.cap.demands[checkpoint..] {
@@ -242,15 +224,15 @@ pub fn context(handshake: [u8;64], local: &[u8], peer: &[u8]) { with(|s| {
 }); }
 /// Called by exactly the existing native-attempt classifier, without re-consuming its token.
 pub fn commit_proof(kind: usize, proof: u8) { if kind == 1 { with(|s| s.proof = proof); } }
-pub fn feedback(seq: u64, ns: u64, kind: u8) { with(|s| { #[cfg(all())] {s.latest_ns=s.latest_ns.max(ns);} push(&mut s.cap.feedback, Feedback { conn:s.context,seq,ns,kind }, FEEDBACK_LIMIT,&mut s.cap.overflow); }); }
+pub fn feedback(seq: u64, ns: u64, kind: u8) { with(|s| { {s.latest_ns=s.latest_ns.max(ns);} push(&mut s.cap.feedback, Feedback { conn:s.context,seq,ns,kind }, FEEDBACK_LIMIT,&mut s.cap.overflow); }); }
 pub fn layout_start(mut l: Layout) -> Layout { with(|s| {
     s.generation = s.generation.checked_add(1).unwrap_or_else(|| { s.cap.overflow = true; u64::MAX });
     l.conn = s.context; l.generation = s.generation;
-    #[cfg(all())] {s.latest_ns=s.latest_ns.max(l.ns);}
+    {s.latest_ns=s.latest_ns.max(l.ns);}
     push(&mut s.cap.layouts,l,LAYOUT_LIMIT,&mut s.cap.overflow);
 }); l }
 pub fn layout_event(mut l: Layout, planned: u32, assembled: u32, ns: u64, event: u8) { with(|s| {
-    #[cfg(all())] {s.latest_ns=s.latest_ns.max(ns);}
+    {s.latest_ns=s.latest_ns.max(ns);}
     l.conn=s.context; l.planned=planned; l.assembled=assembled; l.ns=ns; l.event=event;
     push(&mut s.cap.layouts,l,LAYOUT_LIMIT,&mut s.cap.overflow);
 }); }
@@ -261,7 +243,7 @@ fn symbol(frame: &crate::stp::WireFrame<'_>, conn: usize, seq: u64, ordinal:u64,
     Some(Symbol {conn,seq,ordinal,ns,package:*id,root:segment.map_or(*id,|s|s.root),len:*message_len,width:*block_bytes,symbol:*block_id,group,k,source,outcome})
 }
 pub fn tx(seq:u64,ns:u64,payload:&[u8]) { if !active() { return; } with(|s| {
-    #[cfg(all())] {s.latest_ns=s.latest_ns.max(ns);}
+    {s.latest_ns=s.latest_ns.max(ns);}
     let proof=std::mem::replace(&mut s.proof,3);
     s.ordinal=s.ordinal.checked_add(1).unwrap_or_else(||{s.cap.overflow=true;u64::MAX});
     let mut rest=payload; let mut any=false;
@@ -286,7 +268,7 @@ pub fn replay(seq:u64,ns:u64,payload:&[u8]) { if !active(){return;} let mut rest
 /// Connections copied into the next chunk preserve context; ordinals/generations never reset.
 pub fn take(ns:u64) -> Option<Capture> { STATE.with(|state| { let mut b=state.borrow_mut();let s=b.as_mut()?;
     let mut next=Capture::new(s.ordinal);next.connections.extend_from_slice(&s.cap.connections);
-    #[cfg(all())] {
+    {
         s.demand_count+=s.cap.demands.len() as u64;
         DEMANDS_USED.with(|n|n.set(s.demand_count));
         DEMANDS_INVALID.with(|v|v.set(v.get()||s.cap.demand_overflow));
@@ -317,7 +299,7 @@ pub fn take(ns:u64) -> Option<Capture> { STATE.with(|state| { let mut b=state.bo
     }
 }
 
-#[cfg(all(test,all()))]
+#[cfg(test)]
 mod empirical_tests {
     use super::*;
     fn record(g:u64,ns:u64)->Demand {let mut d=Demand::default();d.header.adaptive_generation=g;d.header.adaptive_created_ns=1;d.header.ns=ns;d}

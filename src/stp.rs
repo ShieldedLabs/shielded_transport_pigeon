@@ -1086,6 +1086,13 @@ const FEC_RETAIN_SLOTS: usize = 4096;
 struct RetainedFecSlot { slot: FecSendSlot, package: u64, expires_ns: u64 }
 
 impl FecSendSlot {
+    #[cfg(test)]
+    fn finish_encoder_for_test(&mut self) {
+        if matches!(self.encoder, FecEncoderState::Pending(_)) {
+            self.encoder = FecEncoderState::Ready(crate::fec::encode_message(self.message.clone(), self.block_bytes).unwrap());
+        }
+    }
+
     fn rescue_plan(&mut self) {
         if !self.repair_policy.feedback() || self.repair_policy == crate::fec_adapt::RepairPolicy::MessageBound { return; }
         if self.finalized_symbols < self.next_id { return; }
@@ -4104,39 +4111,16 @@ pub fn connect_to_endpoint(
     let Some(receive_reservation) = budget.reserve(RECEIVE_CONNECTION_BYTES) else { return; };
     assert!(my_connect_keypair.magic1 == endpoint.magic1);
 
-    if my_connect_keypair.magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
-        let magic2_block = build_magic2_client_block_for_limit(max_message_size);
+    let magic2_block = build_magic2_client_block_for_limit(max_message_size);
+    let connection_state = if my_connect_keypair.magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
         let mut hello_packet_payload = vec![0u8; 6 + 32 + MAGIC2_BLOCK_SIZE];
         store_u48(&mut hello_packet_payload[0..6], my_connect_keypair.magic1);
         assert_eq!(my_connect_keypair.public.len(), 32);
         hello_packet_payload[6..6+32].copy_from_slice(&my_connect_keypair.public[..]);
         hello_packet_payload[6+32..6+32+MAGIC2_BLOCK_SIZE].copy_from_slice(&magic2_block);
 
-        let my_ip = if endpoint.is_ipv4() { Ipv6Addr::UNSPECIFIED } else { Ipv6Addr::UNSPECIFIED };
-        connections_map.insert(
-            ConnectionKey::from(endpoint),
-            ConnectionTrackingData {
-                receive_reservation,
-                receive_budget: crate::receive_memory::ReceiveMemoryBudget::connection_with_limit(budget, connection_receive_limit).with_worker_limit(receive_worker_limit(max_message_size, send_queue_count)),
-                creation_time_ns: monotonic_clock_ns(),
-                my_ip,
-                my_transport_identity_keypair: my_connect_keypair.clone(),
-                two_byte_send_prefix: load_u16(&my_connect_keypair.public[0..2]) << 1,
-                other_ip: endpoint.ip,
-                other_port: endpoint.port,
-                other_transport_identity: endpoint.key.clone(),
-                connection_state: ConnectionState::SendingClientHelloPlaintext { last_sent_time_ns: 0, hello_packet_payload },
-                handshake_hash: [0u8; 64],
-                unreliable_send_buffer: SendQueues::new(send_queue_count, send_buffer_params),
-                peer_max_message_size: 0,
-                receive_index: ReceiveIndex::default(),
-                unreliable_reassembly: ReassemblySlot::new_ring(1024),
-                unreliable_fec: FecRecvSlot::new_ring(1024),
-            },
-        );
-    }
-    else {
-        let magic2_block = build_magic2_client_block_for_limit(max_message_size);
+        ConnectionState::SendingClientHelloPlaintext { last_sent_time_ns: 0, hello_packet_payload }
+    } else {
         let mut hello_packet_payload = vec![0u8; 1024];
         store_u48(&mut hello_packet_payload[0..6], my_connect_keypair.magic1);
         let mut handshake = snow::Builder::new(crypto_string_from_connect_magic1(my_connect_keypair.magic1).unwrap().parse().unwrap())
@@ -4149,33 +4133,33 @@ pub fn connect_to_endpoint(
         hello_packet_payload.truncate(6+handshake_size);
         hello_packet_payload.shrink_to_fit();
 
-        let my_ip = if endpoint.is_ipv4() { Ipv6Addr::UNSPECIFIED } else { Ipv6Addr::UNSPECIFIED };
-        connections_map.insert(
-            ConnectionKey::from(endpoint),
-            ConnectionTrackingData {
-                receive_reservation,
-                receive_budget: crate::receive_memory::ReceiveMemoryBudget::connection_with_limit(budget, connection_receive_limit).with_worker_limit(receive_worker_limit(max_message_size, send_queue_count)),
-                creation_time_ns: monotonic_clock_ns(),
-                my_ip,
-                my_transport_identity_keypair: my_connect_keypair.clone(),
-                two_byte_send_prefix: load_u16(&my_connect_keypair.public[0..2]) << 1,
-                other_ip: endpoint.ip,
-                other_port: endpoint.port,
-                other_transport_identity: endpoint.key.clone(),
-                connection_state: ConnectionState::SendingClientHello { magic1: my_connect_keypair.magic1, last_sent_time_ns: 0, hello_packet_payload, handshake },
-                handshake_hash: [0u8; 64],
-                unreliable_send_buffer: SendQueues::new(send_queue_count, send_buffer_params),
-                peer_max_message_size: 0,
-                receive_index: ReceiveIndex::default(),
-                unreliable_reassembly: ReassemblySlot::new_ring(1024),
-                unreliable_fec: FecRecvSlot::new_ring(1024),
-            },
-        );
-    }
+        ConnectionState::SendingClientHello { magic1: my_connect_keypair.magic1, last_sent_time_ns: 0, hello_packet_payload, handshake }
+    };
+
+    connections_map.insert(
+        ConnectionKey::from(endpoint),
+        ConnectionTrackingData {
+            receive_reservation,
+            receive_budget: crate::receive_memory::ReceiveMemoryBudget::connection_with_limit(budget, connection_receive_limit).with_worker_limit(receive_worker_limit(max_message_size, send_queue_count)),
+            creation_time_ns: monotonic_clock_ns(),
+            my_ip: Ipv6Addr::UNSPECIFIED,
+            my_transport_identity_keypair: my_connect_keypair.clone(),
+            two_byte_send_prefix: load_u16(&my_connect_keypair.public[0..2]) << 1,
+            other_ip: endpoint.ip,
+            other_port: endpoint.port,
+            other_transport_identity: endpoint.key.clone(),
+            connection_state,
+            handshake_hash: [0u8; 64],
+            unreliable_send_buffer: SendQueues::new(send_queue_count, send_buffer_params),
+            peer_max_message_size: 0,
+            receive_index: ReceiveIndex::default(),
+            unreliable_reassembly: ReassemblySlot::new_ring(1024),
+            unreliable_fec: FecRecvSlot::new_ring(1024),
+        },
+    );
 }
 
 const        VERBOSE                :bool=0!=                (1);
-const OVERLY_VERBOSE                :bool=0!=                (0);
 
 macro_rules! pod { ($($item:item)*) => { $(#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)] $item)* }; }
 
@@ -5425,7 +5409,6 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                         let client_key = &packet_memory_encrypted[6..6+32];
                                         let magic2_block = &packet_memory_encrypted[6+32..6+32+MAGIC2_BLOCK_SIZE];
                                         let Some(chosen_magic2) = negotiate_magic2(magic2_block) else {
-                                            // if OVERLY_VERBOSE { println!("Did NOT respond to connection: magic2 negotiation failed."); }
                                             break;
                                         };
 
@@ -5442,16 +5425,8 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
 
                                                         existing_connection.peer_max_message_size = peer_max_message_size;
                                                         existing_connection.connection_state = ConnectionState::SendingServerHelloPlaintext { magic2: chosen_magic2, last_sent_time_ns: 0, hello_packet_payload };
-                                                        if OVERLY_VERBOSE { println!("Transitioned connection {} to SendingServerHelloPlaintext.", connection_key.key_15_bits); }
-                                                    } else {
-                                                        if OVERLY_VERBOSE { println!("Did NOT respond to connection {}: Lost the lexicographic compare.", connection_key.key_15_bits); }
                                                     }
-                                                } else {
-                                                    let state_str = connection_state_string(&existing_connection.connection_state);
-                                                    if OVERLY_VERBOSE { println!("Did NOT respond to connection {}: We were not in SendingClientHelloPlaintext state. We are in {} state.", connection_key.key_15_bits, state_str); }
                                                 }
-                                            } else {
-                                                if OVERLY_VERBOSE { println!("Did NOT respond to connection {}: Failed condition \"&existing_connection.my_transport_identity_keypair == my_kp && existing_connection.other_transport_identity == client_key\"", connection_key.key_15_bits); }
                                             }
                                         }
                                         else {
@@ -5484,10 +5459,7 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                                     unreliable_fec: FecRecvSlot::new_ring(1024),
                                                 },
                                             );
-                                            if OVERLY_VERBOSE { println!("Transitioned connection {} to SendingServerHelloPlaintext.", connection_key.key_15_bits); }
                                         }
-                                    } else {
-                                        if OVERLY_VERBOSE { println!("Did NOT respond to connection: The packet was too small (expected {} bytes, got {}).", 6 + 32 + MAGIC2_BLOCK_SIZE, buf_len); }
                                     }
                                 }
                             }
@@ -5504,7 +5476,6 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                     if let Ok(magic2_block_len) = read_message_maybe {
                                         if let Some(client_key) = new_handshake.get_remote_static() {
                                             let Some(chosen_magic2) = negotiate_magic2(&packet_memory_recv[..magic2_block_len]) else {
-                                                if OVERLY_VERBOSE { println!("Did NOT respond to Client Hello from {:?}: magic2 negotiation failed.", (other_ip_addr, other_port)); }
                                                 break;
                                             };
 
@@ -5525,15 +5496,8 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
 
                                                             existing_connection.peer_max_message_size = peer_max_message_size;
                                                         existing_connection.connection_state = ConnectionState::SendingServerHello { cipher, magic1: *magic1, magic2: chosen_magic2, last_sent_time_ns: 0, hello_packet_payload };
-                                                            if OVERLY_VERBOSE { println!("Transitioned connection {} to SendingServerHello.", connection_key.key_15_bits); }
-                                                        } else {
-                                                            if OVERLY_VERBOSE { println!("Did NOT transition {} to SendingServerHello: We \"lost\" the contended initiator comparison.", connection_key.key_15_bits); }
                                                         }
-                                                    } else {
-                                                        if OVERLY_VERBOSE { println!("Did NOT transition {} to SendingServerHello: We were not in the SendingClientHello state.", connection_key.key_15_bits); }
                                                     }
-                                                } else {
-                                                    if OVERLY_VERBOSE { println!("Did NOT respond to client hello from {}: @Todo explanation: Following expression was false: &existing_connection.my_transport_identity_keypair == my_kp && existing_connection.other_transport_identity == client_key", connection_key.key_15_bits); }
                                                 }
                                             }
                                             else {
@@ -5571,13 +5535,8 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                                     },
                                                 );
 
-                                                if OVERLY_VERBOSE { println!("Transitioned connection {} to SendingServerHello.", connection_key.key_15_bits); }
                                             }
-                                        } else {
-                                            if OVERLY_VERBOSE { println!("Did NOT respond to Client Hello from {:?}: @Todo explanation: Following expression failed: let Some(client_key) = new_handshake.get_remote_static()", (other_ip_addr, other_port)); }
                                         }
-                                    } else {
-                                        if OVERLY_VERBOSE { println!("Did NOT respond to Client Hello from {:?}: new_handshake.read_message failed with error = {:?}", (other_ip_addr, other_port), read_message_maybe); }
                                     }
                                 }
                             }
@@ -5587,9 +5546,6 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
 
                         let connection_key = ConnectionKey { ip: other_ip_addr, port: other_port, key_15_bits: first_six_bytes as u16 };
                         let Some(existing_connection) = connections_map.get_mut(&connection_key) else {
-                            if OVERLY_VERBOSE {
-                                println!("Packet arrived from non-connection. Drop!");
-                            }
                             break 'conn;
                         };
 
@@ -5606,16 +5562,11 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                         existing_connection.peer_max_message_size = peer_max_message_size;
                                         let server_magic2 = load_u64(&packet_memory_encrypted[6+32..6+32+8]);
                                         if !validate_magic2(server_magic2) {
-                                            if OVERLY_VERBOSE { println!("Dropping from {connection_key:?}: server chose magic2 {server_magic2:#x} which we did not offer."); }
                                             break 'conn;
                                         }
                                         if VERBOSE { println!("Connected to new server {:?}", server_key); }
                                         existing_connection.connection_state = new_connection_state_connected(None, CONNECT_MAGIC1_PLAIN_TEXT, server_magic2, timestamp_ns);
                                         assert!(ring_state.connected(&thread_inner, existing_connection.address(), existing_connection.handshake_hash));
-                                    }
-                                } else {
-                                    if OVERLY_VERBOSE {
-                                        println!("Dropping from {connection_key:?} because the plain text server hello was incorrectly sized.");
                                     }
                                 }
                                 break 'conn;
@@ -5626,13 +5577,11 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                         debug_assert!(handshake.is_handshake_finished());
                                         existing_connection.handshake_hash = get_handshake_hash(handshake);
                                         if payload_len != SERVER_HELLO_PAYLOAD_LEN || validate_transport_parameters(&packet_memory_recv[8..payload_len]).is_none() {
-                                            if OVERLY_VERBOSE { println!("Dropping from {connection_key:?}: server hello payload was {payload_len} bytes, expected 8 (magic2)."); }
                                             break 'conn;
                                         }
                                         existing_connection.peer_max_message_size = validate_transport_parameters(&packet_memory_recv[8..payload_len]).unwrap();
                                         let server_magic2 = load_u64(&packet_memory_recv[0..8]);
                                         if !validate_magic2(server_magic2) {
-                                            if OVERLY_VERBOSE { println!("Dropping from {connection_key:?}: server chose magic2 {server_magic2:#x} which we did not offer."); }
                                             break 'conn;
                                         }
                                         if VERBOSE { println!("Connected to new server {:?}", handshake.get_remote_static().unwrap()); }
@@ -5645,14 +5594,6 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                         let ConnectionState::Connected(ref mut state) = existing_connection.connection_state else { panic!(); };
                                         state.cipher = Some(ConnectionCipherTriplet::new_from_old_init_only(handshake.into_stateless_transport_mode().expect("Cannot fail given assert above.")));
                                         assert!(ring_state.connected(&thread_inner, existing_connection.address(), existing_connection.handshake_hash));
-                                    } else {
-                                        if OVERLY_VERBOSE {
-                                            println!("Dropping from {connection_key:?} because this failed: let Ok(payload_len) = handshake.read_message(&packet_memory_encrypted[6..buf_len], &mut packet_memory_recv[..])");
-                                        }
-                                    }
-                                } else {
-                                    if OVERLY_VERBOSE {
-                                        println!("Dropping from {connection_key:?} because this was false: first_six_bytes >> 16 == 0xffff_ffff && buf_len >= 6 + 32");
                                     }
                                 }
                                 break 'conn;
@@ -5707,7 +5648,6 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                             if !is_ack { state.rx_tracker.on_packet(nonce, &mut state.stats); }
 
                             if payload.len() < 517 && payload.len() != crate::ack::ACK_PAYLOAD_LEN {
-                                if OVERLY_VERBOSE { println!("Dropping from {connection_key:?}, payload < 517."); }
                                 break 'conn;
                             }
 
@@ -5895,7 +5835,6 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                             // follows it. A memory-erased packet must look lost to the sender.
                             let mut memory_erased = false;
 
-                            // if OVERLY_VERBOSE { println!("Got data from {:?}  data: {:?}", existing_connection.other_transport_identity, payload); }
 
                             let mut remaining_payload = payload;
 
@@ -6027,7 +5966,6 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                 let frag_offset = offset as u64;
                                 let frag_len = frag_data.len() as u64;
                                 if frag_offset + frag_len > u32::MAX as u64 {
-                                    if OVERLY_VERBOSE { println!("Error, frag_offset + frag_len overflows u32 from {connection_key:?}. Disconnecting..."); }
                                     connections_map.remove(&connection_key);
                                         ring_state.disconnected(connection_key, DisconnectReason::TimedOut);
                                     break 'conn;
@@ -6039,7 +5977,6 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                     break 'conn;
                                 }
 
-                                //if OVERLY_VERBOSE { println!("Fragment from {:?}: R:{} F:{} ID:{} L:{} O:{}", connection_key, is_reliable, is_fin, package_id, frag_len, frag_offset); }
 
                                 let Some(slot_idx) = existing_connection.receive_index.admit_at(package_id,
                                     &mut existing_connection.unreliable_reassembly, &mut existing_connection.unreliable_fec, timestamp_ns, fec_inactive_grace_ns(state.RTT_mean, true)) else { memory_erased = true; continue; };
@@ -6619,11 +6556,6 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                         // bonus status debug print
                         if state.last_status_print_time + 1_000_000_000 < current_time_now_ns {
                             state.last_status_print_time = current_time_now_ns;
-                            let mode = cubic_mode;
-                            let mean = state.RTT_mean as f64 / 10.0;
-                            let ack_pace = state.ack_pace_estimate as f64 / 10.0;
-                            let n = (state.RTT_sample_cursor as usize).min(16);
-                            if OVERLY_VERBOSE { println!("{mode} RTT (ms): mean={mean:.1} ack_pace={ack_pace:.1} (n={n}) --- TU: {} B  failed probes: {} --- target: {} pps   in flight: {}/{} (max {})  pacing: {} us  lost/sent: {}/{}", state.current_tu, state.tu_probe_failed_count, allowed_bandwidth_upps as f64 / 1000000.0, state.packets_in_flight, allowed_packets_in_flight, state.max_in_flight_since_last_print, time_between_sends_ns / 1000, state.packet_lost_since_last_print, state.packet_since_last_print); }
                             state.packet_since_last_print = 0;
                             state.packet_lost_since_last_print = 0;
                             state.max_in_flight_since_last_print = state.packets_in_flight;
@@ -8798,6 +8730,51 @@ impl LossEpisodes {
 }
 
 #[cfg(test)]
+fn fec_policy_for_test(policy: crate::fec_adapt::RepairPolicy, p: f64) -> crate::fec_adapt::FecAdaptiveState {
+    let mut adaptive = crate::fec_adapt::FecAdaptiveState::baseline_for_test(crate::ship::FEC, 0);
+    adaptive.policy = policy;
+    adaptive.p = p;
+    adaptive
+}
+
+#[cfg(test)]
+impl SendQueues {
+    fn finish_encoders_for_test(&mut self) {
+        for q in &mut self.queues {
+            if let Some(f) = &mut q.fec_send_slot {
+                f.finish_encoder_for_test();
+            }
+        }
+    }
+
+    /// The shared script behind the frozen W1 and B0 scheduling transcripts.
+    fn baseline_transcript_for_test(&mut self) -> (u64, blake3::Hash) {
+        self.submit_messages(0, vec![vec![7; 28560], vec![8; 80], vec![9; 42840]]);
+        self.submit_messages(1, vec![vec![6; 1000]; 30]);
+        let mut hash = blake3::Hasher::new();
+        let mut seq = 0u64;
+        while self.has_unsent_data() {
+            assert!(seq < 300);
+            self.finish_encoders_for_test();
+            self.fec_prepare_packet(seq);
+            let mut p = vec![0; 1449];
+            assert_eq!(self.fill_packet(&mut p), 1449, "seq {seq}");
+            hash.update(&p);
+            for q in &self.queues {
+                hash.update(&q.send_package_id.to_le_bytes());
+                hash.update(&[q.p4_open as u8, q.p4_closing as u8, q.p4_tail_refreshed as u8]);
+                if let Some(f) = &q.fec_send_slot {
+                    for x in [f.k, f.n, f.n_planned, f.next_id] { hash.update(&x.to_le_bytes()); }
+                }
+            }
+            if seq >= 6 { self.fec_on_packet_finalized(seq - 6, (seq - 6) % 11 == 0); }
+            seq += 1;
+        }
+        (seq, hash.finalize())
+    }
+}
+
+#[cfg(test)]
 mod congestion_tests {
     use super::*;
 
@@ -10648,8 +10625,7 @@ mod fec_closed_loop_tests {
 
     fn race_buffer(policy: crate::fec_adapt::RepairPolicy) -> UnreliableSendBuffer {
         let mut b = UnreliableSendBuffer::new(1000000, 1000000, 1000000);
-        let mut a = FecAdaptiveState::baseline_for_test(crate::ship::FEC, 0);
-        a.policy = policy; a.p = 0.02; b.fec_adaptive = Some(a);
+        let mut a = fec_policy_for_test(policy, 0.02); b.fec_adaptive = Some(a);
         b
     }
     #[test]
@@ -10980,8 +10956,7 @@ mod send_queue_tests {
         use crate::fec_adapt::RepairPolicy;
         for policy in [RepairPolicy::MeanTopup, RepairPolicy::Streaming] {
             let mut s = SendQueues::baseline_for_test(2, (1000000, 2<<20, 2<<20));
-            let mut a = crate::fec_adapt::FecAdaptiveState::baseline_for_test(crate::ship::FEC, 0);
-            a.policy = policy; a.p = 0.02; s.fec_adaptive = Some(a);
+            let mut a = fec_policy_for_test(policy, 0.02); s.fec_adaptive = Some(a);
             s.submit_messages(1, vec![vec![7; 1433*12]]);
             let mut seq = 0;
             while s.queues[1].has_unsent_data() { assert_eq!(packet(&mut s, seq).0, 1); seq += 1; }
@@ -13132,9 +13107,7 @@ use crate::fec_adapt::{FecAdaptiveState, RepairPolicy};
 
 fn buffer(policy: RepairPolicy) -> UnreliableSendBuffer {
     let mut b = UnreliableSendBuffer::new(1_000_000, 1_000_000, 1_000_000);
-    let mut a = FecAdaptiveState::baseline_for_test(crate::ship::FEC, 0);
-    a.policy = policy;
-    a.p = 0.02;
+    let mut a = fec_policy_for_test(policy, 0.02);
     b.fec_adaptive = Some(a);
     b
 }
@@ -13213,8 +13186,7 @@ mod race_expiry_block_tests {
     fn retention_expires_while_locally_refused_ciphertext_remains_pending() {
         for policy in [RepairPolicy::MeanTopup, RepairPolicy::Streaming] {
             let mut q = SendQueues::baseline_for_test(1, (1000000, 1000000, 1000000));
-            let mut a = FecAdaptiveState::baseline_for_test(crate::ship::FEC, 0);
-            a.policy = policy; a.p = 0.02; q.fec_adaptive = Some(a);
+            let mut a = fec_policy_for_test(policy, 0.02); q.fec_adaptive = Some(a);
             q.submit_messages(0, vec![vec![7;1433*20], vec![8;1433*20]]);
             let mut seq = 0;
             while q.has_unsent_data() {
@@ -14029,9 +14001,7 @@ mod p4_tests {
 
     fn buffer(policy: RepairPolicy, p: f64) -> UnreliableSendBuffer {
         let mut b = UnreliableSendBuffer::new(0, 16 << 20, 16 << 20);
-        let mut a = FecAdaptiveState::baseline_for_test(crate::ship::FEC, 0);
-        a.policy = policy;
-        a.p = p;
+        let mut a = fec_policy_for_test(policy, p);
         b.fec_adaptive = Some(a);
         b
     }
@@ -14039,9 +14009,7 @@ mod p4_tests {
     fn emit(b: &mut UnreliableSendBuffer, seq: &mut u64) -> Option<(u64, u32, Option<FecSegment>)> {
         b.fec_prepare_packet(*seq);
         if let Some(f) = &mut b.fec_send_slot {
-            if matches!(f.encoder, FecEncoderState::Pending(_)) {
-                f.encoder = FecEncoderState::Ready(crate::fec::encode_message(f.message.clone(), f.block_bytes).unwrap());
-            }
+            f.finish_encoder_for_test();
         }
         let result = match b.next_fragment(1449, 1449) {
             Some(UnreliableFragment::Fec { package_id, block_id, segment, .. }) => Some((package_id, block_id, segment)),
@@ -14165,9 +14133,7 @@ mod p4_tests {
         let ConnectionState::Connected(mut s) = new_connection_state_connected(None, 0, 1, 1_000_000_000) else { unreachable!() };
         s.RTT_mean = 1000;
         let mut b = SendQueues::baseline_for_test(1, (0, 16 << 20, 16 << 20));
-        let mut a = FecAdaptiveState::baseline_for_test(crate::ship::FEC, 0);
-        a.policy = RepairPolicy::MessageBound;
-        a.p = 0.0;
+        let mut a = fec_policy_for_test(RepairPolicy::MessageBound, 0.0);
         b.fec_adaptive = Some(a);
         b.queues[0].event_repair_q = 10;
         b.queues[0].submit_messages(vec![vec![7; EV_BLOCK * 20]]);
@@ -14254,9 +14220,7 @@ mod p4_tests {
         let ConnectionState::Connected(mut s) = new_connection_state_connected(None, 0, 1, 1_000_000_000) else { unreachable!() };
         s.RTT_mean = 1000; // 100 ms established RTT
         let mut b = SendQueues::baseline_for_test(1, (0, 16 << 20, 16 << 20));
-        let mut a = FecAdaptiveState::baseline_for_test(crate::ship::FEC, 0);
-        a.policy = RepairPolicy::MessageBound;
-        a.p = 0.0;
+        let mut a = fec_policy_for_test(RepairPolicy::MessageBound, 0.0);
         b.fec_adaptive = Some(a);
         b.queues[0].event_repair_q = 10;
         b.queues[0].submit_messages(vec![vec![7; EV_BLOCK * 20]]);
@@ -14332,9 +14296,7 @@ mod p4_tests {
     fn independent_event_review_pending_first_source_commit_and_ciphertext_freeze() {
         let ConnectionState::Connected(mut s) = new_connection_state_connected(None, 0, 1, 1_000_000_000) else { unreachable!() };
         let mut b = SendQueues::baseline_for_test(1, (0, 16 << 20, 16 << 20));
-        let mut a = FecAdaptiveState::baseline_for_test(crate::ship::FEC, 0);
-        a.policy = RepairPolicy::MessageBound;
-        a.p = 0.0;
+        let mut a = fec_policy_for_test(RepairPolicy::MessageBound, 0.0);
         b.fec_adaptive = Some(a);
         b.queues[0].event_repair_q = 10;
         b.queues[0].submit_messages(vec![vec![7; EV_BLOCK * 20]]);
@@ -14670,18 +14632,14 @@ mod p4_review_tests {
     use crate::fec_adapt::{FecAdaptiveState, RepairPolicy};
     fn buffer() -> UnreliableSendBuffer {
         let mut b = UnreliableSendBuffer::new(0, 16 << 20, 16 << 20);
-        let mut a = FecAdaptiveState::baseline_for_test(crate::ship::FEC, 0);
-        a.policy = RepairPolicy::MessageBound;
-        a.p = 0.0;
+        let mut a = fec_policy_for_test(RepairPolicy::MessageBound, 0.0);
         b.fec_adaptive = Some(a);
         b
     }
     fn emit(b: &mut UnreliableSendBuffer, seq: &mut u64, size: usize) -> bool {
         b.fec_prepare_packet(*seq);
         if let Some(f) = &mut b.fec_send_slot {
-            if matches!(f.encoder, FecEncoderState::Pending(_)) {
-                f.encoder = FecEncoderState::Ready(crate::fec::encode_message(f.message.clone(), f.block_bytes).unwrap());
-            }
+            f.finish_encoder_for_test();
         }
         let sent = b.next_fragment(size, size).is_some();
         if sent { *seq += 1; }
@@ -14704,9 +14662,7 @@ mod p4_review_tests {
             assert!(attempts < 20000, "sender stalled");
             for q in &mut s.queues {
                 for f in q.fec_send_slot.iter_mut().chain(q.fec_suspended.iter_mut()).chain(q.fec_retained.values_mut().map(|r| &mut r.slot)) {
-                    if matches!(f.encoder, FecEncoderState::Pending(_)) {
-                        f.encoder = FecEncoderState::Ready(crate::fec::encode_message(f.message.clone(), f.block_bytes).unwrap());
-                    }
+                    f.finish_encoder_for_test();
                 }
             }
             // Growth during the first segment must not change its existing codec.
@@ -15477,48 +15433,17 @@ mod p4_interleave_tests {
     }
     fn scheduler() -> SendQueues {
         let mut s = SendQueues::baseline_for_test(2, (0, 16 << 20, 16 << 20));
-        let mut a = crate::fec_adapt::FecAdaptiveState::baseline_for_test(crate::ship::FEC, 0);
-        a.policy = crate::fec_adapt::RepairPolicy::MessageBound;
-        a.p = 0.1;
+        let mut a = fec_policy_for_test(crate::fec_adapt::RepairPolicy::MessageBound, 0.1);
         s.fec_adaptive = Some(a);
         s
-    }
-    fn ready(s: &mut SendQueues) {
-        for q in &mut s.queues {
-            if let Some(f) = &mut q.fec_send_slot {
-                if matches!(f.encoder, FecEncoderState::Pending(_)) {
-                    f.encoder = FecEncoderState::Ready(crate::fec::encode_message(f.message.clone(), f.block_bytes).unwrap());
-                }
-            }
-        }
     }
     #[test]
     fn interleave_w1_checked_baseline() {
         let mut s = scheduler();
-        s.submit_messages(0, vec![vec![7; 28560], vec![8; 80], vec![9; 42840]]);
-        s.submit_messages(1, vec![vec![6; 1000]; 30]);
-        let mut h = blake3::Hasher::new();
-        let mut seq = 0u64;
-        while s.has_unsent_data() {
-            assert!(seq < 300);
-            ready(&mut s);
-            s.fec_prepare_packet(seq);
-            let mut p = vec![0; 1449];
-            assert_eq!(s.fill_packet(&mut p), 1449);
-            h.update(&p);
-            for q in &s.queues {
-                h.update(&q.send_package_id.to_le_bytes());
-                h.update(&[q.p4_open as u8, q.p4_closing as u8, q.p4_tail_refreshed as u8]);
-                if let Some(f) = &q.fec_send_slot {
-                    for x in [f.k, f.n, f.n_planned, f.next_id] { h.update(&x.to_le_bytes()); }
-                }
-            }
-            if seq >= 6 { s.fec_on_packet_finalized(seq - 6, (seq - 6) % 11 == 0); }
-            seq += 1;
-        }
+        let (seq, hash) = s.baseline_transcript_for_test();
         // Captured before scheduler changes, at c30614e (baseline.log).
         assert_eq!(seq, 83);
-        assert_eq!(h.finalize().to_hex().as_str(), "6150da0b14f6b2ddf5f5094051ff43c581dd473564387c66a19f79b5f3480f74");
+        assert_eq!(hash.to_hex().as_str(), "6150da0b14f6b2ddf5f5094051ff43c581dd473564387c66a19f79b5f3480f74");
     }
     #[test]
     fn interleave_single_baseline() {
@@ -15534,7 +15459,7 @@ mod p4_interleave_tests {
         let mut h = blake3::Hasher::new();
         let mut seq = 0;
         while s.has_unsent_data() {
-            ready(&mut s);
+            s.finish_encoders_for_test();
             s.fec_prepare_packet(seq);
             let mut p = vec![0; 1449];
             assert_eq!(s.fill_packet(&mut p), 1449);
@@ -15553,7 +15478,7 @@ mod p4_interleave_tests {
         }
     }
     fn packet(s: &mut SendQueues, seq: u64, size: usize) -> Vec<u8> {
-        ready(s);
+        s.finish_encoders_for_test();
         s.fec_prepare_packet(seq);
         let mut p = vec![0; size];
         assert_eq!(s.fill_packet(&mut p), size, "seq {seq}");
@@ -15886,25 +15811,8 @@ mod p4_interleave_tests {
         let mut a = crate::fec_adapt::FecAdaptiveState::baseline_for_test(crate::ship::FEC, 0);
         a.p = 0.1;
         s.fec_adaptive = Some(a);
-        s.submit_messages(0, vec![vec![7; 28560], vec![8; 80], vec![9; 42840]]);
-        s.submit_messages(1, vec![vec![6; 1000]; 30]);
-        let mut h = blake3::Hasher::new();
-        let mut seq = 0;
-        while s.has_unsent_data() {
-            assert!(seq < 300);
-            let p = packet(&mut s, seq, 1449);
-            h.update(&p);
-            for q in &s.queues {
-                h.update(&q.send_package_id.to_le_bytes());
-                h.update(&[q.p4_open as u8, q.p4_closing as u8, q.p4_tail_refreshed as u8]);
-                if let Some(f) = &q.fec_send_slot {
-                    for x in [f.k, f.n, f.n_planned, f.next_id] { h.update(&x.to_le_bytes()); }
-                }
-            }
-            if seq >= 6 { s.fec_on_packet_finalized(seq - 6, (seq - 6) % 11 == 0); }
-            seq += 1;
-        }
-        println!("ENV_TRANSCRIPT {seq} {}", h.finalize());
+        let (seq, hash) = s.baseline_transcript_for_test();
+        println!("ENV_TRANSCRIPT {seq} {hash}");
     }
     // Legacy policy startup is exercised by the four predecessor-feature full gates.
     // This feature intentionally refuses those non-isolated policies before transport starts.
@@ -16202,24 +16110,13 @@ mod cohort_observer_tests {
     }
     fn message_bound() -> SendQueues {
         let mut s = SendQueues::baseline_for_test(1, (0, 64 << 20, 64 << 20));
-        let mut a = crate::fec_adapt::FecAdaptiveState::baseline_for_test(crate::ship::FEC, 0);
-        a.policy = crate::fec_adapt::RepairPolicy::MessageBound;
-        a.p = 0.1;
+        let mut a = fec_policy_for_test(crate::fec_adapt::RepairPolicy::MessageBound, 0.1);
         s.fec_adaptive = Some(a);
         s
     }
-    fn ready(s: &mut SendQueues) {
-        for q in &mut s.queues {
-            if let Some(f) = &mut q.fec_send_slot {
-                if matches!(f.encoder, FecEncoderState::Pending(_)) {
-                    f.encoder = FecEncoderState::Ready(crate::fec::encode_message(f.message.clone(), f.block_bytes).unwrap());
-                }
-            }
-        }
-    }
     /// Emit one data packet (inline encoder); false when the queues produced nothing.
     fn emit(s: &mut SendQueues, seq: &mut u64) -> bool {
-        ready(s);
+        s.finish_encoders_for_test();
         s.fec_prepare_packet(*seq);
         let mut p = vec![0; 1449];
         if s.fill_packet(&mut p) == 0 { return false; }
@@ -16512,9 +16409,7 @@ mod burst_base_slot_tests {
     const T: u64 = 1_000 * 0x400000;
 
     fn state(on: bool) -> FecAdaptiveState {
-        let mut a = FecAdaptiveState::baseline_for_test(crate::ship::FEC, 0);
-        a.policy = RepairPolicy::MessageBound;
-        a.p = 0.05;
+        let mut a = fec_policy_for_test(RepairPolicy::MessageBound, 0.05);
         a.set_base_parity_for_test(on);
         a.set_base_context(1, 500 * 1_000_000, Some(200_000_000)); // H = 100 packets
         a
@@ -16527,9 +16422,7 @@ mod burst_base_slot_tests {
     fn emit(b: &mut UnreliableSendBuffer, seq: &mut u64) -> bool {
         b.fec_prepare_packet(*seq);
         if let Some(f) = &mut b.fec_send_slot {
-            if matches!(f.encoder, FecEncoderState::Pending(_)) {
-                f.encoder = FecEncoderState::Ready(crate::fec::encode_message(f.message.clone(), f.block_bytes).unwrap());
-            }
+            f.finish_encoder_for_test();
         }
         let some = b.next_fragment(1449, 1449).is_some();
         if some { b.fec_commit_marks(*seq, T + *seq * 0x400000 + 1); *seq += 1; }
@@ -16647,15 +16540,6 @@ mod burst_base_slot_tests {
         s.fec_adaptive = Some(state(on));
         s
     }
-    fn ready(s: &mut SendQueues) {
-        for q in &mut s.queues {
-            if let Some(f) = &mut q.fec_send_slot {
-                if matches!(f.encoder, FecEncoderState::Pending(_)) {
-                    f.encoder = FecEncoderState::Ready(crate::fec::encode_message(f.message.clone(), f.block_bytes).unwrap());
-                }
-            }
-        }
-    }
 
     #[test]
     fn b0_queues_reproduce_checked_baseline_hash() {
@@ -16663,26 +16547,9 @@ mod burst_base_slot_tests {
         // here with the B1 flag present but off and the B1 context set.
         let mut s = queues(false);
         s.fec_adaptive.as_mut().unwrap().p = 0.1;
-        s.submit_messages(0, vec![vec![7; 28560], vec![8; 80], vec![9; 42840]]);
-        s.submit_messages(1, vec![vec![6; 1000]; 30]);
-        let mut h = blake3::Hasher::new();
-        let mut seq = 0u64;
-        while s.has_unsent_data() {
-            ready(&mut s);
-            s.fec_prepare_packet(seq);
-            let mut p = vec![0; 1449];
-            assert_eq!(s.fill_packet(&mut p), 1449);
-            h.update(&p);
-            for q in &s.queues {
-                h.update(&q.send_package_id.to_le_bytes());
-                h.update(&[q.p4_open as u8, q.p4_closing as u8, q.p4_tail_refreshed as u8]);
-                if let Some(f) = &q.fec_send_slot { for x in [f.k, f.n, f.n_planned, f.next_id] { h.update(&x.to_le_bytes()); } }
-            }
-            if seq >= 6 { s.fec_on_packet_finalized(seq - 6, (seq - 6) % 11 == 0); }
-            seq += 1;
-        }
+        let (seq, hash) = s.baseline_transcript_for_test();
         assert_eq!(seq, 83);
-        assert_eq!(h.finalize().to_hex().as_str(), "6150da0b14f6b2ddf5f5094051ff43c581dd473564387c66a19f79b5f3480f74");
+        assert_eq!(hash.to_hex().as_str(), "6150da0b14f6b2ddf5f5094051ff43c581dd473564387c66a19f79b5f3480f74");
     }
 
     #[test]
@@ -16698,7 +16565,7 @@ mod burst_base_slot_tests {
             let (mut seq, mut seen_complete, mut trace) = (65536u64, false, Vec::new());
             while s.has_unsent_data() {
                 assert!(seq < 65536 + 2000);
-                ready(&mut s);
+                s.finish_encoders_for_test();
                 s.fec_prepare_packet(seq);
                 let mut p = vec![0; 1449];
                 assert_eq!(s.fill_packet(&mut p), 1449);
@@ -16761,9 +16628,7 @@ mod budget_base_slot_tests {
     }
     fn ready(b: &mut UnreliableSendBuffer) {
         if let Some(f) = &mut b.fec_send_slot {
-            if matches!(f.encoder, FecEncoderState::Pending(_)) {
-                f.encoder = FecEncoderState::Ready(crate::fec::encode_message(f.message.clone(), f.block_bytes).unwrap());
-            }
+            f.finish_encoder_for_test();
         }
     }
     fn emit(b: &mut UnreliableSendBuffer, seq: &mut u64, payload: usize) -> bool {

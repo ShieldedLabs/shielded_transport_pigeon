@@ -6,11 +6,11 @@
 //! Unknown/disconnected peers, invalid queues and oversized sends are dropped and
 //! counted. Full receive rings drop data, not lifecycle events. Disconnect is local
 //! cancellation, not a wire close; a remote peer may reconnect.
-use super::{Endpoint, Ready};
+use super::{Endpoint, Ready, ring::Ring};
 use crate::stp::{ConnectionKey, Dscp, STPAddress};
 use std::cell::Cell;
 use std::marker::PhantomData;
-use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}};
 
 /// Each capacity must be a power of two in 1..=65_536.
 #[derive(Debug, Clone, Copy)]
@@ -46,36 +46,30 @@ pub struct Stats {
 pub struct LockfreeEndpoint { owner: Endpoint, _single_owner: PhantomData<Cell<()>> }
 impl LockfreeEndpoint {
     pub(crate) fn new(owner: Endpoint) -> Self { Self { owner, _single_owner: PhantomData } }
-    /// Constant-time ownership transfer; false also means closed, and preserves payload.
-    pub fn try_send(&mut self, peer: ConnectionKey, queue: usize, class: Dscp, payload: &mut Vec<u8>) -> bool {
+    // Only the endpoint's unique producer calls this for its send/control rings.
+    #[inline]
+    fn admit<T>(&self, ring: &Ring<T>, full: &AtomicBool, make: impl FnOnce() -> T) -> bool {
         let inner = &self.owner.inner;
-        let n = inner.native.get().unwrap();
         if inner.stop.load(Ordering::Acquire) || self.is_finished() { return false; }
-        if !n.send.has_space() {
-            n.send_full.store(true, Ordering::SeqCst);
+        if !ring.has_space() {
+            full.store(true, Ordering::SeqCst);
             // Pair with consumer's post-pop fence: do not miss a concurrent drain.
-            if !n.send.has_space() { return false; }
-            n.send_full.store(false, Ordering::SeqCst);
+            if !ring.has_space() { return false; }
+            full.store(false, Ordering::SeqCst);
         }
-        n.send_full.store(false, Ordering::SeqCst);
-        let message = SendMessage { peer, queue, class, payload: std::mem::take(payload) };
-        assert!(unsafe { n.send.push(message) }.is_ok());
+        full.store(false, Ordering::SeqCst);
+        assert!(unsafe { ring.push(make()) }.is_ok());
         inner.wake.notify();
         true
     }
+    /// Constant-time ownership transfer; false also means closed, and preserves payload.
+    pub fn try_send(&mut self, peer: ConnectionKey, queue: usize, class: Dscp, payload: &mut Vec<u8>) -> bool {
+        let n = self.owner.inner.native.get().unwrap();
+        self.admit(&n.send, &n.send_full, || SendMessage { peer, queue, class, payload: std::mem::take(payload) })
+    }
     pub fn try_control(&mut self, control: Control) -> bool {
-        let inner = &self.owner.inner;
-        let n = inner.native.get().unwrap();
-        if inner.stop.load(Ordering::Acquire) || self.is_finished() { return false; }
-        if !n.control.has_space() {
-            n.control_full.store(true, Ordering::SeqCst);
-            if !n.control.has_space() { return false; }
-            n.control_full.store(false, Ordering::SeqCst);
-        }
-        n.control_full.store(false, Ordering::SeqCst);
-        assert!(unsafe { n.control.push(control) }.is_ok());
-        inner.wake.notify();
-        true
+        let n = self.owner.inner.native.get().unwrap();
+        self.admit(&n.control, &n.control_full, || control)
     }
     pub fn try_connect(&mut self, address: STPAddress) -> bool { self.try_control(Control::Connect(address)) }
     pub fn try_disconnect(&mut self, peer: ConnectionKey) -> bool { self.try_control(Control::Disconnect(peer)) }
