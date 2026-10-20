@@ -7,6 +7,37 @@ use std::{
     },
     time::{Duration, Instant},
 };
+
+// Caller-owned PUBLIC ring-pump driver. No reference exchange adapter.
+struct Worker(Arc<AtomicBool>, Option<std::thread::JoinHandle<()>>);
+impl Worker {
+    fn start(mut pump: Pump) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = stop.clone();
+        let join = std::thread::spawn(move || {
+            while !stopping.load(Ordering::Acquire) {
+                pump.run_for(Duration::from_millis(100));
+            }
+        });
+        Self(stop, Some(join))
+    }
+}
+impl Drop for Worker {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+        self.1.take().unwrap().join().unwrap();
+    }
+}
+
+fn pump_stats(endpoint: &crate::pump::port::lockfree::LockfreeEndpoint) -> NetworkThreadPull {
+    endpoint.request_protocol_stats();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(stats) = endpoint.try_protocol_stats() { return stats; }
+        assert!(Instant::now() < deadline, "parked pump did not service telemetry");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
 #[test]
 fn encrypted_multimegabyte_mid_codec_shrink_keeps_bytes_identity_and_pending_ciphertext() {
     let server_port = std::net::UdpSocket::bind("127.0.0.1:0")
@@ -516,9 +547,10 @@ fn recovery_small_outage_proofs_do_not_postpone_current_tu_probe_backoff() {
         commit_connected_send(
             &mut state,
             &mut queues,
-            PendingSendKind::Reachability,
+            if step % 2 == 0 { PendingSendKind::Reachability }
+                else { PendingSendKind::ReachabilityCurrent },
             sent,
-            512,
+            if step % 2 == 0 { 512 } else { 1204 },
             &[],
             0,
             None,
@@ -744,9 +776,10 @@ fn generic_four_pps_receipts_preserve_one_pps_ordinary_pacing_credit() {
         commit_connected_send(
             &mut state,
             &mut queues,
-            PendingSendKind::Reachability,
+            if tick % 2 == 1 { PendingSendKind::Reachability }
+                else { PendingSendKind::ReachabilityCurrent },
             sent,
-            512,
+            if tick % 2 == 1 { 512 } else { 1204 },
             &[],
             0,
             None,
@@ -960,27 +993,6 @@ fn padding_feedback_parks_but_mixed_feedback_and_local_refusal_stay_active() {
 #[test]
 fn native_initial_and_post_idle_bursts_after_multiple_generic_cycles_complete() {
     use crate::pump::port::lockfree::Event;
-    // This caller-owned driver intentionally uses the PUBLIC ring pump, not the
-    // synchronous reference adapter used by codec/capture fixtures above.
-    struct Worker(Arc<AtomicBool>, Option<std::thread::JoinHandle<()>>);
-    impl Worker {
-        fn start(mut pump: Pump) -> Self {
-            let stop = Arc::new(AtomicBool::new(false));
-            let stopping = stop.clone();
-            let join = std::thread::spawn(move || {
-                while !stopping.load(Ordering::Acquire) {
-                    pump.run_for(Duration::from_millis(100));
-                }
-            });
-            Self(stop, Some(join))
-        }
-    }
-    impl Drop for Worker {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::Release);
-            self.1.take().unwrap().join().unwrap();
-        }
-    }
     for (max_pps, rounds, count, payload_size, wait_secs) in [
         (2000, 2u8, 64u8, 80usize, 5),
         // More source bytes than three maximum-TU packets: this necessarily
@@ -1052,7 +1064,7 @@ fn native_initial_and_post_idle_bursts_after_multiple_generic_cycles_complete() 
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|d| d.kind == "reachability")
+                .filter(|d| matches!(d.kind, "reachability" | "reachability_current"))
                 .count();
             // No application command/service call: both retained native schedulers
             // must park and wake solely for generic send and receipt deadlines.
@@ -1061,7 +1073,7 @@ fn native_initial_and_post_idle_bursts_after_multiple_generic_cycles_complete() 
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|d| d.kind == "reachability")
+                .filter(|d| matches!(d.kind, "reachability" | "reachability_current"))
                 .count();
             assert!(after >= before + 4, "multiple generic idle cycles must run");
             let burst_started = Instant::now();
@@ -1097,9 +1109,325 @@ fn native_initial_and_post_idle_bursts_after_multiple_generic_cycles_complete() 
                 assert!(burst_started.elapsed() >= Duration::from_secs(1));
                 let captured = log.lock().unwrap();
                 assert!(captured.iter().filter(|d| d.kind == "data").count() >= 4);
-                assert!(captured.iter().filter(|d| d.kind == "reachability").count() >= after + 4);
+                assert!(captured.iter().filter(|d| matches!(d.kind, "reachability" | "reachability_current")).count() >= after + 4);
             }
         }
         assert_eq!(received.len(), rounds as usize * count as usize);
     }
+}
+
+// Socket-free tests use the real send commitment and native first-positive gate;
+// all decisions are deferred until every positive in the ACK has been processed.
+fn recovery_ack(state: &mut ConnectionStateConnected, sequences: &[u64], now: u64) -> bool {
+    let mut proof = false;
+    for &sequence in sequences {
+        if state.take_positive_receipt(sequence).is_some() {
+            proof |= state.on_positive_receipt(sequence, now);
+        }
+    }
+    let decision = proof && state.current_tu > 512 && state.recovery.large_stalled(now);
+    if decision {
+        state.recovery.downshifted(now);
+        state.downshift_for_recovery(false);
+    }
+    decision
+}
+fn recovery_send(state: &mut ConnectionStateConnected, queues: &mut SendQueues,
+    kind: PendingSendKind, sent: u64, bytes: usize) -> u64 {
+    let sequence = state.send_sequence_number;
+    commit_connected_send(state, queues, kind, sent, bytes, &[], 0, None);
+    sequence
+}
+
+#[test]
+fn recovery_healthy_idle_drain_ignores_old_lost_ordinary_and_is_size_independent() {
+    for payload_size in [80, 512, 10_000] {
+        let (mut state, mut queues, start) = parked_fixture();
+        state.current_tu = 1322;
+        // An old lost ordinary record survives the application stopping at45s.
+        recovery_send(&mut state, &mut queues, PendingSendKind::Data, start + 1, 1322);
+        let final_data = recovery_send(&mut state, &mut queues, PendingSendKind::Data,
+            start + 44_976_000_000, 1322);
+        assert!(!recovery_ack(&mut state, &[final_data], start + 44_977_000_000));
+        let mut saw_small = 0;
+        let mut saw_current = 0;
+        for tick in 0..40 {
+            let now = start + 45_000_000_000 + tick * crate::mtu_recovery::PERIOD;
+            let size = state.recovery.probe_size(state.current_tu);
+            let kind = if size == 512 { saw_small += 1; PendingSendKind::Reachability }
+                else { saw_current += 1; PendingSendKind::ReachabilityCurrent };
+            let sequence = recovery_send(&mut state, &mut queues, kind, now, size as usize);
+            assert!(!recovery_ack(&mut state, &[sequence], now + 1_000_000));
+            assert_eq!(state.current_tu, 1322, "false idle shrink after {payload_size}B app");
+            assert!(!needs_active_retry(&state, false) || state.active_send_frontier > state.packets_waiting_ack_tail);
+        }
+        assert_eq!((saw_small, saw_current), (20, 20));
+    }
+}
+
+#[test]
+fn recovery_repeated_differential_probes_recover_idle_and_high_rate_blackhole() {
+    for ordinary_per_slot in [0, 5000] {
+        let (mut state, mut queues, start) = parked_fixture();
+        state.current_tu = 1322;
+        let mut decisions = 0;
+        for tick in 0..=8 {
+            let now = start + 1 + tick * crate::mtu_recovery::PERIOD;
+            let size = state.recovery.probe_size(state.current_tu);
+            let kind = if size == 512 { PendingSendKind::Reachability }
+                else { PendingSendKind::ReachabilityCurrent };
+            let sequence = recovery_send(&mut state, &mut queues, kind, now, size as usize);
+            // More than the complete metadata ring churns between probes. The
+            // protected generic ledger must retain both failures AND positives.
+            for _ in 0..ordinary_per_slot {
+                recovery_send(&mut state, &mut queues, PendingSendKind::Data, now + 1, 1322);
+            }
+            if size == 512 {
+                assert!(state.recovery.is_generic(sequence));
+                let changed = recovery_ack(&mut state, &[sequence], now + 10_000_000);
+                decisions += usize::from(changed);
+                if tick < 8 { assert!(!changed, "two aged failures required"); }
+            }
+        }
+        assert_eq!(decisions, 1, "ordinary_per_slot={ordinary_per_slot}");
+        assert_eq!(state.current_tu, 512);
+        assert_eq!(state.recovery.upward_after, start + 12_010_000_001);
+        assert!(!state.recovery.can_promote(start + 2_100_000_000, start + 3_000_000_000));
+    }
+}
+
+fn repeated_probe_fixture() -> (ConnectionStateConnected, SendQueues, u64, [u64; 2], [u64; 2]) {
+    let (mut state, mut queues, start) = parked_fixture();
+    let large = [
+        recovery_send(&mut state, &mut queues, PendingSendKind::ReachabilityCurrent, start + 1, 1204),
+        recovery_send(&mut state, &mut queues, PendingSendKind::ReachabilityCurrent, start + 500_000_001, 1204),
+    ];
+    let small = [
+        recovery_send(&mut state, &mut queues, PendingSendKind::Reachability, start + 600_000_000, 512),
+        recovery_send(&mut state, &mut queues, PendingSendKind::Reachability, start + 1_100_000_000, 512),
+    ];
+    (state, queues, start, large, small)
+}
+
+#[test]
+fn recovery_single_loss_or_single_small_positive_or_upward_failure_cannot_shrink() {
+    for scenario in 0..4 {
+        let (mut state, mut queues, start, large, small) = repeated_probe_fixture();
+        match scenario {
+            0 => { // One failed current-TU probe, the other has positive proof.
+                assert!(!recovery_ack(&mut state, &[large[1]], start + 600_000_001));
+            }
+            1 => { // Only one exact small receipt; duplicates cannot add evidence.
+                assert!(!recovery_ack(&mut state, &[small[0]], start + 1_500_000_001));
+                assert!(!recovery_ack(&mut state, &[small[0]], start + 1_600_000_001));
+                continue;
+            }
+            2 => { // Failures at an old TU must not classify a promoted TU.
+                state.current_tu = 1472;
+                for tick in 0..2 {
+                    recovery_send(&mut state, &mut queues, PendingSendKind::MtuProbe,
+                        start + 1 + tick, 1500);
+                }
+            }
+            _ => { // The same differential history cannot resize a512TU.
+                state.current_tu = 512;
+            }
+        }
+        assert!(!recovery_ack(&mut state, &small, start + 1_500_000_001));
+    }
+}
+
+#[test]
+fn recovery_mixed_reordered_and_delayed_ack_progress_vetoes_entire_decision() {
+    for kind in [PendingSendKind::Data, PendingSendKind::ReachabilityCurrent] {
+        for large_first in [false, true] {
+            let (mut state, mut queues, start, _, small) = repeated_probe_fixture();
+            let good = recovery_send(&mut state, &mut queues, kind, start + 1_200_000_000, 1204);
+            assert!(!recovery_ack(&mut state, &[small[0]], start + 1_300_000_000));
+            let ack = if large_first { [good, small[1]] } else { [small[1], good] };
+            assert!(!recovery_ack(&mut state, &ack, start + 1_500_000_001));
+            assert_eq!(state.current_tu, 1204);
+            let small_later = recovery_send(&mut state, &mut queues, PendingSendKind::Reachability,
+                start + 2_600_000_000, 512);
+            assert!(!recovery_ack(&mut state, &[small_later], start + 2_700_000_000),
+                "old failed probes must stay cancelled after the one-second veto");
+        }
+    }
+    let (mut state, _, start, _, small) = repeated_probe_fixture();
+    // Delayed receipts beyond two seconds are not fresh small evidence.
+    assert!(!recovery_ack(&mut state, &small, start + 3_100_000_001));
+}
+
+#[test]
+fn recovery_current_probe_refusal_keeps_ciphertext_schedule_and_deferred_tu() {
+    let (mut state, mut queues, start) = parked_fixture();
+    let before = state.recovery.next_probe;
+    let ciphertext = vec![17; 1204];
+    assert!(!finish_connected_send(&mut state, &mut queues, PendingSendKind::ReachabilityCurrent,
+        None, start, &ciphertext, &[], Dscp::BestEffort, 0, None));
+    assert_eq!(state.recovery.next_probe, before);
+    state.promote_tu(1472);
+    assert_eq!(state.current_tu, 1204);
+    assert_eq!(state.deferred_tu, Some(1472));
+    let pending = state.pending_send.take().unwrap();
+    assert_eq!(pending.bytes, ciphertext);
+    commit_connected_send(&mut state, &mut queues, pending.kind, start + 1,
+        pending.bytes.len(), &pending.plaintext, 0, None);
+    assert_eq!(state.current_tu, 1472);
+    assert_eq!(state.recovery.next_probe, start + 1 + crate::mtu_recovery::PERIOD);
+    assert_eq!(state.recovery.probe_size(state.current_tu), 512);
+    assert!(!needs_active_retry(&state, false));
+}
+
+#[test]
+fn recovery_unknown_positive_vetoes_mixed_ack_after_ordinary_metadata_overwrite() {
+    for unknown_first in [false, true] {
+        let (mut state, mut queues, start) = parked_fixture();
+        let good = recovery_send(&mut state, &mut queues, PendingSendKind::Data, start + 1, 1204);
+        for _ in 0..5000 {
+            recovery_send(&mut state, &mut queues, PendingSendKind::Data, start + 2, 1204);
+        }
+        let mut small = Vec::new();
+        for (kind, sent, bytes) in [
+            (PendingSendKind::ReachabilityCurrent, start + 10, 1204),
+            (PendingSendKind::ReachabilityCurrent, start + 500_000_010, 1204),
+            (PendingSendKind::Reachability, start + 600_000_000, 512),
+            (PendingSendKind::Reachability, start + 1_100_000_000, 512),
+        ] {
+            let seq = recovery_send(&mut state, &mut queues, kind, sent, bytes);
+            if bytes == 512 { small.push(seq); }
+        }
+        assert!(!recovery_ack(&mut state, &small[..1], start + 1_300_000_000));
+        let ack = if unknown_first { [good, small[1]] } else { [small[1], good] };
+        assert!(!recovery_ack(&mut state, &ack, start + 1_500_000_010));
+        assert_eq!(state.current_tu, 1204);
+    }
+}
+
+#[test]
+fn recovery_skipped_slots_allow_recent_repeated_failures_but_not_stale_history() {
+    for failed_age in [2_500_000_000, 3_000_000_001] {
+        let (mut state, mut queues, start) = parked_fixture();
+        recovery_send(&mut state, &mut queues, PendingSendKind::ReachabilityCurrent, start + 1, 1204);
+        recovery_send(&mut state, &mut queues, PendingSendKind::ReachabilityCurrent,
+            start + 1_000_000_001, 1204);
+        let first = recovery_send(&mut state, &mut queues, PendingSendKind::Reachability,
+            start + 1_600_000_000, 512);
+        let second = recovery_send(&mut state, &mut queues, PendingSendKind::Reachability,
+            start + 2_100_000_000, 512);
+        assert!(!recovery_ack(&mut state, &[first], start + 1_700_000_000));
+        assert_eq!(recovery_ack(&mut state, &[second], start + 1 + failed_age),
+            failed_age <= 3_000_000_000);
+    }
+}
+
+#[test]
+fn recovery_overwritten_old_generic_receipt_is_unknown_veto_not_fresh_proof() {
+    let (mut state, mut queues, start) = parked_fixture();
+    let old = recovery_send(&mut state, &mut queues, PendingSendKind::Reachability, start + 1, 512);
+    for tick in 1..=20 {
+        recovery_send(&mut state, &mut queues, PendingSendKind::Reachability,
+            start + tick * crate::mtu_recovery::PERIOD, 512);
+    }
+    for _ in 0..5000 {
+        recovery_send(&mut state, &mut queues, PendingSendKind::Data, start + 5_000_000_001, 1204);
+    }
+    assert!(!state.recovery.is_generic(old));
+    assert!(!recovery_ack(&mut state, &[old], start + 5_100_000_000));
+    assert_eq!(state.last_pacing_ack_received_time, start + 5_100_000_000);
+    assert!(!state.recovery.large_stalled(start + 5_100_000_001));
+}
+
+#[test]
+fn recovery_native_healthy_idle_with_old_data_loss_then_idle_size_blackhole() {
+    let port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let relay = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    relay.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
+    let relay_port = relay.local_addr().unwrap().port();
+    let stop = Arc::new(AtomicBool::new(false));
+    let blackhole = Arc::new(AtomicBool::new(false));
+    let dropped = Arc::new(Mutex::new(BTreeSet::new()));
+    let (st, bh, dr) = (stop.clone(), blackhole.clone(), dropped.clone());
+    let forwarder = std::thread::spawn(move || {
+        let mut peer = None;
+        let mut bytes = [0u8; 10000];
+        while !st.load(Ordering::Acquire) {
+            match relay.recv_from(&mut bytes) {
+                Ok((len, src)) => {
+                    let target = if src == server_addr { peer }
+                        else { peer = Some(src); Some(server_addr) };
+                    let limit = if bh.load(Ordering::Acquire) { 512 } else { 1204 };
+                    if len <= limit {
+                        if let Some(target) = target { relay.send_to(&bytes[..len], target).unwrap(); }
+                    } else if src != server_addr {
+                        dr.lock().unwrap().insert(bytes[..len].to_vec());
+                    }
+                }
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+                Err(e) => panic!("relay: {e}"),
+            }
+        }
+    });
+    let magic = CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s;
+    let keypair = new_keypair_from_connect_magic1(magic).unwrap();
+    let address = STPAddress {
+        ip: std::net::Ipv4Addr::LOCALHOST.to_ipv6_mapped(), port: relay_port,
+        magic1: magic, key: keypair.public.clone(),
+    };
+    let peer = address.connection_key();
+    let log = Arc::new(Mutex::new(Vec::new()));
+    use crate::pump::port::lockfree::Event;
+    let (server_pump, mut server) = new_pump_with_options(vec![keypair], port, Some(2000),
+        (1_000_000, 1 << 20, 1 << 20), 1 << 20, NetworkThreadOptions::default());
+    let (client_pump, mut client) = new_pump_with_options(vec![new_keypair_from_connect_magic1(magic).unwrap()], 0,
+        Some(2000), (1_000_000, 1 << 20, 1 << 20), 1 << 20,
+        NetworkThreadOptions { datagram_log: Some(log.clone()), ..Default::default() });
+    let server_worker = Worker::start(server_pump);
+    let client_worker = Worker::start(client_pump);
+    assert!(client.try_connect(address));
+    let (mut outgoing, mut incoming) = (false, false);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !outgoing || !incoming {
+        while let Some(event) = client.try_recv() {
+            assert!(matches!(event, Event::Connected { peer: p, .. } if p == peer));
+            outgoing = true;
+        }
+        while let Some(event) = server.try_recv() {
+            assert!(matches!(event, Event::Connected { .. }));
+            incoming = true;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // Lose ordinary DATA briefly, then restore a healthy path before any aged
+    // differential evidence exists. The application then drains and stays idle.
+    blackhole.store(true, Ordering::Release);
+    for i in 0..32 {
+        let mut payload = vec![i; 80];
+        assert!(client.try_send(peer, 0, Dscp::BestEffort, &mut payload));
+    }
+    std::thread::sleep(Duration::from_millis(150));
+    blackhole.store(false, Ordering::Release);
+    assert!(log.lock().unwrap().iter().any(|p| p.kind == "data" && dropped.lock().unwrap().contains(&p.bytes)),
+        "fixture must actually retain an unconfirmed ordinary DATA history");
+    // Neither endpoint receives further application send work during these idle
+    // periods. Generic current-TU success must defeat old DATA loss indefinitely.
+    std::thread::sleep(Duration::from_millis(3100));
+    let healthy = pump_stats(&client);
+    assert_eq!(healthy.connection_stats[0].1.udp_payload_tu, 1204);
+    blackhole.store(true, Ordering::Release);
+    std::thread::sleep(Duration::from_millis(3100));
+    let recovered = pump_stats(&client);
+    assert!(client.try_recv().is_none(), "idle recovery must not reconnect or disconnect");
+    assert_eq!(recovered.connection_stats[0].1.udp_payload_tu, 512,
+        "a real size blackhole must recover without application sends");
+    let log = log.lock().unwrap();
+    assert!(log.iter().any(|p| p.kind == "reachability_current" && p.bytes.len() == 1204));
+    assert!(log.iter().any(|p| p.kind == "reachability" && p.bytes.len() == 512));
+    drop(log);
+    drop(client_worker);
+    drop(server_worker);
+    stop.store(true, Ordering::Release);
+    forwarder.join().unwrap();
 }

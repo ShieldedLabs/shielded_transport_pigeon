@@ -116,13 +116,15 @@ implemented on the same public rings; it is not another library API.
   to the application. The supported authenticated profiles use Noise IK and
   require the responder's static public key. Developer plaintext is not secure.
 - Directional UDP transmission units start at 1204 bytes. Default-on recovery
-  sends a generic 512-byte best-effort padding probe every 250 ms, independent
-  of application message sizes. Fresh positive small-packet proof plus stalled
-  larger data can lower the TU to 512, with a ten-second upward hold. Recovery
-  is conservative, can fall back on an older unconfirmed send during idle, and
-  does not promise delivery or support paths below 512 bytes. It adds a bounded
-  96 KiB packet-history allocation per connected peer on Linux x64. See
-  `PROTOCOL.md` for proof, retry and FEC identity rules.
+  alternates generic 512-byte and current-TU best-effort padding probes on a
+  250 ms schedule, independent of application message sizes or queued work.
+  Recent repeated current-TU failures alongside repeated fresh small-packet
+  receipts can lower the TU to 512, with a ten-second upward hold. Healthy
+  current-TU progress cancels this evidence; old unconfirmed data alone cannot
+  cause an idle/drain fallback. At TU 512 every slot sends a small probe.
+  Recovery does not promise delivery or support paths below 512 bytes. It adds
+  a bounded 96 KiB packet-history allocation per connected peer on Linux x64.
+  See `PROTOCOL.md` for proof, retry and FEC identity rules.
 - Receive resources are bounded. Incoming data may be dropped under local
   memory or ring pressure, even when its network packet was acknowledged.
 - Cryptographic authentication is not a claim of a security audit, anonymity,

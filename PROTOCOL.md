@@ -285,7 +285,8 @@ rejected. This implementation also rejects non-ACK plaintext shorter than
 plaintext must never be 152 bytes. No packet-type
 byte replaces the size test. Ordinary sender data packets and idle/outage
 keepalives fill exactly the current transmission unit (TU); upward MTU probes fill
-exactly their probed TU and periodic reachability probes are exactly 512 UDP bytes.
+exactly their probed TU. Periodic reachability probes alternate 512 UDP bytes
+and the current TU.
 Handshakes are the explicitly separate exception.
 TU is the effective sender transmission unit: if an MTU-probe ACK arrives
 while a locally refused current-TU ciphertext is pending, its discovered
@@ -733,34 +734,45 @@ TU. The search doubles its step after success and divides it by five after loss.
 
 Default-on local size-recovery policy:
 
-- Send a generic **512-byte BE** all-padding data-space probe every **250 ms**
-  when locally able. Its schedule depends on time and accepted generic probe
-  attempts, never on application availability or message length; ordinary
-  512-byte data does not move this clock. A pending ciphertext or whole-packet
-  copy takes priority; send-ring capacity still applies. Pump wake deadlines
-  include the generic probe and the upward hold. No library thread is created.
+- Alternate generic **512-byte and current-TU BE** all-padding data-space probes
+  on **250 ms** slots when locally able: two probes per second of each size,
+  with no increase in the total four-probe-per-second schedule. At TU 512 every
+  slot sends a small probe. The schedule depends on time and accepted generic
+  attempts, never on application availability, queue occupancy or message length;
+  ordinary 512-byte data does not move this clock. A pending ciphertext or
+  whole-packet copy takes priority; send-ring capacity still applies. Pump wake
+  deadlines include the generic probe and the upward hold. No thread is created.
 - Feed only native authenticated, exact first-positive receipts into a bounded
-  4096-entry nonce/size/send-time history. A small proof must be at most two
-  seconds old. After at least one second without fresh positive receipt of
-  larger ordinary data, and with an aged (at least one second) unconfirmed larger
-  data record, a fresh exact 512-byte proof lowers the effective TU to 512.
-  Fresh larger progress anywhere in the same ACK vetoes the decision. ACK-highest,
-  aggregate counts, duplicate receipts and upward-probe failure alone do not
-  establish this proof. Overwritten records cannot supply proof.
+  4096-entry nonce/size/send-time allocation: 4080 nonce-indexed metadata entries
+  and a protected chronological 16-generic-probe ledger. Ordinary-send churn
+  cannot erase recent generic evidence. A fresh exact small receipt can lower
+  the effective TU to 512 only after at least one second without fresh larger
+  ordinary or exact-current-TU generic progress, with **at least two unconfirmed
+  exact-current-TU generic probes aged one to three seconds** and **at least two
+  positively receipted generic 512-byte probes whose sends are at most two
+  seconds old**. All counted sends must follow the last such larger progress.
+  Upward-probe failures and old ordinary losses supply no failure evidence;
+  old-TU failures cannot classify a newly promoted TU. Fresh larger progress
+  anywhere in the same ACK vetoes the decision regardless of receipt order.
+  A native first-positive receipt with overwritten metadata can only veto,
+  never establish evidence. ACK-highest, aggregate counts and duplicate
+  receipts supply no proof. Normal larger receipts take constant-time lookup;
+  eligible small receipts scan only the protected 16-entry ledger.
 - Hold upward discovery/promotion for ten seconds after a decision. Pending
   ciphertext and planned duplication copies retain their exact bytes and nonce;
   effective shrink waits for their acceptance. Restart a still-active FEC unit
   from its full shared source under a fresh unit ID if its symbol no longer fits;
   preserve segmented root/offset, and never reopen a sealed root or mutate an
   existing unit's layout. Already-forgotten messages are not made reliable.
-- During outage, a generic small probe also records an outage probe, so its fresh
-  positive receipt can satisfy the existing outage-resumption rule. Ordinary
-  current-TU outage probes and exponential outage backoff remain in place.
+- During outage, either generic probe class also records an outage probe, so its
+  fresh positive receipt can satisfy the existing outage-resumption rule without
+  postponing independently backed-off current-TU outage probes.
 
-This is a conservative classifier, not proof of a path failure: an older
-unconfirmed larger send can trigger fallback during idle/drain. A successful
-small proof does not guarantee future delivery. History overwrite and local
-backpressure may delay recovery; paths below 512 bytes are unsupported. The
+This is a conservative classifier, not proof of a path failure. Old unconfirmed
+ordinary sends alone cannot trigger idle/drain fallback, but recent repeated
+size-selective loss can. A successful small proof does not guarantee future
+delivery. History overwrite and local backpressure may delay recovery; paths
+below 512 bytes are unsupported. The
 history uses 96 KiB per connected peer on Linux x64, charged in the 608 KiB
 connection-bookkeeping reservation separately from the derived receive-data cap.
 Packet-rate congestion control and FEC planning policy are unchanged. These

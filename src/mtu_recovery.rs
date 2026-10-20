@@ -4,9 +4,14 @@
 pub(crate) const SMALL: u64 = 512;
 pub(crate) const PERIOD: u64 = 250_000_000;
 const MAX_PROOF_AGE: u64 = 2_000_000_000;
+const MAX_FAILURE_AGE: u64 = 3_000_000_000;
 const STALL: u64 = 1_000_000_000;
+const REPEATED: usize = 2;
 const UPWARD_HOLD: u64 = 10_000_000_000;
 const RECORDS: usize = 4096;
+// Four seconds at the generic schedule, protected from ordinary-send churn.
+const GENERIC_RECORDS: usize = 16;
+const PACKET_RECORDS: usize = RECORDS - GENERIC_RECORDS;
 /// Heap storage charged in the connection's process-budget reservation.
 pub(crate) const HISTORY_BYTES: usize = RECORDS * std::mem::size_of::<Sent>();
 
@@ -17,6 +22,7 @@ struct Sent {
     bytes: u16,
     ordinary: bool,
     generic: bool,
+    acknowledged: bool,
 }
 impl Sent {
     const EMPTY: Self = Self {
@@ -25,13 +31,16 @@ impl Sent {
         bytes: 0,
         ordinary: false,
         generic: false,
+        acknowledged: false,
     };
 }
 
 #[derive(Debug)]
 pub(crate) struct Recovery {
     records: Box<[Sent]>,
-    pub(crate) next_small: u64,
+    generic_cursor: usize,
+    pub(crate) next_probe: u64,
+    probe_current: bool,
     pub(crate) upward_after: u64,
     last_large_progress: u64,
 }
@@ -39,7 +48,9 @@ impl Recovery {
     pub(crate) fn new(now: u64) -> Self {
         Self {
             records: vec![Sent::EMPTY; RECORDS].into_boxed_slice(),
-            next_small: now,
+            generic_cursor: 0,
+            next_probe: now,
+            probe_current: false,
             upward_after: 0,
             last_large_progress: now,
         }
@@ -53,20 +64,31 @@ impl Recovery {
         generic: bool,
     ) {
         debug_assert!(bytes <= u16::MAX as u64);
-        self.records[sequence as usize % RECORDS] = Sent {
+        let record = Sent {
             sequence,
             time: now,
             bytes: bytes as u16,
             ordinary,
             generic,
+            acknowledged: false,
         };
+        self.records[sequence as usize % PACKET_RECORDS] = record;
+        if generic {
+            self.records[PACKET_RECORDS + self.generic_cursor] = record;
+            self.generic_cursor = (self.generic_cursor + 1) % GENERIC_RECORDS;
+        }
     }
     pub(crate) fn is_generic(&self, sequence: u64) -> bool {
-        let record = &self.records[sequence as usize % RECORDS];
-        record.sequence == sequence && record.generic
+        let record = &self.records[sequence as usize % PACKET_RECORDS];
+        if record.sequence == sequence { return record.generic; }
+        self.records[PACKET_RECORDS..].iter().any(|r| r.sequence == sequence)
     }
-    pub(crate) fn scheduled_small_sent(&mut self, now: u64) {
-        self.next_small = now.saturating_add(PERIOD);
+    pub(crate) fn probe_size(&self, current_tu: u64) -> u64 {
+        if self.probe_current { current_tu } else { SMALL }
+    }
+    pub(crate) fn scheduled_probe_sent(&mut self, now: u64, bytes: u64) {
+        self.next_probe = now.saturating_add(PERIOD);
+        self.probe_current = bytes == SMALL;
     }
     pub(crate) fn large_stalled(&self, now: u64) -> bool {
         now.saturating_sub(self.last_large_progress) >= STALL
@@ -77,41 +99,60 @@ impl Recovery {
             && sent != u64::MAX
             && now.saturating_sub(sent) <= MAX_PROOF_AGE
     }
-    /// Returns a fresh small proof with aged, unacknowledged larger ordinary work.
-    /// Normal large ACKs take O(1); only eligible small proofs scan bounded history.
-    pub(crate) fn acknowledged(&mut self, sequence: u64, now: u64) -> bool {
-        let record = &mut self.records[sequence as usize % RECORDS];
-        if record.sequence != sequence {
-            return false;
+    /// Normal large ACKs take O(1). Only fresh small receipts scan bounded history.
+    /// Ordinary historical loss and unconfirmed upward probes are not evidence.
+    pub(crate) fn acknowledged(&mut self, sequence: u64, now: u64, current_tu: u64) -> bool {
+        let record = &mut self.records[sequence as usize % PACKET_RECORDS];
+        let mut sent = Sent::EMPTY;
+        if record.sequence == sequence {
+            sent = *record;
+            *record = Sent::EMPTY;
         }
-        let sent = *record;
-        *record = Sent::EMPTY;
+        if sent.generic || sent.sequence == u64::MAX {
+            let Some(record) = self.records[PACKET_RECORDS..].iter_mut()
+                .find(|r| r.sequence == sequence) else {
+                    // Exact metadata was overwritten. A native first positive
+                    // might be healthy ordinary progress: it can only veto.
+                    self.last_large_progress = now;
+                    return false;
+                };
+            if record.acknowledged { return false; }
+            sent = *record;
+            // Keep positive generic evidence; first-positive admission stays exact.
+            record.acknowledged = true;
+        }
         if now.saturating_sub(sent.time) > MAX_PROOF_AGE {
             return false;
         }
-        if sent.bytes as u64 > SMALL && sent.ordinary {
+        if sent.bytes as u64 > SMALL
+            && (sent.ordinary || (sent.generic && sent.bytes as u64 == current_tu)) {
             self.last_large_progress = now;
             return false;
         }
-        if sent.bytes as u64 != SMALL || !self.large_stalled(now) {
+        if current_tu <= SMALL || sent.bytes as u64 != SMALL || !self.large_stalled(now) {
             return false;
         }
-        self.records.iter().any(|r| {
-            r.sequence != u64::MAX
-                && r.ordinary
-                && r.bytes as u64 > SMALL
-                && now.saturating_sub(r.time) >= STALL
-        })
+        let mut failures = 0;
+        let mut small_positives = 0;
+        for r in self.records[PACKET_RECORDS..].iter() {
+            let age = now.saturating_sub(r.time);
+            if r.sequence == u64::MAX || r.time <= self.last_large_progress {
+                continue;
+            }
+            if r.acknowledged && r.bytes as u64 == SMALL && age <= MAX_PROOF_AGE {
+                small_positives += 1;
+            } else if !r.acknowledged && r.bytes as u64 == current_tu
+                && (STALL..=MAX_FAILURE_AGE).contains(&age) {
+                failures += 1;
+            }
+        }
+        failures >= REPEATED && small_positives >= REPEATED
     }
     /// Commit only after the whole ACK has been admitted: large progress in the
     /// same bitmap must veto a small proof regardless of sequence ordering.
     pub(crate) fn downshifted(&mut self, now: u64) {
         self.upward_after = now.saturating_add(UPWARD_HOLD);
-        for record in &mut self.records {
-            if record.ordinary && record.bytes as u64 > SMALL {
-                *record = Sent::EMPTY;
-            }
-        }
+        self.records.fill(Sent::EMPTY);
         self.last_large_progress = now;
     }
 }
@@ -137,53 +178,36 @@ mod tests {
         assert_eq!(std::mem::size_of_val(r.records.as_ref()), 96 * 1024);
     }
     #[test]
-    fn application_packets_do_not_move_generic_probe_schedule() {
+    fn application_packets_do_not_move_alternating_generic_probe_schedule() {
         let mut r = Recovery::new(10);
         for (seq, bytes) in [80, 512, 1000, 1204, 9000].into_iter().enumerate() {
             r.sent(seq as u64, bytes, 100, true, false);
-            assert_eq!(r.next_small, 10);
+            assert_eq!(r.next_probe, 10);
         }
-        r.scheduled_small_sent(300);
-        assert_eq!(r.next_small, 300 + PERIOD);
+        for size in [512, 1204, 512, 1204] {
+            assert_eq!(r.probe_size(1204), size);
+            r.scheduled_probe_sent(300, size);
+            assert_eq!(r.next_probe, 300 + PERIOD);
+        }
+        for _ in 0..8 {
+            assert_eq!(r.probe_size(512), 512);
+            r.scheduled_probe_sent(300, 512);
+        }
     }
     #[test]
-    fn exact_small_proof_and_stalled_large_required() {
+    fn overwritten_metadata_and_protected_generic_history_have_distinct_lifetimes() {
         let mut r = Recovery::new(0);
-        r.sent(1, 1204, 1, true, false);
-        r.sent(2, 512, 900_000_000, true, false);
-        assert!(!r.acknowledged(3, 1_100_000_000));
-        assert!(r.acknowledged(2, 1_100_000_000));
-        r.downshifted(1_100_000_000);
-        assert_eq!(r.upward_after, 11_100_000_000);
-        assert!(!r.acknowledged(2, 1_200_000_000));
-    }
-    #[test]
-    fn recent_and_same_bitmap_large_progress_prevent_downshift() {
-        let mut r = Recovery::new(0);
-        r.sent(1, 1204, 1, true, false);
-        r.sent(2, 512, 900_000_000, false, false);
-        r.sent(3, 1204, 900_000_000, true, false);
-        assert!(r.acknowledged(2, 1_100_000_000));
-        assert!(!r.acknowledged(3, 1_100_000_000));
-        assert!(!r.large_stalled(1_100_000_000));
-        r.sent(4, 512, 1_200_000_000, true, false);
-        assert!(!r.acknowledged(4, 1_200_000_000));
-    }
-    #[test]
-    fn stale_small_and_probe_only_failures_do_not_prove_recovery() {
-        let mut r = Recovery::new(0);
-        r.sent(1, 1204, 1, true, false);
-        r.sent(2, 512, 2, false, false);
-        assert!(!r.acknowledged(2, MAX_PROOF_AGE + 3));
-        r.sent(1, 1400, 1, false, false);
-        r.sent(2, 512, 900_000_000, false, false);
-        assert!(!r.acknowledged(2, 1_100_000_000));
-    }
-    #[test]
-    fn overwritten_sequence_cannot_supply_a_proof() {
-        let mut r = Recovery::new(0);
-        r.sent(1, 512, 10, false, false);
-        r.sent(1 + RECORDS as u64, 512, 20, false, false);
-        assert!(!r.acknowledged(1, 100));
+        r.sent(1, 512, 10, false, true);
+        r.sent(1 + PACKET_RECORDS as u64, 1204, 20, true, false);
+        assert_eq!(r.records[1].sequence, 1 + PACKET_RECORDS as u64);
+        assert!(r.is_generic(1), "generic proof survives real nonce-slot overwrite");
+        assert!(!r.is_generic(1 + PACKET_RECORDS as u64));
+        assert!(!r.acknowledged(1, 100, 1204));
+        for seq in 2..=1 + GENERIC_RECORDS as u64 {
+            r.sent(seq, 512, 200, false, true);
+        }
+        assert!(!r.is_generic(1), "chronological ledger is bounded too");
+        assert!(!r.acknowledged(1, 300, 1204));
+        assert_eq!(r.last_large_progress, 300, "unknown positive may only veto");
     }
 }

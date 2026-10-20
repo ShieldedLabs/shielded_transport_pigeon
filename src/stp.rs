@@ -3454,12 +3454,14 @@ pub enum ConnectionState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PendingSendKind { Ack, Data, Keepalive, MtuProbe, Outage, Reachability }
+enum PendingSendKind { Ack, Data, Keepalive, MtuProbe, Outage, Reachability, ReachabilityCurrent }
 impl PendingSendKind {
+    fn is_generic(self) -> bool { matches!(self, Self::Reachability | Self::ReachabilityCurrent) }
     #[cfg(test)]
     fn name(self) -> &'static str {
         match self { Self::Ack => "ack", Self::Data => "data", Self::Keepalive => "keepalive",
-            Self::MtuProbe => "mtu_probe", Self::Outage => "outage", Self::Reachability => "reachability" }
+            Self::MtuProbe => "mtu_probe", Self::Outage => "outage", Self::Reachability => "reachability",
+            Self::ReachabilityCurrent => "reachability_current" }
     }
 }
 
@@ -4009,7 +4011,7 @@ impl ConnectionStateConnected {
     }
     fn promote_tu(&mut self, tu: u64) {
         if self.pending_send.as_ref().is_some_and(|p| matches!(p.kind,
-            PendingSendKind::Data | PendingSendKind::Keepalive | PendingSendKind::Outage | PendingSendKind::Reachability)) {
+            PendingSendKind::Data | PendingSendKind::Keepalive | PendingSendKind::Outage | PendingSendKind::Reachability | PendingSendKind::ReachabilityCurrent)) {
             self.deferred_tu = Some(tu);
         } else { self.current_tu = tu; }
     }
@@ -4023,7 +4025,7 @@ impl ConnectionStateConnected {
         if !self.recovery.is_generic(sequence) { self.last_pacing_ack_received_time = now; }
         self.last_ack_received_time = now;
         self.outage.pending_since_ns = None;
-        self.recovery.acknowledged(sequence, now)
+        self.recovery.acknowledged(sequence, now, self.current_tu)
     }
     // The receive loop and socket-free tests share first-positive admission.
     // Clearing either ring bit here makes duplicate receipts ineligible.
@@ -6265,20 +6267,24 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
 
                         // Generic time-driven reachability, independent of queued message lengths.
                         // A pending ciphertext retry or planned whole-packet copy always goes first.
-                        if current_time_now_ns >= state.recovery.next_small
+                        if current_time_now_ns >= state.recovery.next_probe
                             && !connection_tracking_data.unreliable_send_buffer.target_copy_pending()
                             && state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY - 1 {
-                            let payload_len = crate::mtu_recovery::SMALL as usize
+                            let probe_size = state.recovery.probe_size(state.current_tu);
+                            let kind = if probe_size == crate::mtu_recovery::SMALL {
+                                PendingSendKind::Reachability
+                            } else { PendingSendKind::ReachabilityCurrent };
+                            let payload_len = probe_size as usize
                                 - total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(state.magic1).unwrap();
                             packet_memory_send[..payload_len].fill(0xff);
                             let Some(packet_len) = seal_connected_packet(&mut state.cipher, connection_tracking_data.two_byte_send_prefix,
                                 state.send_sequence_number, &packet_memory_send[..payload_len], &mut packet_memory_encrypted[..], current_time_now_ns) else { return false; };
                             #[cfg(test)]
-                            datagram_expectation.set(("reachability", Some(crate::mtu_recovery::SMALL as usize)));
+                            datagram_expectation.set((kind.name(), Some(probe_size as usize)));
                             let sent = udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip,
                                 connection_tracking_data.other_port, &packet_memory_encrypted[..packet_len], Dscp::BestEffort, false);
                             if !finish_connected_send(state, &mut connection_tracking_data.unreliable_send_buffer,
-                                PendingSendKind::Reachability, sent, current_time_now_ns, &packet_memory_encrypted[..packet_len],
+                                kind, sent, current_time_now_ns, &packet_memory_encrypted[..packet_len],
                                 &[], Dscp::BestEffort, connection_tracking_data.two_byte_send_prefix, loss_trace.as_mut()) { return true; }
                         }
 
@@ -6768,7 +6774,7 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                 include(c.ack_timer.saturating_add(1));
                                 if c.pending_send.is_none() && !conn.unreliable_send_buffer.target_copy_pending()
                                     && c.send_sequence_number - c.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY - 1 {
-                                    include(c.recovery.next_small);
+                                    include(c.recovery.next_probe);
                                 }
                                 include(c.last_sent_data_packet.saturating_add(5_000_000_001));
                                 let last_activity = if authenticated_peer_liveness {
@@ -7299,9 +7305,9 @@ fn commit_connected_send(state: &mut ConnectionStateConnected, buf: &mut SendQue
     if kind != PendingSendKind::Data { buf.fec_prepare_packet(seq); }
     let active_frontier = state.active_send_frontier;
     state.account_send(sent);
-    if kind == PendingSendKind::Reachability { state.active_send_frontier = active_frontier; }
-    state.recovery.sent(seq, len as u64, sent, kind == PendingSendKind::Data, kind == PendingSendKind::Reachability);
-    if kind == PendingSendKind::Reachability { state.recovery.scheduled_small_sent(sent); }
+    if kind.is_generic() { state.active_send_frontier = active_frontier; }
+    state.recovery.sent(seq, len as u64, sent, kind == PendingSendKind::Data, kind.is_generic());
+    if kind.is_generic() { state.recovery.scheduled_probe_sent(sent, len as u64); }
     state.packet_since_last_print += 1;
     if kind == PendingSendKind::MtuProbe {
         state.tu_probe_sequence_number = seq;
@@ -7314,9 +7320,9 @@ fn commit_connected_send(state: &mut ConnectionStateConnected, buf: &mut SendQue
         buf.fec_on_data_committed(seq, sent);
         if let Some(a) = &mut buf.fec_adaptive { a.on_data_sent(seq); }
     }
-    if kind == PendingSendKind::Outage || (kind == PendingSendKind::Reachability && state.outage.since_ns.is_some()) {
+    if kind == PendingSendKind::Outage || (kind.is_generic() && state.outage.since_ns.is_some()) {
         state.outage.probes[(seq % 8) as usize] = (seq, sent);
-        // Generic small proofs can resume outage, but must not postpone the
+        // Either generic probe can resume outage, but must not postpone the
         // independently backed-off current-TU outage probe schedule.
         if kind == PendingSendKind::Outage { state.outage.probe_sent(sent); }
     }
@@ -13051,7 +13057,8 @@ mod local_backpressure_tests {
     #[test]
     fn refused_data_and_control_commit_no_nonce_time_flight_or_loss() {
         for kind in [PendingSendKind::Data, PendingSendKind::MtuProbe,
-            PendingSendKind::Keepalive, PendingSendKind::Outage] {
+            PendingSendKind::Keepalive, PendingSendKind::Outage,
+            PendingSendKind::Reachability, PendingSendKind::ReachabilityCurrent] {
             let mut s = state();
             let mut b = SendQueues::baseline_for_test(1, (1_000_000, 8<<20, 8<<20));
             let bytes = vec![7; 1184];

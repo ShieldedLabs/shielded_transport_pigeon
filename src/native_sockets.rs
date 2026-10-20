@@ -378,6 +378,21 @@ mod linux {
         }
     }
 
+    /// PROBE keeps DF/no-source-fragmentation, but ignores cached path MTU so STP
+    /// can discover an increased TU. Both levels are required on our dual-stack socket.
+    /// On failure this helper owns and closes fd, like the other setup failure paths.
+    fn set_pmtu_probe(fd: libc::c_int) -> Option<()> {
+        for (level, option, value, name) in [
+            (libc::IPPROTO_IP, libc::IP_MTU_DISCOVER, libc::IP_PMTUDISC_PROBE, "IP_MTU_DISCOVER=IP_PMTUDISC_PROBE"),
+            (libc::IPPROTO_IPV6, libc::IPV6_MTU_DISCOVER, libc::IPV6_PMTUDISC_PROBE, "IPV6_MTU_DISCOVER=IPV6_PMTUDISC_PROBE"),
+        ] {
+            if unsafe { setsockopt_int(fd, level, option, value) } != 0 {
+                return setup_failed(Some(fd), format_args!("Failed to set {name}"));
+            }
+        }
+        Some(())
+    }
+
     #[inline]
     pub fn setup_and_bind_udp_socket(port: u16) -> Option<SockHandle> { // Linux
         setup_and_bind_udp_socket_on(port, None)
@@ -438,8 +453,7 @@ mod linux {
             return setup_failed(Some(fd), format_args!("bind([{}]:{}) failed", bind_addr, port));
         }
 
-        // Receive metadata, and disable fragmentation: with PMTUDISC_DO the kernel returns an
-        // error instead of fragmenting. None of these failures is fatal.
+        // Metadata is advisory; unlike the required probing policy, failure is non-fatal.
         unsafe {
             if setsockopt_int(fd, libc::IPPROTO_IP, libc::IP_RECVTOS, 1) != 0 {
                 eprintln!("Failed to Enable IPv4 TOS, error: {}", std::io::Error::last_os_error());
@@ -450,13 +464,8 @@ mod linux {
             if setsockopt_int(fd, libc::IPPROTO_IPV6, libc::IPV6_RECVPKTINFO, 1) != 0 {
                 eprintln!("Failed to Enable IPv6 PKTINFO, error: {}", std::io::Error::last_os_error());
             }
-            if setsockopt_int(fd, libc::IPPROTO_IPV6, libc::IPV6_MTU_DISCOVER, libc::IPV6_PMTUDISC_DO) != 0 {
-                eprintln!("Failed to set IPV6_MTU_DISCOVER: {}", std::io::Error::last_os_error());
-            }
-            if setsockopt_int(fd, libc::IPPROTO_IP, libc::IP_MTU_DISCOVER, libc::IP_PMTUDISC_DO) != 0 {
-                eprintln!("Failed to set IP_MTU_DISCOVER: {}", std::io::Error::last_os_error());
-            }
         }
+        set_pmtu_probe(fd)?;
         Some(SockHandle(fd, known_good_ipv6_address))
     }
 
@@ -655,6 +664,56 @@ mod linux {
         }
         (ipv4, probe_v6_source())
     }
+
+    #[cfg(test)]
+    mod pmtu_tests {
+        use super::*;
+        use std::os::fd::{FromRawFd, OwnedFd};
+
+        #[test]
+        fn all_bind_entrypoints_require_both_pmtu_probe_options() {
+            for socket in [
+                setup_and_bind_udp_socket(0),
+                setup_and_bind_udp_socket_on(0, None),
+                setup_and_bind_udp_socket_on(0, Some(std::net::Ipv4Addr::LOCALHOST.into())),
+                setup_and_bind_udp_socket_on(0, Some(Ipv6Addr::LOCALHOST.into())),
+            ] {
+                let socket = socket.expect("dual-stack bind with required PROBE policy");
+                let _owned = unsafe { OwnedFd::from_raw_fd(socket.0) };
+                for (level, option, expected) in [
+                    (libc::IPPROTO_IP, libc::IP_MTU_DISCOVER, libc::IP_PMTUDISC_PROBE),
+                    (libc::IPPROTO_IPV6, libc::IPV6_MTU_DISCOVER, libc::IPV6_PMTUDISC_PROBE),
+                ] {
+                    let mut value: libc::c_int = -1;
+                    let mut len = std::mem::size_of_val(&value) as libc::socklen_t;
+                    assert_eq!(unsafe { libc::getsockopt(socket.0, level, option, (&mut value as *mut libc::c_int).cast(), &mut len) }, 0);
+                    assert_eq!(len as usize, std::mem::size_of_val(&value));
+                    assert_eq!(value, expected, "level={level}, option={option}");
+                }
+            }
+        }
+
+        #[test]
+        fn pmtu_probe_failure_closes_socket_at_either_required_option() {
+            // AF_UNIX fails the first (IPv4) option. AF_INET accepts the first,
+            // then fails the IPv6 option. Neither may escape as a usable socket.
+            let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) }, 0);
+            let minimum_fd = (limit.rlim_cur / 2).min(4096) as libc::c_int;
+            for family in [libc::AF_UNIX, libc::AF_INET] {
+                let original = unsafe { libc::socket(family, libc::SOCK_DGRAM, 0) };
+                assert!(original >= 0);
+                // Keep the closed descriptor away from low-fd socket churn in
+                // parallel tests, while staying below this process's soft limit.
+                let fd = unsafe { libc::fcntl(original, libc::F_DUPFD_CLOEXEC, minimum_fd) };
+                unsafe { libc::close(original); }
+                assert!(fd >= 0);
+                assert!(set_pmtu_probe(fd).is_none());
+                assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+                assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+            }
+        }
+    }
 }
 
 /// Binding one specific address is implemented on Linux only; elsewhere `Some` fails.
@@ -823,6 +882,10 @@ mod windows {
             return None;
         }
 
+        // Close on every setup error (including unsupported required PMTU policy).
+        use std::os::windows::io::{FromRawSocket, IntoRawSocket, OwnedSocket};
+        let owned = unsafe { OwnedSocket::from_raw_socket(sock as _) };
+
         // non-blocking
         unsafe {
             let mut nonblocking: u32 = 1;
@@ -879,19 +942,22 @@ mod windows {
             return None;
         }
 
-        // Disable fragmentation
-        if setsockopt_val(sock, IPPROTO_IPV6 as i32, IPV6_DONTFRAG as i32, 1u32) == SOCKET_ERROR {
-            eprintln!("setsockopt(IPV6_DONTFRAG=1) failed: {}", wsa_last_error());
-            return None;
-        }
-        if setsockopt_val(sock, IPPROTO_IP as i32, IP_DONTFRAGMENT as i32, 1u32) == SOCKET_ERROR {
-            eprintln!("setsockopt(IP_DONTFRAGMENT=1) failed: {}", wsa_last_error());
-            return None;
+        // Winsock IPPROTO_IP/IPPROTO_IPV6 socket-options documentation specifies
+        // DWORD(PMTUD_STATE)=PROBE: no fragmentation, ignore cached path MTU,
+        // and fail sends above the interface MTU. Plain DONTFRAG is not enough.
+        for (level, option, name) in [
+            (IPPROTO_IP, IP_MTU_DISCOVER, "IP_MTU_DISCOVER"),
+            (IPPROTO_IPV6, IPV6_MTU_DISCOVER, "IPV6_MTU_DISCOVER"),
+        ] {
+            if setsockopt_val(sock, level, option, IP_PMTUDISC_PROBE as u32) == SOCKET_ERROR {
+                eprintln!("setsockopt({name}=IP_PMTUDISC_PROBE) failed: {}", wsa_last_error());
+                return None;
+            }
         }
 
         let recvmsg = get_wsarecvmsg(sock);
 
-        Some(SockHandle(sock, recvmsg))
+        Some(SockHandle(owned.into_raw_socket() as SOCKET, recvmsg))
     }
 
     #[inline]
@@ -1197,39 +1263,38 @@ mod macos {
             return setup_failed(None, format_args!("socket() failed"));
         }
         if let Err(what) = set_nonblocking(fd) {
-            return setup_failed(None, format_args!("{what}"));
+            return setup_failed(Some(fd), format_args!("{what}"));
         }
 
         // Dual-stack: allow IPv4-mapped IPv6 addresses (::ffff:a.b.c.d).
         if unsafe { setsockopt_int(fd, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, 0) } != 0 {
-            return setup_failed(None, format_args!("Failed to disable IPV6_V6ONLY"));
+            return setup_failed(Some(fd), format_args!("Failed to disable IPV6_V6ONLY"));
         }
 
         // Bind [::]:port
         let addr = sockaddr_in6([0; 16], port);
         if unsafe { libc::bind(fd, &addr as *const _ as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t) } != 0 {
-            return setup_failed(None, format_args!("bind([::]:{}) failed", port));
+            return setup_failed(Some(fd), format_args!("bind([::]:{}) failed", port));
         }
 
         unsafe {
             // macOS: receive IPv6 Traffic Class as a cmsg (type IPV6_TCLASS).
             // On a dual-stack IPv6 socket this is the supported way to read DSCP/ECN.
             if setsockopt_int(fd, libc::IPPROTO_IPV6, libc::IPV6_RECVTCLASS, 1) != 0 {
-                return setup_failed(None, format_args!("Failed to enable IPV6_RECVTCLASS"));
+                return setup_failed(Some(fd), format_args!("Failed to enable IPV6_RECVTCLASS"));
             }
             // Receive IPV6_PKTINFO cmsg (dst addr + ifindex) on recvmsg (and usable for sendmsg).
             if setsockopt_int(fd, libc::IPPROTO_IPV6, libc::IPV6_RECVPKTINFO, 1) != 0 {
-                return setup_failed(None, format_args!("Failed to enable IPV6_RECVPKTINFO"));
+                return setup_failed(Some(fd), format_args!("Failed to enable IPV6_RECVPKTINFO"));
             }
-            // Disable fragmentation
+            // Darwin has no MTU_DISCOVER/PROBE option. Its IPV6_DONTFRAG is the
+            // equivalent: XNU bsd/netinet6/ip6_output.c ip6_fragment_packet() sends
+            // unchanged up to interface MTU, ignoring cached path MTU. Setting it
+            // also sets INP2_DONTFRAG for mapped IPv4; udp_usrreq.c emits IP_DF and
+            // ip_output.c checks interface MTU. A separate IP_DONTFRAG is rejected
+            // on this AF_INET6 socket and is unnecessary for either family.
             if setsockopt_int(fd, libc::IPPROTO_IPV6, libc::IPV6_DONTFRAG, 1) != 0 {
-                return setup_failed(None, format_args!("Failed to set IPV6_DONTFRAG"));
-            }
-            // Best-effort: on a dual-stack AF_INET6 socket, macOS rejects the
-            // IPv4-level IP_DONTFRAG with EINVAL (the IPV6_DONTFRAG above already
-            // covers fragmentation control). Don't treat this as fatal.
-            if setsockopt_int(fd, libc::IPPROTO_IP, libc::IP_DONTFRAG, 1) != 0 {
-                eprintln!("Failed to set IP_DONTFRAG (non-fatal): {}", std::io::Error::last_os_error());
+                return setup_failed(Some(fd), format_args!("Failed to set IPV6_DONTFRAG (required PMTU probing policy)"));
             }
         }
 
