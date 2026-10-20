@@ -40,11 +40,13 @@ Version **0.3.0** replaces the 0.2 application API with a caller-driven pump and
 three SPSC rings. This is a breaking API release. The library does not start
 network or FEC threads. Move the pump to an application-owned thread if desired.
 The package version and wire-profile version are separate. Current main uses
-**wire profile 3**, incompatible with the published 0.3.0 version-2 profile.
-Both peers must be updated together: mismatched declarations are rejected during
-handshake. Profile 3 retains the bitmap ACK and duplication framing, but lowers
-the declared minimum FEC symbol to 445 bytes for 512-byte MTU recovery. This is
-not a new package release.
+**wire profile 4**, incompatible with profiles 2 and 3, including the published
+0.3.0 version-2 profile. Both peers must be updated together: mismatched
+handshake declarations are rejected. Profile 4 retains the bitmap ACK and
+445-byte minimum FEC symbol for 512-byte MTU recovery, and adds the exact sampled
+UDP payload size inside the unchanged 152-byte ACK. Known size mismatches are
+rejected before receipt, congestion or MTU feedback is admitted. This is not a
+new package release.
 
 ## Application API
 
@@ -119,9 +121,24 @@ implemented on the same public rings; it is not another library API.
   alternates generic 512-byte and current-TU best-effort padding probes on a
   250 ms schedule, independent of application message sizes or queued work.
   Recent repeated current-TU failures alongside repeated fresh small-packet
-  receipts can lower the TU to 512, with a ten-second upward hold. Healthy
+  receipts can lower the TU to 512, with a ten-second hold at the failed size. Healthy
   current-TU progress cancels this evidence; old unconfirmed data alone cannot
   cause an idle/drain fallback. At TU 512 every slot sends a small probe.
+  Proof ages adapt to exact generic-probe raw RTT, retaining the original
+  one/two/three-second windows on a stable 20 ms path. A protected 256-probe
+  history survives ordinary-send churn; outage proof uses a separate
+  chronological 32-entry ledger without weakening outstanding/replay checks.
+  Upward search tries coarse rungs 1452, 1472, 2048, 4096, 8192 and 9216 bytes.
+  A recent failed size bounds binary refinement above the confirmed TU; accepted
+  attempts stay at least 500 ms apart. Within eight bytes, search rechecks the
+  exact failed boundary after max(5 seconds, B), capped at 30 seconds. Failed
+  boundary rechecks back off independently to 10, 20 and 30 seconds on a low-RTT
+  path; interior outcomes do not restart that clock. An expired settled bound
+  remains a target, not promotion proof. Fresh authenticated success releases
+  the bound only when the larger TU becomes effective, then coarse search resumes.
+  An effective shrink seeds the bound from the old TU, permitting interior
+  refinement during the ten-second failed-size hold. These are issuance deadlines
+  once locally eligible, not ACK-arrival guarantees.
   Recovery does not promise delivery or support paths below 512 bytes. It adds
   a bounded 96 KiB packet-history allocation per connected peer on Linux x64.
   See `PROTOCOL.md` for proof, retry and FEC identity rules.

@@ -16,6 +16,8 @@ pub struct BitmapAck {
     pub receipt_base: u64,
     /// Most recently received unique packet, also acknowledged even outside the bitmap.
     pub sample_seq: u64,
+    /// Exact UDP payload size of sample_seq, including STP framing and authentication.
+    pub sample_udp_payload_bytes: u16,
     pub delay_us: u32,
     /// Cumulative number of unique CE-marked data/probe/keepalive packets, saturating at u64::MAX (close before exhaustion).
     pub ce_count: u64,
@@ -29,17 +31,19 @@ impl BitmapAck {
         b[8..16].copy_from_slice(&self.sample_seq.to_le_bytes());
         b[16..24].copy_from_slice(&self.ce_count.to_le_bytes());
         b[24..28].copy_from_slice(&self.delay_us.to_le_bytes());
-        // bytes 28..32: encoding 0 (bitmap), reserved zero.
+        b[28] = 1; // Bitmap plus exact sample size; byte 29 is reserved zero.
+        b[30..32].copy_from_slice(&self.sample_udp_payload_bytes.to_le_bytes());
         for (i, w) in self.bitmap.iter().enumerate() { b[32+i*8..40+i*8].copy_from_slice(&w.to_le_bytes()); }
         b
     }
     pub fn decode(b: &[u8]) -> Option<Self> {
-        if b.len() != ACK_PAYLOAD_LEN || b[28..32] != [0; 4] { return None; }
+        if b.len() != ACK_PAYLOAD_LEN || b[28] != 1 || b[29] != 0 || b[30..32] == [0; 2] { return None; }
         let mut a = Self {
             highest: 0,
             receipt_base: u64::from_le_bytes(b[..8].try_into().ok()?),
             sample_seq: u64::from_le_bytes(b[8..16].try_into().ok()?),
             ce_count: u64::from_le_bytes(b[16..24].try_into().ok()?),
+            sample_udp_payload_bytes: u16::from_le_bytes(b[30..32].try_into().ok()?),
             delay_us: u32::from_le_bytes(b[24..28].try_into().ok()?), bitmap: [0; 15],
         };
         if a.receipt_base >= crate::sequence::ACK_SPACE || a.sample_seq >= crate::sequence::ACK_SPACE { return None; }
@@ -97,6 +101,7 @@ pub struct AckReceiver {
     highest: Option<u64>,
     sample_seq: u64,
     sample_time_ns: u64,
+    sample_udp_payload_bytes: u16,
     ce_count: u64,
     pending: u16,
     last_arrival_ns: Option<u64>,
@@ -107,7 +112,7 @@ pub struct AckReceiver {
     feedback_pages: std::collections::VecDeque<(u64, u8)>,
 }
 impl Default for AckReceiver {
-    fn default() -> Self { Self { history: vec![0; (HISTORY_BITS/64) as usize].into_boxed_slice(), highest: None, sample_seq: 0, sample_time_ns: 0, ce_count: 0, pending: 0, last_arrival_ns: None, mean_gap_ns: 1_000_000, gap_seq: None, gap_since_ns: 0, last_ack_ns: None, feedback_pages: std::collections::VecDeque::new() } }
+    fn default() -> Self { Self { history: vec![0; (HISTORY_BITS/64) as usize].into_boxed_slice(), highest: None, sample_seq: 0, sample_time_ns: 0, sample_udp_payload_bytes: 0, ce_count: 0, pending: 0, last_arrival_ns: None, mean_gap_ns: 1_000_000, gap_seq: None, gap_since_ns: 0, last_ack_ns: None, feedback_pages: std::collections::VecDeque::new() } }
 }
 impl AckReceiver {
     /// Returns false for duplicate/too-old data; duplicates still refresh ACK feedback.
@@ -115,7 +120,8 @@ impl AckReceiver {
         self.receive_with_rtt(seq, now, ce, timer, 0, 1204)
     }
     pub fn receive_with_rtt(&mut self, seq: u64, now: u64, ce: bool, timer: &mut u64, rtt_us: u64, wire_bytes: usize) -> bool {
-        if seq >= crate::sequence::ACK_SPACE { return false; }
+        let Ok(sample_udp_payload_bytes) = u16::try_from(wire_bytes) else { return false; };
+        if sample_udp_payload_bytes == 0 || seq >= crate::sequence::ACK_SPACE { return false; }
         let old_highest = self.highest;
         if old_highest.is_some_and(|h| seq < h.saturating_sub(HISTORY_BITS - 1)) { return false; }
         if let Some(h) = old_highest {
@@ -136,6 +142,7 @@ impl AckReceiver {
         self.highest = Some(old_highest.unwrap_or(seq).max(seq));
         self.sample_seq = seq;
         self.sample_time_ns = now;
+        self.sample_udp_payload_bytes = sample_udp_payload_bytes;
         if ce { self.ce_count = self.ce_count.saturating_add(1); }
         let floor = self.highest.unwrap().saturating_sub(HISTORY_BITS - 1);
         self.feedback_pages.retain(|&(base, _)| base.saturating_add(ACK_BITMAP_BITS) > floor);
@@ -203,6 +210,7 @@ impl AckReceiver {
         }
         let mut a = BitmapAck { highest: self.sample_seq, receipt_base: base, sample_seq: self.sample_seq,
             delay_us: (now.saturating_sub(self.sample_time_ns)/1000).min(u32::MAX as u64) as u32,
+            sample_udp_payload_bytes: self.sample_udp_payload_bytes,
             ce_count: self.ce_count, bitmap };
         a.highest = a.acknowledged().max().unwrap_or(a.sample_seq);
         a
@@ -323,7 +331,7 @@ mod tests {
     fn malformed_and_future_bitmap_positions() {
         let mut r = AckReceiver::default(); recv(&mut r, 1, 0, false);
         let a = r.ack(0);
-        let mut bytes = a.encode(); bytes[28] = 1;
+        let mut bytes = a.encode(); bytes[28] = 0;
         assert!(BitmapAck::decode(&bytes).is_none());
         bytes = a.encode(); bytes[..8].copy_from_slice(&u64::MAX.to_le_bytes());
         assert!(BitmapAck::decode(&bytes).is_none());
@@ -467,6 +475,132 @@ mod tests {
         assert!(!update_ce_count_bounded(&mut ce, 4, 12));
         assert!(update_ce_count_bounded(&mut ce, 12, 12));
         assert_eq!(ce, 12);
+    }
+
+    #[test]
+    fn exact_sample_size_roundtrips_without_changing_ack_layout() {
+        for size in [1, 512, 1204, 1472, 9216, u16::MAX] {
+            let mut r = AckReceiver::default();
+            assert!(r.receive_with_rtt(7, 1000, true, &mut u64::MAX, 0, size as usize));
+            let a = r.ack(6000);
+            let bytes = a.encode();
+            assert_eq!(bytes.len(), 152);
+            assert_eq!(bytes[28..30], [1, 0]);
+            assert_eq!(bytes[30..32], size.to_le_bytes());
+            assert_eq!(bytes[..8], a.receipt_base.to_le_bytes());
+            assert_eq!(bytes[8..16], 7u64.to_le_bytes());
+            assert_eq!(bytes[16..24], 1u64.to_le_bytes());
+            assert_eq!(bytes[24..28], 5u32.to_le_bytes());
+            assert_eq!(bytes[32], 1 << 7);
+            assert_eq!(a.sample_udp_payload_bytes, size);
+            assert_eq!(BitmapAck::decode(&bytes), Some(a));
+        }
+        let mut r = AckReceiver::default();
+        assert!(recv(&mut r, 0, 0, false).0);
+        assert_eq!(r.ack(0).sample_udp_payload_bytes, 1204);
+    }
+
+    #[test]
+    fn sample_size_encoding_rejects_old_tags_flags_zero_and_bad_bounds() {
+        let mut r = AckReceiver::default();
+        assert!(recv(&mut r, 1, 0, false).0);
+        let valid = r.ack(0).encode();
+        for tag in [0, 2, 255] {
+            let mut bytes = valid; bytes[28] = tag;
+            assert!(BitmapAck::decode(&bytes).is_none());
+        }
+        for flags in [1, 128, 255] {
+            let mut bytes = valid; bytes[29] = flags;
+            assert!(BitmapAck::decode(&bytes).is_none());
+        }
+        let mut bytes = valid; bytes[30..32].fill(0);
+        assert!(BitmapAck::decode(&bytes).is_none());
+        assert!(BitmapAck::decode(&valid[..ACK_PAYLOAD_LEN-1]).is_none());
+        let mut longer = valid.to_vec(); longer.push(0);
+        assert!(BitmapAck::decode(&longer).is_none());
+        for offset in [0, 8] {
+            let mut bytes = valid;
+            bytes[offset..offset+8].copy_from_slice(&crate::sequence::ACK_SPACE.to_le_bytes());
+            assert!(BitmapAck::decode(&bytes).is_none());
+        }
+        let mut bytes = valid;
+        bytes[..8].copy_from_slice(&(crate::sequence::ACK_SPACE-1).to_le_bytes());
+        bytes[32..].fill(0); bytes[32] = 2;
+        assert!(BitmapAck::decode(&bytes).is_none());
+        // Before any receipt the internal sample size is zero, not a wire sentinel.
+        let empty = AckReceiver::default().ack(0);
+        assert_eq!(empty.sample_udp_payload_bytes, 0);
+        assert!(BitmapAck::decode(&empty.encode()).is_none());
+    }
+
+    #[test]
+    fn sample_size_follows_unique_reordered_receipt_and_its_delay_origin() {
+        let mut r = AckReceiver::default(); let mut timer = u64::MAX;
+        assert!(r.receive_with_rtt(0, 1000, false, &mut timer, 0, 1204));
+        assert!(r.receive_with_rtt(3000, 2000, false, &mut timer, 0, 1472));
+        let a = r.ack(7000);
+        assert!(!a.contains(3000)); // The exact sample is independent of the old page.
+        assert_eq!((a.sample_seq, a.sample_udp_payload_bytes, a.delay_us), (3000, 1472, 5));
+        assert_eq!(BitmapAck::decode(&a.encode()), Some(a));
+        assert!(r.receive_with_rtt(1, 8000, true, &mut timer, 0, 512));
+        let a = r.ack(11000);
+        assert_eq!((a.sample_seq, a.sample_udp_payload_bytes, a.delay_us, a.ce_count), (1, 512, 3, 1));
+        assert!(!r.receive_with_rtt(1, 12000, true, &mut timer, 0, 9216));
+        assert!(!r.receive_with_rtt(3000, 13000, true, &mut timer, 0, 65535));
+        let a = r.ack(20000);
+        assert_eq!((a.sample_seq, a.sample_udp_payload_bytes, a.delay_us, a.ce_count), (1, 512, 12, 1));
+        assert_eq!(r.sample_time_ns, 8000);
+        r.sent(20000);
+        let a = r.ack(25000);
+        assert_eq!((a.sample_seq, a.sample_udp_payload_bytes, a.delay_us), (1, 512, 17));
+    }
+
+    #[test]
+    fn history_eviction_never_zeros_or_rebinds_the_size_sample() {
+        let mut r = AckReceiver::default(); let mut timer = u64::MAX;
+        assert!(r.receive_with_rtt(0, 1000, false, &mut timer, 0, 512));
+        // A new nonce reuses the same history slot, but has its own receipt size.
+        assert!(r.receive_with_rtt(HISTORY_BITS, 2000, true, &mut timer, 0, 9216));
+        assert!(!r.receive_with_rtt(0, 3000, true, &mut timer, 0, 512));
+        assert!(!r.receive_with_rtt(HISTORY_BITS, 4000, true, &mut timer, 0, 1204));
+        let a = r.ack(7000);
+        assert_eq!((a.sample_seq, a.sample_udp_payload_bytes, a.delay_us, a.ce_count), (HISTORY_BITS, 9216, 5, 1));
+        assert!(!a.contains(0));
+        assert_eq!(BitmapAck::decode(&a.encode()), Some(a));
+        assert!(r.receive_with_rtt(HISTORY_BITS+1, 8000, false, &mut timer, 0, 1472));
+        assert_eq!(r.ack(9000).sample_udp_payload_bytes, 1472);
+    }
+
+    #[test]
+    fn invalid_wire_sizes_cannot_mutate_any_receiver_state_or_timer() {
+        for seeded in [false, true] {
+            let mut r = AckReceiver::default();
+            if seeded {
+                assert!(recv(&mut r, 0, 1000, false).0);
+                assert!(recv(&mut r, 2, 2000, true).0);
+                r.sent(3000);
+            }
+            let before = format!("{r:?}");
+            let ack_before = r.ack(10000);
+            for size in [0, u16::MAX as usize + 1, usize::MAX] {
+                // Includes duplicate, unfilled hole, forward advance and ring clear.
+                for seq in [0, 1, 2, 3, HISTORY_BITS+2] {
+                    let mut timer = 123456;
+                    assert!(!r.receive_with_rtt(seq, 9000, true, &mut timer, 40000, size));
+                    assert_eq!(timer, 123456);
+                    assert_eq!(format!("{r:?}"), before);
+                    assert_eq!(r.ack(10000), ack_before);
+                }
+            }
+            // Rejected input did not create a receipt or destroy the old gap.
+            assert!(r.receive_with_rtt(1, 11000, false, &mut u64::MAX, 0, 1204));
+            assert_eq!(r.ack(12000).sample_seq, 1);
+            if seeded {
+                assert!(r.ack(12000).contains(0));
+                assert!(r.ack(12000).contains(2));
+                assert!(r.gap_seq.is_none());
+            }
+        }
     }
 
 }

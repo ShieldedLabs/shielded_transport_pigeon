@@ -317,7 +317,9 @@ fn recovery_downshift_waits_for_whole_and_mixed_fec_duplicate_copies() {
             0,
             None
         ));
-        state.downshift_for_recovery(queues.target_copy_pending());
+        state.tu_probe_failed_count = 40;
+        state.downshift_for_recovery(queues.target_copy_pending(), 1_000_002);
+        assert_eq!(state.tu_probe_failed_count, 40);
         assert_eq!(state.current_tu, tu);
         assert_eq!(state.deferred_tu, Some(512));
         let pending = state.pending_send.take().unwrap();
@@ -336,6 +338,7 @@ fn recovery_downshift_waits_for_whole_and_mixed_fec_duplicate_copies() {
             state.current_tu, tu,
             "accepting refused original must NOT shrink before its copy"
         );
+        assert_eq!(state.tu_probe_failed_count, 40);
         queues.fec_prepare_packet(1);
         let mut copy = vec![0u8; original.len()];
         assert_eq!(queues.take_target_copy(&mut copy), original.len());
@@ -370,6 +373,7 @@ fn recovery_downshift_waits_for_whole_and_mixed_fec_duplicate_copies() {
             None,
         );
         assert_eq!(state.current_tu, 512);
+        assert_eq!(state.tu_probe_failed_count, 0);
         assert_eq!(state.deferred_tu, None);
         assert_eq!(state.send_sequence_number, 2);
         assert_eq!(state.packets_in_flight, 2);
@@ -557,15 +561,13 @@ fn recovery_small_outage_proofs_do_not_postpone_current_tu_probe_backoff() {
         );
         assert_eq!(state.outage.next_probe_ns, due);
         assert_eq!(state.outage.probe_interval_ns, interval);
-        assert_eq!(
-            state.outage.probes[(sequence % 8) as usize],
-            (sequence, sent)
-        );
+        assert!(state.outage.probes.contains(&(sequence, sent)));
         assert!(state.outage.probe_due(sent));
         let ack = crate::ack::BitmapAck {
             highest: sequence,
             receipt_base: sequence,
             sample_seq: sequence,
+            sample_udp_payload_bytes: if step % 2 == 0 { 512 } else { 1204 },
             delay_us: 0,
             ce_count: 0,
             bitmap: [0; 15],
@@ -609,7 +611,7 @@ fn recovery_send_timestamp_after_tick_is_zero_age_not_loss() {
 }
 
 #[test]
-fn profile_three_small_data_is_admitted_in_both_directions_and_cipher_modes() {
+fn profile_four_small_data_is_admitted_in_both_directions_and_cipher_modes() {
     for magic in [
         CONNECT_MAGIC1_PLAIN_TEXT,
         CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s,
@@ -1125,10 +1127,10 @@ fn recovery_ack(state: &mut ConnectionStateConnected, sequences: &[u64], now: u6
             proof |= state.on_positive_receipt(sequence, now);
         }
     }
-    let decision = proof && state.current_tu > 512 && state.recovery.large_stalled(now);
+    let decision = proof && state.current_tu > 512 && state.recovery.ready(now, state.current_tu);
     if decision {
         state.recovery.downshifted(now);
-        state.downshift_for_recovery(false);
+        state.downshift_for_recovery(false, now);
     }
     decision
 }
@@ -1137,6 +1139,38 @@ fn recovery_send(state: &mut ConnectionStateConnected, queues: &mut SendQueues,
     let sequence = state.send_sequence_number;
     commit_connected_send(state, queues, kind, sent, bytes, &[], 0, None);
     sequence
+}
+
+#[test]
+fn recovery_final_ack_budget_rechecks_failures_after_later_small_rtt_sample() {
+    for late_first in [false, true] {
+        let (mut state, mut queues, start) = parked_fixture();
+        let seed = recovery_send(&mut state, &mut queues, PendingSendKind::Reachability, start + 1, 512);
+        assert!(!recovery_ack(&mut state, &[seed], start + 20_000_001));
+        let now = start + 8_000_000_000;
+        let late = recovery_send(&mut state, &mut queues, PendingSendKind::Reachability, now - 3_500_000_000, 512);
+        for sent in [now - 1_500_000_000, now - 1_250_000_000] {
+            recovery_send(&mut state, &mut queues, PendingSendKind::ReachabilityCurrent, sent, 1204);
+        }
+        let first = recovery_send(&mut state, &mut queues, PendingSendKind::Reachability, now - 21_000_000, 512);
+        assert!(!recovery_ack(&mut state, &[first], now - 1_000_000));
+        let trigger = recovery_send(&mut state, &mut queues, PendingSendKind::Reachability, now - 20_000_000, 512);
+        // Bitmap iteration precedes the independent sample; both processing
+        // orders are valid on wire even though data nonces are monotonic.
+        let mut ack = sample_ack(if late_first { trigger } else { late }, 512);
+        ack.receipt_base = if late_first { late } else { trigger };
+        ack.bitmap[0] = 1;
+        let ack = state.decode_peer_ack(&ack.encode()).unwrap();
+        let sequences = ack.acknowledged().collect::<Vec<_>>();
+        assert_eq!(sequences, if late_first { vec![late, trigger] } else { vec![trigger, late] });
+        assert!(!recovery_ack(&mut state, &sequences, now),
+            "final generic RTT budget must invalidate earlier immature failures");
+        assert_eq!(state.current_tu, 1204);
+        let mature = now + 3_000_000_000;
+        let next = recovery_send(&mut state, &mut queues, PendingSendKind::Reachability, mature - 20_000_000, 512);
+        assert!(recovery_ack(&mut state, &[next], mature), "the same failures eventually mature");
+        assert_eq!(state.current_tu, 512);
+    }
 }
 
 #[test]
@@ -1192,8 +1226,333 @@ fn recovery_repeated_differential_probes_recover_idle_and_high_rate_blackhole() 
         assert_eq!(decisions, 1, "ordinary_per_slot={ordinary_per_slot}");
         assert_eq!(state.current_tu, 512);
         assert_eq!(state.recovery.upward_after, start + 12_010_000_001);
-        assert!(!state.recovery.can_promote(start + 2_100_000_000, start + 3_000_000_000));
+        assert!(!state.recovery.can_promote(1322, start + 2_100_000_000, start + 3_000_000_000));
+        assert!(state.recovery.can_promote(1204, start + 2_100_000_000, start + 3_000_000_000));
     }
+}
+
+#[test]
+fn upward_policy_cadence_is_bounded_and_success_preserves_the_floor() {
+    use crate::mtu_recovery::upward_retry_delay;
+    for (failures, delay) in [(0, 500_000_000), (1, 500_000_000),
+        (2, 1_000_000_000), (10, 25_000_000_000), (11, 30_000_000_000),
+        (u64::MAX, 30_000_000_000)] {
+        assert_eq!(upward_retry_delay(failures), delay);
+    }
+    let (mut state, mut queues, start) = parked_fixture();
+    assert!(state.prepare_upward_probe(start));
+    assert_eq!(state.tu_probe_size, 1452);
+    let seq = recovery_send(&mut state, &mut queues, PendingSendKind::MtuProbe, start, 1452);
+    assert_eq!(state.take_positive_receipt(seq), Some(PositiveReceipt::PendingProbe));
+    state.finish_upward_probe(true, start, start + 1);
+    assert_eq!(state.current_tu, 1452);
+    assert_eq!(state.last_sent_tu_probe_time_ns, start);
+    assert_eq!(state.upward_probe_deadline(start), start + 500_000_000);
+    state.stats.cc_rate_upps = 1;
+    assert!(!state.prepare_upward_probe(start + 499_999_999));
+    assert_eq!(state.upward_probe_deadline(start), start + 500_000_000);
+    state.recovery.upward_after = start + 10_000_000_000;
+    assert_eq!(state.upward_probe_deadline(start), state.recovery.upward_after);
+}
+
+#[test]
+fn upward_policy_coarse_bracket_paths_stop_within_eight_bytes() {
+    for (limit, shrink) in [(1452, false), (1472, false), (1322, false),
+        (1366, false), (9216, false), (512, true), (700, true), (1204, true)] {
+        let (mut state, mut queues, mut now) = parked_fixture();
+        let start = now;
+        if shrink { state.downshift_for_recovery(false, now); }
+        let mut attempted = Vec::new();
+        for _ in 0..24 {
+            let due = state.upward_probe_deadline(now);
+            // The settled bracket waits for revalidation instead of one-byte climbing.
+            if due > now + 2_000_000_000 { break; }
+            now = now.max(due);
+            assert!(state.prepare_upward_probe(now));
+            let candidate = state.tu_probe_size;
+            attempted.push(candidate);
+            let seq = recovery_send(&mut state, &mut queues, PendingSendKind::MtuProbe,
+                now, candidate as usize);
+            let success = candidate <= limit;
+            if success {
+                assert_eq!(state.take_positive_receipt(seq), Some(PositiveReceipt::PendingProbe));
+            }
+            state.finish_upward_probe(success, now, now + 20_000_000);
+            now += 20_000_000;
+            if state.current_tu == 9216 { break; }
+        }
+        assert_eq!(attempted[0], if shrink { 858 } else { 1452 });
+        assert!(state.current_tu <= limit && limit - state.current_tu <= 8,
+            "limit={limit}, floor={}, attempts={attempted:?}", state.current_tu);
+        assert!(now - start < 10_000_000_000, "{attempted:?}");
+        assert!(attempted.iter().all(|&n| n <= 9216));
+        println!("BRACKET limit={limit} shrink={shrink} floor={} ns={} attempts={attempted:?}",
+            state.current_tu, now - start);
+    }
+}
+
+#[test]
+fn upward_policy_drop_refines_inside_hold_then_revalidates_stepup_and_false_loss() {
+    let (mut state, mut queues, start) = parked_fixture();
+    state.promote_tu(1472, start);
+    state.recovery.downshifted(start);
+    state.downshift_for_recovery(false, start);
+    let mut now = start;
+    let mut reached = None;
+    for _ in 0..16 {
+        let due = state.upward_probe_deadline(now);
+        if due > now + 2_000_000_000 { break; }
+        now = now.max(due);
+        assert!(state.prepare_upward_probe(now));
+        let candidate = state.tu_probe_size;
+        assert!(candidate < 1472);
+        let seq = recovery_send(&mut state, &mut queues, PendingSendKind::MtuProbe,
+            now, candidate as usize);
+        let success = candidate <= 1172;
+        if success { assert_eq!(state.take_positive_receipt(seq), Some(PositiveReceipt::PendingProbe)); }
+        state.finish_upward_probe(success, now, now + 20_000_000);
+        now += 20_000_000;
+        if state.current_tu >= 1100 { reached.get_or_insert(now); }
+    }
+    assert!(reached.unwrap() < start + 10_000_000_000);
+    assert!((1164..=1172).contains(&state.current_tu));
+    let due = state.upward_probe_deadline(now);
+    assert_eq!(due, (now + 5_000_000_000).max(start + 10_000_000_000));
+    assert!(!state.prepare_upward_probe(due - 1));
+    assert!(state.prepare_upward_probe(due));
+    let boundary = state.tu_probe_size;
+    assert!(boundary > state.current_tu && boundary - state.current_tu <= 8);
+    let seq = recovery_send(&mut state, &mut queues, PendingSendKind::MtuProbe,
+        due, boundary as usize);
+    assert_eq!(state.take_positive_receipt(seq), Some(PositiveReceipt::PendingProbe));
+    state.finish_upward_probe(true, due, due + 20_000_000);
+    assert_eq!(state.current_tu, boundary);
+    assert_eq!(state.upward_probe_deadline(due), due + 500_000_000);
+    assert!(state.prepare_upward_probe(due + 500_000_000));
+    assert_eq!(state.tu_probe_size, 1452, "partial lift opens coarse discovery after exact boundary proof");
+}
+
+#[test]
+fn upward_policy_resets_only_on_effective_shrink_and_obsoletes_old_attempts() {
+    for success in [false, true] {
+        for deferred in [false, true] {
+            let (mut state, mut queues, start) = parked_fixture();
+            assert!(state.prepare_upward_probe(start));
+            recovery_send(&mut state, &mut queues, PendingSendKind::MtuProbe, start, 1452);
+            state.tu_probe_failed_count = 40;
+            if deferred {
+                assert!(!finish_connected_send(&mut state, &mut queues, PendingSendKind::Data,
+                    None, start + 1, &[9; 1204], &[], Dscp::BestEffort, 0, None));
+            }
+            state.downshift_for_recovery(false, start + 1);
+            if deferred {
+                assert_eq!((state.current_tu, state.tu_probe_failed_count), (1204, 40));
+                let pending = state.pending_send.take().unwrap();
+                assert_eq!(pending.bytes, vec![9; 1204]);
+                commit_connected_send(&mut state, &mut queues, pending.kind, start + 2,
+                    pending.bytes.len(), &pending.plaintext, 0, None);
+            }
+            assert_eq!((state.current_tu, state.tu_probe_failed_count), (512, 0));
+            state.finish_upward_probe(success, start, start + 3);
+            assert_eq!((state.current_tu, state.tu_probe_failed_count), (512, 0));
+            assert!(state.prepare_upward_probe(start + 500_000_000));
+            assert_eq!(state.tu_probe_size, 858);
+            state.finish_upward_probe(false, start + 4, start + 5);
+            assert!(state.prepare_upward_probe(start + 500_000_000));
+            assert_eq!(state.tu_probe_size, 685);
+        }
+    }
+}
+
+#[test]
+fn upward_policy_locally_refused_old_probe_keeps_immutable_tuple_across_shrink() {
+    for success in [false, true] {
+        let (mut state, mut queues, start) = parked_fixture();
+        assert!(state.prepare_upward_probe(start));
+        let old_size = state.tu_probe_size;
+        let old_nonce = state.send_sequence_number;
+        assert!(!finish_connected_send(&mut state, &mut queues, PendingSendKind::MtuProbe,
+            None, start, &vec![7; old_size as usize], &[], Dscp::BestEffort, 0, None));
+        state.downshift_for_recovery(false, start);
+        assert_eq!((state.current_tu, state.tu_probe_size), (512, old_size));
+        let pending = state.pending_send.take().unwrap();
+        assert_eq!(pending.bytes, vec![7; old_size as usize]);
+        assert_eq!(state.send_sequence_number, old_nonce);
+        commit_connected_send(&mut state, &mut queues, pending.kind, start + 1,
+            pending.bytes.len(), &pending.plaintext, 0, None);
+        assert_eq!((state.tu_probe_sequence_number, state.tu_probe_size), (old_nonce, old_size));
+        state.finish_upward_probe(success, start + 1, start + 2);
+        assert_eq!((state.current_tu, state.tu_probe_failed_count), (512, 0));
+        assert!(state.prepare_upward_probe(start + 500_000_001));
+        assert_eq!(state.tu_probe_size, 858);
+    }
+}
+
+// Locate a boundary through an accepted probe's completed loss outcome. The
+// fixture starts with a known floor so the tests isolate revalidation, not search.
+fn boundary_fixture() -> (ConnectionStateConnected, SendQueues, u64) {
+    let (mut state, mut queues, start) = parked_fixture();
+    state.apply_effective_tu(1068, start);
+    state.tu_probe_size = 1076;
+    state.tu_probe_obsolete = false;
+    recovery_send(&mut state, &mut queues, PendingSendKind::MtuProbe, start, 1076);
+    state.finish_upward_probe(false, start, start + 20_000_000);
+    assert_eq!(state.upward_probe_deadline(start), start + 5_020_000_000);
+    (state, queues, start)
+}
+
+#[test]
+fn boundary_refused_probe_keeps_exact_ciphertext_nonce_and_outcome_clock() {
+    let (mut state, mut queues, start) = boundary_fixture();
+    let (cipher, _) = super::wire_v2_tests::ciphers();
+    state.cipher = Some(cipher);
+    for delay in [10_000_000_000, 20_000_000_000, 30_000_000_000, 30_000_000_000] {
+        let due = state.upward_probe_deadline(start);
+        assert!(!state.prepare_upward_probe(due - 1));
+        assert!(state.prepare_upward_probe(due));
+        assert_eq!(state.tu_probe_size, 1076);
+        let nonce = state.send_sequence_number;
+        let last = state.last_sent_tu_probe_time_ns;
+        let failures = state.tu_probe_failed_count;
+        let mut ciphertext = vec![0; 1076];
+        let n = seal_connected_packet(&mut state.cipher, 42, nonce, &[0xff; 1046],
+            &mut ciphertext, due).unwrap();
+        assert_eq!(n, 1076);
+        assert_eq!(load_u64(&ciphertext[2..10]), nonce);
+        assert!(!finish_connected_send(&mut state, &mut queues, PendingSendKind::MtuProbe,
+            None, due, &ciphertext, &[], Dscp::BestEffort, 42, None));
+        // Refusal, timer reads, generic clocks and 30s evidence expiry cannot
+        // count a failed attempt or rewrite the already sealed target.
+        for now in [due, due + 1, due + 31_000_000_000] {
+            assert_eq!(state.upward_probe_deadline(now), due);
+            assert_eq!((state.send_sequence_number, state.last_sent_tu_probe_time_ns,
+                state.tu_probe_failed_count), (nonce, last, failures));
+            assert_eq!(state.tu_probe_sequence_number, u64::MAX);
+            assert_eq!(state.recovery.sent_bytes(nonce), None);
+            assert!(state.take_positive_receipt(nonce).is_none());
+            let pending = state.pending_send.as_ref().unwrap();
+            assert_eq!(pending.bytes, ciphertext);
+            assert_eq!(pending.kind, PendingSendKind::MtuProbe);
+            assert!(needs_active_retry(&state, false));
+            assert_eq!(next_service_deadline(now, due), now + 150_000);
+        }
+        let accepted = due + 31_000_000_000;
+        let pending = state.pending_send.take().unwrap();
+        assert!(finish_connected_send(&mut state, &mut queues, pending.kind, Some(accepted),
+            accepted, &pending.bytes, &pending.plaintext, pending.dscp, 42, None));
+        assert_eq!(state.last_sent_tu_probe_time_ns, accepted);
+        assert_eq!(state.tu_probe_sequence_number, nonce);
+        assert_eq!(state.recovery.sent_bytes(nonce), Some(1076));
+        assert_eq!(state.tu_probe_failed_count, failures, "acceptance alone is not failure");
+        let outcome = accepted + 20_000_000;
+        state.finish_upward_probe(false, accepted, outcome);
+        assert_eq!(state.tu_probe_failed_count, failures + 1);
+        assert_eq!(state.upward_probe_deadline(outcome), outcome + delay);
+        assert_eq!(state.current_tu, 1068);
+    }
+}
+
+#[test]
+fn boundary_fresh_receipt_clears_only_after_pending_copy_effective_promotion() {
+    for copy in [false, true] {
+        let (mut state, mut queues, start) = boundary_fixture();
+        let due = state.upward_probe_deadline(start);
+        assert!(state.prepare_upward_probe(due));
+        let probe = recovery_send(&mut state, &mut queues, PendingSendKind::MtuProbe, due, 1076);
+        let mut plaintext = vec![0xff; 1054];
+        plaintext[..4].copy_from_slice(&[1, 1, 0, 7]);
+        if copy {
+            plaintext[0] |= TARGET_DUP_ORIGINAL;
+            queues.fec_prepare_packet(state.send_sequence_number);
+            queues.target_duplicate = Some((state.send_sequence_number, Dscp::BestEffort, plaintext.clone()));
+            assert!(finish_connected_send(&mut state, &mut queues, PendingSendKind::Data,
+                Some(due + 1), due + 1, &[8; 1068], &plaintext, Dscp::BestEffort, 0, None));
+            queues.fec_prepare_packet(state.send_sequence_number);
+            let mut prepared_copy = vec![0; plaintext.len()];
+            assert_eq!(queues.take_target_copy(&mut prepared_copy), plaintext.len());
+            assert_eq!(&prepared_copy[1..], &plaintext[1..]);
+            assert!(target_is_copy(&prepared_copy));
+            plaintext = prepared_copy;
+        }
+        assert!(!finish_connected_send(&mut state, &mut queues, PendingSendKind::Data,
+            None, due + 1, &[9; 1068], &plaintext, Dscp::BestEffort, 0, None));
+        assert!(state.decode_peer_ack(&sample_ack(probe, 1068).encode()).is_none());
+        let ack = state.decode_peer_ack(&sample_ack(probe, 1076).encode()).unwrap();
+        assert_eq!(ack.sample_seq, probe);
+        assert_eq!(state.take_positive_receipt(probe), Some(PositiveReceipt::PendingProbe));
+        state.finish_upward_probe(true, due, due + 20_000_000);
+        assert!(state.take_positive_receipt(probe).is_none(), "duplicate cannot promote twice");
+        assert_eq!((state.current_tu, state.deferred_tu), (1068, Some(1076)));
+        assert_eq!(state.upward_probe_deadline(due + 20_000_000), due + 500_000_000,
+            "old boundary is retained until its floor actually changes");
+        let pending = state.pending_send.take().unwrap();
+        assert_eq!(pending.bytes, vec![9; 1068]);
+        commit_connected_send(&mut state, &mut queues, pending.kind, due + 30_000_000,
+            pending.bytes.len(), &pending.plaintext, 0, None);
+        // The bound survives proof and refusal; only acceptance of this exact
+        // pending datagram (the copy in the second case) makes growth effective.
+        assert_eq!((state.current_tu, state.deferred_tu), (1076, None));
+        assert!(state.prepare_upward_probe(due + 500_000_000));
+        assert_eq!(state.tu_probe_size, 1452, "cleared ceiling opens coarse discovery");
+    }
+}
+
+#[test]
+fn boundary_partial_lift_reopens_binary_search_and_stale_proof_cannot_unlock() {
+    let (mut state, mut queues, start) = boundary_fixture();
+    let due = state.upward_probe_deadline(start);
+    assert!(state.prepare_upward_probe(due));
+    recovery_send(&mut state, &mut queues, PendingSendKind::MtuProbe, due, 1076);
+    state.finish_upward_probe(true, due, due + 2_000_000_001);
+    assert_eq!(state.current_tu, 1068);
+    assert_eq!(state.upward_probe_deadline(due + 2_000_000_001), due + 500_000_000);
+    let mut now = due + 3_000_000_000;
+    let mut attempts = Vec::new();
+    for _ in 0..24 {
+        now = now.max(state.upward_probe_deadline(now));
+        assert!(state.prepare_upward_probe(now));
+        let size = state.tu_probe_size;
+        attempts.push(size);
+        let seq = recovery_send(&mut state, &mut queues, PendingSendKind::MtuProbe, now, size as usize);
+        if size <= 1200 {
+            assert_eq!(state.take_positive_receipt(seq), Some(PositiveReceipt::PendingProbe));
+        }
+        state.finish_upward_probe(size <= 1200, now, now + 20_000_000);
+        now += 20_000_000;
+        if state.upward_probe_deadline(now) > now + 2_000_000_000 { break; }
+    }
+    assert_eq!(&attempts[..2], &[1076, 1452]);
+    assert!((1192..=1200).contains(&state.current_tu), "{attempts:?}");
+}
+
+#[test]
+fn upward_policy_stale_positive_does_not_mutate_search_or_floor() {
+    let (mut state, _, start) = parked_fixture();
+    assert!(state.prepare_upward_probe(start));
+    let before = state.upward_probe_deadline(start);
+    state.finish_upward_probe(true, start, start + 2_000_000_001);
+    assert_eq!(state.current_tu, 1204);
+    assert_eq!(state.tu_probe_failed_count, 0);
+    assert_eq!(state.upward_probe_deadline(start), before);
+    assert!(state.prepare_upward_probe(start));
+    assert_eq!(state.tu_probe_size, 1452);
+}
+
+#[test]
+fn upward_policy_valid_loss_after_generic_freshness_still_refines() {
+    let (mut state, mut queues, start) = parked_fixture();
+    state.loss_timer.observe(1_000_000_000); // Ordinary jitter, independent of generic B.
+    let timeout = state.loss_timer.timeout_ns(20_000_000, 0, &crate::ship::CC);
+    assert_eq!(timeout, 3_000_000_000);
+    assert!(state.prepare_upward_probe(start));
+    recovery_send(&mut state, &mut queues, PendingSendKind::MtuProbe, start, 1452);
+    let now = start + timeout + 1;
+    assert!(!state.recovery.upward_fresh(start, now));
+    state.finish_upward_probe(false, start, now);
+    assert_eq!(state.current_tu, 1204);
+    assert_eq!(state.tu_probe_failed_count, 1);
+    assert!(state.prepare_upward_probe(now));
+    assert_eq!(state.tu_probe_size, 1328, "valid aged loss must not loop on 1452");
 }
 
 fn repeated_probe_fixture() -> (ConnectionStateConnected, SendQueues, u64, [u64; 2], [u64; 2]) {
@@ -1207,6 +1566,263 @@ fn repeated_probe_fixture() -> (ConnectionStateConnected, SendQueues, u64, [u64;
         recovery_send(&mut state, &mut queues, PendingSendKind::Reachability, start + 1_100_000_000, 512),
     ];
     (state, queues, start, large, small)
+}
+
+#[test]
+fn outage_proof_ledger_retains_exact_pending_probe_through_2500ms_generic_churn() {
+    let (mut state, mut queues, start) = parked_fixture();
+    enter_outage(&mut state, &mut queues, start, 0, None);
+    let probe = recovery_send(&mut state, &mut queues, PendingSendKind::Outage, start + 1, 1204);
+    let mut old_slots = [(u64::MAX, 0); 8];
+    old_slots[probe as usize % 8] = (probe, start + 1);
+    for tick in 1..=10 {
+        let sent = start + tick * crate::mtu_recovery::PERIOD;
+        let kind = if tick % 2 == 0 { PendingSendKind::ReachabilityCurrent }
+            else { PendingSendKind::Reachability };
+        let bytes = if tick % 2 == 0 { 1204 } else { 512 };
+        let seq = recovery_send(&mut state, &mut queues, kind, sent, bytes);
+        old_slots[seq as usize % 8] = (seq, sent);
+    }
+    let now = start + 2_500_000_001;
+    let ack = state.decode_peer_ack(&sample_ack(probe, 1204).encode()).unwrap();
+    assert_ne!(old_slots[probe as usize % 8].0, probe, "legacy proof tuple was overwritten");
+    assert!(probe >= state.packets_waiting_ack_tail);
+    assert_ne!(state.packets_waiting_ack_field[0] & (1 << probe), 0);
+    assert!(state.send_time(probe) != 0 && now.saturating_sub(state.send_time(probe)) < 3_000_000_000);
+    println!("OUTAGE_LEDGER_MEMORY outage_state={} connected_state={} reservation={}",
+        std::mem::size_of::<OutageState>(), std::mem::size_of::<ConnectionStateConnected>(),
+        RECEIVE_CONNECTION_BYTES);
+    assert!(recent_outage_probe_acked(&state, &ack, now),
+        "a still-outstanding exact 2.5-second-old outage proof must survive generic churn");
+    assert_eq!(state.take_positive_receipt(probe), Some(PositiveReceipt::PendingData));
+    assert!(!recent_outage_probe_acked(&state, &ack, now + 1), "first positive consumes proof");
+}
+
+#[test]
+fn outage_proof_ledger_preserves_age_epoch_pending_and_exact_identity_gates() {
+    let (mut state, mut queues, start) = parked_fixture();
+    state.RTT_mean = 1000;
+    enter_outage(&mut state, &mut queues, start, 0, None);
+    assert_eq!(state.outage.max_probe_age_ns, 4_000_000_000);
+    let probe = recovery_send(&mut state, &mut queues, PendingSendKind::Outage, start + 1, 1204);
+    let ack = sample_ack(probe, 1204);
+    assert!(recent_outage_probe_acked(&state, &ack, start + 4_000_000_001));
+    assert!(!recent_outage_probe_acked(&state, &ack, start + 4_000_000_002));
+    assert!(!recent_outage_probe_acked(&state, &ack, start), "future send time");
+    assert!(state.decode_peer_ack(&sample_ack(probe, 512).encode()).is_none());
+    let small = recovery_send(&mut state, &mut queues, PendingSendKind::Reachability, start + 2, 512);
+    let mut bitmap_ack = sample_ack(small, 512);
+    bitmap_ack.bitmap[0] = 1 << probe;
+    let bitmap_ack = state.decode_peer_ack(&bitmap_ack.encode()).unwrap();
+    assert!(recent_outage_probe_acked(&state, &bitmap_ack, start + 10),
+        "a retained proof may be in the bitmap rather than the size sample");
+    let bit = probe % PACKETS_WAITING_ACK_CAPACITY;
+    state.packets_waiting_ack_field[(bit / 64) as usize] &= !(1 << (bit % 64));
+    assert!(!recent_outage_probe_acked(&state, &ack, start + 10), "not pending");
+    state.packets_waiting_ack_field[(bit / 64) as usize] |= 1 << (bit % 64);
+    state.packets_waiting_ack_tail = probe + 1;
+    assert!(!recent_outage_probe_acked(&state, &ack, start + 10), "retired before tail");
+    state.packets_waiting_ack_tail = probe;
+    let future = state.send_sequence_number;
+    state.outage.record_probe(future, start + 2);
+    assert!(!recent_outage_probe_acked(&state, &sample_ack(future, 1204), start + 10),
+        "only accepted emitted nonces are plausible");
+    state.outage.enter(start + 20, 100_000_000);
+    assert!(state.outage.probes.iter().all(|&tuple| tuple == (0, 0)));
+    assert_eq!(state.outage.probe_cursor, 0);
+    assert!(!recent_outage_probe_acked(&state, &ack, start + 30), "new outage clears old proof");
+    state.outage.record_probe(probe, start + 1);
+    assert!(!recent_outage_probe_acked(&state, &ack, start + 30), "epoch send-time gate");
+    state.outage.enter(start + 40, 100_000_000);
+    for i in 0..=OUTAGE_PROBE_RECORDS {
+        state.outage.record_probe(i as u64, start + 41 + i as u64);
+    }
+    assert!(!state.outage.probes.iter().any(|&(seq, _)| seq == 0));
+    assert!(!recent_outage_probe_acked(&state, &ack, start + 100), "chronological eviction");
+}
+
+#[test]
+fn outage_proof_ledger_encrypted_replay_cannot_reuse_a_consumed_positive() {
+    let (mut state, mut queues, start) = parked_fixture();
+    enter_outage(&mut state, &mut queues, start, 0, None);
+    let probe = recovery_send(&mut state, &mut queues, PendingSendKind::Outage, start + 1, 1204);
+    let (sender, mut receiver) = super::wire_v2_tests::ciphers();
+    let mut sender = Some(sender);
+    let nonce = crate::sequence::ACK_SPACE;
+    let mut packet = [0; 182];
+    let n = seal_connected_packet(&mut sender, 42, nonce, &sample_ack(probe, 1204).encode(),
+        &mut packet, start + 2).unwrap();
+    let mut plaintext = [0; 182];
+    for replay in [false, true] {
+        let len = receiver.open(nonce, load_u32(&packet[10..14]), &packet[..14],
+            &packet[14..n], &mut plaintext, start + 10).unwrap();
+        let fresh = state.receive_sequences.commit(nonce);
+        assert_eq!(fresh, !replay);
+        if fresh {
+            let ack = state.decode_peer_ack(&plaintext[..len]).unwrap();
+            assert!(recent_outage_probe_acked(&state, &ack, start + 10));
+            assert!(state.take_positive_receipt(probe).is_some());
+            assert!(!recent_outage_probe_acked(&state, &ack, start + 11));
+        }
+    }
+}
+
+#[test]
+fn outage_proof_ledger_memory_delta_fits_existing_connection_reservation() {
+    let added = (OUTAGE_PROBE_RECORDS - 8) * std::mem::size_of::<(u64, u64)>()
+        + std::mem::size_of::<usize>();
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        // Independently measured be71bf4: Outage232, Recovery56; research
+        // Connected already carried a pre-existing 40-byte feature delta.
+        let baseline = if cfg!(feature = "research_target_validation") { 44384 } else { 44344 };
+        assert_eq!(added, 392);
+        assert_eq!(std::mem::size_of::<OutageState>(), 232 + added);
+        let recovery_state_added = std::mem::size_of::<crate::mtu_recovery::Recovery>() - 56;
+        assert_eq!(recovery_state_added, 24 + 16 + 16,
+            "raw RTT/count, recent search upper/expiry, independent boundary clock/backoff");
+        // Preserve the 416-byte outage/RTT delta; bracket and boundary state
+        // add 32 and replace the old 8-byte additive-search step.
+        assert_eq!(std::mem::size_of::<ConnectionStateConnected>(),
+            baseline + added + recovery_state_added - 8);
+    }
+    assert!(std::mem::size_of::<ConnectionStateConnected>() < 512 << 10);
+    assert_eq!(RECEIVE_CONNECTION_BYTES, (512 << 10) + crate::mtu_recovery::HISTORY_BYTES);
+    println!("OUTAGE_LEDGER_MEMORY added={added} state={} connected={} reservation={}",
+        std::mem::size_of::<OutageState>(), std::mem::size_of::<ConnectionStateConnected>(),
+        RECEIVE_CONNECTION_BYTES);
+}
+
+fn sample_ack(sequence: u64, bytes: u16) -> crate::ack::BitmapAck {
+    crate::ack::BitmapAck { highest: sequence, receipt_base: 0, sample_seq: sequence,
+        sample_udp_payload_bytes: bytes, delay_us: 0, ce_count: 0, bitmap: [0; 15] }
+}
+
+// Encrypted ACK-stage regression, not a full socket-injection fixture. This
+// executes the production AEAD/replay/decode gates in their receive-loop order.
+#[test]
+fn profile_four_ack_encrypted_wrong_size_spends_nonce_without_feedback_effects() {
+    let (mut state, mut queues, start) = parked_fixture();
+    let (sender, receiver) = super::wire_v2_tests::ciphers();
+    let mut sender = Some(sender);
+    state.cipher = Some(receiver);
+    assert!(state.prepare_upward_probe(start));
+    let probe = recovery_send(&mut state, &mut queues, PendingSendKind::MtuProbe, start, 1452);
+    assert!(!finish_connected_send(&mut state, &mut queues, PendingSendKind::Data,
+        None, start + 1, &[9; 1204], &[], Dscp::BestEffort, 0, None));
+    state.promote_tu(1366, start + 1);
+    let before = (state.packets_waiting_ack_field, state.peer_ce_count, state.current_tu,
+        state.deferred_tu, state.last_ack_received_time, state.tu_probe_sequence_number);
+    let pending_bytes = state.pending_send.as_ref().unwrap().bytes.clone();
+    let mut encrypted = [0; 182];
+    let mut plaintext = [0; 182];
+    for (step, bytes) in [(0, 512), (1, 1452)] {
+        let nonce = crate::sequence::ACK_SPACE + step;
+        let mut ack = sample_ack(probe, bytes);
+        ack.ce_count = 1;
+        let n = seal_connected_packet(&mut sender, 42, nonce, &ack.encode(),
+            &mut encrypted, start + 2 + step).unwrap();
+        assert_eq!(n, 182);
+        let epoch = load_u32(&encrypted[10..14]);
+        let len = state.cipher.as_mut().unwrap().open(nonce, epoch, &encrypted[..14],
+            &encrypted[14..n], &mut plaintext, start + 10 + step).unwrap();
+        assert_eq!(len, crate::ack::ACK_PAYLOAD_LEN);
+        assert!(crate::sequence::is_ack_space(nonce));
+        assert!(state.receive_sequences.commit(nonce));
+        let decoded = state.decode_peer_ack(&plaintext[..len]);
+        if step == 0 {
+            assert!(decoded.is_none());
+            assert_eq!((state.packets_waiting_ack_field, state.peer_ce_count, state.current_tu,
+                state.deferred_tu, state.last_ack_received_time, state.tu_probe_sequence_number), before);
+            assert_eq!(state.pending_send.as_ref().unwrap().bytes, pending_bytes);
+            // The authenticated packet remains decryptable, but its replay
+            // commit cannot be undone by failure of the later semantic gate.
+            state.cipher.as_mut().unwrap().open(nonce, epoch, &encrypted[..14],
+                &encrypted[14..n], &mut plaintext, start + 20).unwrap();
+            assert!(!state.receive_sequences.commit(nonce));
+        } else {
+            let decoded = decoded.unwrap();
+            assert_eq!(decoded.sample_udp_payload_bytes, 1452);
+            assert_eq!(state.take_positive_receipt(probe), Some(PositiveReceipt::PendingProbe));
+            state.on_positive_receipt(probe, start + 30);
+            state.finish_upward_probe(true, start, start + 30);
+            assert_eq!(state.current_tu, 1204, "pending ciphertext still defers promotion");
+            assert_eq!(state.deferred_tu, Some(1452));
+            assert_eq!(state.pending_send.as_ref().unwrap().bytes, pending_bytes);
+        }
+    }
+}
+
+#[test]
+fn profile_four_ack_sample_size_rejects_mismatch_before_receipt_ce_or_tu_changes() {
+    let (mut state, mut queues, start, large, small) = repeated_probe_fixture();
+    let probe = recovery_send(&mut state, &mut queues, PendingSendKind::MtuProbe,
+        start + 1_200_000_000, 1472);
+    state.tu_probe_size = 1472;
+    let before = (state.packets_waiting_ack_field, state.peer_ce_count, state.current_tu,
+        state.last_ack_received_time, state.tu_probe_sequence_number);
+    for (sequence, size) in [(large[0], 512), (small[0], 1204), (probe, 1204)] {
+        let mut ack = sample_ack(sequence, size);
+        ack.ce_count = 1;
+        ack.bitmap[0] = (1 << small[0]) | (1 << small[1]) | (1 << probe);
+        assert!(state.decode_peer_ack(&ack.encode()).is_none());
+        assert_eq!((state.packets_waiting_ack_field, state.peer_ce_count, state.current_tu,
+            state.last_ack_received_time, state.tu_probe_sequence_number), before);
+    }
+    let good = sample_ack(probe, 1472).encode();
+    assert!(state.decode_peer_ack(&good).is_some());
+    for (offset, value) in [(28, 0), (29, 1), (30, 0), (31, 0)] {
+        let mut malformed = good;
+        if offset >= 30 { malformed[30..32].fill(0); }
+        else { malformed[offset] = value; }
+        assert!(state.decode_peer_ack(&malformed).is_none());
+    }
+    assert_eq!(good.len(), 152);
+    for magic in [CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s,
+        CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b] {
+        assert_eq!(good.len() + total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(magic).unwrap(), 182);
+    }
+}
+
+#[test]
+fn profile_four_ack_size_belongs_to_sample_not_highest_or_other_bitmap_receipts() {
+    let (mut state, mut queues, start, _, small) = repeated_probe_fixture();
+    let large = recovery_send(&mut state, &mut queues, PendingSendKind::Data,
+        start + 1_200_000_000, 1204);
+    let mut ack = sample_ack(small[1], 512);
+    ack.bitmap[0] = (1 << large) | (1 << small[0]);
+    let decoded = state.decode_peer_ack(&ack.encode()).unwrap();
+    assert_eq!(decoded.highest, large);
+    assert_eq!(decoded.sample_seq, small[1]);
+    let sequences = decoded.acknowledged().collect::<Vec<_>>();
+    assert!(!recovery_ack(&mut state, &sequences, start + 1_500_000_001));
+    assert_eq!(state.current_tu, 1204, "mixed larger progress vetoes fallback");
+    assert!(state.decode_peer_ack(&ack.encode()).is_some(), "duplicate validation is not admission");
+    assert!(!recovery_ack(&mut state, &sequences, start + 1_500_000_002));
+}
+
+#[test]
+fn profile_four_ack_size_uses_protected_generic_and_exact_outstanding_probe_metadata() {
+    let (mut state, mut queues, start) = parked_fixture();
+    let generic = recovery_send(&mut state, &mut queues, PendingSendKind::Reachability,
+        start + 1, 512);
+    for i in 0..5000 {
+        recovery_send(&mut state, &mut queues, PendingSendKind::Data, start + 2 + i, 1204);
+    }
+    assert_eq!(state.recovery.sent_bytes(generic), Some(512));
+    assert!(state.decode_peer_ack(&sample_ack(generic, 1204).encode()).is_none());
+    assert!(state.decode_peer_ack(&sample_ack(generic, 512).encode()).is_some());
+    let probe = recovery_send(&mut state, &mut queues, PendingSendKind::MtuProbe,
+        start + 6000, 1472);
+    state.tu_probe_size = 1472;
+    for i in 0..5000 {
+        recovery_send(&mut state, &mut queues, PendingSendKind::Data, start + 6001 + i, 1204);
+    }
+    assert_eq!(state.recovery.sent_bytes(probe), None);
+    assert!(state.decode_peer_ack(&sample_ack(probe, 1204).encode()).is_none());
+    assert!(state.decode_peer_ack(&sample_ack(probe, 1472).encode()).is_some());
+    // Unknown ordinary history remains unknown, never inferred from a high-water mark.
+    assert!(state.decode_peer_ack(&sample_ack(1, 512).encode()).is_some());
 }
 
 #[test]
@@ -1266,7 +1882,7 @@ fn recovery_current_probe_refusal_keeps_ciphertext_schedule_and_deferred_tu() {
     assert!(!finish_connected_send(&mut state, &mut queues, PendingSendKind::ReachabilityCurrent,
         None, start, &ciphertext, &[], Dscp::BestEffort, 0, None));
     assert_eq!(state.recovery.next_probe, before);
-    state.promote_tu(1472);
+    state.promote_tu(1472, start);
     assert_eq!(state.current_tu, 1204);
     assert_eq!(state.deferred_tu, Some(1472));
     let pending = state.pending_send.take().unwrap();
@@ -1313,9 +1929,11 @@ fn recovery_skipped_slots_allow_recent_repeated_failures_but_not_stale_history()
             start + 1_000_000_001, 1204);
         let first = recovery_send(&mut state, &mut queues, PendingSendKind::Reachability,
             start + 1_600_000_000, 512);
-        let second = recovery_send(&mut state, &mut queues, PendingSendKind::Reachability,
-            start + 2_100_000_000, 512);
         assert!(!recovery_ack(&mut state, &[first], start + 1_700_000_000));
+        // Keep both exact generic RTT samples at100ms; a deliberately delayed
+        // ACK would legitimately widen the adaptive failure window instead.
+        let second = recovery_send(&mut state, &mut queues, PendingSendKind::Reachability,
+            start + 1 + failed_age - 100_000_000, 512);
         assert_eq!(recovery_ack(&mut state, &[second], start + 1 + failed_age),
             failed_age <= 3_000_000_000);
     }
@@ -1325,17 +1943,17 @@ fn recovery_skipped_slots_allow_recent_repeated_failures_but_not_stale_history()
 fn recovery_overwritten_old_generic_receipt_is_unknown_veto_not_fresh_proof() {
     let (mut state, mut queues, start) = parked_fixture();
     let old = recovery_send(&mut state, &mut queues, PendingSendKind::Reachability, start + 1, 512);
-    for tick in 1..=20 {
+    for tick in 1..=300 {
         recovery_send(&mut state, &mut queues, PendingSendKind::Reachability,
             start + tick * crate::mtu_recovery::PERIOD, 512);
     }
     for _ in 0..5000 {
-        recovery_send(&mut state, &mut queues, PendingSendKind::Data, start + 5_000_000_001, 1204);
+        recovery_send(&mut state, &mut queues, PendingSendKind::Data, start + 75_000_000_001, 1204);
     }
     assert!(!state.recovery.is_generic(old));
-    assert!(!recovery_ack(&mut state, &[old], start + 5_100_000_000));
-    assert_eq!(state.last_pacing_ack_received_time, start + 5_100_000_000);
-    assert!(!state.recovery.large_stalled(start + 5_100_000_001));
+    assert!(!recovery_ack(&mut state, &[old], start + 75_100_000_000));
+    assert_eq!(state.last_pacing_ack_received_time, start + 75_100_000_000);
+    assert!(!state.recovery.large_stalled(start + 75_100_000_001));
 }
 
 #[test]

@@ -137,7 +137,7 @@ pub fn crypto_string_from_connect_magic1(magic: u64) -> Option<&'static str> {
     }
 }
 
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 pub const TRANSPORT_PARAMETERS_LEN: usize = 32;
 const MAGIC2_LIST_SIZE: usize = 1 + 32 * 8;
 pub const MAGIC2_BLOCK_SIZE: usize = MAGIC2_LIST_SIZE + TRANSPORT_PARAMETERS_LEN;
@@ -3546,8 +3546,9 @@ pub struct ConnectionStateConnected {
     pub last_sent_tu_probe_time_ns: u64,
     pub tu_probe_sequence_number: u64,
     pub tu_probe_size: u64,
-    pub tu_probe_size_advance: u64,
     pub tu_probe_failed_count: u64,
+    // A pre-shrink attempt keeps its identity but cannot alter the reset search.
+    tu_probe_obsolete: bool,
 
     pub packets_in_flight: u64,
     pub send_pacer_acc_ns: u64,
@@ -3631,8 +3632,8 @@ pub fn new_connection_state_connected(cipher: Option<ConnectionCipherTriplet>, m
         last_sent_tu_probe_time_ns: 0,
         tu_probe_sequence_number: u64::MAX,
         tu_probe_size: 0,
-        tu_probe_size_advance: 0,
         tu_probe_failed_count: 0,
+        tu_probe_obsolete: false,
 
         packets_in_flight: 0,
         send_pacer_acc_ns: 0,
@@ -4009,15 +4010,62 @@ impl ConnectionStateConnected {
         self.send_ack_sequence_number = nonce.checked_add(1)?;
         Some(nonce)
     }
-    fn promote_tu(&mut self, tu: u64) {
+    fn promote_tu(&mut self, tu: u64, now: u64) {
         if self.pending_send.as_ref().is_some_and(|p| matches!(p.kind,
             PendingSendKind::Data | PendingSendKind::Keepalive | PendingSendKind::Outage | PendingSendKind::Reachability | PendingSendKind::ReachabilityCurrent)) {
             self.deferred_tu = Some(tu);
-        } else { self.current_tu = tu; }
+        } else { self.apply_effective_tu(tu, now); }
     }
-    fn downshift_for_recovery(&mut self, copy_pending: bool) {
+    fn apply_effective_tu(&mut self, tu: u64, now: u64) {
+        if tu < self.current_tu {
+            self.tu_probe_failed_count = 0;
+            self.tu_probe_obsolete = true;
+        }
+        self.recovery.effective_tu(self.current_tu, tu, now);
+        self.current_tu = tu;
+    }
+    fn upward_probe_deadline(&self, now: u64) -> u64 {
+        self.recovery.upward_plan(self.current_tu, self.last_sent_tu_probe_time_ns,
+            self.tu_probe_failed_count, now).map_or(u64::MAX, |(_, due)| due)
+    }
+    fn prepare_upward_probe(&mut self, now: u64) -> bool {
+        let Some((size, due)) = self.recovery.upward_plan(self.current_tu,
+            self.last_sent_tu_probe_time_ns, self.tu_probe_failed_count, now) else { return false; };
+        if now < due { return false; }
+        self.tu_probe_size = size;
+        self.tu_probe_obsolete = false;
+        true
+    }
+    fn finish_upward_probe(&mut self, success: bool, sent: u64, now: u64) {
+        self.tu_probe_sequence_number = u64::MAX;
+        if self.tu_probe_obsolete || self.tu_probe_size <= self.current_tu { return; }
+        if success {
+            if !self.recovery.can_promote(self.tu_probe_size, sent, now) { return; }
+            self.promote_tu(self.tu_probe_size, now);
+            self.tu_probe_failed_count = 0;
+        } else {
+            self.recovery.upward_failed(self.current_tu, self.tu_probe_size, now);
+            self.tu_probe_failed_count = self.tu_probe_failed_count.saturating_add(1);
+        }
+    }
+    fn downshift_for_recovery(&mut self, copy_pending: bool, now: u64) {
         if copy_pending { self.deferred_tu = Some(crate::mtu_recovery::SMALL); }
-        else { self.promote_tu(crate::mtu_recovery::SMALL); }
+        else { self.promote_tu(crate::mtu_recovery::SMALL, now); }
+    }
+    /// Validate the independently sampled nonce before admitting any ACK effects.
+    /// A size report is never receipt evidence; missing history remains unknown.
+    fn ack_sample_size_matches(&self, ack: &crate::ack::BitmapAck) -> bool {
+        let expected = self.recovery.sent_bytes(ack.sample_seq).or_else(|| {
+            (ack.sample_seq == self.tu_probe_sequence_number
+                && ack.sample_seq < self.send_sequence_number)
+                .then_some(self.tu_probe_size as u16)
+        });
+        expected.is_none_or(|bytes| bytes == ack.sample_udp_payload_bytes)
+    }
+    fn decode_peer_ack(&self, payload: &[u8]) -> Option<crate::ack::BitmapAck> {
+        let ack = crate::ack::BitmapAck::decode(payload)?;
+        (ack.highest < self.send_sequence_number && self.ack_sample_size_matches(&ack))
+            .then_some(ack)
     }
     // Only call after native exact first-positive admission. A missing metadata
     // record defaults to ordinary, never suppressing real application's progress.
@@ -4243,10 +4291,18 @@ fn fec_ingress_bytes(layout: crate::fec::MessageLayout) -> usize {
 // Provisional conservative P3 allowance: Wi-Fi fleet peaked at seven codecs
 // outside a ceiling-hit CC flood. Re-measure after CC overshoot and P4 fixes.
 const FEC_WORKERS_PER_QUEUE: usize = 8;
-fn receive_worker_limit(max_message_size: usize, queues: usize) -> usize {
+// This dimension sizes the existing byte cap, not the runtime codec count.
+fn receive_worker_capacity_dimension(max_message_size: usize, queues: usize) -> usize {
     let unit = max_message_size.min(FEC_SEGMENT_BYTES);
     if unit.div_ceil(FEC_MIN_BLOCK_BYTES) <= FEC_INLINE_MAX_BLOCKS { return 0; }
     (queues * max_message_size.div_ceil(unit).min(FEC_WORKERS_PER_QUEUE)).min(MAX_FEC_DECODE_WORKERS)
+}
+fn receive_worker_limit(max_message_size: usize, queues: usize) -> usize {
+    // Smaller units may use the already reserved byte capacity without an
+    // artificial per-queue permit bottleneck. Every admission still reserves
+    // its full lease; the unchanged process-wide ceiling also remains hard.
+    if receive_worker_capacity_dimension(max_message_size, queues) == 0 { 0 }
+    else { MAX_FEC_DECODE_WORKERS }
 }
 
 /// Hard per-peer receive cap derived only from REQUIRED local application configuration.
@@ -4256,7 +4312,7 @@ pub fn receive_connection_memory_limit(max_message_size: usize, queues: usize) -
     if !(1..=64).contains(&queues) { return None; }
     let max_message_size = max_message_size.min(MAX_JUMBOGRAM_LEN);
     let unit = max_message_size.min(FEC_SEGMENT_BYTES);
-    let workers = receive_worker_limit(max_message_size, queues);
+    let workers = receive_worker_capacity_dimension(max_message_size, queues);
     let decoder = if unit > FEC_MIN_BLOCK_BYTES {
         let layout = wire_fec_layout(unit, FEC_MIN_BLOCK_BYTES)?;
         // k*block_bytes < unit+block_bytes, and every wire width fits u16.
@@ -5718,8 +5774,7 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                             // ACKs remain identified ONLY by exact decrypted packet size.
                             if payload.len() == crate::ack::ACK_PAYLOAD_LEN {
                                 let bitmap_ack = if payload.len() == crate::ack::ACK_PAYLOAD_LEN {
-                                    let Some(a) = crate::ack::BitmapAck::decode(payload) else { break 'conn; };
-                                    if a.highest >= state.send_sequence_number { break 'conn; }
+                                    let Some(a) = state.decode_peer_ack(payload) else { break 'conn; };
                                     // A fresh authenticated ACK proves peer activity, not
                                     // positive receipt or round-trip outage recovery.
                                     state.last_peer_packet_received_time = timestamp_ns;
@@ -5757,6 +5812,9 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                         state.highest_peer_acked = Some(state.highest_peer_acked.unwrap_or(index).max(index));
                                     }
                                     let Some(receipt) = state.take_positive_receipt(index) else { continue; };
+                                    // Upward proof identity has a full accepted timestamp;
+                                    // the compact send-time band remains solely CC/RTT input.
+                                    let probe_sent_ns = state.last_sent_tu_probe_time_ns;
                                     small_recovery_proof |= state.on_positive_receipt(index, timestamp_ns);
                                     if let Some(t) = &mut loss_trace { t.outcome('A', existing_connection.two_byte_send_prefix, index, timestamp_ns); }
                                     #[cfg(feature = "research_budget_diagnostic")]
@@ -5768,13 +5826,7 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                             oldest_newly_acked_send_time = oldest_newly_acked_send_time.min(sent_ns);
                                         }
                                         if receipt == PositiveReceipt::PendingProbe {
-                                            state.tu_probe_sequence_number = u64::MAX;
-                                            state.last_sent_tu_probe_time_ns = 0;
-                                            if state.recovery.can_promote(sent_ns, timestamp_ns) {
-                                                state.promote_tu(state.tu_probe_size);
-                                            }
-                                            state.tu_probe_size_advance *= 2;
-                                            state.tu_probe_failed_count = 0;
+                                            state.finish_upward_probe(true, probe_sent_ns, timestamp_ns);
                                         } else {
                                             state.ack_hole.acknowledged(index);
                                             data_ack_progress = true;
@@ -5820,9 +5872,9 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                     }
                                 }
                                 if small_recovery_proof && state.current_tu > crate::mtu_recovery::SMALL
-                                    && state.recovery.large_stalled(timestamp_ns) {
+                                    && state.recovery.ready(timestamp_ns, state.current_tu) {
                                     state.recovery.downshifted(timestamp_ns);
-                                    state.downshift_for_recovery(existing_connection.unreliable_send_buffer.target_copy_pending());
+                                    state.downshift_for_recovery(existing_connection.unreliable_send_buffer.target_copy_pending(), timestamp_ns);
                                 }
                                 if ack_latency_ns != 0 { state.loss_timer.observe(ack_latency_ns); }
                                 state.delivery_growth.acknowledged_samples(timestamp_ns, (newly_acked_data, delivery_latency_ns),
@@ -6414,9 +6466,7 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                 }
 
                                 if state.packets_waiting_ack_tail == state.tu_probe_sequence_number {
-                                    state.tu_probe_sequence_number = u64::MAX;
-                                    state.tu_probe_size_advance /= 5;
-                                    state.tu_probe_failed_count += 1;
+                                    state.finish_upward_probe(false, state.last_sent_tu_probe_time_ns, current_time_now_ns);
                                     state.stats.tu_probes_lost += 1;
                                 }
                                 else {
@@ -6533,9 +6583,7 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                         // ring space is checked live at each send site below so the head can never lap the tail within a tick
 
                         state.current_tu = state.current_tu.min(ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE as u64);
-                        if current_time_now_ns >= state.recovery.upward_after && !connection_tracking_data.unreliable_send_buffer.target_copy_pending() && state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY - 1 && state.current_tu != ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE as u64 && state.tu_probe_sequence_number == u64::MAX && state.last_sent_tu_probe_time_ns + (state.tu_probe_failed_count.min(50)*state.tu_probe_failed_count.min(50)*250_000_000).max(time_between_sends_ns) < current_time_now_ns {
-                            state.tu_probe_size_advance = state.tu_probe_size_advance.max(1).min(ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE as u64);
-                            state.tu_probe_size = (state.current_tu + state.tu_probe_size_advance).min(ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE as u64);
+                        if !connection_tracking_data.unreliable_send_buffer.target_copy_pending() && state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY - 1 && state.current_tu != ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE as u64 && state.tu_probe_sequence_number == u64::MAX && state.prepare_upward_probe(current_time_now_ns) {
                             let payload_size = state.tu_probe_size as usize - total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(state.magic1).unwrap();
                             let null_bytes = [0xffu8; ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE];
 
@@ -6652,7 +6700,7 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                             if let Some(fixture) = &recovery_copy_grant_fixture {
                                 match fixture.load(std::sync::atomic::Ordering::Acquire) {
                                     1 if connection_tracking_data.unreliable_send_buffer.target_copy_pending() => {
-                                        state.downshift_for_recovery(true);
+                                        state.downshift_for_recovery(true, current_time_now_ns);
                                         fixture.store(2, std::sync::atomic::Ordering::Release);
                                     }
                                     2 if !connection_tracking_data.unreliable_send_buffer.target_copy_pending() => {
@@ -6781,12 +6829,11 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                     c.last_ack_received_time.max(c.last_peer_packet_received_time)
                                 } else { c.last_ack_received_time };
                                 include(last_activity.saturating_add(OUTAGE_TIMEOUT_NS));
-                                if c.current_tu != ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE as u64
+                                if c.pending_send.is_none() && !conn.unreliable_send_buffer.target_copy_pending()
+                                    && c.send_sequence_number - c.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY - 1
+                                    && c.current_tu != ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE as u64
                                     && c.tu_probe_sequence_number == u64::MAX {
-                                    // Delivery growth may legitimately be below the rate floor.
-                                    let interval = send_interval_ns(c.stats.cc_rate_upps);
-                                    let probe_delay = (c.tu_probe_failed_count.min(50).pow(2) * 250_000_000).max(interval);
-                                    include(c.last_sent_tu_probe_time_ns.saturating_add(probe_delay).saturating_add(1).max(c.recovery.upward_after));
+                                    include(c.upward_probe_deadline(now));
                                 }
                             }
                             ConnectionState::SendingClientHelloPlaintext { last_sent_time_ns, .. }
@@ -6953,6 +7000,7 @@ const OUTAGE_ACK_SILENCE_NS: u64 = 2_000_000_000;
 const OUTAGE_TIMEOUT_NS: u64 = 120_000_000_000;
 const OUTAGE_FIRST_PROBE_NS: u64 = 250_000_000;
 const OUTAGE_MAX_PROBE_NS: u64 = 4_000_000_000;
+const OUTAGE_PROBE_RECORDS: usize = 32;
 
 #[derive(Debug, Default)]
 struct OutageState {
@@ -6962,7 +7010,8 @@ struct OutageState {
     probe_interval_ns: u64,
     resume_rate_upps: u64,
     ignore_loss_before_seq: u64,
-    probes: [(u64, u64); 8],
+    probes: [(u64, u64); OUTAGE_PROBE_RECORDS],
+    probe_cursor: usize,
     max_probe_age_ns: u64,
     ignored_losses: u64,
     ignored_spurious: u64,
@@ -6970,20 +7019,29 @@ struct OutageState {
     pre_startup_done: bool,
 }
 fn recent_outage_probe_acked(state: &ConnectionStateConnected, ack: &crate::ack::BitmapAck, now: u64) -> bool {
-    ack.acknowledged().any(|seq| {
-        let (record_seq, sent) = state.outage.probes[(seq % 8) as usize];
+    let Some(since) = state.outage.since_ns else { return false; };
+    // Scan the bounded chronological ledger once, not every ACK bit per record.
+    state.outage.probes.iter().any(|&(seq, sent)| {
         let bit = seq % PACKETS_WAITING_ACK_CAPACITY;
-        seq >= state.packets_waiting_ack_tail && seq < state.send_sequence_number &&
+        sent != 0 && sent >= since && sent <= now &&
+            (ack.sample_seq == seq || ack.contains(seq)) &&
+            seq >= state.packets_waiting_ack_tail && seq < state.send_sequence_number &&
             state.packets_waiting_ack_field[(bit / 64) as usize] & (1 << (bit % 64)) != 0 &&
-            record_seq == seq && sent != 0 && now.saturating_sub(sent) <= state.outage.max_probe_age_ns.max(OUTAGE_MAX_PROBE_NS)
+            now - sent <= state.outage.max_probe_age_ns.max(OUTAGE_MAX_PROBE_NS)
     })
 }
 impl OutageState {
     fn enter(&mut self, now: u64, rate: u64) {
         self.since_ns = Some(now);
+        self.probes.fill((0, 0));
+        self.probe_cursor = 0;
         self.next_probe_ns = now;
         self.probe_interval_ns = OUTAGE_FIRST_PROBE_NS;
         self.resume_rate_upps = rate.min(crate::ship::CC.initial_rate_upps);
+    }
+    fn record_probe(&mut self, sequence: u64, sent: u64) {
+        self.probes[self.probe_cursor] = (sequence, sent);
+        self.probe_cursor = (self.probe_cursor + 1) % OUTAGE_PROBE_RECORDS;
     }
     fn probe_due(&self, now: u64) -> bool {
         self.since_ns.is_some() && now >= self.next_probe_ns
@@ -7321,7 +7379,7 @@ fn commit_connected_send(state: &mut ConnectionStateConnected, buf: &mut SendQue
         if let Some(a) = &mut buf.fec_adaptive { a.on_data_sent(seq); }
     }
     if kind == PendingSendKind::Outage || (kind.is_generic() && state.outage.since_ns.is_some()) {
-        state.outage.probes[(seq % 8) as usize] = (seq, sent);
+        state.outage.record_probe(seq, sent);
         // Either generic probe can resume outage, but must not postpone the
         // independently backed-off current-TU outage probe schedule.
         if kind == PendingSendKind::Outage { state.outage.probe_sent(sent); }
@@ -7336,7 +7394,7 @@ fn commit_connected_send(state: &mut ConnectionStateConnected, buf: &mut SendQue
     // The accepted datagram used the old effective TU. Promote before framing
     // any later current-TU datagram, never by changing/resealing its ciphertext.
     if !buf.target_copy_pending() || state.deferred_tu.is_some_and(|tu| tu >= state.current_tu) {
-        if let Some(tu) = state.deferred_tu.take() { state.current_tu = tu; }
+        if let Some(tu) = state.deferred_tu.take() { state.apply_effective_tu(tu, sent); }
     }
     state.max_in_flight_since_last_print = state.max_in_flight_since_last_print.max(state.packets_in_flight);
 }
@@ -9271,7 +9329,7 @@ mod congestion_tests {
         let old_ack = 5_001_000_000;
         let old_sent = s.send_time(0);
         assert!(old_sent <= 751_000_000 && old_ack - old_sent >= 4_250_000_000);
-        let mut ack = crate::ack::BitmapAck { highest: 0, sample_seq: 0, delay_us: 0, ce_count: 0, receipt_base: 0, bitmap: [0; 15] };
+        let mut ack = crate::ack::BitmapAck { highest: 0, sample_seq: 0, sample_udp_payload_bytes: 1204, delay_us: 0, ce_count: 0, receipt_base: 0, bitmap: [0; 15] };
         ack.bitmap[0] = 1;
         let growth_receipts = growth_ack(&mut s, &ack, old_ack, 1_000_000);
         assert_eq!(s.packets_waiting_ack_field[0] & 1, 0);
@@ -9309,7 +9367,7 @@ mod congestion_tests {
         s.declared_lost_field[0] = 3;
         s.outage.ignore_loss_before_seq = 1;
         s.tu_probe_sequence_number = 3;
-        let mut ack = crate::ack::BitmapAck { highest: 3, sample_seq: 3, delay_us: 0, ce_count: 0, receipt_base: 0, bitmap: [0; 15] };
+        let mut ack = crate::ack::BitmapAck { highest: 3, sample_seq: 3, sample_udp_payload_bytes: 1204, delay_us: 0, ce_count: 0, receipt_base: 0, bitmap: [0; 15] };
         ack.bitmap[0] = 15;
         // seq0: pre-outage; seq1: declared-lost data; seq2: pending data;
         // seq3: pending MTU probe. Only seq1 and seq2 authorize growth.
@@ -9342,7 +9400,7 @@ mod congestion_tests {
         assert!(s.send_time(2) >= resume);
         assert_eq!(s.delivery_growth.receipt_latency(resume + 10_000_000, s.send_time(0)), None);
         assert_eq!(s.delivery_growth.receipt_latency(resume + 10_000_000, s.send_time(1)), None);
-        let mut ack = crate::ack::BitmapAck { highest: 2, sample_seq: 2, delay_us: 0, ce_count: 0, receipt_base: 0, bitmap: [0; 15] };
+        let mut ack = crate::ack::BitmapAck { highest: 2, sample_seq: 2, sample_udp_payload_bytes: 1204, delay_us: 0, ce_count: 0, receipt_base: 0, bitmap: [0; 15] };
         ack.bitmap[0] = 7;
         assert_eq!(growth_ack(&mut s, &ack, resume + 10_000_000, 1_000_000), 1);
         assert_eq!(s.packets_waiting_ack_field[0], 0); // all still ACKed normally
@@ -11752,7 +11810,7 @@ mod outage_review_repros {
         s.outage.enter(3_000_000_000, 100_000_000);
         s.account_send(3_000_000_000);
         s.outage.probes[0] = (0, 3_000_000_000);
-        let a = crate::ack::BitmapAck { receipt_base: 0, highest: 0, sample_seq: 0, delay_us: 0, ce_count: 0, bitmap: [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0] };
+        let a = crate::ack::BitmapAck { receipt_base: 0, highest: 0, sample_seq: 0, sample_udp_payload_bytes: 1204, delay_us: 0, ce_count: 0, bitmap: [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0] };
         assert!(recent_outage_probe_acked(&s, &a, 3_100_000_000));
         assert!(!recent_outage_probe_acked(&s, &a, 120_000_000_000));
         assert_eq!(s.last_ack_received_time, 1_000_000_000);
@@ -12450,6 +12508,156 @@ mod lazy_fec_segment_tests {
         drop(message); drop(reservation); assert_eq!(budget.used(), 0);
     }
 
+    mod receiver_permit_tests {
+        use super::*;
+        use std::sync::{atomic::{AtomicUsize, Ordering::Acquire}, mpsc};
+        use crate::receive_memory::ReceiveMemoryBudget;
+
+        const LEN: usize = 1 << 20;
+        const WIDTH: usize = 1323;
+        const CAP: usize = 40_106_748;
+        const BASE: u64 = 1_000_000_000;
+
+        struct Fixture {
+            budget: Arc<ReceiveMemoryBudget>,
+            workers: Arc<AtomicUsize>,
+            done: mpsc::Sender<FecCompletion>,
+            completions: mpsc::Receiver<FecCompletion>,
+            receiver: crate::ack::AckReceiver,
+            next_ack_ns: u64,
+        }
+
+        impl Fixture {
+            fn new(budget: Arc<ReceiveMemoryBudget>) -> Self {
+                let (done, completions) = mpsc::channel();
+                Self { budget, workers: Arc::new(AtomicUsize::new(0)), done, completions,
+                    receiver: crate::ack::AckReceiver::default(), next_ack_ns: u64::MAX }
+            }
+
+            fn feed(&mut self, slot: &mut FecRecvSlot, id: u64, block: u32, data: &[u8], seq: u64) {
+                let before = slot.ingress_dropped;
+                let key = ConnectionKey { ip: std::net::Ipv6Addr::LOCALHOST, port: 1, key_15_bits: 0 };
+                fec_receive_block(slot, key, id, LEN, WIDTH, block, data,
+                    &self.done, &self.workers, &self.budget);
+                // Mirror the native receive loop's !memory_erased ACK gate;
+                // this fixture uses the real FEC admission path, not UDP I/O.
+                if slot.ingress_dropped == before {
+                    self.receiver.receive_with_rtt(seq, BASE + seq, false,
+                        &mut self.next_ack_ns, 42_000, 1374);
+                }
+            }
+
+            fn damaged_pair(&mut self) -> Vec<FecRecvSlot> {
+                let mut slots = FecRecvSlot::new_ring(2);
+                let k = LEN.div_ceil(WIDTH);
+                for (i, slot) in slots.iter_mut().enumerate() {
+                    slot.package_id = i as u64;
+                    // Two otherwise clean source units, each missing block zero.
+                    for block in 1..k {
+                        let size = (LEN - block * WIDTH).min(WIDTH);
+                        self.feed(slot, i as u64, block as u32, &vec![0x55; size], (i * k + block) as u64);
+                    }
+                    slot.last_block_ns = BASE + i as u64 * 1_000_000;
+                    assert!(matches!(slot.state, FecRecvState::Worker { .. }));
+                }
+                assert_eq!(self.workers.load(Acquire), 2);
+                slots
+            }
+
+            fn complete_good(&mut self, slot: &mut FecRecvSlot, id: u64) {
+                for block in 0..LEN.div_ceil(WIDTH) {
+                    let size = (LEN - block * WIDTH).min(WIDTH);
+                    self.feed(slot, id, block as u32, &vec![0x55; size], 10_000 + block as u64);
+                }
+            }
+        }
+
+        #[test]
+        fn pipeline_accepts_good_unit_after_two_damaged() {
+            let cap = receive_connection_memory_limit(2 << 20, 2).unwrap();
+            assert_eq!(cap, CAP, "byte cap must remain unchanged");
+            let parent = ReceiveMemoryBudget::new(cap);
+            let budget = ReceiveMemoryBudget::connection_with_limit(&parent, cap)
+                .with_worker_limit(receive_worker_limit(2 << 20, 2));
+            let mut fixture = Fixture::new(budget.clone());
+            let slots = fixture.damaged_pair();
+            assert_eq!(budget.used(), 14_031_180);
+            let mut good = FecRecvSlot { package_id: 2, ..Default::default() };
+            fixture.complete_good(&mut good, 2);
+            let completion = fixture.completions.try_recv().expect(
+                "two damaged units must not erase a complete third unit with 26 MB of byte capacity free");
+            assert_eq!(completion.message, vec![0x55; LEN]);
+            assert_eq!(good.ingress_dropped, 0);
+            assert_eq!(fixture.receiver.ack(BASE + 1_000_000).sample_seq,
+                10_000 + LEN.div_ceil(WIDTH) as u64 - 1);
+            assert_eq!(budget.peak(), 21_046_770);
+            assert!(budget.peak() <= cap);
+            drop(completion); drop(good); drop(slots);
+            assert_eq!(fixture.workers.load(Acquire), 0);
+            assert_eq!(budget.used(), 0);
+            assert_eq!(parent.used(), 0);
+        }
+
+        #[test]
+        fn two_permit_characterization_and_expiry() {
+            let parent = ReceiveMemoryBudget::new(CAP);
+            let budget = ReceiveMemoryBudget::connection_with_limit(&parent, CAP).with_worker_limit(2);
+            let mut fixture = Fixture::new(budget.clone());
+            let mut slots = fixture.damaged_pair();
+            let grace = fec_inactive_grace_ns(420, true);
+            assert_eq!(grace, 2_000_000_000);
+            assert_eq!(retire_inactive_fec_workers(&mut slots, BASE + grace, grace, true), 0);
+            let mut refused = FecRecvSlot { package_id: 2, ..Default::default() };
+            fixture.complete_good(&mut refused, 2);
+            assert_eq!(refused.ingress_dropped, LEN.div_ceil(WIDTH) as u64);
+            assert!(fixture.completions.try_recv().is_err());
+            assert!(fixture.receiver.ack(BASE + grace).sample_seq < 10_000,
+                "erased source may not be ACKed");
+            assert_eq!(retire_inactive_fec_workers(&mut slots, BASE + grace + 1, grace, true), 1);
+            assert_eq!(fixture.workers.load(Acquire), 1);
+            let mut good = FecRecvSlot { package_id: 3, ..Default::default() };
+            fixture.complete_good(&mut good, 3);
+            let completion = fixture.completions.try_recv().expect("freed permit admits a later complete unit");
+            assert_eq!(completion.message, vec![0x55; LEN]);
+            drop(completion); drop(good); drop(refused); drop(slots);
+            assert_eq!(fixture.workers.load(Acquire), 0);
+            assert_eq!(budget.used(), 0);
+            assert_eq!(parent.used(), 0);
+        }
+
+        #[test]
+        fn tight_bytes_and_global_limit_remain_hard() {
+            assert_eq!(receive_worker_limit(100, 2), 0, "inline-only stays zero");
+            assert_eq!(receive_worker_limit(0, 2), 0, "zero dimension stays zero");
+            let layout = crate::fec::MessageLayout::new(LEN, WIDTH).unwrap();
+            let charge = crate::fec::receive_memory_charge(layout, true, fec_ingress_bytes(layout)).unwrap();
+            assert_eq!(charge, 7_015_590);
+            let parent = ReceiveMemoryBudget::new(charge);
+            let budget = ReceiveMemoryBudget::connection_with_limit(&parent, charge)
+                .with_worker_limit(MAX_FEC_DECODE_WORKERS);
+            let mut fixture = Fixture::new(budget.clone());
+            let mut first = FecRecvSlot { package_id: 0, ..Default::default() };
+            fixture.feed(&mut first, 0, 0, &vec![0x55; WIDTH], 0);
+            let mut next = FecRecvSlot { package_id: 1, ..Default::default() };
+            fixture.feed(&mut next, 1, 0, &vec![0x55; WIDTH], 10_000);
+            assert_eq!(next.ingress_dropped, 1);
+            assert_eq!(budget.used(), charge);
+            assert_eq!(fixture.receiver.ack(BASE + 1).sample_seq, 0);
+            drop(first); drop(next);
+            assert_eq!(fixture.workers.load(Acquire), 0);
+            assert_eq!(budget.used(), 0);
+            assert_eq!(parent.used(), 0);
+            fixture.workers.store(MAX_FEC_DECODE_WORKERS, std::sync::atomic::Ordering::Release);
+            let mut blocked = FecRecvSlot { package_id: 2, ..Default::default() };
+            fixture.feed(&mut blocked, 2, 0, &vec![0x55; WIDTH], 10_001);
+            assert_eq!(blocked.ingress_dropped, 1);
+            assert_eq!(fixture.workers.load(Acquire), MAX_FEC_DECODE_WORKERS);
+            assert_eq!(budget.used(), 0);
+            assert_eq!(parent.used(), 0);
+            assert_eq!(fixture.receiver.ack(BASE + 2).sample_seq, 0);
+        }
+    }
+
     #[test]
     fn default_peer_budget_fits_maximum_message_and_decoder_margin() {
         let process = Arc::new(crate::receive_memory::ReceiveMemoryBudget::default());
@@ -12469,11 +12677,15 @@ mod lazy_fec_segment_tests {
             (15_000_000, 1, 142_555_024), (15_000_000, 2, 167_152_944)] {
             assert_eq!(receive_connection_memory_limit(size, queues), Some(expected));
         }
+        assert_eq!(receive_worker_capacity_dimension(65536, 2), 0);
+        assert_eq!(receive_worker_capacity_dimension(2 << 20, 1), 1);
+        assert_eq!(receive_worker_capacity_dimension(2 << 20, 2), 2);
+        assert_eq!(receive_worker_capacity_dimension(15_000_000, 1), 8);
+        assert_eq!(receive_worker_capacity_dimension(15_000_000, 2), 8);
         assert_eq!(receive_worker_limit(65536, 2), 0);
-        assert_eq!(receive_worker_limit(2 << 20, 1), 1);
-        assert_eq!(receive_worker_limit(2 << 20, 2), 2);
-        assert_eq!(receive_worker_limit(15_000_000, 1), 8);
-        assert_eq!(receive_worker_limit(15_000_000, 2), 8);
+        for (size, queues) in [(2 << 20, 1), (2 << 20, 2), (15_000_000, 1), (15_000_000, 2)] {
+            assert_eq!(receive_worker_limit(size, queues), MAX_FEC_DECODE_WORKERS);
+        }
         // The configured ingress upper bound covers every wire symbol width.
         let unit = FEC_SEGMENT_BYTES;
         let worst = unit + u16::MAX as usize + FEC_MAX_SOURCE_BLOCKS * FEC_INGRESS_SLOT_BYTES;
@@ -13015,10 +13227,10 @@ mod review2_tests {
     #[test]
     fn review2_bitmap_ack_decode_bounds() {
         use crate::ack::BitmapAck;
-        let mut a = BitmapAck { receipt_base: 0, highest: 100, sample_seq: 101, delay_us: 0, ce_count: 0, bitmap: [0; 15] };
+        let mut a = BitmapAck { receipt_base: 0, highest: 100, sample_seq: 101, sample_udp_payload_bytes: 1204, delay_us: 0, ce_count: 0, bitmap: [0; 15] };
         a.bitmap[((100 - a.base()) / 64) as usize] |= 1u64 << ((100 - a.base()) % 64);
         assert_eq!(BitmapAck::decode(&a.encode()).unwrap().highest, 101);
-        let mut b = BitmapAck { receipt_base: 0, highest: 100, sample_seq: 100, delay_us: 0, ce_count: 0, bitmap: [0; 15] };
+        let mut b = BitmapAck { receipt_base: 0, highest: 100, sample_seq: 100, sample_udp_payload_bytes: 1204, delay_us: 0, ce_count: 0, bitmap: [0; 15] };
         assert_eq!(BitmapAck::decode(&b.encode()).unwrap().acknowledged().collect::<Vec<_>>(), vec![100]);
         b.bitmap[((100 - b.base()) / 64) as usize] |= 1u64 << ((100 - b.base()) % 64);
         let d = BitmapAck::decode(&b.encode()).unwrap();
@@ -13915,7 +14127,13 @@ mod wire_v2_tests {
     #[test]
     fn declared_version_layout_and_limits_are_checked() {
         let p = transport_parameters(65536); assert_eq!(validate_transport_parameters(&p), Some(65536));
-        assert_eq!(load_u16(&p[..2]), 3);
+        assert_eq!(load_u16(&p[..2]), 4);
+        let mut profile_three = p;
+        store_u16(&mut profile_three[..2], 3);
+        assert!(validate_transport_parameters(&profile_three).is_none());
+        let mut old_hello = build_magic2_client_block_for_limit(65536);
+        old_hello[MAGIC2_LIST_SIZE..].copy_from_slice(&profile_three);
+        assert!(negotiate_magic2(&old_hello).is_none());
         assert_eq!(load_u16(&p[12..14]), 445);
         let mut legacy = p;
         store_u16(&mut legacy[..2], 2);
@@ -14070,7 +14288,7 @@ mod wire_v2_tests {
             let bytes = vec![0; state.current_tu as usize];
             assert!(!finish_connected_send(&mut state, &mut queues, kind,
                 None, 1_000_000_000, &bytes, &[], Dscp::Af21, 0, None));
-            state.promote_tu(1472); // same operation as receipt of the outstanding probe
+            state.promote_tu(1472, 1_000_000_001); // same operation as receipt of the outstanding probe
             assert_eq!(state.current_tu, 1204);
             assert_eq!(state.deferred_tu, Some(1472));
             let pending = state.pending_send.take().unwrap();
@@ -18130,7 +18348,7 @@ mod target_dup_tests {
         commit_connected_send(&mut state,&mut q,PendingSendKind::Data,5,p.len()+14,&p,42,None);
         q.fec_prepare_packet(3);let mut copy=vec![0;1442];assert_eq!(q.take_target_copy(&mut copy),1442);
         commit_connected_send(&mut state,&mut q,PendingSendKind::Outage,6,copy.len()+14,&copy,42,None);
-        assert_eq!(state.outage.probes[3],(3,6));assert_eq!(state.stats.dup_datagrams,2);
+        assert!(state.outage.probes.contains(&(3,6)));assert_eq!(state.stats.dup_datagrams,2);
     }
     #[test] fn encrypted_nonce_and_physical_ack_ce_are_independent_of_whole_dedup() {
         let mut q=queues();q.submit_messages(0,vec![vec![4;100],vec![5;1000]]);

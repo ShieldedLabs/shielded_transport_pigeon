@@ -1,20 +1,21 @@
-# STP wire protocol, version 3
+# STP wire protocol, version 4
 
-This document specifies the incompatible version-3 transport implemented by
+This document specifies the incompatible version-4 transport implemented by
 `shielded_transport_pigeon`. It does not change the crate's package version.
 All STP framing integers are unsigned little-endian; offsets below are byte
 offsets. Public keys and Noise messages are byte strings with the encodings
 specified by Noise, not little-endian STP integers. One UDP payload is one STP
-packet. There is no compatibility with versions 1 or 2.
+packet. There is no compatibility with versions 1, 2 or 3.
 
 The words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** specify
 requirements for this interoperable wire profile. Statements explicitly labelled
 "this implementation", "local", or "sender policy" describe the shipped Rust
-implementation, not additional peer-negotiated requirements. Wire version 3 is
-independent of the crate version and the application API. It retains version 2's
-bitmap ACK and whole-duplication framing but declares a 445-byte minimum FEC
-symbol instead of 1136, permitting 512-byte recovery datagrams. Both endpoints
-MUST reject a mismatched profile; they cannot silently reinterpret the old floor.
+implementation, not additional peer-negotiated requirements. Wire version 4 is
+independent of the crate version and the application API. It retains version 3's
+445-byte minimum FEC symbol, bitmap ACK and whole-duplication framing. The
+unchanged 152-byte ACK now includes its sampled nonce's exact UDP payload size.
+Both endpoints MUST reject a mismatched profile; they cannot silently
+reinterpret the old ACK encoding.
 
 An independent implementation needs this document, the Noise specification for
 the selected suite, and the exact vendored Wirehair codec pinned below. No Rust
@@ -186,6 +187,13 @@ an all-padding current-TU outage probe, then probes after 250 ms, 500 ms,
 subject to the same local-refusal and cryptographic-budget rules as data.
 Only an authenticated ACK positively receipting a still-outstanding recorded
 outage probe younger than max(4 s, twice the pre-outage RTT) resumes sending.
+The sender retains 32 accepted outage/generic probe tuples in chronological
+order, not nonce-modulo slots; generic traffic cannot overwrite a 2.5-second
+proof after only eight sends. Each new outage clears this ledger. A candidate
+must have been sent during the current outage, still be pending and at/after
+the pending tail, and satisfy the unchanged age bound above. The lookup scans
+at most 32 tuples and checks bitmap/sample membership, not every ACK bit per
+tuple. Retired, consumed, pre-outage or replayed proof cannot resume sending.
 Old withheld/replayed feedback cannot prove recovery. Outage resumption retains the
 current TU (which the independent size-recovery policy below may lower),
 nonce/epoch histories and message identities, resets pacing credit and RTT
@@ -213,7 +221,7 @@ inbound traffic or ACK-of-ACK as round-trip confirmation.
 
 | Offset | Width | Field | This implementation sends |
 |---|---:|---|---|
-| 0 | 2 | protocol version | 3 |
+| 0 | 2 | protocol version | 4 |
 | 2 | 2 | declaration length, including these four bytes | 32 |
 | 4 | 4 | maximum coded unit / balanced segmentation layout | 2097152 (2 MiB) |
 | 8 | 4 | Wirehair grouped-codec maximum source blocks per group | 32000 |
@@ -224,7 +232,7 @@ inbound traffic or ACK-of-ACK as round-trip confirmation.
 | 24 | 4 | maximum previous-key retention, microseconds | 10000000 |
 | 28 | 4 | per-space replay/receipt support capacity, packets | 262144 |
 
-Version 3 of this implementation requires exact agreement on every declared
+Version 4 of this implementation requires exact agreement on every declared
 field except maximum application-message size, which may differ and must be
 in 1..1073741824. In particular it rejects, rather than silently reinterprets,
 a different coded-unit or grouped-codec layout. These are declared profile
@@ -314,7 +322,10 @@ an atomic transaction and state changes are not rolled back.
    ACK semantic, frame and resource checks: a later rejected nonce stays spent.
 5. Reject data plaintext shorter than 482. For ACKs, decode the fixed format
    and validate that the highest positive receipt is below the next **sent**
-   data nonce (locally pending data have not advanced that counter). Valid ACKs
+   data nonce (locally pending data have not advanced that counter). Reject the
+   entire ACK if its sampled UDP size conflicts with retained exact emitted-size
+   metadata, before activity, key confirmation, CE, receipt or TU effects. This
+   semantic rejection does not undo replay admission. Valid ACKs
    refresh peer activity and may confirm outgoing keys; only new positive
    receipts progress delivery/loss state. ACK packets never elicit ACKs.
 6. For data, refresh peer activity, apply whole-duplication admission and parse
@@ -453,7 +464,7 @@ Receiver rules:
   sees every physical loss.
 
 Both peers must implement these flags. This is an incompatible framing
-extension introduced within version 2's frame-kind byte and retained in version 3;
+extension introduced within version 2's frame-kind byte and retained in version 4;
 it adds no header bytes.
 
 Plain fragmented messages and coded units have connection-direction-scoped
@@ -560,7 +571,7 @@ but cannot rebind a retained ID to another role/layout. Deferred completion is
 delivered only for its exact still-live decoder instance and connection
 generation, once; a Done slot is not live.
 
-Version 3 declares the current balanced segmentation layout explicitly. For
+Version 4 retains the explicitly declared balanced segmentation layout. For
 `total > max_unit`, let `groups = ceil(total / max_unit)` and
 `unit_span = ceil(total / groups)`. Unit offsets must be multiples of
 `unit_span`, below total; `unit_len = min(unit_span, total - unit_offset)`.
@@ -583,8 +594,9 @@ size is 166 bytes. No other connected traffic uses that size.
 | 8 | 8 | sample_seq (also positively acknowledged) |
 | 16 | 8 | cumulative unique CE-marked data-class packet count |
 | 24 | 4 | delay_us for sample_seq only |
-| 28 | 1 | receipt encoding (0 = bitmap) |
-| 29 | 3 | reserved zero |
+| 28 | 1 | receipt encoding (1 = bitmap with sampled UDP payload size) |
+| 29 | 1 | reserved zero |
+| 30 | 2 | sample_udp_payload_bytes (nonzero, for sample_seq only) |
 | 32 | 120 | 960 receipt bits, least significant bit first in each byte |
 
 Bit i means positive receipt of `receipt_base + i`. The base is absolute and
@@ -596,8 +608,17 @@ pending datagram cannot yet be receipted. `receipt_base` itself must be in data
 space even if its bitmap is empty; zero-bit positions need not be below the
 next emitted nonce. There is no "no sample" sentinel: sample_seq always
 positively receipts a packet, even with an empty bitmap. Additions are checked.
-Unknown ACK
-encodings or nonzero reserved bytes are rejected safely. A highest receipt,
+Unknown ACK encodings (including the old encoding 0), nonzero reserved bytes,
+and a zero sampled size are rejected safely. The sample size is the exact
+received UDP payload length, including STP framing and any AEAD tag but excluding
+UDP/IP headers; it is not decrypted plaintext size or a largest-ever counter.
+The receiver retains it with the latest unique admitted sample; duplicates and
+old rejected packets cannot replace it. Before admitting receipt, CE or MTU
+feedback, this implementation rejects the entire ACK if its sampled size
+conflicts with retained exact emitted-size metadata, including protected generic
+history or the outstanding upward probe. Missing history remains unknown and
+cannot itself reject feedback. This field describes only sample_seq, never all
+bitmap receipts, and size alone is not positive receipt or loss evidence. A highest receipt,
 when needed internally, is derived from set bits and the sample; it is not a
 separate wire field.
 
@@ -729,8 +750,42 @@ TU. All data receivers MUST accept valid current-profile packets independently
 of their own send TU. The implementation admits non-ACK plaintext down to 482
 bytes and never emits trimmed ordinary data. Local upward discovery searches up
 to 9216 bytes using best-effort (BE) all-`ff` padding probes. Only an exact new
-positive receipt of the recorded probe, at most two seconds old, can promote
-TU. The search doubles its step after success and divides it by five after loss.
+positive receipt of the recorded probe, at most `B + 1 s` old (B defined below),
+can promote TU. Its full accepted timestamp is paired with its recorded nonce.
+The probe's own delayed ACK cannot expand B to justify its freshness. With no
+live failed-size bound, search chooses the first rung above the confirmed TU
+from **1452, 1472, 2048, 4096, 8192, 9216**, identically for both IP families.
+A failed candidate above current TU establishes a temporary exclusive upper
+bound (the smaller of it and any live bound), expiring 30 seconds after that
+failure. While the gap exceeds eight bytes, search tries the integer midpoint
+between confirmed TU and the bound, with a **500 ms accepted-attempt floor**.
+Success moves only the confirmed floor; it does not erase a useful upper bound.
+Further interior failures renew the 30-second bound. When an outcome first
+settles the gap to at most eight bytes, an independent clock schedules a recheck
+of the **exact remembered upper**, not a coarse rung. Its delay is
+`min(30 s, max(5 s, B) * 2^min(boundary_failures, 3))`, with B snapshotted when
+that deadline is armed. Only completed failures of accepted exact-boundary
+attempts increment this separate counter: low-RTT waits are initially 5 s, then
+10, 20 and 30 s. Intermediate floor gains and interior failures neither restart
+an already armed clock nor increment its counter. An expired settled upper stays
+a revalidation target, not fresh evidence or a promotion/hold exception. Fresh
+authenticated success at that exact upper clears it only upon effective TU
+promotion, allowing normal coarse discovery after the accepted-attempt floor;
+a partial path increase is therefore not trapped below the old boundary. With
+an unsettled expired bound, coarse search retains
+`max(500 ms, min(30 s, failures² * 250 ms))` backoff; it never slows interior
+refinement. These are issuance deadlines once locally eligible, not ACK-arrival
+guarantees. Both issuance and pump wakeups use the same candidate/deadline plan,
+independent of CC/application occupancy. Success never bypasses the last
+accepted attempt's 500 ms floor.
+Only an **effective** shrink resets the failure count and seeds a bound from
+the old effective TU, not from an unrelated upward probe. During the ten-second
+post-recovery hold, strictly interior candidates below that live failed-size
+bound may issue and promote; candidates at or above it remain excluded. An
+obsolete pre-shrink attempt retains its exact size, nonce and pending ciphertext,
+but its later ACK or failure cannot undo the reset search. A valid loss declaration
+may narrow the bracket even if its ordinary loss timer exceeds B+1 seconds;
+only positive promotion proof is subject to that freshness limit.
 
 Default-on local size-recovery policy:
 
@@ -743,22 +798,36 @@ Default-on local size-recovery policy:
   whole-packet copy takes priority; send-ring capacity still applies. Pump wake
   deadlines include the generic probe and the upward hold. No thread is created.
 - Feed only native authenticated, exact first-positive receipts into a bounded
-  4096-entry nonce/size/send-time allocation: 4080 nonce-indexed metadata entries
-  and a protected chronological 16-generic-probe ledger. Ordinary-send churn
-  cannot erase recent generic evidence. A fresh exact small receipt can lower
-  the effective TU to 512 only after at least one second without fresh larger
-  ordinary or exact-current-TU generic progress, with **at least two unconfirmed
-  exact-current-TU generic probes aged one to three seconds** and **at least two
-  positively receipted generic 512-byte probes whose sends are at most two
-  seconds old**. All counted sends must follow the last such larger progress.
+  4096-entry nonce/size/send-time allocation: 3840 nonce-indexed metadata entries
+  and a protected chronological 256-generic-probe ledger (64 seconds at four
+  probes/s). Ordinary-send churn cannot erase recent generic evidence. Exact
+  first-positive generic receipts train a separate raw RTT EWMA from their full
+  accepted send times, before freshness/classification; ordinary and upward
+  probes do not train it. First sample initializes SRTT=raw and variance=raw/2;
+  subsequent samples use 1/8 SRTT and 1/4 absolute-error variance updates.
+  Define `B = min(30 s, max(1 s, SRTT + 4*variance, 2*SRTT + ACK_delay_cap))`.
+  Samples older than the absolute 31-second supported freshness ceiling are
+  marked received but cannot train the estimate or prove recovery. With unknown
+  RTT or a stable 20 ms path, B remains one second: original windows are unchanged.
+  A fresh exact small receipt can lower the effective TU to 512 only after at
+  least **B without fresh larger ordinary or exact-current-TU generic progress**,
+  with **at least two unconfirmed exact-current-TU generic probes aged B to B+2 s**
+  and **at least two positive generic 512-byte receipts whose sends are at most
+  B+1 s old**. All counted sends must follow the last such larger progress.
   Upward-probe failures and old ordinary losses supply no failure evidence;
   old-TU failures cannot classify a newly promoted TU. Fresh larger progress
   anywhere in the same ACK vetoes the decision regardless of receipt order.
+  The complete predicate is rechecked after the whole ACK using its final RTT
+  budget: a later sample cannot leave earlier, now-immature failure proof valid.
   A native first-positive receipt with overwritten metadata can only veto,
   never establish evidence. ACK-highest, aggregate counts and duplicate
   receipts supply no proof. Normal larger receipts take constant-time lookup;
-  eligible small receipts scan only the protected 16-entry ledger.
-- Hold upward discovery/promotion for ten seconds after a decision. Pending
+  unknown metadata uses binary search of the rotated chronological generic ring,
+  not a linear 256-entry scan. Only eligible fresh small proofs scan that ledger.
+  A downshift clears both history rings, their cursor and valid count, while
+  retaining the independently learned raw RTT estimate.
+- Hold discovery/promotion at or above the failed TU for ten seconds after a
+  decision; strictly interior bracket refinement is allowed as above. Pending
   ciphertext and planned duplication copies retain their exact bytes and nonce;
   effective shrink waits for their acceptance. Restart a still-active FEC unit
   from its full shared source under a fresh unit ID if its symbol no longer fits;
@@ -770,13 +839,22 @@ Default-on local size-recovery policy:
 
 This is a conservative classifier, not proof of a path failure. Old unconfirmed
 ordinary sends alone cannot trigger idle/drain fallback, but recent repeated
-size-selective loss can. A successful small proof does not guarantee future
-delivery. History overwrite and local backpressure may delay recovery; paths
+size-selective loss can. Sustained occasional positive progress at the larger
+size can delay or prevent downshift even under severe size-selective loss.
+A successful small proof does not guarantee future delivery. History overwrite and local backpressure may delay recovery; paths
 below 512 bytes are unsupported. The
 history uses 96 KiB per connected peer on Linux x64, charged in the 608 KiB
 connection-bookkeeping reservation separately from the derived receive-data cap.
-Packet-rate congestion control and FEC planning policy are unchanged. These
-schedules/search limits are local sender policy, not additional wire fields.
+The 32-entry outage ledger and generic RTT/count state add 416 inline bytes on
+Linux x64 within that existing reservation, with no extra history allocation.
+The upward bracket and independent boundary clock use another 32 inline bytes,
+replacing the old eight-byte additive-search step; history and reservation sizes
+are unchanged.
+Adaptive classifier windows do not promise native 5–10-second RTT support: the
+ordinary compact send-time history still has an approximately 4.295-second
+horizon and the CC RTT mean is capped at 6.5535 seconds. Packet-rate congestion
+control and FEC planning policy are unchanged. These schedules/search limits
+are local sender policy, not additional wire fields.
 
 The table excludes IP/UDP headers, padding and coding redundancy; these are
 encoding overhead bytes, not a claim about measured wire/app ratio. The
@@ -815,7 +893,7 @@ is not rate-limited. The initial 391-byte request/94-byte response is not
 large-response reflection; retransmitted responses before confirmation can
 exceed the original request cumulatively. Stateless return-routability retry
 cookies and an aggregate pre-confirmation response budget are **not** part of
-version 3. No current anti-spoofing/strict anti-amplification guarantee is
+version 4. No current anti-spoofing/strict anti-amplification guarantee is
 claimed; adding such a handshake exchange requires a separately specified
 compatible mechanism or a new profile/version.
 
@@ -826,7 +904,7 @@ counts, gaps and rate; the clear epoch reveals update cadence, including the
 cross-address correlation and leaks those key bits. ACKs are intentionally
 identifiable by their fixed size, and their cadence exposes receive timing.
 Probe sizes, handshake sizes, DSCP, outage/idle timing and IP/UDP endpoints
-are also observable. Version 3 does not provide traffic-flow confidentiality,
+are also observable. Version 4 does not provide traffic-flow confidentiality,
 constant-rate cover traffic, unlinkable connection identifiers or epoch-age
 jitter. These residual surfaces are deployment threat-model considerations,
 not removed by encrypting/padding message frames.
@@ -840,8 +918,12 @@ current support explicit and rejects incompatible interpretations. The library
 creates no worker threads: the caller drives a Pump; encoder construction and
 persistent decoder work run on that caller's thread. Historical internal
 "Worker" names and worker counters now denote admitted decoder jobs, not
-library-owned threads. Job generations prevent stale completions from reaching
-a different decoder or replacement association.
+library-owned threads. Worker-capable connections may admit up to the unchanged
+process-wide ceiling of eight decoder jobs, subject to full per-job byte leases
+and the unchanged connection/process receive-memory caps; inline-only connections
+admit no worker jobs. The configured worst-case worker dimension still sizes the
+connection byte cap, not its runtime job count. Job generations prevent stale
+completions from reaching a different decoder or replacement association.
 
 ### Release candidate sender policy (frozen)
 
