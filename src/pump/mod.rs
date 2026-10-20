@@ -69,6 +69,15 @@ impl Deadline {
     /// The first command take of a call is exempt from the admission deadline.
     pub(crate) fn command_owed(&self) -> bool { self.command_owed }
     pub(crate) fn admitted(&mut self) { self.command_owed = false; }
+    /// Test fixture: a call entered before its deadline whose deadline has
+    /// already passed at `now_ns` (calibration latency/preemption stand-in).
+    #[cfg(test)]
+    pub(crate) fn entered_then_passed(now_ns: u64) -> Self {
+        let now = Instant::now();
+        let mut deadline = Self::new(now + Duration::from_micros(1), now, 0);
+        deadline.sampled(now_ns);
+        deadline
+    }
 }
 impl Pump {
     pub fn run_until(&mut self, deadline: Instant) {

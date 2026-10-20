@@ -137,7 +137,7 @@ pub fn crypto_string_from_connect_magic1(magic: u64) -> Option<&'static str> {
     }
 }
 
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5; // RESEARCH profile 5: adaptive immutable unit ranges
 pub const TRANSPORT_PARAMETERS_LEN: usize = 32;
 const MAGIC2_LIST_SIZE: usize = 1 + 32 * 8;
 pub const MAGIC2_BLOCK_SIZE: usize = MAGIC2_LIST_SIZE + TRANSPORT_PARAMETERS_LEN;
@@ -723,21 +723,23 @@ fn medium_duration_class(packets: u32, payload_len: usize, rate: u64, rtt: u64) 
 // Metadata-only whole-logical P4 initial train. Balanced segmentation has at
 // most two distinct range lengths; no source copy, codec or worker for estimates.
 // Initial P4 really plans K + min(2,K) per range. Later real plans stay on slots.
-fn p4_new_train(total: usize, offset: usize, payload: usize) -> (u32, u32) {
+// `cap` is Some(unit cap) for a segmented root (37-byte kind 6 header, the
+// unstarted remainder partitioned exactly as start_segment will at that cap),
+// None for one ordinary unit (21-byte header).
+fn p4_new_train(total: usize, offset: usize, payload: usize, cap: Option<usize>) -> (u32, u32) {
     if total <= payload.saturating_sub(STP_WHOLE_HEADER_SIZE) || offset >= total { return (0, 0); }
-    let groups = total.div_ceil(FEC_SEGMENT_BYTES);
-    let header = if groups > 1 { STP_SEGMENT_FEC_HEADER_SIZE } else { STP_FEC_FRAGMENT_HEADER_SIZE };
+    let header = if cap.is_some() { STP_SEGMENT_FEC_HEADER_SIZE } else { STP_FEC_FRAGMENT_HEADER_SIZE };
     let Some(block) = payload.checked_sub(header).filter(|b| *b > 0) else { return (0, 0); };
-    let group_len = total.div_ceil(groups);
-    let remaining = groups.saturating_sub(offset / group_len);
-    let last_len = total - (groups - 1) * group_len;
-    let unit = |len| crate::fec::MessageLayout::new(len, block).map_or((0, 0), |l| {
+    let rem = total - offset;
+    let (count, short, long) = balanced_parts(rem, cap.unwrap_or(rem));
+    let unit = |len| crate::fec::MessageLayout::new(len, if cap.is_some() { segment_width(len, block) } else { block }).map_or((0, 0), |l| {
         let k = l.k as u32;
         (k, l.round_plan(k.saturating_add(2.min(k))))
     });
-    let (k, n) = unit(group_len);
-    let (last_k, last_n) = unit(last_len);
-    ((remaining as u32 - 1) * k + last_k, (remaining as u32 - 1) * n + last_n)
+    let (k, n) = unit(short);
+    let (long_k, long_n) = if long.1 == 0 { (0, 0) } else { unit(long.0) };
+    let short_count = (count - long.1) as u32;
+    (short_count * k + long.1 as u32 * long_k, short_count * n + long.1 as u32 * long_n)
 }
 fn source_bonus(k: u64, percent: u32) -> u32 { (k * percent as u64).div_ceil(100) as u32 }
 fn owner_remaining_packets(active: Option<&FecSendSlot>, suspended: Option<&FecSendSlot>,
@@ -751,11 +753,12 @@ fn owner_remaining_packets(active: Option<&FecSendSlot>, suspended: Option<&FecS
             n.saturating_sub(f.next_id)
         }).sum::<u32>();
     if let Some(g) = giant {
-        let (k, n) = p4_new_train(g.message.len(), g.offset, payload);
+        let plan = g.plan_ks.lock().unwrap();
+        let (k, n) = p4_new_train(g.message.len(), g.offset, payload, Some(plan.cap));
         packets = packets.saturating_add(n);
         if !initial && bonus_eligible {
-            let group_len = g.message.len().div_ceil(g.message.len().div_ceil(FEC_SEGMENT_BYTES));
-            let prefix_k: u64 = g.plan_ks.lock().unwrap()[..g.offset.div_ceil(group_len)].iter().sum();
+            // Every started unit lies below g.offset (the next unstarted byte).
+            let prefix_k: u64 = plan.started_k();
             packets = packets.saturating_add(source_bonus(prefix_k + k as u64, percent).saturating_sub(source_bonus(prefix_k, percent)));
         }
     }
@@ -833,6 +836,11 @@ pub struct UnreliableSendBuffer {
     fec_suspended: Option<FecSendSlot>,
     fec_now_ns: u64,
     fec_rtt_ns: u64,
+    // RESEARCH adaptive units: initial TU assessment unresolved, so a new
+    // root caps its coded units at ADAPTIVE_PREFIX_CAP. Fixtures default settled.
+    tu_unresolved: bool,
+    // RESEARCH adaptive exposure: connection R/T/Q/E copied every prepare tick.
+    exposure: ExposureSnapshot,
     /// Cumulative source/repair progress snapshots, when recording is enabled (Some).
     pub fec_record: Option<Vec<crate::fec_adapt::FecMessageInfo>>,
     // The fields above are the selected context's legacy projection. W1 never
@@ -882,7 +890,7 @@ pub struct FecSendSlot {
     diagnostic: Option<diag::Layout>,
     segment: Option<FecSegment>,
     root_lease: Option<std::sync::Arc<PackageLease>>,
-    plan_ks: Option<std::sync::Arc<std::sync::Mutex<Vec<u64>>>>,
+    plan_ks: Option<PlanKs>,
     retention_lease: Option<std::sync::Arc<RetentionLease>>,
     retain_limit: usize,
     package_lease: Option<std::sync::Arc<PackageLease>>,
@@ -1160,7 +1168,7 @@ impl FecSendSlot {
     fn plan_context(&self) -> (u64, usize, bool) {
         let layout = crate::fec::MessageLayout::new(self.message.len(), self.block_bytes).unwrap();
         let total = self.segment.map_or(self.message.len(), |s| s.total as usize);
-        let groups = self.segment.map_or(layout.groups, |s| (s.total as usize).div_ceil(FEC_SEGMENT_BYTES));
+        let groups = self.segment.map_or(layout.groups, |s| segment_unit_count(s.total as usize, self.plan_ks.as_ref()));
         (segment_source_horizon(total, self.block_bytes, self.plan_ks.as_ref()), groups, self.message.len() > self.retain_limit)
     }
 
@@ -1362,7 +1370,7 @@ impl FecSendSlot {
     }
     /// Wirehair codecs of the whole logical root: every segment times this layout's groups.
     fn base_codecs(&self, layout: &crate::fec::MessageLayout) -> usize {
-        self.segment.map_or(layout.groups, |s| (s.total as usize).div_ceil(FEC_SEGMENT_BYTES) * layout.groups)
+        self.segment.map_or(layout.groups, |s| segment_unit_count(s.total as usize, self.plan_ks.as_ref()) * layout.groups)
     }
 
     fn refresh_plan(&mut self, a: &crate::fec_adapt::FecAdaptiveState) {
@@ -1448,16 +1456,102 @@ impl std::fmt::Debug for FecSendSlot {
     }
 }
 
-// Started segments keep their real K, including after TU growth or restart.
-// Future widths are unknowable: estimate those ranges at the current width,
-// replacing each estimate when it starts. Shared context also updates retained tails.
+// RESEARCH adaptive units. Started units keep their real (offset, len, K),
+// including after TU growth or a same-range restart. The unstarted remainder is
+// estimated as start_segment would partition it at the plan's current cap and
+// the current width; each estimate is replaced when that unit starts.
+#[derive(Debug, Default)]
+struct UnitPlan { cap: usize, units: Vec<(u32, u32, u64)>, fenwick: Vec<u64>, total_k: u64 }
+type PlanKs = std::sync::Arc<std::sync::Mutex<UnitPlan>>;
+impl UnitPlan {
+    fn new(cap: usize) -> PlanKs { std::sync::Arc::new(std::sync::Mutex::new(Self { cap, ..Default::default() })) }
+    /// A first start appends the next contiguous range; a restart (exact same
+    /// range, fresh unit id) only replaces its K. Ranges are never cut again.
+    /// Units stay sorted by offset (contiguous appends), so a restart is a
+    /// binary search plus an O(log n) Fenwick delta; an append is O(log n).
+    fn record(&mut self, offset: u32, len: u32, k: u64) {
+        if offset as usize == self.end() {
+            let i = self.units.len() + 1; // 1-based Fenwick index of the new unit
+            let low = i & i.wrapping_neg();
+            let node = k.wrapping_add(self.fenwick_prefix(i - 1)).wrapping_sub(self.fenwick_prefix(i - low));
+            self.units.push((offset, len, k));
+            self.fenwick.push(node);
+            self.total_k = self.total_k.checked_add(k).expect("adaptive root K overflow");
+            return;
+        }
+        let i = self.units.partition_point(|u| u.0 < offset);
+        let u = self.units.get_mut(i).filter(|u| u.0 == offset).expect("adaptive units start contiguously");
+        assert_eq!(u.1, len, "adaptive unit range is immutable");
+        let (old, delta) = (u.2, k.wrapping_sub(u.2));
+        u.2 = k;
+        self.total_k = self.total_k.checked_sub(old).and_then(|t| t.checked_add(k)).expect("adaptive root K overflow");
+        let mut j = i + 1;
+        while j <= self.fenwick.len() { self.fenwick[j - 1] = self.fenwick[j - 1].wrapping_add(delta); j += j & j.wrapping_neg(); }
+    }
+    /// Sum of K over the first `n` units (exact: every true partial sum fits u64,
+    /// so wrapping deltas cancel).
+    fn fenwick_prefix(&self, mut n: usize) -> u64 {
+        let mut sum = 0u64;
+        while n > 0 { sum = sum.wrapping_add(self.fenwick[n - 1]); n &= n - 1; }
+        sum
+    }
+    fn end(&self) -> usize { self.units.last().map_or(0, |u| u.0 as usize + u.1 as usize) }
+    fn started_k(&self) -> u64 { self.total_k }
+    fn prefix_k(&self, offset: u32) -> u64 { self.fenwick_prefix(self.units.partition_point(|u| u.0 < offset)) }
+}
+/// Floor-aware balanced partition of `rem` bytes: g = min(ceil(R/cap), floor(R/MIN))
+/// units (at least one), as (count, short_len, (long_len, long_count)) with
+/// long_len = short_len + 1. Every unit of a splittable remainder is >= MIN.
+/// Successive start_segment steps len=ceil(R/g(R)) produce exactly these.
+fn balanced_parts(rem: usize, cap: usize) -> (usize, usize, (usize, usize)) {
+    if rem == 0 { return (0, 0, (0, 0)); }
+    let count = rem.div_ceil(cap.max(1)).min(rem / ADAPTIVE_MIN_UNIT_LEN).max(1);
+    (count, rem / count, (rem / count + 1, rem % count))
+}
+/// RESEARCH one-flight exposure (frozen constants): smallest cap 892 bytes.
+const ADAPTIVE_EXPOSURE_MIN_CAP: usize = 2 * ADAPTIVE_MIN_UNIT_LEN;
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ExposureSnapshot { rate_upps: u64, rtt_ns: Option<u64>, queues: u64, unresolved: u64 }
+fn adaptive_exposure_k0(width: usize) -> usize { ADAPTIVE_EXPOSURE_MIN_CAP.div_ceil(width.max(1)).max(2) }
+/// C = k*W for the LARGEST k in [k0, max(k0, floor(113920/W))] whose upper
+/// initial packet train U(k) <= B = max(B0, U(k0)); B0 = ceil(R*T/(1e15*Q)) with
+/// a measured RTT, else ceil(E/Q). U must be non-decreasing in k; an unknown
+/// U(k0) yields the minimum cap. Wide integers, no overflow.
+fn adaptive_exposure_cap(snap: ExposureSnapshot, width: usize, upper: impl Fn(u32) -> Option<u64>) -> usize {
+    let w = width.max(1);
+    let k0 = adaptive_exposure_k0(w);
+    let kmax = (ADAPTIVE_PREFIX_CAP / w).max(k0);
+    let q = u128::from(snap.queues.max(1));
+    let b0 = match snap.rtt_ns {
+        Some(t) => (u128::from(snap.rate_upps) * u128::from(t)).div_ceil(1_000_000_000_000_000 * q),
+        None => u128::from(snap.unresolved).div_ceil(q),
+    };
+    let Some(u0) = u32::try_from(k0).ok().and_then(&upper) else { return k0 * w; };
+    let budget = b0.max(u128::from(u0));
+    let fits = |k: usize| u32::try_from(k).ok().and_then(&upper).is_some_and(|u| u128::from(u) <= budget);
+    let (mut lo, mut hi) = (k0, kmax); // fits(lo) holds
+    while lo < hi { let mid = lo + (hi - lo).div_ceil(2); if fits(mid) { lo = mid } else { hi = mid - 1 } }
+    lo * w
+}
+fn adaptive_unit_len(rem: usize, cap: usize) -> usize { rem.div_ceil(balanced_parts(rem, cap).0.max(1)) }
+/// Symbol width of a segmented unit: the TU width clamped to len-1 (so every
+/// unit has K >= 2), never below the wire minimum symbol.
+fn segment_width(len: usize, block_bytes: usize) -> usize {
+    block_bytes.min(len.saturating_sub(1).max(FEC_MIN_BLOCK_BYTES))
+}
+fn segment_unit_k(len: usize, block_bytes: usize) -> usize { len.div_ceil(segment_width(len, block_bytes).max(1)) }
+fn segment_unit_count(total: usize, plan_ks: Option<&PlanKs>) -> usize {
+    let Some(plan) = plan_ks else { return total.div_ceil(FEC_SEGMENT_BYTES); };
+    let plan = plan.lock().unwrap();
+    plan.units.len() + balanced_parts(total.saturating_sub(plan.end()), plan.cap).0
+}
 fn segment_source_horizon(total: usize, block_bytes: usize,
-    plan_ks: Option<&std::sync::Arc<std::sync::Mutex<Vec<u64>>>>) -> u64 {
+    plan_ks: Option<&PlanKs>) -> u64 {
     let Some(plan_ks) = plan_ks else { return total.div_ceil(block_bytes) as u64; };
-    let ks = plan_ks.lock().unwrap();
-    let group_len = total.div_ceil(ks.len());
-    ks.iter().enumerate().map(|(group, &k)| if k != 0 { k }
-        else { (total - group * group_len).min(group_len).div_ceil(block_bytes) as u64 }).sum()
+    let plan = plan_ks.lock().unwrap();
+    let (count, short, (long, longs)) = balanced_parts(total.saturating_sub(plan.end()), plan.cap);
+    let unit_k = |len| if len == 0 { 0 } else { segment_unit_k(len, block_bytes) };
+    plan.started_k() + ((count - longs) * unit_k(short) + longs * unit_k(long)) as u64
 }
 
 /// TLV prefix (3), identity (8), symbol (4), unit length (4), symbol bytes (2).
@@ -1481,13 +1575,24 @@ fn wire_fec_layout(len: usize, block_bytes: usize) -> Option<crate::fec::Message
     (layout.k <= FEC_MAX_SOURCE_BLOCKS).then_some(layout)
 }
 
-/// Independently coded, fixed byte-range group of one application message.
+/// RESEARCH adaptive units (wire profile 5). While the initial TU assessment is
+/// unresolved a root's coded units are capped at the FIXED byte width that keeps
+/// K <= FEC_INLINE_MAX_BLOCKS even at the minimum symbol; this cap never follows
+/// feedback/width changes, so the byte partition cannot oscillate.
+const ADAPTIVE_PREFIX_CAP: usize = FEC_MIN_BLOCK_BYTES * FEC_INLINE_MAX_BLOCKS;
+/// Wire floor for EVERY unit range of a split root, including the last: one
+/// byte above the minimum symbol, so a unit always has K >= 2 at its clamped
+/// width and a root of total T has at most floor(T/446) extents.
+pub(crate) const ADAPTIVE_MIN_UNIT_LEN: usize = FEC_MIN_BLOCK_BYTES + 1;
+
+/// Independently coded, immutable contiguous byte range of one application message.
+/// The unit's own length is its FEC message_len (kind 6 header carries all five).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FecSegment { pub(crate) root: u64, total: u32, offset: u32 }
 
 #[derive(Debug)]
 struct SegmentedSend {
-    plan_ks: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+    plan_ks: PlanKs,
     message: std::sync::Arc<Vec<u8>>,
     offset: usize,
     root: u64,
@@ -1495,14 +1600,14 @@ struct SegmentedSend {
 }
 
 impl FecSegment {
+    /// Profile 5: any bounded range strictly inside the root. Overlap and
+    /// same-offset/different-length conflicts are the root ledger's job.
     fn valid(self, len: usize) -> bool {
         let total = self.total as usize;
         let offset = self.offset as usize;
-        total > FEC_SEGMENT_BYTES && total <= MAX_JUMBOGRAM_LEN &&
-            offset < total && {
-                let group_len = total.div_ceil(total.div_ceil(FEC_SEGMENT_BYTES));
-                offset % group_len == 0 && len == (total - offset).min(group_len)
-            }
+        let Some(end) = offset.checked_add(len) else { return false; };
+        total <= MAX_JUMBOGRAM_LEN && len >= 1 && len < total && len <= FEC_SEGMENT_BYTES &&
+            end <= total && len >= ADAPTIVE_MIN_UNIT_LEN
     }
 }
 /// Balanced groups of <=32000 blocks, inferred from length/block size; same 21-byte header.
@@ -1649,6 +1754,8 @@ impl UnreliableSendBuffer {
             fec_suspended: None,
             fec_now_ns: 0,
             fec_rtt_ns: 0,
+            tu_unresolved: false,
+            exposure: ExposureSnapshot::default(),
             fec_record: None,
             interleave_width: crate::fec_adapt::research_interleave_width(),
             interleave_parked: VecDeque::new(),
@@ -1770,7 +1877,7 @@ impl UnreliableSendBuffer {
         // following lane. Tiny messages can retire and refill within its packet.
         if eligible && !self.slipstream_turn_head && self.interleave_parked.len() == 1 {
             if let Some((_, m)) = self.message_queue.front() {
-                let reserve = m.capacity().saturating_add(if m.len() > FEC_SEGMENT_BYTES { m.len() } else { 0 });
+                let reserve = m.capacity().saturating_add(if self.segmented_class(m.len(), payload_len) { m.len() } else { 0 });
                 if self.interleave_source_bytes().saturating_add(reserve) <= self.current_byte_capacity() as usize {
                     let (dscp, m) = self.message_queue.pop_front().unwrap();
                     self.current_dscp = dscp;
@@ -1822,7 +1929,10 @@ impl UnreliableSendBuffer {
         if !self.slipstream_started {
             self.slipstream_started = true;
             if !self.slipstream_head {
-                let kind = if self.logical_len > FEC_SEGMENT_BYTES { "segmented_giant" }
+                // fec_adaptive is back on SendQueues here, so label from the actual
+                // owner: legacy >2 MiB, or a root start_message really segmented.
+                let kind = if self.logical_len > FEC_SEGMENT_BYTES || self.segmented_send.is_some() ||
+                    self.fec_send_slot.as_ref().is_some_and(|f| f.segment.is_some()) { "segmented_giant" }
                     else if self.fec_send_slot.is_some() { "ordinary_fec" } else { "tiny_whole_or_packed" };
                 match kind {
                     "segmented_giant" => self.slipstream_info.follower_starts_segmented_giant += 1,
@@ -1875,7 +1985,7 @@ impl UnreliableSendBuffer {
         self.interleave_last_packet = Some(self.next_packet_seq);
         let eligible_head = self.message_queue.front().is_some_and(|(_, m)|
             m.len() <= payload_len.saturating_sub(STP_WHOLE_HEADER_SIZE) ||
-            m.len() <= FEC_SEGMENT_BYTES && self.fec_block_bytes(m.len(), payload_len)
+            !self.segmented_class(m.len(), payload_len) && self.fec_block_bytes(m.len(), payload_len)
                 .and_then(|b| crate::fec::MessageLayout::new(m.len(), b)).is_some_and(|l| l.groups == 1));
         let selected = self.partial_send_slot.is_some() || self.fec_send_slot.is_some();
         // No peer work: exercise the exact legacy W1 path, without an idle hold.
@@ -2100,6 +2210,10 @@ impl UnreliableSendBuffer {
             if !self.p4_open || self.p4_closing || matches!(slot.encoder, FecEncoderState::Failed) { return; }
             slot.original_symbols.get_or_insert(slot.next_id);
             self.remove_retained(package);
+            // Same condition that cleans an already retained unit on feedback: the
+            // final ACK may have arrived while the unit was ACTIVE. Retaining it would
+            // keep its package lease forever with no future ACK to free it.
+            if slot.next_id >= slot.n && slot.finalized_symbols >= slot.next_id { return; }
             self.retained_bytes += slot.message.len();
             if slot.next_id < slot.n { self.rescue_ready.push_back(package); self.rescue_ready_count += 1; }
             // Open-message state: no deadline, quota lease, or post-message rounds.
@@ -2380,13 +2494,71 @@ impl UnreliableSendBuffer {
         Some(block_bytes)
     }
 
+    /// Exposure sizing applies while the TU assessment is unresolved AND a
+    /// budget root exists to freeze risk; budget-base inactive keeps the legacy
+    /// fixed prefix cap; settled is 2 MiB.
+    fn exposure_sized(&self) -> bool {
+        self.tu_unresolved && self.fec_adaptive.as_ref().is_some_and(|a| a.budget_base_active())
+    }
+    /// Smallest cap this queue could choose for a new unit at `payload_len`
+    /// (pure: no root, risk, draw or admission). The actual cap is never below it.
+    fn adaptive_unit_cap_floor(&self, payload_len: usize) -> usize {
+        if !self.tu_unresolved { return FEC_SEGMENT_BYTES; }
+        if !self.exposure_sized() { return ADAPTIVE_PREFIX_CAP; }
+        let w = payload_len.saturating_sub(STP_SEGMENT_FEC_HEADER_SIZE).max(FEC_MIN_BLOCK_BYTES);
+        adaptive_exposure_k0(w) * w
+    }
+    /// Cap for a NEW unit of the current root at the current width. Needs the
+    /// root's frozen risk (budget_root) when exposure-sized.
+    fn adaptive_unit_cap(&self, payload_len: usize, root_total: usize) -> usize {
+        if !self.exposure_sized() { return self.adaptive_unit_cap_floor(payload_len); }
+        let w = payload_len.saturating_sub(STP_SEGMENT_FEC_HEADER_SIZE).max(FEC_MIN_BLOCK_BYTES);
+        let a = self.fec_adaptive.as_ref().unwrap();
+        let risk = self.budget_root.as_ref().map(|r| r.lock().unwrap().target_risk);
+        let selector = a.target_selector();
+        let profile = crate::target_validation::configuration().0;
+        adaptive_exposure_cap(self.exposure, w, |k| if selector == 0 {
+            Some(u64::from(k) + u64::from(k.min(2)))
+        } else {
+            let risk = risk?;
+            crate::target_validation::adaptive_unit_packet_upper(k, profile, risk, u32::try_from(root_total).ok()?).ok().map(u64::from)
+        })
+    }
+    /// Pure queued-head class: a root that MAY split at the current width
+    /// (len above the smallest possible cap). Conservative: reservations and
+    /// interleave exclusion cover every root start_message could split.
+    fn may_segment(&self, len: usize, payload_len: usize) -> bool {
+        self.fec_adaptive.is_some() && len >= 2 * ADAPTIVE_MIN_UNIT_LEN && len > self.adaptive_unit_cap_floor(payload_len)
+    }
+    /// Admission/reservation class: the legacy >2 MiB giant (any FEC state,
+    /// unchanged) plus a root the unresolved exposure cap may split.
+    fn segmented_class(&self, len: usize, payload_len: usize) -> bool {
+        len > FEC_SEGMENT_BYTES || self.may_segment(len, payload_len)
+    }
+
+    /// One logical root, one risk admission/draw/ordinal: created at the first
+    /// coded start of a message, or EARLIER by start_message when the exposure
+    /// cap needs the frozen root risk before the split decision. Every later
+    /// unit, restart or whole-FEC start of the same message reuses it.
+    fn ensure_budget_root(&mut self, root_message: &[u8]) {
+        let Some(a) = self.fec_adaptive.as_ref() else { return; };
+        if !a.budget_base_active() || self.budget_root.is_some() { return; }
+        let cap_percent = a.repair_cap_percent();
+        self.target_root_sequence=self.target_root_sequence.checked_add(1).expect("target root ordinal exhausted");
+        let mut tag=[0;8];let len=root_message.len().min(8);tag[..len].copy_from_slice(&root_message[..len]);
+        self.budget_sink.lock().unwrap().merge(BudgetBaseInfo{roots:1,..Default::default()});
+        self.budget_root=Some(std::sync::Arc::new(std::sync::Mutex::new(BudgetRoot{sink:self.budget_sink.clone(),limited:false,cap_percent,
+            target_tail_applied:false,target_risk:crate::target_validation::risk_admission(&self.target_state),
+            target_draw:crate::target_validation::draw(self.target_root_sequence),target_ordinal:self.target_root_sequence,target_app_tag:tag,#[cfg(any(test,feature="research_target_validation"))] target_owners:Vec::new(),target_state:self.target_state.clone(),target_source_symbols:0})));
+    }
+
     fn start_fec(&mut self, message: std::sync::Arc<Vec<u8>>, block_bytes: usize) {
         self.start_fec_group(message, block_bytes, None, None, None, None);
     }
 
     fn start_fec_group(&mut self, message: std::sync::Arc<Vec<u8>>, block_bytes: usize,
         segment: Option<FecSegment>, root_lease: Option<std::sync::Arc<PackageLease>>,
-        plan_ks: Option<std::sync::Arc<std::sync::Mutex<Vec<u64>>>>,
+        plan_ks: Option<PlanKs>,
         restart_budget: Option<std::sync::Arc<std::sync::Mutex<BudgetSegment>>>) {
         let layout = crate::fec::MessageLayout::new(message.len(), block_bytes).unwrap();
         let k = layout.k as u32;
@@ -2399,27 +2571,26 @@ impl UnreliableSendBuffer {
         }
         let total = segment.map_or(message.len(), |s| s.total as usize);
         if let (Some(segment), Some(ks)) = (segment, &plan_ks) {
-            let group_len = total.div_ceil(total.div_ceil(FEC_SEGMENT_BYTES));
-            ks.lock().unwrap()[segment.offset as usize / group_len] = k as u64;
+            ks.lock().unwrap().record(segment.offset, message.len() as u32, k as u64);
         }
 
-        if a.budget_base_active() && self.budget_root.is_none() && restart_budget.is_none() {
-            self.target_root_sequence=self.target_root_sequence.checked_add(1).expect("target root ordinal exhausted");
-            let mut tag=[0;8];let len=message.len().min(8);tag[..len].copy_from_slice(&message[..len]);
-            self.budget_sink.lock().unwrap().merge(BudgetBaseInfo{roots:1,..Default::default()});
-            self.budget_root=Some(std::sync::Arc::new(std::sync::Mutex::new(BudgetRoot{sink:self.budget_sink.clone(),limited:false,cap_percent:a.repair_cap_percent(),
-                target_tail_applied:false,target_risk:crate::target_validation::risk_admission(&self.target_state),
-                target_draw:crate::target_validation::draw(self.target_root_sequence),target_ordinal:self.target_root_sequence,target_app_tag:tag,#[cfg(any(test,feature="research_target_validation"))] target_owners:Vec::new(),target_state:self.target_state.clone(),target_source_symbols:0})));
-        }
+        if restart_budget.is_none() { self.ensure_budget_root(&message); }
+        let a = self.fec_adaptive.as_ref().expect("adaptive FEC initialized before coding");
 
         let target_plans=if a.target_selector()!=0 {
-            if let Some(b)=&restart_budget {b.lock().unwrap().target_plans.clone()} else {
-                let (draw,risk)={let root=self.budget_root.as_ref().unwrap().lock().unwrap();(root.target_draw,root.target_risk)};
-                (0..layout.groups).map(|g|crate::target_validation::plan_at_admission(layout.group(g).1 as u32,a.target_selector(),crate::target_validation::configuration().0,draw,risk).unwrap_or_else(|_|{self.budget_sink.lock().unwrap().merge(BudgetBaseInfo{counter_overflow:1,..Default::default()});crate::target_validation::Plan::default()})).collect::<Vec<_>>()
-            }
+            // Plan the CURRENT layout's K. A TU-shrink restart replans from the SAME
+            // frozen root admission (root draw + risk, not a live risk/share/owner
+            // admission) and the unit's immutable extent; it never reuses the old-K plan.
+            let root=match &restart_budget {Some(b)=>b.lock().unwrap().root.clone(),None=>self.budget_root.clone().unwrap()};
+            let (draw,risk)={let root=root.lock().unwrap();(root.target_draw,root.target_risk)};
+            // Whole roots: offset 0, len == total (exact old path). Units carry their immutable range.
+            let (unit_offset, unit_len) = (segment.map_or(0, |s| s.offset), message.len() as u32);
+            let plans=(0..layout.groups).map(|g|crate::target_validation::plan_at_unit_admission(layout.group(g).1 as u32,a.target_selector(),crate::target_validation::configuration().0,draw,risk,unit_offset,unit_len,total as u32).unwrap_or_else(|_|{self.budget_sink.lock().unwrap().merge(BudgetBaseInfo{counter_overflow:1,..Default::default()});crate::target_validation::Plan::default()})).collect::<Vec<_>>();
+            if let Some(b)=&restart_budget {b.lock().unwrap().target_plans=plans.clone();}
+            plans
         }else{Vec::new()};
         let whole_k = segment_source_horizon(total, block_bytes, plan_ks.as_ref());
-        let target_groups = segment.map_or(layout.groups, |s| (s.total as usize).div_ceil(FEC_SEGMENT_BYTES));
+        let target_groups = segment.map_or(layout.groups, |s| segment_unit_count(s.total as usize, plan_ks.as_ref()));
         let repairs = (0..layout.groups).map(|g| a.repair_blocks_for_group_at_tail(layout.group(g).1 as u64,
             whole_k, target_groups, message.len() > self.retention_quota.byte_limit)).max().unwrap_or(0);
         // p4-burst-base B1: immutable absolute base per codec group from the blind horizon.
@@ -2434,7 +2605,7 @@ impl UnreliableSendBuffer {
 
             }else if a.cost_smooth_active() {1}else{2.min(layout.group(g).1 as u32)}).collect::<Vec<u32>>(), false)
         } else if a.base_parity_active() {
-            let codecs = segment.map_or(layout.groups, |s| (s.total as usize).div_ceil(FEC_SEGMENT_BYTES) * layout.groups);
+            let codecs = segment.map_or(layout.groups, |s| segment_unit_count(s.total as usize, plan_ks.as_ref()) * layout.groups);
             let eps = crate::fec_adapt::base_group_eps(codecs);
             let mut capped = false;
             let b = (0..layout.groups).map(|g| { let (b, c) = a.base_initial_repairs(layout.group(g).1 as u64, eps); capped |= c; b as u32 }).collect::<Vec<u32>>();
@@ -2451,16 +2622,14 @@ impl UnreliableSendBuffer {
         if a.policy == crate::fec_adapt::RepairPolicy::MessageBound && self.category_bonus_percent != 0 {
             if self.category_eligible.is_none() {
                 let payload = block_bytes + if segment.is_some() { STP_SEGMENT_FEC_HEADER_SIZE } else { STP_FEC_FRAGMENT_HEADER_SIZE };
-                let (_, packets) = p4_new_train(total, 0, payload);
+                let cap = plan_ks.as_ref().map(|p| p.lock().unwrap().cap);
+                let (_, packets) = p4_new_train(total, 0, payload, segment.and(cap));
                 self.category_eligible = Some(medium_duration_class(packets, payload,
                     self.current_bytes_per_second, self.fec_rtt_ns) == "eligible");
                 self.category_bonus_messages += u64::from(self.category_eligible == Some(true));
             }
             if self.category_eligible == Some(true) {
-                let prefix_k = segment.zip(plan_ks.as_ref()).map_or(0, |(seg, ks)| {
-                    let group_len = total.div_ceil(total.div_ceil(FEC_SEGMENT_BYTES));
-                    ks.lock().unwrap()[..seg.offset as usize / group_len].iter().sum::<u64>()
-                });
+                let prefix_k = segment.zip(plan_ks.as_ref()).map_or(0, |(seg, ks)| ks.lock().unwrap().prefix_k(seg.offset));
                 category_bonus = source_bonus(prefix_k + k as u64, self.category_bonus_percent)
                     .saturating_sub(source_bonus(prefix_k, self.category_bonus_percent));
             }
@@ -2493,7 +2662,8 @@ impl UnreliableSendBuffer {
                     let owner=crate::target_validation::register(crate::target_validation::OwnerEvidence{
                         root_id:segment.map_or(self.send_package_id,|s|s.root),package_id:self.send_package_id,root_ordinal:r.target_ordinal,app_tag:r.target_app_tag,
                         segment_offset:segment.map_or(0,|s|s.offset),selector:a.target_selector(),k,current_k:k,groups:layout.groups as u32,
-                        proactive:n_base-k,lower:plan.lower,upper:plan.upper,w_bits:plan.upper_probability.to_bits(),mix_threshold:plan.mix_threshold,mix_draw:r.target_draw,
+                        proactive:n_base-k,lower:plan.lower,upper:plan.upper,w_bits:plan.upper_probability.to_bits(),mix_threshold:plan.mix_threshold,mix_draw:plan.mix_draw,
+                        unit_len:message.len() as u32,root_total:total as u32,
                         risk:r.target_risk.risk,p_eff:r.target_risk.p_eff,rate_over_anchor:r.target_risk.rate_over_anchor,
                         queue_delay_us:r.target_risk.queue_delay_us,qd_ref_us:r.target_risk.qd_ref_us,mode:r.target_risk.mode,
                         started_ns:self.fec_now_ns,..Default::default()});r.target_owners.push(owner.clone());Some(owner)
@@ -2574,8 +2744,18 @@ impl UnreliableSendBuffer {
         }
         self.category_eligible = None;
         self.budget_root = None;
-        if self.fec_adaptive.is_some() && msg.len() > FEC_SEGMENT_BYTES {
-            self.segmented_send = Some(SegmentedSend { plan_ks: std::sync::Arc::new(std::sync::Mutex::new(vec![0; msg.len().div_ceil(FEC_SEGMENT_BYTES)])), message: std::sync::Arc::new(msg), offset: 0,
+        // RESEARCH adaptive units: split a root only when it exceeds the unit cap
+        // (2 MiB settled; while the initial TU trial is unresolved the one-flight
+        // exposure cap, or the fixed prefix cap without a budget root). A root that
+        // may split freezes its ONE risk/draw/ordinal here; the split decision and
+        // start_fec_group both reuse it. Smaller roots keep the old order exactly.
+        // Whole fitting/tiny messages keep the ordinary kind 4 path.
+        let cap = if self.may_segment(msg.len(), payload_len) {
+            self.ensure_budget_root(&msg);
+            self.adaptive_unit_cap(payload_len, msg.len())
+        } else { usize::MAX };
+        if msg.len() > cap {
+            self.segmented_send = Some(SegmentedSend { plan_ks: UnitPlan::new(cap), message: std::sync::Arc::new(msg), offset: 0,
                 root: self.send_package_id, root_lease: self.package_lease.take() });
             return self.start_segment(payload_len);
         }
@@ -2595,10 +2775,13 @@ impl UnreliableSendBuffer {
         let Some(block_bytes) = payload_len.checked_sub(STP_SEGMENT_FEC_HEADER_SIZE) else { return false; };
         let source = self.segmented_send.as_ref().unwrap();
         let start = source.offset;
-        // Balanced fixed byte ranges make the last group at least ~1 MiB, too;
-        // their boundaries do not depend on TU and are validated by the receiver.
-        let group_len = source.message.len().div_ceil(source.message.len().div_ceil(FEC_SEGMENT_BYTES));
-        let end = (start + group_len).min(source.message.len());
+        // RESEARCH adaptive units: balanced partition of the REMAINING bytes at the
+        // current cap (fixed prefix cap while the TU trial is unresolved, else 2 MiB).
+        // Floor-aware: every range (incl. the last) is >= ADAPTIVE_MIN_UNIT_LEN and the
+        // byte range is immutable once started. Width is frozen for this unit at the
+        // current TU, clamped to len-1 so K >= 2 (balanced_parts/p4_new_train agree).
+        let cap = self.adaptive_unit_cap(payload_len, source.message.len());
+        let end = start + adaptive_unit_len(source.message.len() - start, cap);
         let lease = match self.package_allocator.clone() {
             Some(ids) => { let Some(lease) = ids.allocate() else { return false; }; Some(lease) },
             None => None,
@@ -2608,9 +2791,11 @@ impl UnreliableSendBuffer {
         let segment = FecSegment { root: source.root, total: source.message.len() as u32, offset: start as u32 };
         let root_lease = source.root_lease.clone();
         let plan_ks = source.plan_ks.clone();
+        plan_ks.lock().unwrap().cap = cap;
         let message = std::sync::Arc::new(source.message[start..end].to_vec());
         self.segmented_send.as_mut().unwrap().offset = end;
         if end == segment.total as usize { self.segmented_send = None; }
+        let block_bytes = segment_width(message.len(), block_bytes);
         self.start_fec_group(message, block_bytes, Some(segment), root_lease, Some(plan_ks), None);
         true
     }
@@ -2698,7 +2883,7 @@ impl UnreliableSendBuffer {
                     // FIFO head may start, under that same physical-source cap;
                     // a medium/giant must wait for its ordinary admission turn.
                     // Recursion also obeys first-symbol FIFO, just like fill_tier.
-                    let extra = head.capacity().saturating_add(if self.slipstream && head.len() > FEC_SEGMENT_BYTES { head.len() } else { 0 });
+                    let extra = head.capacity().saturating_add(if self.slipstream && self.segmented_class(head.len(), payload_len) { head.len() } else { 0 });
                     if self.slipstream && self.slipstream_head ||
                         (head.len() > payload_len.saturating_sub(STP_WHOLE_HEADER_SIZE) && (!self.slipstream || space < payload_len)) ||
                         self.interleave_source_bytes().saturating_add(extra) > self.current_byte_capacity() as usize ||
@@ -2739,7 +2924,8 @@ impl UnreliableSendBuffer {
                     self.package_lease = lease;
 
                     if let Some(b)=&f.repair_accounting.budget {let mut b=b.lock().unwrap();b.target_prior_losses=b.target_prior_losses.saturating_add(f.group_lost.iter().copied().sum::<u32>());}
-                    self.start_fec_group(f.message, payload_len - STP_SEGMENT_FEC_HEADER_SIZE, f.segment, f.root_lease, f.plan_ks, f.repair_accounting.budget);
+                    let block_bytes = segment_width(f.message.len(), payload_len - STP_SEGMENT_FEC_HEADER_SIZE);
+                    self.start_fec_group(f.message, block_bytes, f.segment, f.root_lease, f.plan_ks, f.repair_accounting.budget);
                     return self.next_fragment(payload_len, space);
                 }
                 if (self.slipstream || self.interleave_width > 1 || self.category_bonus_percent != 0 || self.fec_send_slot.as_ref().unwrap().repair_accounting.budget.is_some()) && self.fec_rescue_package.is_none() {
@@ -2936,6 +3122,24 @@ impl SendQueues {
 
     }
     pub fn has_unsent_data(&self) -> bool { self.target_copy_pending() || self.queues.iter().any(|q| q.has_unsent_data()) }
+    fn set_tu_unresolved(&mut self, unresolved: bool) {
+        for q in &mut self.queues { q.tu_unresolved = unresolved; }
+    }
+    /// R = last allowed pacing (micro-pps, 0 before the first CC pass), T = a
+    /// measured RTT only (0 and the u16::MAX "unknown" sentinel are not RTTs),
+    /// Q = max(1, queues holding send work: has_unsent_data, the set_rate set),
+    /// E = committed unresolved DATA packets from the span ledger (0 without one).
+    fn exposure_snapshot(&self, rate_upps: u64, rtt_mean: u16) -> ExposureSnapshot {
+        ExposureSnapshot {
+            rate_upps,
+            rtt_ns: (rtt_mean != 0 && rtt_mean != u16::MAX).then(|| rtt_mean as u64 * 100_000),
+            queues: (self.queues.iter().filter(|q| q.has_unsent_data()).count() as u64).max(1),
+            unresolved: self.fec_adaptive.as_ref().map_or(0, |a| a.unresolved_data_packets()),
+        }
+    }
+    fn set_exposure(&mut self, exposure: ExposureSnapshot) {
+        for q in &mut self.queues { q.exposure = exposure; }
+    }
     fn set_time(&mut self, now: u64, rtt: u64) {
         for q in &mut self.queues { q.fec_now_ns = now; q.fec_rtt_ns = rtt; q.fec_prune_retained(); q.fec_expire_active_rescue(); }
     }
@@ -3543,6 +3747,7 @@ pub struct ConnectionStateConnected {
     recovery: crate::mtu_recovery::Recovery,
     // Effective TU cannot change while an immutable current-TU datagram retries.
     deferred_tu: Option<u64>,
+    tu_assessment_settled: bool,
     pub last_sent_tu_probe_time_ns: u64,
     pub tu_probe_sequence_number: u64,
     pub tu_probe_size: u64,
@@ -3626,9 +3831,11 @@ pub fn new_connection_state_connected(cipher: Option<ConnectionCipherTriplet>, m
         packets_waiting_ack_tail: 0,
         active_send_frontier: 0,
 
-        current_tu: ASSUMED_UDP_PAYLOAD_SIZE_WITH_GUARANTEED_DELIVERY as u64,
-        recovery: crate::mtu_recovery::Recovery::new(timestamp_ns),
+        // RESEARCH: a new connection starts at SMALL with one startup 1204 candidate.
+        current_tu: crate::mtu_recovery::SMALL,
+        recovery: crate::mtu_recovery::Recovery::new_connection(timestamp_ns),
         deferred_tu: None,
+        tu_assessment_settled: false,
         last_sent_tu_probe_time_ns: 0,
         tu_probe_sequence_number: u64::MAX,
         tu_probe_size: 0,
@@ -4032,18 +4239,27 @@ impl ConnectionStateConnected {
         let Some((size, due)) = self.recovery.upward_plan(self.current_tu,
             self.last_sent_tu_probe_time_ns, self.tu_probe_failed_count, now) else { return false; };
         if now < due { return false; }
+        self.recovery.upward_issued(size);
         self.tu_probe_size = size;
         self.tu_probe_obsolete = false;
         true
     }
     fn finish_upward_probe(&mut self, success: bool, sent: u64, now: u64) {
         self.tu_probe_sequence_number = u64::MAX;
-        if self.tu_probe_obsolete || self.tu_probe_size <= self.current_tu { return; }
+        if self.tu_probe_obsolete || self.tu_probe_size <= self.current_tu {
+            self.recovery.upward_finished(self.tu_probe_size, false);
+            return;
+        }
         if success {
-            if !self.recovery.can_promote(self.tu_probe_size, sent, now) { return; }
+            if !self.recovery.can_promote(self.tu_probe_size, sent, now) {
+                self.recovery.upward_finished(self.tu_probe_size, false);
+                return;
+            }
             self.promote_tu(self.tu_probe_size, now);
             self.tu_probe_failed_count = 0;
+            self.recovery.upward_finished(self.tu_probe_size, true);
         } else {
+            self.recovery.upward_finished(self.tu_probe_size, false);
             self.recovery.upward_failed(self.current_tu, self.tu_probe_size, now);
             self.tu_probe_failed_count = self.tu_probe_failed_count.saturating_add(1);
         }
@@ -4271,14 +4487,26 @@ const        VERBOSE                :bool=0!=                (1);
 
 macro_rules! pod { ($($item:item)*) => { $(#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)] $item)* }; }
 
-// This formula and finish_segment's geometric prefix growth form one policy.
-// A resize can hold min(2*prefix,total) destination bytes plus total-prefix
-// sparse bytes and the group being copied: at most ceil(1.5*total)+one group.
+// This formula and flush_contiguous_segment's prefix growth form one policy.
+// The decoded Vec and its lease move into the root without a second unit copy.
+// Geometric growth is attempted only through shared-budget admission; it can
+// exceed 1.5*total while the joining part is still live. If admission refuses,
+// exact-end growth needs at most total + one unit payload bytes (destination
+// end + sparse bytes <= end + total-prefix). Root metadata is 256 + 40*cap
+// (8-byte extent + 32-byte part entry), cap <= max(4, 2*N) with every unit
+// >= ADAPTIVE_MIN_UNIT_LEN, so N <= floor(total/446). A splittable root has
+// total >= 892: 160 <= ceil(total/2) and 80*N <= 0.18*total, so this metadata
+// fits in ceil(total/2) + 256 + groups*64 (SegmentParts' cached sums live in
+// the slot itself, not in the charged heap tables). Thus the unchanged allowance suffices for
+// exact-end progress, even when a later unit is larger than half the root.
 fn segment_reassembly_peak(total: usize) -> usize {
     total + total.div_ceil(2) + total.min(FEC_SEGMENT_BYTES)
         + 256 + total.div_ceil(FEC_SEGMENT_BYTES) * 64
 }
 
+/// Base metadata of a segmented root (was 256 + groups*64 up front; ranges
+/// and the sparse part table are now charged dynamically as they bind/grow).
+const SEGMENT_ROOT_METADATA: usize = 256;
 const FEC_INGRESS_SLOT_BYTES: usize = std::mem::size_of::<(u32, Vec<u8>)>() + 128;
 
 fn fec_ingress_bytes(layout: crate::fec::MessageLayout) -> usize {
@@ -4328,6 +4556,44 @@ pub fn receive_connection_memory_limit(max_message_size: usize, queues: usize) -
         .checked_add(codecs.checked_mul(decoder)?)?.checked_add(metadata)
 }
 
+/// Sparse decoded units of one segmented root, sorted by DESCENDING offset so
+/// the lowest (next joinable) part is popped from the end in O(1). Cached sums of
+/// part lengths and capacities replace per-call scans (bytes_received, charge,
+/// flush). Lookup is a binary search. Insertion is a Vec insert: O(1) for in-order
+/// or reverse-order arrival, an O(n) element shift in the explicit worst case
+/// (ascending arrival behind a hole); n <= floor(total/ADAPTIVE_MIN_UNIT_LEN).
+#[derive(Debug, Default)]
+struct SegmentParts { desc: Vec<(u32, Vec<u8>)>, bytes: usize, part_capacity: usize }
+impl SegmentParts {
+    fn with_capacity(n: usize) -> Self { Self { desc: Vec::with_capacity(n), bytes: 0, part_capacity: 0 } }
+    fn capacity(&self) -> usize { self.desc.capacity() }
+    fn reserve_exact(&mut self, additional: usize) { self.desc.reserve_exact(additional) }
+    fn position(&self, offset: u32) -> usize { self.desc.partition_point(|p| p.0 > offset) }
+    fn contains(&self, offset: u32) -> bool { self.desc.get(self.position(offset)).is_some_and(|p| p.0 == offset) }
+    /// Caller guarantees `!contains(offset)` and spare capacity (prepaid table).
+    fn insert(&mut self, offset: u32, part: Vec<u8>) {
+        debug_assert!(!self.contains(offset) && self.desc.len() < self.desc.capacity());
+        self.bytes += part.len();
+        self.part_capacity += part.capacity();
+        let i = self.position(offset);
+        self.desc.insert(i, (offset, part));
+    }
+    /// Length of the part starting exactly at `prefix`, if it is the lowest part.
+    fn next_len(&self, prefix: usize) -> Option<usize> {
+        self.desc.last().filter(|p| p.0 as usize == prefix).map(|p| p.1.len())
+    }
+    fn pop_next(&mut self) -> Vec<u8> {
+        let (_, part) = self.desc.pop().expect("joinable part");
+        self.bytes -= part.len();
+        self.part_capacity -= part.capacity();
+        part
+    }
+}
+impl std::ops::Deref for SegmentParts {
+    type Target = [(u32, Vec<u8>)];
+    fn deref(&self) -> &Self::Target { &self.desc }
+}
+
 #[derive(Debug, Default)]
 pub struct ReassemblySlot {
     reservation: Option<crate::receive_memory::Reservation>,
@@ -4336,7 +4602,12 @@ pub struct ReassemblySlot {
     pub received: Vec<(u32, u32)>, // sorted non-overlapping non-adjacent ranges: [start, end)
     pub package_id: u64,
     completed: bool,
-    segment_parts: Option<Vec<(u32, Vec<u8>)>>,
+    segment_parts: Option<SegmentParts>,
+    // RESEARCH profile 5 root ledger: every admitted unit range (offset, len),
+    // sorted, disjoint, immutable, kept (incl. the completed prefix) until the
+    // root is done. Bound: floor(total/ADAPTIVE_MIN_UNIT_LEN) entries. A middle
+    // insert is an O(n) Vec shift (explicit worst case); append is a push.
+    segment_extents: Vec<(u32, u32)>,
     last_segment_ns: u64, // Last accepted plain fragment or segment symbol.
 }
 
@@ -4350,6 +4621,7 @@ impl ReassemblySlot {
             package_id: 0,
             completed: false,
             segment_parts: None,
+            segment_extents: Vec::new(),
             last_segment_ns: 0,
         }
     }
@@ -4357,7 +4629,7 @@ impl ReassemblySlot {
     /// Message bytes received so far.
     pub fn bytes_received(&self) -> u64 {
         self.segment_parts.as_ref().map_or_else(|| self.received.iter().map(|&(s, e)| (e - s) as u64).sum(),
-            |parts| self.buf.len() as u64 + parts.iter().map(|(_, bytes)| bytes.len() as u64).sum::<u64>())
+            |parts| self.buf.len() as u64 + parts.bytes as u64)
     }
 
     pub fn new_ring(size: usize) -> Vec<ReassemblySlot> {
@@ -4399,50 +4671,132 @@ impl ReassemblySlot {
         if self.completed { return true; }
         if self.total_len.is_some_and(|n| n != segment.total) ||
             (!self.buf.is_empty() && self.segment_parts.is_none()) || !self.received.is_empty() { return false; }
-        if self.reservation.is_none() {
-            let groups = (segment.total as usize).div_ceil(FEC_SEGMENT_BYTES);
-            let Some(r) = budget.reserve(256 + groups * 64) else { return false; };
+        if self.segment_parts.is_none() {
+            // First unit of this root: base metadata plus a small ledger and an
+            // equally sized sparse part table, reserved in one step so a refusal
+            // leaves the slot untouched. The table is prepaid with every bound
+            // range (parts.cap >= extents.cap >= extents.len >= parts.len), so a
+            // decoded unit hands over without growing metadata at completion.
+            // Later ranges and part bytes are charged inside the unchanged hard cap.
+            let Some(r) = budget.reserve(SEGMENT_ROOT_METADATA + 4 * std::mem::size_of::<(u32, u32)>()
+                + 4 * std::mem::size_of::<(u32, Vec<u8>)>()) else { return false; };
             self.reservation = Some(r);
-            self.segment_parts = Some(Vec::with_capacity(groups));
+            self.segment_parts = Some(SegmentParts::with_capacity(4));
+            self.segment_extents = Vec::with_capacity(4);
             self.total_len = Some(segment.total);
         }
+        self.bind_segment_extent(segment, layout.len, now_ns)
+    }
+
+    /// Exact already-bound range: accepted (restart/fresh id or duplicate). Any
+    /// other overlap, incl. same offset with a different length, is refused
+    /// before receipt. A new range grows the charge FIRST; refusal binds nothing.
+    fn bind_segment_extent(&mut self, segment: FecSegment, len: usize, now_ns: u64) -> bool {
+        let (offset, end) = (segment.offset as usize, segment.offset as usize + len);
+        let ext = &self.segment_extents;
+        let i = ext.partition_point(|e| (e.0 as usize) < offset);
+        if ext.get(i).is_some_and(|e| e.0 as usize == offset && e.1 as usize == len) {
+            self.last_segment_ns = now_ns;
+            return true;
+        }
+        if ext.get(i).is_some_and(|e| (e.0 as usize) < end) ||
+            i > 0 && ext[i - 1].0 as usize + ext[i - 1].1 as usize > offset { return false; }
+        if self.segment_extents.len() == self.segment_extents.capacity() {
+            // Ledger and part table grow together under ONE checked charge
+            // before anything binds; refusal leaves both and the charge as is.
+            let cap = (self.segment_extents.capacity() * 2).max(4);
+            let Some(parts_cap) = self.segment_parts.as_ref().map(|p| p.capacity().max(cap)) else { return false; };
+            let charge = self.segment_charge(cap, Some(parts_cap), 0);
+            let Some(reservation) = self.reservation.as_mut() else { return false; };
+            if !reservation.grow(charge) { return false; }
+            self.segment_extents.reserve_exact(cap - self.segment_extents.len());
+            let parts = self.segment_parts.as_mut().unwrap();
+            parts.reserve_exact(parts_cap - parts.len());
+        }
+        self.segment_extents.insert(i, (segment.offset, len as u32));
         self.last_segment_ns = now_ns;
         true
     }
 
-    fn finish_segment(&mut self, segment: FecSegment, message: &[u8])
+    /// Whole current charge of a segmented root: base + ledger capacity + sparse
+    /// part-table capacity + destination + sparse part bytes (+ `extra` bytes).
+    fn segment_charge(&self, extent_cap: usize, parts_cap: Option<usize>, extra: usize) -> usize {
+        let parts = self.segment_parts.as_ref();
+        SEGMENT_ROOT_METADATA + extent_cap * std::mem::size_of::<(u32, u32)>()
+            + parts_cap.unwrap_or_else(|| parts.map_or(0, |p| p.capacity())) * std::mem::size_of::<(u32, Vec<u8>)>()
+            + self.buf.capacity() + parts.map_or(0, |p| p.part_capacity) + extra
+    }
+
+    /// Late unit (fresh id or duplicate) whose exact bound range is already in
+    /// the delivered/contiguous prefix: accept coverage, allocate no decoder.
+    fn segment_covered(&self, segment: FecSegment, len: usize) -> bool {
+        self.package_id == segment.root && (self.completed ||
+            self.segment_parts.is_some() && segment.offset as usize + len <= self.buf.len())
+    }
+
+    /// Ownership handoff of one decoded unit: the decoded Vec moves into the
+    /// prepaid part table and its lease (`donor`, same budget, already shrunk by
+    /// the caller to the Vec's capacity after the decode arena was released) is
+    /// absorbed into the root without release/reacquire. No payload copy and no
+    /// second charge of the same bytes. A stale, unbound or duplicate unit drops
+    /// the Vec first and then its lease; it never touches the root charge.
+    fn finish_segment(&mut self, segment: FecSegment, message: Vec<u8>, mut donor: crate::receive_memory::Reservation)
         -> Option<(Vec<u8>, crate::receive_memory::Reservation)> {
-        if self.package_id != segment.root || self.completed || self.total_len != Some(segment.total) ||
-            !segment.valid(message.len()) { return None; }
-        let parts = self.segment_parts.as_mut()?;
-        let total = segment.total as usize;
-        let metadata = 256 + total.div_ceil(FEC_SEGMENT_BYTES) * 64;
-        let reservation = self.reservation.as_mut()?;
-        let mut bytes: usize = parts.iter().map(|(_, bytes)| bytes.capacity()).sum();
-        if segment.offset as usize >= self.buf.len() && !parts.iter().any(|(offset, _)| *offset == segment.offset) {
-            if !reservation.grow(metadata + self.buf.capacity() + bytes + message.len()) { return None; }
-            parts.push((segment.offset, message.to_vec()));
-            bytes += message.len();
+        // Same-generation identity: root id, total and an admission-bound range.
+        // Only a range bound at admission may complete; it is immutable, so a
+        // range wholly inside the contiguous prefix is an exact old duplicate.
+        let bound = self.package_id == segment.root && !self.completed && self.total_len == Some(segment.total)
+            && segment.valid(message.len()) && self.segment_extents.binary_search(&(segment.offset, message.len() as u32)).is_ok()
+            && self.reservation.is_some() && donor.bytes() >= message.capacity()
+            && self.segment_parts.as_ref().is_some_and(|parts| segment.offset as usize >= self.buf.len()
+                && parts.len() < parts.capacity() && !parts.contains(segment.offset));
+        if !bound {
+            drop(message); drop(donor);
+            return None; // a blocked join is retried by sweep_segment_roots
         }
+        donor.shrink(message.capacity());
+        if let Err(donor) = self.reservation.as_mut().unwrap().absorb(donor) {
+            drop(message); drop(donor);
+            return None;
+        }
+        // Prepaid with the bound range: this push never reallocates the table.
+        self.segment_parts.as_mut().unwrap().insert(segment.offset, message);
+        self.flush_contiguous_segment()
+    }
+
+    /// Join every part that extends the contiguous prefix; complete the root
+    /// once the prefix covers the total. Also the retry path of the periodic
+    /// root sweep. Each destination growth first tries the geometric step,
+    /// then the exact end of the joining part; if both are refused the parts
+    /// stay in the table under the unchanged root charge for a later retry.
+    fn flush_contiguous_segment(&mut self) -> Option<(Vec<u8>, crate::receive_memory::Reservation)> {
+        if self.completed { return None; }
+        let total = self.total_len? as usize;
+        let metadata = SEGMENT_ROOT_METADATA + self.segment_extents.capacity() * std::mem::size_of::<(u32, u32)>()
+            + self.segment_parts.as_ref()?.capacity() * std::mem::size_of::<(u32, Vec<u8>)>();
+        let parts = self.segment_parts.as_mut()?;
+        let reservation = self.reservation.as_mut()?;
+        let mut bytes: usize = parts.part_capacity;
         // Only a contiguous completed prefix grows the destination. A high-offset
         // segment remains sparse; neither a header nor one decoded group can pin
-        // the claimed total. Geometric growth avoids quadratic realloc/copy work.
-        // At a growth step, capacity <= min(2 * old_prefix, total), and remaining
-        // sparse bytes <= total - old_prefix: peak <= 1.5 * total + one segment
-        // plus metadata. Do not concatenate into a second full-message buffer.
-        while let Some(index) = parts.iter().position(|(offset, _)| *offset as usize == self.buf.len()) {
+        // the claimed total. Geometric growth avoids quadratic realloc/copy work;
+        // see segment_reassembly_peak for the bound of either growth step.
+        // Do not concatenate into a second full-message buffer.
+        while let Some(next_len) = parts.next_len(self.buf.len()) {
             if self.buf.is_empty() {
-                let (_, part) = parts.swap_remove(index);
+                let part = parts.pop_next();
                 bytes -= part.capacity();
                 self.buf = part;
             } else {
-                let end = self.buf.len() + parts[index].1.len();
-                let capacity = if end > self.buf.capacity() {
-                    (self.buf.capacity() * 2).max(end).min(total)
-                } else { self.buf.capacity() };
-                if !reservation.grow(metadata + capacity + bytes) { return None; }
-                self.buf.reserve_exact(capacity - self.buf.len());
-                let (_, part) = parts.swap_remove(index);
+                let end = self.buf.len() + next_len;
+                if end > self.buf.capacity() {
+                    let geometric = (self.buf.capacity() * 2).max(end).min(total);
+                    let capacity = if reservation.grow(metadata + geometric + bytes) { geometric }
+                        else if reservation.grow(metadata + end + bytes) { end }
+                        else { return None; }; // retained: parts, prefix and charge unchanged
+                    self.buf.reserve_exact(capacity - self.buf.len());
+                }
+                let part = parts.pop_next();
                 self.buf.extend_from_slice(&part);
                 bytes -= part.capacity();
             }
@@ -4450,12 +4804,21 @@ impl ReassemblySlot {
         }
         if self.buf.len() != total { return None; }
         self.segment_parts = None;
+        self.segment_extents = Vec::new();
         let message = std::mem::take(&mut self.buf);
         let mut reservation = self.reservation.take().unwrap();
         reservation.shrink(message.capacity() + 256);
         self.completed = true;
         self.total_len = None;
         Some((message, reservation))
+    }
+
+    /// Test handoff: the decoded Vec arrives with its own lease on `budget`.
+    #[cfg(test)]
+    fn finish_charged(&mut self, segment: FecSegment, message: Vec<u8>,
+        budget: &std::sync::Arc<crate::receive_memory::ReceiveMemoryBudget>) -> Option<(Vec<u8>, crate::receive_memory::Reservation)> {
+        let donor = budget.reserve(message.capacity()).expect("decoded unit lease");
+        self.finish_segment(segment, message, donor)
     }
 
     fn take_complete(&mut self) -> Vec<u8> {
@@ -4615,6 +4978,56 @@ fn retire_inactive_segment_roots(slots: &mut [ReassemblySlot], now_ns: u64, grac
             *slot = ReassemblySlot::new();
         }
     }
+}
+
+/// Periodic root maintenance, resumable at each root rather than each connection.
+/// Retry a retained join BEFORE expiring that root. A paused scan leaves later
+/// roots untouched; the caller keeps this cursor and the connection queue head.
+/// Each root flush remains one indivisible work unit, like packet completion.
+/// Returns (number delivered, scan finished); a finished cursor is not reset here.
+fn sweep_segment_roots_bounded(slots: &mut [ReassemblySlot], cursor: &mut usize,
+    now_ns: u64, grace_ns: u64, mut checkpoint: impl FnMut() -> bool,
+    mut deliver: impl FnMut(Vec<u8>, crate::receive_memory::Reservation)) -> (u64, bool) {
+    let mut delivered = 0;
+    while *cursor < slots.len() {
+        if checkpoint() { return (delivered, false); }
+        let slot = &mut slots[*cursor];
+        let joinable = !slot.completed && slot.segment_parts.as_ref().is_some_and(|parts|
+            parts.next_len(slot.buf.len()).is_some());
+        if joinable {
+            if let Some((message, reservation)) = slot.flush_contiguous_segment() {
+                delivered += 1;
+                deliver(message, reservation);
+            }
+        }
+        retire_inactive_segment_roots(std::slice::from_mut(slot), now_ns, grace_ns);
+        *cursor += 1;
+    }
+    (delivered, true)
+}
+
+/// Root checkpoint for one FEC sweep entry (one call of the bounded sweep).
+/// The entry's own checkpoint already paid for its first root, at any cursor:
+/// a caller deadline that passed during an owed unit must still advance one
+/// root, never re-run cursor-0 work forever. Later roots need a fresh sample:
+/// a root join is an indivisible work unit, not cached-clock bookkeeping.
+fn sweep_entry_root_checkpoint(budget: &mut crate::pump::Deadline) -> impl FnMut() -> bool + '_ {
+    sweep_entry_root_checkpoint_with_clock(budget, monotonic_clock_ns)
+}
+
+fn sweep_entry_root_checkpoint_with_clock<'a>(budget: &'a mut crate::pump::Deadline,
+    mut clock: impl FnMut() -> u64 + 'a) -> impl FnMut() -> bool + 'a {
+    let mut first_root_prepaid = true;
+    move || {
+        if std::mem::take(&mut first_root_prepaid) { return false; }
+        if budget.sampled(clock()) { true } else { budget.progressed(); false }
+    }
+}
+
+#[cfg(test)]
+fn sweep_segment_roots(slots: &mut [ReassemblySlot], now_ns: u64, grace_ns: u64,
+    deliver: impl FnMut(Vec<u8>, crate::receive_memory::Reservation)) -> u64 {
+    sweep_segment_roots_bounded(slots, &mut 0, now_ns, grace_ns, || false, deliver).0
 }
 
 fn valid_fec_symbol(layout: crate::fec::MessageLayout, block_id: u32, data_len: usize) -> bool {
@@ -5186,6 +5599,7 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
         let mut receiving = true;
         let mut send_keys = VecDeque::<ConnectionKey>::new();
         let mut fec_sweep_keys = VecDeque::<ConnectionKey>::new();
+        let mut fec_sweep_root_index = 0usize;
         #[cfg(test)]
         let mut active_wait = options.initial_active_wait;
         #[cfg(not(test))]
@@ -6027,6 +6441,8 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                         if !existing_connection.unreliable_reassembly[root_idx].admit_segment(segment, layout, block_id, data.len(), timestamp_ns, &existing_connection.receive_budget) {
                                             memory_erased = true; continue;
                                         }
+                                        // Exact range already delivered/joined: ACK coverage, no decoder.
+                                        if existing_connection.unreliable_reassembly[root_idx].segment_covered(segment, message_len) { continue; }
                                     }
 
                                     {
@@ -6065,9 +6481,11 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                     if let Some((message, mut _reservation)) = fec_receive_block_waking(&mut existing_connection.unreliable_fec[slot_idx], connection_key, package_id, message_len, block_bytes, block_id, data, &fec_done_tx, &fec_workers, &existing_connection.receive_budget, Some(thread_inner.wake.clone())) {
                                         let completed = if let Some(segment) = segment {
                                             let Some(root_idx) = existing_connection.receive_index.admit_at(segment.root,
-                                            &mut existing_connection.unreliable_reassembly, &mut existing_connection.unreliable_fec, timestamp_ns, fec_inactive_grace_ns(state.RTT_mean, true)) else { memory_erased = true; continue; };
+                                            &mut existing_connection.unreliable_reassembly, &mut existing_connection.unreliable_fec, timestamp_ns, fec_inactive_grace_ns(state.RTT_mean, true)) else { memory_erased = true; drop(message); continue; };
+                                            // The inline decoder is already released: the lease shrinks
+                                            // to the Vec and moves with it into the root (no copy).
                                             _reservation.shrink(message.capacity());
-                                            existing_connection.unreliable_reassembly[root_idx].finish_segment(segment, &message)
+                                            existing_connection.unreliable_reassembly[root_idx].finish_segment(segment, message, _reservation)
                                         } else { Some((message, _reservation)) };
                                         if let Some((message, reservation)) = completed {
                                             state.stats.rx_messages_completed += 1;
@@ -6178,9 +6596,9 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                         let tail = monotonic_clock_ns().saturating_sub(slot.last_block_ns);
                         slot.state = FecRecvState::Done;
                         let completed = if let Some(segment) = slot.segment {
-                            let Some(root_idx) = conn.receive_index.get(segment.root) else { continue; };
+                            let Some(root_idx) = conn.receive_index.get(segment.root) else { drop(message); continue; };
                             _reservation.shrink(message.capacity());
-                            conn.unreliable_reassembly[root_idx].finish_segment(segment, &message)
+                            conn.unreliable_reassembly[root_idx].finish_segment(segment, message, _reservation)
                         } else { Some((message, _reservation)) };
                         if let ConnectionState::Connected(c) = &mut conn.connection_state {
                             if completed.is_some() { c.stats.rx_messages_completed += 1; }
@@ -6203,18 +6621,27 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                     fec_sweep_ns = current_time_now_ns;
                 }
                 while let Some(key) = fec_sweep_keys.front().copied() {
-                    if budget.checkpoint() { return Some(std::time::Instant::now()); }
-                    fec_sweep_keys.pop_front();
+                    if budget.sampled(monotonic_clock_ns()) { return Some(std::time::Instant::now()); }
                     budget.progressed();
                     if let Some(conn) = connections_map.get_mut(&key) {
                         if let ConnectionState::Connected(c) = &mut conn.connection_state {
                             let grace = if c.outage.since_ns.is_some() || current_time_now_ns.saturating_sub(c.last_ack_received_time) >= OUTAGE_ACK_SILENCE_NS {
                                 OUTAGE_TIMEOUT_NS
                             } else { fec_inactive_grace_ns(c.RTT_mean, false) };
-                            c.stats.fec_decode_timeouts += retire_inactive_fec_workers(&mut conn.unreliable_fec, current_time_now_ns, grace, false);
-                            retire_inactive_segment_roots(&mut conn.unreliable_reassembly, current_time_now_ns, grace);
+                            if fec_sweep_root_index == 0 {
+                                c.stats.fec_decode_timeouts += retire_inactive_fec_workers(&mut conn.unreliable_fec, current_time_now_ns, grace, false);
+                            }
+                            let (delivered, done) = sweep_segment_roots_bounded(&mut conn.unreliable_reassembly,
+                                &mut fec_sweep_root_index, current_time_now_ns, grace,
+                                sweep_entry_root_checkpoint(&mut budget),
+                                |message, reservation| if thread_inner.is_reference() { receive_queue.push_reserved(key, message, MAX_RECV_QUEUE_BYTES, Some(reservation)); } else { ring_state.message(&thread_inner, key, message); });
+                            c.stats.rx_messages_completed += delivered;
+                            // Keep both queue head and root cursor when the caller budget ends.
+                            if !done { return Some(std::time::Instant::now()); }
                         }
                     }
+                    fec_sweep_keys.pop_front();
+                    fec_sweep_root_index = 0;
                 }
 
                 if receive_queue_report_time_ns + 10_000_000_000 <= current_time_now_ns {
@@ -7090,6 +7517,7 @@ fn enter_outage(state: &mut ConnectionStateConnected, buf: &mut SendQueues,
         state.packets_waiting_ack_tail += 1;
     }
     state.tu_probe_sequence_number = u64::MAX;
+    state.recovery.startup_cancel();
     state.ecn_congestion_received = false;
     state.loss_count_in_window = 0;
     state.stats.cc_rate_upps = 0;
@@ -7243,6 +7671,14 @@ fn prepare_connected_send_tick(state: &mut ConnectionStateConnected, buf: &mut S
     // socket refusal is not an outage, and must still free expired sources.
     drain_accepted_cc_events(state, buf);
     if state.outage.since_ns.is_none() { buf.set_time(now, state.RTT_mean as u64 * 100_000); }
+    // Latched once: the initial 1204 trial finished (success OR failure, or was
+    // settled by cancel/outage/shrink) AND any promotion it caused is effective
+    // (no deferred larger TU behind a pending copy). Never re-arms.
+    if !state.tu_assessment_settled && !state.recovery.assessment_unresolved()
+        && !state.deferred_tu.is_some_and(|tu| tu > state.current_tu) { state.tu_assessment_settled = true; }
+    buf.set_tu_unresolved(!state.tu_assessment_settled);
+    let exposure = buf.exposure_snapshot(state.stats.cc_rate_upps, state.RTT_mean);
+    buf.set_exposure(exposure);
     if state.locally_blocked { freeze_local_send(state, now); }
 }
 
@@ -12458,7 +12894,7 @@ mod lazy_fec_segment_tests {
                     let (_,decoder) = decoders.entry(package).or_insert_with(|| (segment,crate::fec::MessageDecoder::new(message_len,width).unwrap()));
                     if decoder.add(id,data).unwrap()==crate::fec::DecodeStatus::Done {
                         if let Some(message) = decoder.recover() {
-                            if let Some((message,reservation))=root.finish_segment(segment,&message) {
+                            if let Some((message,reservation))=root.finish_charged(segment,message,&budget) {
                                 delivered+=1; finished=Some((message,reservation));
                             }
                         }
@@ -12493,7 +12929,7 @@ mod lazy_fec_segment_tests {
             let segment = FecSegment { root: 13, total: total as u32,
                 offset: (group * FEC_SEGMENT_BYTES) as u32 };
             assert!(root.admit_segment(segment, layout, 0, 1000, 1, &budget));
-            delivered = root.finish_segment(segment, &vec![group as u8; FEC_SEGMENT_BYTES]);
+            delivered = root.finish_charged(segment, vec![group as u8; FEC_SEGMENT_BYTES], &budget);
             if group != 0 {
                 assert!(delivered.is_none());
                 assert_eq!(root.buf.capacity(), 0); // no sparse high-water allocation
@@ -12711,7 +13147,7 @@ mod lazy_fec_segment_tests {
             let segment = FecSegment { root: 13, total: total as u32,
                 offset: (group * FEC_SEGMENT_BYTES) as u32 };
             assert!(root.admit_segment(segment, layout, 0, FEC_MIN_BLOCK_BYTES, 1, &peer));
-            delivered = root.finish_segment(segment, &vec![group as u8; FEC_SEGMENT_BYTES]);
+            delivered = root.finish_charged(segment, vec![group as u8; FEC_SEGMENT_BYTES], &peer);
             if group != 0 {
                 assert!(delivered.is_none());
                 assert_eq!(root.buf.capacity(), 0);
@@ -12841,15 +13277,16 @@ mod lazy_fec_segment_tests {
         assert!(!slot.admit_segment(first, crate::fec::MessageLayout::new(2<<20, 1000).unwrap(), 0, 1000, 1, &refused));
         assert_eq!(refused.used(),0); assert!(slot.buf.is_empty());
         assert!(slot.admit_segment(second, crate::fec::MessageLayout::new(2<<20, 1000).unwrap(), 0, 1000, 1, &budget));
-        let charge=budget.used(); assert_eq!(charge, 256 + 2 * 64);
-        assert!(slot.finish_segment(second,&vec![2;2<<20]).is_none());
+        let charge=budget.used(); assert_eq!(charge, (SEGMENT_ROOT_METADATA + 4 * std::mem::size_of::<(u32, u32)>() + 4 * std::mem::size_of::<(u32, Vec<u8>)>()));
+        assert!(slot.finish_charged(second,vec![2;2<<20],&budget).is_none());
         assert!(slot.admit_segment(first, crate::fec::MessageLayout::new(2<<20, 1000).unwrap(), 0, 1000, 1, &budget)); assert_eq!(budget.used(),charge + (2<<20));
-        let (message,reservation)=slot.finish_segment(first,&vec![1;2<<20]).unwrap();
+        let (message,reservation)=slot.finish_charged(first,vec![1;2<<20],&budget).unwrap();
         assert_eq!(&message[..2<<20],&vec![1;2<<20]);
         assert_eq!(&message[2<<20..],&vec![2;2<<20]);
-        assert!(slot.finish_segment(first,&vec![1;2<<20]).is_none());
+        assert!(slot.finish_charged(first,vec![1;2<<20],&budget).is_none());
         drop(reservation); assert_eq!(budget.used(),0);
-        for bad in [FecSegment{offset:1,..first},FecSegment{total:0,..first},FecSegment{offset:total,..first}] {
+        // Profile 5: arbitrary bounded ranges; these are out of bounds or a too-short nonfinal span.
+        for bad in [FecSegment{offset:(2<<20)+1,..first},FecSegment{total:0,..first},FecSegment{offset:total,..first},FecSegment{total:2<<20,..first}] {
             assert!(!bad.valid(2<<20));
         }
     }
@@ -12949,7 +13386,7 @@ mod lazy_fec_segment_tests {
         // A valid symbol charges only root metadata plus the bounded decoder,
         // never the claimed 1 GiB application message.
         assert!(roots[4].admit_segment(segment, layout, 0, 1000, 1, &budget));
-        let metadata = 256 + 512 * 64;
+        let metadata = SEGMENT_ROOT_METADATA + 4 * std::mem::size_of::<(u32, u32)>() + 4 * std::mem::size_of::<(u32, Vec<u8>)>();
         assert_eq!(budget.used(), metadata);
         assert_eq!(roots[4].buf.capacity(), 0);
         fec[5].package_id = 5;
@@ -12971,18 +13408,18 @@ mod lazy_fec_segment_tests {
         // only its own bytes. Expiry, ring eviction and close all release it.
         let last = FecSegment { offset: (MAX_JUMBOGRAM_LEN - (2 << 20)) as u32, ..segment };
         assert!(roots[4].admit_segment(last, layout, 0, 1000, 10, &budget));
-        assert!(roots[4].finish_segment(last, &vec![7; 2 << 20]).is_none());
+        assert!(roots[4].finish_charged(last, vec![7; 2 << 20], &budget).is_none());
         assert_eq!(roots[4].buf.capacity(), 0);
         assert_eq!(roots[4].bytes_received(), 2 << 20);
         assert_eq!(budget.used(), metadata + (2 << 20));
         let next = FecSegment { root: 1028, total: 4 << 20, offset: 0 };
         assert!(roots[4].admit_segment(next, layout, 0, 1000, 11, &budget));
-        assert_eq!(budget.used(), 256 + 2 * 64);
-        assert!(roots[4].finish_segment(next, &vec![8; 2 << 20]).is_none());
+        assert_eq!(budget.used(), metadata);
+        assert!(roots[4].finish_charged(next, vec![8; 2 << 20], &budget).is_none());
         retire_inactive_segment_roots(&mut roots, 12 + grace, grace);
         assert_eq!(budget.used(), 0);
         assert!(roots[4].admit_segment(next, layout, 0, 1000, 13, &budget));
-        assert!(roots[4].finish_segment(next, &vec![8; 2 << 20]).is_none());
+        assert!(roots[4].finish_charged(next, vec![8; 2 << 20], &budget).is_none());
         drop(roots); drop(fec);
         assert_eq!(budget.used(), 0);
         let smaller_process = crate::receive_memory::ReceiveMemoryBudget::new(512 << 20);
@@ -13996,9 +14433,10 @@ mod wire_v2_tests {
         assert_eq!(index.admit(13, &mut plain, &mut fec), Some(root));
         assert!(plain[root].admit_segment(segment, layout, 1, 1168, 2, &budget));
         let first = vec![3; 2 << 20];
-        assert!(plain[root].finish_segment(segment, &first).is_none());
+        assert!(plain[root].finish_charged(segment, first.clone(), &budget).is_none());
         let second = FecSegment { offset: 2 << 20, ..segment };
-        let (message, _) = plain[root].finish_segment(second, &first).unwrap();
+        assert!(plain[root].admit_segment(second, layout, 1, 1168, 2, &budget));
+        let (message, _) = plain[root].finish_charged(second, first, &budget).unwrap();
         assert_eq!(message, vec![3; 4 << 20]);
         assert!(index.admit(15, &mut plain, &mut fec).is_none());
     }
@@ -14127,13 +14565,15 @@ mod wire_v2_tests {
     #[test]
     fn declared_version_layout_and_limits_are_checked() {
         let p = transport_parameters(65536); assert_eq!(validate_transport_parameters(&p), Some(65536));
-        assert_eq!(load_u16(&p[..2]), 4);
-        let mut profile_three = p;
-        store_u16(&mut profile_three[..2], 3);
-        assert!(validate_transport_parameters(&profile_three).is_none());
-        let mut old_hello = build_magic2_client_block_for_limit(65536);
-        old_hello[MAGIC2_LIST_SIZE..].copy_from_slice(&profile_three);
-        assert!(negotiate_magic2(&old_hello).is_none());
+        assert_eq!(load_u16(&p[..2]), 5);
+        for old_version in [3, 4] {
+            let mut old_profile = p;
+            store_u16(&mut old_profile[..2], old_version);
+            assert!(validate_transport_parameters(&old_profile).is_none());
+            let mut old_hello = build_magic2_client_block_for_limit(65536);
+            old_hello[MAGIC2_LIST_SIZE..].copy_from_slice(&old_profile);
+            assert!(negotiate_magic2(&old_hello).is_none());
+        }
         assert_eq!(load_u16(&p[12..14]), 445);
         let mut legacy = p;
         store_u16(&mut legacy[..2], 2);
@@ -14289,7 +14729,7 @@ mod wire_v2_tests {
             assert!(!finish_connected_send(&mut state, &mut queues, kind,
                 None, 1_000_000_000, &bytes, &[], Dscp::Af21, 0, None));
             state.promote_tu(1472, 1_000_000_001); // same operation as receipt of the outstanding probe
-            assert_eq!(state.current_tu, 1204);
+            assert_eq!(state.current_tu, 512); // immutable pending datagram keeps the initial safe TU
             assert_eq!(state.deferred_tu, Some(1472));
             let pending = state.pending_send.take().unwrap();
             assert_eq!(pending.bytes.len(), state.current_tu as usize);
@@ -15488,6 +15928,72 @@ mod p4_interleave_tests {
         assert_eq!(s.queues[0].slipstream_info.follower_packets, 1);
         assert!(s.queues[0].slipstream_info.follower_starts_tiny_whole_or_packed >= 17);
         assert_eq!(s.queues[0].slipstream_info.max_concurrent_started_messages, 2);
+    }
+    // RESEARCH adaptive units: while the initial TU assessment is unresolved, a
+    // 200 KB root exceeds the 113920-byte prefix cap and start_message segments it.
+    // Interleave admission must classify it as segmented (W1 only), not ordinary.
+    #[test]
+    fn adaptive_unresolved_medium_head_is_not_interleaved_as_ordinary() {
+        for unresolved in [true, false] {
+            let mut s = scheduler();
+            s.queues[0].interleave_width = 2;
+            s.set_tu_unresolved(unresolved);
+            assert!(s.submit_messages(0, vec![vec![7; 28560], vec![8; 200_000], vec![9; 5712]]).is_empty());
+            let (mut medium_parked, mut segment_seen) = (false, false);
+            for seq in 0..1000 {
+                if !s.has_unsent_data() { break; }
+                let p = packet(&mut s, seq, 1449);
+                if let Some((WireFrame::Fec { segment: Some(seg), .. }, _)) = read_frame(&p) {
+                    assert_eq!(seg.total, 200_000);
+                    segment_seen = true;
+                }
+                let q = &s.queues[0];
+                let segmented = |g: Option<&SegmentedSend>, f: Option<&FecSendSlot>| g.is_some() || f.is_some_and(|f| f.segment.is_some());
+                for c in &q.interleave_parked {
+                    assert!(!segmented(c.segmented_send.as_ref(), c.fec_send_slot.as_ref()), "unresolved={unresolved} seq={seq}: segmented root parked");
+                    medium_parked |= c.fec_send_slot.as_ref().is_some_and(|f| f.message.len() == 200_000);
+                }
+                assert!(q.interleave_parked.is_empty() || !segmented(q.segmented_send.as_ref(), q.fec_send_slot.as_ref()),
+                    "unresolved={unresolved} seq={seq}: segmented root admitted beside a parked peer");
+                assert!(q.interleave_source_bytes() <= q.current_byte_capacity() as usize);
+            }
+            assert!(!s.has_unsent_data(), "unresolved={unresolved}");
+            assert_eq!(segment_seen, unresolved);
+            assert_eq!(medium_parked, !unresolved, "settled 200 KB stays an ordinary interleaved message");
+        }
+    }
+    // Same classification for the slipstream following lane: the unit copy is charged
+    // inside current_byte_capacity (tight case), and the start is labelled segmented.
+    #[test]
+    fn adaptive_unresolved_medium_follower_charges_unit_copy_and_is_labelled_segmented() {
+        for (unresolved, tight) in [(true, true), (false, true), (true, false), (false, false)] {
+            let mut s = slip_scheduler();
+            if tight {
+                // head 100000 + follower 200000 fits; + its 200000 unit copy does not.
+                s.queues[0].min_queue_size_bytes = 400_000;
+                s.queues[0].max_queue_size_bytes = 400_000;
+            }
+            s.set_tu_unresolved(unresolved);
+            assert!(s.submit_messages(0, vec![vec![7; 100_000], vec![8; 200_000]]).is_empty());
+            for seq in 0..1000 {
+                if !s.has_unsent_data() { break; }
+                slip_packet(&mut s, seq, 1449);
+                let q = &s.queues[0];
+                assert!(q.interleave_source_bytes() <= q.current_byte_capacity() as usize,
+                    "unresolved={unresolved} tight={tight} seq={seq}: {} > {}", q.interleave_source_bytes(), q.current_byte_capacity());
+            }
+            let q = &s.queues[0];
+            assert!(!s.has_unsent_data(), "unresolved={unresolved} tight={tight}");
+            assert!(q.slipstream_info.heads_eligible >= 1);
+            let i = &q.slipstream_info;
+            let started = (i.follower_starts_ordinary_fec, i.follower_starts_segmented_giant);
+            let expected = match (unresolved, tight) {
+                (true, true) => (0, 0),   // refused: waits for its own head turn
+                (true, false) => (0, 1),  // admitted, and it really is segmented
+                (false, _) => (1, 0),     // settled 2 MiB policy unchanged
+            };
+            assert_eq!(started, expected, "unresolved={unresolved} tight={tight}");
+        }
     }
     // Mixed live bounds are a one-second dynamic target, not a 64 MiB
     // source allowance. Keep both public submission and owner admission covered.
@@ -17175,10 +17681,174 @@ mod budget_base_slot_tests {
         b.fec_on_packet_finalized(80,true);assert_eq!(owner.lock().unwrap().known_losses,1,"repair loss replaced1:1 while open");
         assert!(emit(&mut b,&mut seq,PAYLOAD-100));
         let new=b.fec_send_slot.as_ref().unwrap().repair_accounting.budget.clone().unwrap();assert!(std::sync::Arc::ptr_eq(&budget,&new));
-        assert_eq!(new.lock().unwrap().limit,allowance);assert_eq!(new.lock().unwrap().target_plans[0].proactive,original[0].proactive);
+        assert_eq!(new.lock().unwrap().limit,allowance);
+        // The live plan is the CURRENT K's plan from the same frozen root admission; the
+        // owner evidence keeps the original first-admission K/proactive/draw.
+        let live=new.lock().unwrap().target_plans.clone();assert_eq!(live,current_target_oracle(&b));assert_eq!(live[0].mix_draw,original[0].mix_draw);
+        let row=*owner.lock().unwrap();assert_eq!((row.k,row.proactive),(before.k,before.proactive));
         assert_eq!(owner.lock().unwrap().mix_draw,before.mix_draw);assert_eq!(owner.lock().unwrap().root_ordinal,before.root_ordinal);assert_eq!(owner.lock().unwrap().restarts,1);
         let a=b.fec_adaptive.clone().unwrap();b.fec_send_slot.as_mut().unwrap().refresh_plan(&a);assert_eq!(owner.lock().unwrap().known_losses,1);
         drain(&mut b,&mut seq,PAYLOAD-100,false);assert!(owner.lock().unwrap().sealed);assert_eq!(info(&b).roots,1);
+    }
+    /// Current-layout target plans from the SAME frozen root draw/risk and the immutable extent.
+    fn current_target_oracle(b:&UnreliableSendBuffer)->Vec<crate::target_validation::Plan> {
+        let f=b.fec_send_slot.as_ref().unwrap();
+        let seg=f.repair_accounting.budget.as_ref().unwrap().lock().unwrap();
+        let (draw,risk)={let r=seg.root.lock().unwrap();(r.target_draw,r.target_risk)};
+        let layout=crate::fec::MessageLayout::new(f.message.len(),f.block_bytes).unwrap();
+        let (offset,total)=f.segment.map_or((0,f.message.len() as u32),|s|(s.offset,s.total));
+        (0..layout.groups).map(|g|crate::target_validation::plan_at_unit_admission(layout.group(g).1 as u32,b.fec_adaptive.as_ref().unwrap().target_selector(),
+            crate::target_validation::configuration().0,draw,risk,offset,f.message.len() as u32,total).unwrap()).collect()
+    }
+    fn target_budget(b:&UnreliableSendBuffer)->std::sync::Arc<std::sync::Mutex<BudgetSegment>> {b.fec_send_slot.as_ref().unwrap().repair_accounting.budget.clone().unwrap()}
+    fn target_lrs(b:&UnreliableSendBuffer)->(u32,u32,u64) {let g=target_budget(b);let g=g.lock().unwrap();(g.limit,g.reserved,g.emitted)}
+    fn active_parity(b:&UnreliableSendBuffer)->u32 {let f=b.fec_send_slot.as_ref().unwrap();f.n-f.k}
+    fn proactive_sum(p:&[crate::target_validation::Plan])->u32 {p.iter().map(|p|p.proactive).sum()}
+    const SHRINK_1153:usize=1153+STP_FEC_FRAGMENT_HEADER_SIZE;
+    const SHRINK_700:usize=700+STP_FEC_FRAGMENT_HEADER_SIZE;
+    const SHRINK_461:usize=461+STP_FEC_FRAGMENT_HEADER_SIZE;
+
+    /// Ordinary 1 MiB root, width 1153 (K910) -> 461 (K2275). The restart must
+    /// plan the CURRENT K from the frozen root admission (no live risk, no fresh
+    /// admission/owner/credits), and charge its full proactive count in the same
+    /// non-refunding allowance. Selector 1 under frozen policy: 133 -> 302.
+    #[test]
+    fn target_tu_shrink_replans_current_k_from_frozen_root_admission() {
+        for selector in [1,2] {
+            let mut b=target_buffer(selector);b.submit_messages(vec![vec![7;1<<20]]);let mut seq=0;
+            assert!(emit(&mut b,&mut seq,SHRINK_1153));
+            let budget=target_budget(&b);let root=budget.lock().unwrap().root.clone();let owner=budget.lock().unwrap().target_owner.clone().unwrap();
+            assert_eq!((b.fec_send_slot.as_ref().unwrap().k,b.fec_send_slot.as_ref().unwrap().block_bytes),(910,1153));
+            let old=current_target_oracle(&b);assert_eq!(budget.lock().unwrap().target_plans,old);
+            let p_old=proactive_sum(&old);assert_eq!(active_parity(&b),p_old);
+            let (limit,reserved,_)=target_lrs(&b);assert_eq!(reserved,p_old);
+            let (draw,risk_bits)={let r=root.lock().unwrap();(r.target_draw,(r.target_risk.risk.to_bits(),r.target_risk.p_eff.to_bits(),r.target_risk.p_base.to_bits()))};
+            let before=*owner.lock().unwrap();assert_eq!(info(&b).source_symbols,910);
+            // A later live-risk change cannot reach the frozen admission input.
+            crate::target_validation::risk_rate(&b.target_state,80_000_000,100_000_000,'G',100_000_000);
+            assert!(emit(&mut b,&mut seq,SHRINK_461));
+            assert!(std::sync::Arc::ptr_eq(&budget,&target_budget(&b)));assert!(std::sync::Arc::ptr_eq(&root,&budget.lock().unwrap().root));
+            assert_eq!((b.fec_send_slot.as_ref().unwrap().k,b.fec_send_slot.as_ref().unwrap().block_bytes),(2275,461));
+            let new=current_target_oracle(&b);assert_eq!(budget.lock().unwrap().target_plans,new,"selector {selector}: current-K plan, not the old K910 plan");
+            let p_new=proactive_sum(&new);
+            assert_eq!(active_parity(&b),p_new);assert_eq!(target_lrs(&b),(limit,p_old+p_new,0),"full new proactive charged, nothing refunded or reset");
+            {let r=root.lock().unwrap();assert_eq!((r.target_draw,(r.target_risk.risk.to_bits(),r.target_risk.p_eff.to_bits(),r.target_risk.p_base.to_bits())),(draw,risk_bits));
+             assert_eq!(r.target_source_symbols,910,"first-layout source credits only");assert_eq!(r.target_owners.len(),1);}
+            assert_eq!((info(&b).roots,info(&b).source_symbols),(1,910));
+            let row=*owner.lock().unwrap();
+            assert_eq!((row.k,row.current_k,row.restarts,row.proactive,row.planned_repairs),(910,2275,1,before.proactive,p_old+p_new));
+            assert_eq!((row.mix_draw,row.lower,row.upper,row.w_bits,row.root_ordinal,row.unit_len,row.root_total),(before.mix_draw,before.lower,before.upper,before.w_bits,before.root_ordinal,before.unit_len,before.root_total));
+            assert_eq!(before.proactive,p_old);
+            if selector==1 {assert_eq!((p_old,p_new,p_old+p_new),(133,302,435));}
+            let a=b.fec_adaptive.clone().unwrap();
+            for _ in 0..3 {b.fec_send_slot.as_mut().unwrap().refresh_plan(&a);assert_eq!(active_parity(&b),p_new);assert_eq!(target_lrs(&b).1,p_old+p_new,"repeated refresh flat");}
+            drain(&mut b,&mut seq,SHRINK_461,false);assert!(owner.lock().unwrap().sealed);assert_eq!(info(&b).roots,1);
+        }
+    }
+    /// Repeated shrink 1153 -> 700 -> 461: each layout plans its own K; cumulative reservation.
+    #[test]
+    fn target_tu_shrink_repeated_restarts_plan_each_current_k() {
+        for selector in [1,2] {
+            let mut b=target_buffer(selector);b.submit_messages(vec![vec![7;1<<20]]);let mut seq=0;
+            let (mut cumulative,mut plans)=(0,Vec::new());
+            for payload in [SHRINK_1153,SHRINK_700,SHRINK_461] {
+                assert!(emit(&mut b,&mut seq,payload));
+                let oracle=current_target_oracle(&b);let p=proactive_sum(&oracle);let live=target_budget(&b).lock().unwrap().target_plans.clone();assert_eq!(live,oracle);
+                cumulative+=p;plans.push((b.fec_send_slot.as_ref().unwrap().k,p));
+                assert_eq!(active_parity(&b),p);assert_eq!(target_lrs(&b).1,cumulative);
+            }
+            if selector==1 {assert_eq!(plans,vec![(910,133),(1498,207),(2275,302)]);assert_eq!(cumulative,642);}
+            let owner=target_budget(&b).lock().unwrap().target_owner.clone().unwrap();
+            let row=*owner.lock().unwrap();assert_eq!((row.k,row.current_k,row.restarts),(910,2275,2));
+            assert_eq!(info(&b).source_symbols,910);
+            drain(&mut b,&mut seq,SHRINK_461,false);assert!(owner.lock().unwrap().sealed);
+        }
+    }
+    /// Known old loss plus spent parity: the old reservation (proactive + 1 loss) and its
+    /// emitted parity stay charged; the restart admits the new proactive; the carried loss is
+    /// demanded at refresh exactly once; a new loss adds 1:1; late old-id feedback is ignored.
+    #[test]
+    fn target_tu_shrink_carries_known_loss_once_without_refund() {
+        for selector in [1,2] {
+            let mut b=target_buffer(selector);b.submit_messages(vec![vec![7;1<<20]]);let mut seq=0;
+            for _ in 0..912 {assert!(emit(&mut b,&mut seq,SHRINK_1153));}
+            let p_old=proactive_sum(&current_target_oracle(&b));
+            assert_eq!(target_budget(&b).lock().unwrap().target_tail_added,0,"example assumes no old tail grant");
+            b.fec_on_packet_finalized(0,true);
+            let (limit,old_reserved,emitted)=target_lrs(&b);assert_eq!((old_reserved,emitted),(p_old+1,2));
+            let budget=target_budget(&b);let owner=budget.lock().unwrap().target_owner.clone().unwrap();
+            assert!(emit(&mut b,&mut seq,SHRINK_461));let restart_seq=seq-1;
+            let p_new=proactive_sum(&current_target_oracle(&b));
+            assert_eq!(budget.lock().unwrap().target_prior_losses,1);
+            assert_eq!(active_parity(&b),p_new);assert_eq!(target_lrs(&b),(limit,old_reserved+p_new,2));
+            let a=b.fec_adaptive.clone().unwrap();b.fec_send_slot.as_mut().unwrap().refresh_plan(&a);
+            assert_eq!(active_parity(&b),p_new+1);assert_eq!(target_lrs(&b).1,old_reserved+p_new+1);
+            for _ in 0..3 {b.fec_send_slot.as_mut().unwrap().refresh_plan(&a);assert_eq!(active_parity(&b),p_new+1);assert_eq!(target_lrs(&b).1,old_reserved+p_new+1);}
+            b.fec_on_packet_finalized(5,true);
+            assert_eq!(active_parity(&b),p_new+1,"abandoned old-id late feedback ignored");assert_eq!(owner.lock().unwrap().known_losses,1);
+            b.fec_on_packet_finalized(restart_seq,true);
+            assert_eq!(active_parity(&b),p_new+2);assert_eq!(target_lrs(&b).1,old_reserved+p_new+2);assert_eq!(owner.lock().unwrap().known_losses,2);
+            for _ in 0..3 {b.fec_send_slot.as_mut().unwrap().refresh_plan(&a);assert_eq!(active_parity(&b),p_new+2);}
+            if selector==1 {assert_eq!((old_reserved,old_reserved+p_new,old_reserved+p_new+1,old_reserved+p_new+2),(134,436,437,438));}
+            drain(&mut b,&mut seq,SHRINK_461,false);assert!(owner.lock().unwrap().sealed);
+        }
+    }
+    /// One loss before each of two restarts: prior losses are 2 (each known once), not 3.
+    #[test]
+    fn target_tu_shrink_prior_losses_counted_once_per_restart() {
+        let mut b=target_buffer(1);b.submit_messages(vec![vec![7;1<<20]]);let mut seq=0;
+        assert!(emit(&mut b,&mut seq,SHRINK_1153));b.fec_on_packet_finalized(0,true);
+        assert!(emit(&mut b,&mut seq,SHRINK_700));b.fec_on_packet_finalized(1,true);
+        assert!(emit(&mut b,&mut seq,SHRINK_461));
+        let budget=target_budget(&b);assert_eq!(budget.lock().unwrap().target_prior_losses,2);
+        let a=b.fec_adaptive.clone().unwrap();b.fec_send_slot.as_mut().unwrap().refresh_plan(&a);
+        let p=proactive_sum(&current_target_oracle(&b));assert_eq!(active_parity(&b),p+2);
+        let owner=budget.lock().unwrap().target_owner.clone().unwrap();assert_eq!(owner.lock().unwrap().known_losses,2);
+        drain(&mut b,&mut seq,SHRINK_461,false);assert_eq!(owner.lock().unwrap().known_losses,2);
+    }
+    /// Segmented unit at a nonzero offset: unchanged extent and share, stable derived draw
+    /// (the UNIT-offset domain applied once to the frozen root draw, never re-hashed).
+    #[test]
+    fn target_tu_shrink_segmented_nonzero_offset_keeps_extent_share_and_draw() {
+        let mut b=target_buffer(1);b.submit_messages(vec![vec![7;3<<20]]);let mut seq=0;
+        assert!(emit(&mut b,&mut seq,PAYLOAD));let first=b.send_package_id;
+        while b.send_package_id==first {assert!(emit(&mut b,&mut seq,PAYLOAD));}
+        let seg=b.fec_send_slot.as_ref().unwrap().segment.unwrap();assert_ne!(seg.offset,0);
+        let len=b.fec_send_slot.as_ref().unwrap().message.len();
+        let budget=target_budget(&b);let owner=budget.lock().unwrap().target_owner.clone().unwrap();
+        let root_draw=budget.lock().unwrap().root.lock().unwrap().target_draw;
+        let old=current_target_oracle(&b);assert_eq!(budget.lock().unwrap().target_plans,old);
+        let unit_draw=crate::target_validation::draw(root_draw^(0x554e495400000000|u64::from(seg.offset)));
+        assert_eq!(old[0].mix_draw,unit_draw);
+        let (limit,reserved,_)=target_lrs(&b);let credits=info(&b).source_symbols;let before=*owner.lock().unwrap();
+        crate::target_validation::risk_rate(&b.target_state,80_000_000,100_000_000,'G',100_000_000);
+        assert!(emit(&mut b,&mut seq,1162));
+        let f=b.fec_send_slot.as_ref().unwrap();let now=f.segment.unwrap();
+        assert_eq!((now.root,now.offset,now.total,f.message.len()),(seg.root,seg.offset,seg.total,len),"immutable extent");
+        assert_ne!(f.k,before.k);
+        let new=current_target_oracle(&b);assert_eq!(budget.lock().unwrap().target_plans,new);
+        assert_eq!(new[0].mix_draw,unit_draw,"stable derived draw, no double hash");
+        assert_eq!(target_lrs(&b),(limit,reserved+proactive_sum(&new),0));assert_eq!(info(&b).source_symbols,credits);
+        let row=*owner.lock().unwrap();assert_eq!((row.mix_draw,row.segment_offset,row.unit_len,row.root_total,row.k,row.proactive,row.restarts),(before.mix_draw,before.segment_offset,before.unit_len,before.root_total,before.k,before.proactive,1));
+        drain(&mut b,&mut seq,1162,false);assert_eq!(info(&b).roots,1);
+    }
+    /// Research cap 15/25: the original K910 limit (136/227) is never reset; the old
+    /// reservation stays charged so the restart can add only what the limit has left.
+    #[test]
+    fn target_tu_shrink_cap_limit_original_k_never_reset() {
+        for (cap,expect_limit,expect_new) in [(15,136,3),(25,227,94)] {
+            let mut b=target_buffer(1);b.fec_adaptive.as_mut().unwrap().set_repair_cap_for_test(cap);
+            b.submit_messages(vec![vec![7;1<<20]]);let mut seq=0;
+            assert!(emit(&mut b,&mut seq,SHRINK_1153));
+            let (limit,old_reserved,_)=target_lrs(&b);assert_eq!(limit,expect_limit);
+            let p_old=proactive_sum(&current_target_oracle(&b));assert_eq!(old_reserved,p_old.min(limit));
+            assert!(emit(&mut b,&mut seq,SHRINK_461));let budget=target_budget(&b);
+            let p_new=proactive_sum(&current_target_oracle(&b));
+            let (l,r,e)=target_lrs(&b);assert_eq!(l,limit);assert_eq!(r,(old_reserved+p_new).min(limit));
+            assert_eq!(active_parity(&b),r-old_reserved);assert!(e<=r as u64&&r<=l);
+            assert_eq!(active_parity(&b),expect_new,"cap {cap}");
+            drain(&mut b,&mut seq,SHRINK_461,false);let g=budget.lock().unwrap();assert!(g.emitted<=g.reserved as u64&&g.reserved<=g.limit&&g.limit==limit);
+        }
     }
     #[test]
     fn budget_base_small_integer_caps_plain_and_seal_all_losses() {
@@ -17994,11 +18664,10 @@ mod systematic_rx_tests {
                 if let Some((decoded, mut lease)) = rx.add(layout, id as u32, data) {
                     assert_eq!(&decoded, &message[offset..offset + len]);
                     assert!(budget.used() >= decoded.capacity() + root.bytes_received() as usize);
-                    // The real transport retains the unit lease through copying
-                    // into the separately charged root; no uncharged handoff.
+                    // The real transport hands the decoded Vec and its lease
+                    // (shrunk after the decoder is gone) to the root: no copy.
                     lease.shrink(decoded.capacity());
-                    result = root.finish_segment(segment, &decoded);
-                    drop(lease);
+                    result = root.finish_segment(segment, decoded, lease);
                 }
             }
         }
@@ -18423,12 +19092,39 @@ mod frozen_candidate_transport_tests {
         let expected=crate::target_validation::plan_at_admission(71,2,"b20r20",crate::target_validation::draw(1),admission).unwrap();
         assert!(expected.proactive>0);
         q.fec_adaptive=Some(a);
+        // Precondition (adaptive exposure): a settled TU assessment, so this K=71
+        // root is one ordinary root. While unresolved, the one-flight exposure
+        // cap (no RTT, E=0) would split it into minimum-train units instead.
+        q.set_tu_unresolved(false);
         let mut payload=vec![0;1449];let block=payload.len()-STP_FEC_FRAGMENT_HEADER_SIZE;
         q.submit_messages(0,vec![vec![7;block*71]]);
         q.fec_prepare_packet(0);assert_eq!(q.fill_packet(&mut payload),payload.len());
         let f=q.queues[0].fec_send_slot.as_ref().unwrap();
         assert_eq!(f.k,71);assert_eq!(f.n-f.k,expected.proactive);
         assert_eq!(q.queues[0].budget_sink.lock().unwrap().planned_repairs,expected.proactive as u64);
+    }
+    #[test]
+    fn unresolved_exposure_sizes_units_from_the_frozen_root_risk() {
+        let mut q=SendQueues::new(1,(1_000_000,1_000_000,4_000_000));
+        let mut state=connected();prepare_connected_send_tick(&mut state,&mut q,1);
+        crate::target_validation::risk_rate(&state.target_state,80_000_000,100_000_000,'G',100_000_000);
+        q.fec_adaptive=Some(crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC,1));
+        assert!(q.queues[0].tu_unresolved);
+        let mut payload=vec![0;1449];let total=(payload.len()-STP_FEC_FRAGMENT_HEADER_SIZE)*71;
+        q.submit_messages(0,vec![vec![7;total]]);
+        q.fec_prepare_packet(0);assert_eq!(q.fill_packet(&mut payload),payload.len());
+        let queue=&q.queues[0];
+        let f=queue.fec_send_slot.as_ref().unwrap();
+        assert_eq!((queue.budget_sink.lock().unwrap().roots,queue.target_root_sequence),(1,1),"one admission/draw");
+        let risk=queue.budget_root.as_ref().unwrap().lock().unwrap().target_risk;
+        let profile=crate::target_validation::configuration().0;
+        let upper=|k:u32| crate::target_validation::adaptive_unit_packet_upper(k,profile,risk,total as u32).ok().map(u64::from);
+        let w=payload.len()-STP_SEGMENT_FEC_HEADER_SIZE;
+        let cap=adaptive_exposure_cap(queue.exposure,w,upper);
+        assert!(f.segment.is_some(),"unresolved: the exposure cap splits the K=71 root");
+        assert_eq!(f.message.len(),adaptive_unit_len(total,cap));
+        assert!(f.k>=2);
+        assert!(f.n as u64<=upper(f.k as u32).unwrap(),"actual initial unit train within the sized upper: n={} k={}",f.n,f.k);
     }
     #[test]
     fn reconnect_rebinds_live_roots_and_does_not_inherit_peer_risk() {

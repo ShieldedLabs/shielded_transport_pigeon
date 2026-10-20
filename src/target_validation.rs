@@ -8,6 +8,17 @@ pub const FORECAST_SHA256: &str = "5e5081cd1ebdc9ddb78391fdb8f7eaaabdb74586bda86
 pub const MIX_SEED: u64 = 0x5354505f544d0001;
 pub const EVIDENCE_CAPACITY: usize = 4096;
 pub const MAX_PLAN_K: u32 = 32000;
+// For n disjoint units, sum ceil(len/width) <= n + floor((total-n)/445).
+// This is monotone in n, whose maximum is floor(total/446), and is attained
+// by n-1 minimum-length units plus the remainder. Include whole small roots.
+const fn adaptive_root_source_upper(total:usize)->u64 {
+    if total==0 {return 0;}
+    let units=total/crate::stp::ADAPTIVE_MIN_UNIT_LEN;
+    let units=if units==0 {1}else{units};
+    (units+(total-units)/crate::stp::FEC_MIN_BLOCK_BYTES) as u64
+}
+// Tail exposure only: the ordinary per-codec/admission limit is unchanged.
+const MAX_TAIL_PLAN_K: u32 = adaptive_root_source_upper(crate::stp::MAX_JUMBOGRAM_LEN) as u32;
 static CONFIG: OnceLock<(&'static str, f64, f64, u64)> = OnceLock::new();
 
 pub(crate) fn initialize(selector:u32, profile:Option<&str>, cost:u32, cap:u32, empirical:u32) -> Result<(),String> {
@@ -294,10 +305,18 @@ pub(crate) struct TailPlan {pub risk:f64,pub k:u32,pub added:u32}
 fn tail_from(k:u32,remaining:u32,selector:u32,profile:&str,mix_draw:u64,s:RiskSnapshot,rtt_ns:u64,cfg:Option<RiskConfig>,tail:Option<f64>,root_base:f64) -> Result<TailPlan,String> {
     let Some(t)=tail else {return Ok(TailPlan::default())};
     let c=cfg.ok_or("tail requires risk")?;
+    if k>MAX_TAIL_PLAN_K || !t.is_finite() || t<=0. || !root_base.is_finite() || !(0. ..1.).contains(&root_base) {
+        return Err("unsupported tail exposure/root base".into());
+    }
     let a=if root_base>0. {admission_from(s,Some(RiskConfig{phi:c.phi.max(root_base),..c}),root_base)}
         else {admission_from(s,Some(c),tv_override().map_or(0.005,|o|o.0))};
     let kt=((s.rate as f64/1_000_000.)*(rtt_ns as f64/1e9)*t).ceil().min(k as f64) as u32;
-    let reserve=if kt==0 {0}else{plan_for_risk(kt,selector,profile,draw(mix_draw^0x5441494c5f525356),a,Some(c))?.proactive};
+    let tail_draw=draw(mix_draw^0x5441494c5f525356);
+    let reserve=if kt==0 {0}else if kt<=MAX_PLAN_K {
+        plan_for_risk(kt,selector,profile,tail_draw,a,Some(c))?.proactive
+    }else {
+        plan_with_policy_max(kt,selector,profile,tail_draw,Some((a.p_eff,c.eps)),tv_override(),MAX_TAIL_PLAN_K)?.proactive
+    };
     Ok(TailPlan{risk:a.risk,k:kt,added:reserve.saturating_sub(remaining)})
 }
 pub(crate) fn tail_plan(state: &RiskState,k:u32,remaining:u32,selector:u32,mix_draw:u64,root_base:f64) -> Result<TailPlan,String> {
@@ -325,6 +344,30 @@ fn delivery(k:u32,r:u32,p:f64) -> f64 {
     mass=1.; for i in mode..n { mass*=(n-i) as f64/(i+1) as f64*p/(1.-p); total+=mass; if i+1<=r {good+=mass;} }
     (good/total).clamp(0.,1.)
 }
+/// Same pooled binomial model for large tail exposures, without traversing the
+/// entire root on each reserve-search step. From the mode, each outward ratio
+/// decreases. In exact arithmetic, omitted mass <= mass*q/(1-q); stop each
+/// direction below EPSILON/4 of the accumulated normalization. Floating-point
+/// recurrence/summation error is additional: this is not a formal probability
+/// certificate. Small plans retain delivery() bit-for-bit.
+fn tail_delivery(k:u32,r:u32,p:f64) -> (f64,u32) {
+    // Called only after k,r are bounded by MAX_TAIL_PLAN_K (<4.9M each).
+    let n=k+r; let mode=(((n+1) as f64*p).floor() as u32).min(n);
+    let mut total=1.; let mut good=if mode<=r {1.}else{0.}; let mut terms=1;
+    let mut mass=1.; let mut i=mode;
+    while i>0 {
+        let q=i as f64/(n-i+1) as f64*(1.-p)/p;
+        if q<1. && mass*q/(1.-q)<=f64::EPSILON*0.25*total {break;}
+        mass*=q; i-=1; terms+=1; total+=mass; if i<=r {good+=mass;}
+    }
+    mass=1.; i=mode;
+    while i<n {
+        let q=(n-i) as f64/(i+1) as f64*p/(1.-p);
+        if q<1. && mass*q/(1.-q)<=f64::EPSILON*0.25*total {break;}
+        mass*=q; i+=1; terms+=1; total+=mass; if i<=r {good+=mass;}
+    }
+    ((good/total).clamp(0.,1.),terms)
+}
 pub fn frozen_plan(k:u32,selector:u32,profile:&str,mix_draw:u64) -> Result<Plan,String> {
     plan_with_loss(k,selector,profile,mix_draw,None)
 }
@@ -335,19 +378,97 @@ pub(crate) fn plan_at_admission(k:u32,selector:u32,profile:&str,mix_draw:u64,a:R
 fn plan_for_risk(k:u32,selector:u32,profile:&str,mix_draw:u64,a:RiskAdmission,cfg:Option<RiskConfig>) -> Result<Plan,String> {
     plan_with_loss(k,selector,profile,mix_draw,cfg.map(|c|(a.p_eff,c.eps)))
 }
-/// Revalidate a captured plan using its admission-time loss, never a live snapshot.
+fn validate_unit_extent(offset:u32,len:u32,total:u32) -> Result<(),String> {
+    if len==0 || total==0 || offset.checked_add(len).is_none_or(|end|end>total) {
+        return Err("invalid immutable unit extent".into());
+    }
+    Ok(())
+}
+/// One codec owns this entire immutable byte range. The caller must ensure that
+/// ranges do not overlap and that retries retain the original extent and admission
+/// inputs (frozen root draw/risk), replanning only the current K -- never the old-K
+/// Plan and never a fresh risk/share/owner admission.
+/// Ordinary whole-message planning is deliberately the exact pre-unit path.
+///
+/// Conditional on each unit meeting its modeled share, the union budget is the
+/// root epsilon even with adaptive future boundaries. SplitMix-derived draws
+/// use the existing pseudorandom-ensemble assumption, not a proof of independent
+/// randomness conditional on every history, nor a Wirehair delivery guarantee.
+pub(crate) fn plan_at_unit_admission(k:u32,selector:u32,profile:&str,root_draw:u64,a:RiskAdmission,unit_offset:u32,unit_len:u32,root_total:u32) -> Result<Plan,String> {
+    validate_unit_extent(unit_offset,unit_len,root_total)?;
+    if unit_len==root_total {return plan_at_admission(k,selector,profile,root_draw,a);}
+    let loss=risk_config().map(|c|(a.p_eff,c.eps)).or_else(||rand_config().map(|_|(a.p_eff,None)));
+    let loss=unit_loss(profile,loss,unit_offset,unit_len,root_total,tv_override())?;
+    // ASCII "UNIT" followed by the immutable u32 start offset. Never use unit
+    // number, current TU, time, completion count, or a changing future layout.
+    let mix_draw=draw(root_draw^(0x554e495400000000|u64::from(unit_offset)));
+    plan_with_loss(k,selector,profile,mix_draw,Some(loss))
+}
+/// Conservative sizing only: frozen root inputs, the smallest possible byte
+/// share, and the deterministic upper reserve. No admission, draw or ZERO band.
+pub(crate) fn adaptive_unit_packet_upper(k:u32,profile:&str,a:RiskAdmission,root_total:u32)->Result<u32,String> {
+    if k==0 || k>MAX_PLAN_K {return Err("unsupported frozen target K/selector".into());}
+    let loss=risk_config().map(|c|(a.p_eff,c.eps)).or_else(||rand_config().map(|_|(a.p_eff,None)));
+    let (p,epsilon)=unit_loss(profile,loss,0,crate::stp::ADAPTIVE_MIN_UNIT_LEN as u32,root_total,tv_override())?;
+    let epsilon=epsilon.ok_or("missing unit epsilon")?;
+    let upper=reserve_upper(|r|delivery(k,r,p),epsilon,MAX_PLAN_K)?;
+    k.checked_add(upper).ok_or_else(||"unit packet bound overflow".into())
+}
+fn reserve_upper(cdf:impl Fn(u32)->f64,target:f64,max_k:u32)->Result<u32,String> {
+    let good=|r|1.-cdf(r)<=target;
+    let mut hi=0;
+    if !good(0) {hi=1;while !good(hi) {hi=hi.checked_mul(2).filter(|v|*v<=max_k).ok_or("unbounded frozen reserve")?;} let mut lo=0;while lo+1<hi {let mid=(lo+hi)/2;if good(mid){hi=mid;}else{lo=mid;}}}
+    Ok(hi)
+}
+fn policy_parameters(profile:&str,policy:Option<(f64,f64,f64)>) -> Result<(f64,f64,f64),String> {
+    match (policy,profile) {(Some(o),_)=>Ok(o),(None,"g4")=>Ok((0.04354000000000002,333.33333333333337,1.)),(None,"b20r20")=>Ok((0.005739999999999967,33.333333333333336,1.)),_=>Err("unknown frozen profile".into())}
+}
+/// Returns frozen design loss and this byte extent's effective epsilon. With
+/// EPS disabled, freeze the maximum source exposure over immutable partitions
+/// with minimum unit length 446 and symbol width 445.
+/// Do not run or cap this exposure at the per-codec planner limit.
+fn unit_loss(profile:&str,loss:Option<(f64,Option<f64>)>,offset:u32,len:u32,total:u32,policy:Option<(f64,f64,f64)>) -> Result<(f64,Option<f64>),String> {
+    validate_unit_extent(offset,len,total)?;
+    let (base,h,e)=policy_parameters(profile,policy)?;
+    let p=loss.map_or(base,|v|v.0);
+    if !p.is_finite() || p<=0. || p>=1. || !h.is_finite() || h<=0. || !e.is_finite() || e<=0. {
+        return Err("invalid unit admission loss/policy".into());
+    }
+    let root_k=adaptive_root_source_upper(total as usize);
+    let root_epsilon=loss.and_then(|v|v.1).unwrap_or_else(||p/(1.+(root_k as f64/h).powf(e)));
+    let epsilon=root_epsilon*(len as f64/total as f64);
+    if !root_epsilon.is_finite() || root_epsilon<=0. || root_epsilon>1. || !epsilon.is_finite() || epsilon<=0. || epsilon>1. {
+        return Err("invalid unit admission epsilon".into());
+    }
+    Ok((p,Some(epsilon)))
+}
+/// Revalidate the original K and actual unit draw using frozen admission loss
+/// and immutable lengths, never current_k, current TU or a live risk snapshot.
+/// Zero lengths retain the legacy evidence format and its exact planning path.
 #[cfg(any(test,feature="research_target_validation"))]
 pub fn plan_from_evidence(r:&OwnerEvidence,profile:&str) -> Result<Plan,String> {
-    plan_with_loss(r.k,r.selector,profile,r.mix_draw,risk_config().map(|c|(r.p_eff,c.eps)).or_else(||rand_config().map(|_|(r.p_eff,None))))
+    let mut loss=risk_config().map(|c|(r.p_eff,c.eps)).or_else(||rand_config().map(|_|(r.p_eff,None)));
+    if r.unit_len!=0 || r.root_total!=0 {
+        validate_unit_extent(r.segment_offset,r.unit_len,r.root_total)?;
+        if r.unit_len!=r.root_total {
+            loss=Some(unit_loss(profile,loss,r.segment_offset,r.unit_len,r.root_total,tv_override())?);
+        }
+    }
+    plan_with_loss(r.k,r.selector,profile,r.mix_draw,loss)
 }
 fn plan_with_loss(k:u32,selector:u32,profile:&str,mix_draw:u64,loss:Option<(f64,Option<f64>)>) -> Result<Plan,String> {
     plan_with_policy(k,selector,profile,mix_draw,loss,tv_override())
 }
 fn plan_with_policy(k:u32,selector:u32,profile:&str,mix_draw:u64,loss:Option<(f64,Option<f64>)>,policy:Option<(f64,f64,f64)>) -> Result<Plan,String> {
-    if k==0 || k>MAX_PLAN_K || !(1..=2).contains(&selector) {return Err("unsupported frozen target K/selector".into());}
-    let (base,h,e)=match (policy,profile) {(Some(o),_)=>o,(None,"g4")=>(0.04354000000000002,333.33333333333337,1.),(None,"b20r20")=>(0.005739999999999967,33.333333333333336,1.),_=>return Err("unknown frozen profile".into())};
+    plan_with_policy_max(k,selector,profile,mix_draw,loss,policy,MAX_PLAN_K)
+}
+fn plan_with_policy_max(k:u32,selector:u32,profile:&str,mix_draw:u64,loss:Option<(f64,Option<f64>)>,policy:Option<(f64,f64,f64)>,max_k:u32) -> Result<Plan,String> {
+    if max_k>MAX_TAIL_PLAN_K || k==0 || k>max_k || !(1..=2).contains(&selector) {return Err("unsupported frozen target K/selector".into());}
+    let (base,h,e)=policy_parameters(profile,policy)?;
     let p=loss.map_or(base,|v|v.0);
     if !p.is_finite() || p<=0. || p>=1. {return Err("invalid admission design loss".into());}
+    let target=loss.and_then(|v|v.1).unwrap_or_else(||p/(1.+(k as f64/h).powf(e)));
+    if !target.is_finite() || target<=0. || target>1. || (max_k>MAX_PLAN_K && target==1.) {return Err("invalid admission epsilon".into());}
     #[cfg(feature="research_target_validation")]
     {
     // p4-cc-calm research: STP_TV_ZERO_MIN_K=K -> no proactive parity for native K >= K (post-seal top-up covers them).
@@ -357,11 +478,9 @@ fn plan_with_policy(k:u32,selector:u32,profile:&str,mix_draw:u64,loss:Option<(f6
     let zxk=*ZERO_MAX_K.get_or_init(|| crate::ship::policy_var("STP_TV_ZERO_MAX_K").ok().map(|v| v.parse::<u32>().expect("STP_TV_ZERO_MAX_K")));
     if zmk.is_some_and(|z| k>=z) && zxk.is_none_or(|m| k<m) {return Ok(Plan{k,proactive:0,lower:0,upper:0,upper_probability:0.,mix_threshold:0,mix_draw});}
     }
-    let target=loss.and_then(|v|v.1).unwrap_or_else(||p/(1.+(k as f64/h).powf(e)));
-    let good=|r| 1.-delivery(k,r,p)<=target;
-    let mut hi=0;
-    if !good(0) {hi=1;while !good(hi) {hi=hi.checked_mul(2).filter(|v|*v<=MAX_PLAN_K).ok_or("unbounded frozen reserve")?;} let mut lo=0;while lo+1<hi {let mid=(lo+hi)/2;if good(mid){hi=mid;}else{lo=mid;}}}
-    let lo=hi.saturating_sub(1); let dlo=delivery(k,lo,p);let dhi=delivery(k,hi,p);
+    let cdf=|r| if k<=MAX_PLAN_K {delivery(k,r,p)}else{tail_delivery(k,r,p).0};
+    let hi=reserve_upper(&cdf,target,max_k)?;
+    let lo=hi.saturating_sub(1); let dlo=cdf(lo);let dhi=cdf(hi);
     let w=if dhi>dlo {((1.-target-dlo)/(dhi-dlo)).clamp(0.,1.)}else{0.};
     // floor(w*2^64). Endpoint 1 is handled separately; never wrap 2^64.
     let threshold=(w*18446744073709551616.).floor() as u64;
@@ -374,6 +493,9 @@ fn plan_with_policy(k:u32,selector:u32,profile:&str,mix_draw:u64,loss:Option<(f6
 pub struct OwnerEvidence {
     pub generation:u64, pub root_id:u64, pub package_id:u64, pub root_ordinal:u64, pub app_tag:[u8;8],
     pub segment_offset:u32, pub selector:u32, pub k:u32, pub current_k:u32, pub groups:u32,
+    // Immutable first-admission bytes; zero/zero denotes legacy evidence. With
+    // frozen policy and p_eff these also freeze the effective epsilon share.
+    pub unit_len:u32, pub root_total:u32,
     pub proactive:u32, pub lower:u32, pub upper:u32, pub w_bits:u64, pub mix_threshold:u64, pub mix_draw:u64,
     pub known_losses:u32, pub planned_repairs:u32, pub sources_emitted:u64, pub repairs_emitted:u64,
     pub started_ns:u64, pub sealed_ns:u64, pub sealed:bool, pub restarts:u32,
@@ -556,6 +678,129 @@ mod tests {
         assert_eq!(duplicate_from(s,Some(c)),dup,"RAND does not trigger duplication");
         let tail=|s|tail_from(704,0,2,"g4",draw(5),s,100_000_000,Some(c),Some(1.),frozen.p_base).unwrap();
         let old=RiskSnapshot{rand:RandState::default(),..s};assert_eq!(tail(s),tail(old),"tail reuses root base, not live RAND");
+    }
+    #[test] fn tail_large_root_keeps_full_three_rtt_exposure() {
+        let c=RiskConfig{src:1,lo:0.9,hi:1.1,lo2:0.9,hi2:1.1,phi:0.1,eps:Some(0.002),step:0,hold:None};
+        let s=RiskSnapshot{rate:5_000_000_000,anchor:6_000_000_000,..Default::default()};
+        let result=tail_from(75_408,0,2,"b20r20",draw(3),s,2_500_000_000,Some(c),Some(3.),0.001);
+        assert!(result.is_ok(),"legal 32 MiB root tail must plan kt=37500, not fail: {result:?}");
+        assert_eq!(result.unwrap().k,37_500);
+    }
+    // Independent full-support reference: materialize every binomial weight,
+    // then normalize/sum in index order, without either production CDF routine
+    // or its truncation. This still shares the binomial recurrence identity.
+    fn full_tail_cdf(k:u32,r:u32,p:f64)->f64 {
+        let n=(k+r) as usize; let m=(((n+1) as f64*p).floor() as usize).min(n);
+        let mut weights=vec![0.;n+1]; weights[m]=1.;
+        for j in (0..m).rev() {weights[j]=weights[j+1]*(j+1) as f64/(n-j) as f64*((1.-p)/p);}
+        for j in m+1..=n {weights[j]=weights[j-1]*(n-j+1) as f64/j as f64*(p/(1.-p));}
+        weights[..=r as usize].iter().sum::<f64>()/weights.iter().sum::<f64>()
+    }
+    fn large_tail_plan(k:u32,p:f64,eps:Option<f64>,selector:u32,d:u64)->Plan {
+        plan_with_policy_max(k,selector,"b20r20",d,Some((p,eps)),None,MAX_TAIL_PLAN_K).unwrap()
+    }
+    #[test] fn tail_large_cdf_full_support_reference_and_quantiles() {
+        let mut worst=0f64;
+        for k in [32_769,37_500,75_000,150_000] {for p in [0.001,0.1] {
+            let mean=k as f64*p/(1.-p); let sd=(k as f64*p).sqrt()/(1.-p);
+            for z in [-6.,-4.,-2.,0.,2.,4.,6.] {
+                let r=(mean+z*sd).max(0.).round() as u32;
+                let (got,terms)=tail_delivery(k,r,p); let want=full_tail_cdf(k,r,p);
+                let error=(got-want).abs(); worst=worst.max(error);
+                assert!(error<2e-13,"K={k} p={p} r={r}: {got} vs {want}, terms={terms}");
+            }
+            for eps in [Some(0.002),None] {
+                let plan=large_tail_plan(k,p,eps,1,u64::MAX);
+                let target=eps.unwrap_or(p/(1.+k as f64/33.333333333333336));
+                // Independent binary search over full-support reference CDFs.
+                let (mut lo,mut hi)=(0,k);
+                while lo+1<hi {let mid=(lo+hi)/2;if 1.-full_tail_cdf(k,mid,p)<=target {hi=mid;}else{lo=mid;}}
+                assert_eq!((plan.lower,plan.upper),(hi-1,hi));
+                let dl=full_tail_cdf(k,hi-1,p);let dh=full_tail_cdf(k,hi,p);
+                let w=((1.-target-dl)/(dh-dl)).clamp(0.,1.);
+                assert!((plan.upper_probability-w).abs()<1e-7,"K={k} p={p} w={} reference={w}",plan.upper_probability);
+                assert_eq!(plan.proactive,hi);
+                let mixed=large_tail_plan(k,p,eps,2,0);
+                assert_eq!((mixed.lower,mixed.upper,mixed.mix_threshold),(plan.lower,plan.upper,plan.mix_threshold));
+                for d in [0,mixed.mix_threshold,mixed.mix_threshold.saturating_sub(1),u64::MAX] {
+                    let q=large_tail_plan(k,p,eps,2,d);
+                    let want=if q.upper_probability==1. || d<q.mix_threshold {q.upper}else{q.lower};
+                    assert_eq!(q.proactive,want,"exact selector-2 threshold rule");
+                }
+            }
+        }}
+        eprintln!("large tail full-support CDF maximum absolute error={worst:e}");
+    }
+    #[test] fn tail_maximum_root_eps_on_off_full_support_precision() {
+        let started=std::time::Instant::now();
+        let k=MAX_TAIL_PLAN_K;
+        for p in [0.001,0.1] {for eps in [Some(0.002),None] {
+            let plan=large_tail_plan(k,p,eps,1,0);
+            let target=eps.unwrap_or(p/(1.+k as f64/33.333333333333336));
+            let lo=full_tail_cdf(k,plan.lower,p);let hi=full_tail_cdf(k,plan.upper,p);
+            assert!(1.-lo>target && 1.-hi<=target,"max-root quantile p={p} EPS={eps:?}");
+            let lo_error=(tail_delivery(k,plan.lower,p).0-lo).abs();
+            let hi_error=(tail_delivery(k,plan.upper,p).0-hi).abs();
+            assert!(lo_error<2e-13 && hi_error<2e-13);
+            let w=((1.-target-lo)/(hi-lo)).clamp(0.,1.);
+            let w_error=(plan.upper_probability-w).abs();
+            assert!(w_error<5e-5,"p={p} EPS={eps:?}: weight error={w_error:e}");
+            eprintln!("max-root p={p} EPS={eps:?} target={target:e} CDF error={:e} weight error={w_error:e}",lo_error.max(hi_error));
+        }}
+        eprintln!("max-root full-support precision workload elapsed={:?}",started.elapsed());
+    }
+    #[test] fn tail_large_root_risk_reserve_subtraction_and_root_clamp() {
+        let c=RiskConfig{src:1,lo:0.9,hi:1.1,lo2:0.9,hi2:1.1,phi:0.1,eps:Some(0.002),step:0,hold:None};
+        let mut previous=0;
+        for (anchor,risk,p) in [(6_000_000_000,0.,0.001),(4_000_000_000,1.,0.1)] {
+            let s=RiskSnapshot{rate:5_000_000_000,anchor,..Default::default()};
+            for selector in [1,2] {
+                let calc=|k,remaining|tail_from(k,remaining,selector,"b20r20",draw(3),s,2_500_000_000,Some(c),Some(3.),0.001).unwrap();
+                let got=calc(75_408,0);
+                assert_eq!((got.k,got.risk),(37_500,risk));
+                let expected=large_tail_plan(37_500,p,Some(0.002),selector,draw(draw(3)^0x5441494c5f525356));
+                assert_eq!(got.added,expected.proactive,"TAIL_RSV draw and EPS unchanged");
+                assert_eq!(calc(75_408,got.added/2).added,got.added-got.added/2);
+                assert_eq!(calc(75_408,got.added).added,0);
+                assert_eq!(calc(75_408,u32::MAX).added,0);
+                assert_eq!(calc(33_333,0).k,33_333,"clamp to root K, never 32000");
+                if selector==1 {assert!(got.added>=previous);previous=got.added;}
+            }
+        }
+        for p in [0.001,0.1] {
+            let mut old=0;
+            for k in [32_769,37_500,75_000,150_000,MAX_TAIL_PLAN_K] {
+                let reserve=large_tail_plan(k,p,Some(0.002),1,0).proactive;
+                assert!(reserve>=old);old=reserve;
+            }
+        }
+    }
+    #[test] fn tail_maximum_root_work_is_bounded_and_bad_inputs_return_errors() {
+        assert_eq!(MAX_TAIL_PLAN_K,4_814_984);
+        let started=std::time::Instant::now(); let mut max_terms=0;
+        // n <= 2*max K, so the maximum binomial standard deviation is sqrt(max K/2).
+        let work_bound=(20.*(MAX_TAIL_PLAN_K as f64/2.).sqrt()).ceil() as u32+2;
+        for p in [0.001,0.1,0.5,0.999] {
+            let (cdf,terms)=tail_delivery(MAX_TAIL_PLAN_K,MAX_TAIL_PLAN_K,p);
+            assert!(cdf.is_finite());assert!(terms<work_bound,"visited {terms} terms, bound={work_bound}");max_terms=max_terms.max(terms);
+        }
+        for p in [0.001,0.1] {assert!(large_tail_plan(MAX_TAIL_PLAN_K,p,Some(0.002),1,0).proactive>0);}
+        let c=RiskConfig{src:1,lo:0.9,hi:1.1,lo2:0.9,hi2:1.1,phi:0.1,eps:Some(0.002),step:0,hold:None};
+        let s=RiskSnapshot{rate:u64::MAX,..Default::default()};
+        let calc=|k,t,b|tail_from(k,0,2,"b20r20",0,s,u64::MAX,Some(c),Some(t),b);
+        assert_eq!(calc(MAX_TAIL_PLAN_K,3.,0.001).unwrap().k,MAX_TAIL_PLAN_K,"extreme finite exposure clamps safely");
+        for k in [MAX_TAIL_PLAN_K+1,u32::MAX] {assert!(calc(k,3.,0.001).is_err());}
+        for t in [f64::NAN,f64::INFINITY,-1.,0.] {assert!(calc(75_408,t,0.001).is_err());}
+        for b in [f64::NAN,f64::INFINITY,-0.1,1.] {assert!(calc(75_408,3.,b).is_err());}
+        for p in [f64::NAN,f64::INFINITY,0.,1.] {
+            assert!(plan_with_policy_max(37_500,1,"b20r20",0,Some((p,Some(0.002))),None,MAX_TAIL_PLAN_K).is_err());
+        }
+        for eps in [f64::NAN,f64::INFINITY,0.,1.] {
+            assert!(plan_with_policy_max(37_500,1,"b20r20",0,Some((0.1,Some(eps))),None,MAX_TAIL_PLAN_K).is_err());
+        }
+        assert!(plan_with_policy_max(u32::MAX,1,"b20r20",0,None,None,u32::MAX).is_err());
+        assert!(frozen_plan(32_001,1,"b20r20",0).is_err(),"ordinary per-unit cap retained");
+        eprintln!("max legal root K={MAX_TAIL_PLAN_K} max CDF terms={max_terms}, workload elapsed={:?}",started.elapsed());
     }
     #[test] fn risk_tail_off_increases_only_and_exposure_clamp() {
         let c=RiskConfig{src:1,lo:0.9,hi:1.1,lo2:0.9,hi2:1.1,phi:0.12,eps:Some(0.001),step:0,hold:None};
@@ -822,5 +1067,231 @@ mod frozen_candidate_tests {
         assert!(!duplicate_now(&calm)); assert!(duplicate_now(&busy));
         assert_eq!(rand_counters(&calm),(0,0,0,1000));
         assert_eq!(rand_counters(&busy).0,5000);
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    const ROOT_EPS:f64=0.002;
+    const POLICY:Option<(f64,f64,f64)>=Some((0.001,100./3.,1.));
+    fn share(offset:u32,len:u32,total:u32)->f64 {
+        unit_loss("b20r20",Some((0.001,Some(ROOT_EPS))),offset,len,total,POLICY).unwrap().1.unwrap()
+    }
+    #[test]
+    fn exposure_upper_matches_exhaustive_small_partitions_and_boundaries() {
+        assert_eq!(adaptive_root_source_upper(0),0);
+        let limit=8*446+445;
+        let mut best=vec![0u64;limit+1];
+        for total in 446..=limit {
+            for len in 446..=total {
+                let rest=total-len;
+                if rest==0 || rest>=446 {
+                    best[total]=best[total].max(best[rest]+len.div_ceil(445) as u64);
+                }
+            }
+            assert_eq!(adaptive_root_source_upper(total),best[total],"all partitions of {total}");
+        }
+        for total in 1..446 {assert_eq!(adaptive_root_source_upper(total),total.div_ceil(445) as u64);}
+        for units in [1usize,2,3,127,256,1000,crate::stp::MAX_JUMBOGRAM_LEN/446] {
+            for remainder in [0,1,444,445] {
+                let total=units*446+remainder;
+                let witness=2*(units-1)+(446+remainder).div_ceil(445);
+                assert_eq!(adaptive_root_source_upper(total),witness as u64);
+            }
+        }
+        assert_eq!(adaptive_root_source_upper(crate::stp::MAX_JUMBOGRAM_LEN),4_814_984);
+    }
+    #[test]
+    fn exposure_minimum_units_eps_off_covers_partition_k() {
+        for total in [892u32,893,1337,1338,1_048_576,33_554_432,1_073_741_824] {
+            let units=total/446;
+            let last=446+total%446;
+            let partition_k=2*(units-1)+last.div_ceil(445);
+            let want=0.001/(1.+partition_k as f64/(100./3.))*(446. /total as f64);
+            let actual=unit_loss("b20r20",Some((0.001,None)),0,446,total,POLICY).unwrap().1.unwrap();
+            assert_eq!(actual,want,"EPS-off must freeze full 446-byte partition exposure: total={total}, K={partition_k}");
+        }
+    }
+    #[test]
+    fn exposure_tail_accepts_minimum_unit_root_above_old_bound() {
+        let total=crate::stp::MAX_JUMBOGRAM_LEN as u32;
+        let units=total/446;
+        let k=2*(units-1)+(446+total%446).div_ceil(445);
+        assert!(k>2_431_754);
+        let c=RiskConfig{src:1,lo:0.9,hi:1.1,lo2:0.9,hi2:1.1,phi:0.1,eps:Some(ROOT_EPS),step:0,hold:None};
+        let s=RiskSnapshot{rate:u64::MAX,..Default::default()};
+        let plan=tail_from(k,0,2,"b20r20",draw(3),s,u64::MAX,Some(c),Some(3.),0.001);
+        assert!(plan.is_ok(),"legal 446-byte-unit root must not hit old tail ceiling: {plan:?}");
+        assert_eq!(plan.unwrap().k,k);
+        assert!(frozen_plan(MAX_PLAN_K+1,1,"b20r20",0).is_err());
+    }
+    fn check_sizing_upper() {
+        for total in [1_048_576,crate::stp::MAX_JUMBOGRAM_LEN as u32] {
+            for p_eff in [0.001,0.05,0.1] {
+                let a=RiskAdmission{p_eff,..Default::default()};
+                for profile in ["g4","b20r20"] {
+                    let mut previous=0;
+                    for k in 2..=256 {
+                        let bound=adaptive_unit_packet_upper(k,profile,a,total).unwrap();
+                        assert!(bound>=previous,"constant-epsilon U(K) must be monotone at K={k}");
+                        previous=bound;
+                        for len in [446,k*445] {for selector in [1,2] {for d in [0,u64::MAX] {
+                            let actual=plan_at_unit_admission(k,selector,profile,d,a,0,len,total).unwrap();
+                            assert!(bound>=k+actual.proactive,"K={k} len={len} total={total}");
+                        }}}
+                    }
+                }
+            }
+        }
+        let a=RiskAdmission{p_eff:0.001,..Default::default()};
+        for k in [0,MAX_PLAN_K+1,u32::MAX] {assert!(adaptive_unit_packet_upper(k,"g4",a,892).is_err());}
+        assert!(adaptive_unit_packet_upper(2,"g4",a,445).is_err());
+        assert!(policy_parameters("unknown",None).is_err());
+    }
+    #[test]
+    fn exposure_sizing_upper_is_monotone_and_dominates_actual_plans() {check_sizing_upper();}
+    #[cfg(feature="research_target_validation")]
+    #[test]
+    fn exposure_sizing_eps_off_and_zero_band() {
+        if std::env::var_os("STP_TARGET_SIZING_CHILD").is_some() {
+            assert!(risk_config().is_none());assert!(rand_config().is_none());
+            check_sizing_upper();
+            let a=RiskAdmission::default();
+            let bound=adaptive_unit_packet_upper(8,"b20r20",a,1_048_576).unwrap();
+            assert!(bound>8,"sizing must ignore ZERO band even in EPS-off mode");
+            assert_eq!(plan_at_unit_admission(8,2,"b20r20",0,a,0,446,1_048_576).unwrap().proactive,0);
+            return;
+        }
+        let output=std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","target_validation::unit_tests::exposure_sizing_eps_off_and_zero_band","--nocapture"])
+            .env("STP_TARGET_SIZING_CHILD","1").env("STP_POLICY_FROZEN","0")
+            .env("STP_TV_P","0.001").env("STP_TV_H","33.333333333333336").env("STP_TV_E","1")
+            .env("STP_TV_ZERO_MIN_K","8").env("STP_TV_ZERO_MAX_K","32")
+            .output().unwrap();
+        assert!(output.status.success(),"{}{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+    }
+    #[test]
+    fn ordinary_unit_preserves_exact_admission_plans() {
+        let a=risk_admission(&RiskState::default());
+        for profile in ["g4","b20r20"] {for k in [1,2,3,8,71,704,4713,MAX_PLAN_K-1,MAX_PLAN_K] {for selector in [1,2] {for d in [0,draw(7),u64::MAX] {
+            assert_eq!(plan_at_unit_admission(k,selector,profile,d,a,0,1_048_576,1_048_576).unwrap(),
+                plan_at_admission(k,selector,profile,d,a).unwrap());
+        }}}}
+    }
+    #[test]
+    fn arbitrary_byte_partitions_conserve_root_epsilon() {
+        for total in [1,1009,1_048_576,33_554_432,u32::MAX] {
+            for seed in 0..32 {
+                let mut offset=0;let mut sum=0.;let mut state=seed+1u64;
+                while offset<total {
+                    state=draw(state);
+                    let limit=(total/17).max(1).min(total-offset);
+                    let len=1+(state%u64::from(limit)) as u32;
+                    let epsilon=share(offset,len,total);
+                    assert_eq!(epsilon,ROOT_EPS*(len as f64/total as f64));
+                    sum+=epsilon;offset+=len;
+                }
+                assert!((sum-ROOT_EPS).abs()<1e-15,"total={total}, seed={seed}, sum={sum}");
+            }
+        }
+    }
+    #[test]
+    fn nonbalanced_megabyte_roots_have_weighted_binomial_plans() {
+        for total in [1_048_576u32,33_554_432] {
+            let mut offset=0;let mut epsilon_sum=0.;let mut units=0;
+            while offset<total {
+                let len=if offset==0 {256*445}else{(total-offset).min(2*1024*1024)};
+                let epsilon=share(offset,len,total);
+                let width=if offset==0 {445}else{1385};
+                let k=1+(len-1)/width;
+                for p in [0.001,0.05,0.1] {
+                    let loss=unit_loss("b20r20",Some((p,Some(ROOT_EPS))),offset,len,total,POLICY).unwrap();
+                    assert_eq!(loss,(p,Some(epsilon)));
+                    let plan=plan_with_policy(k,2,"b20r20",draw(units),Some(loss),POLICY).unwrap();
+                    let miss_lo=1.-delivery(k,plan.lower,p);let miss_hi=1.-delivery(k,plan.upper,p);
+                    let modeled_miss=(1.-plan.upper_probability)*miss_lo+plan.upper_probability*miss_hi;
+                    assert!(miss_hi<=epsilon+1e-14);
+                    assert!((modeled_miss-epsilon).abs()<1e-12,"{total}/{offset}/{p}: {modeled_miss} vs {epsilon}");
+                }
+                epsilon_sum+=epsilon;offset+=len;units+=1;
+            }
+            assert!(units>1);
+            assert!((epsilon_sum-ROOT_EPS).abs()<1e-15);
+            assert!(share(0,256*445,total)<ROOT_EPS/2.);
+        }
+    }
+    #[test]
+    fn eps_off_uses_uncapped_immutable_root_exposure() {
+        for total in [1_048_576u32,33_554_432,u32::MAX] {
+            let units=(total/446).max(1);
+            let root_k=units+(total-units)/445;
+            let root_epsilon=0.05/(1.+root_k as f64/(100./3.));
+            let len=12345;
+            let a=unit_loss("b20r20",Some((0.05,None)),0,len,total,POLICY).unwrap();
+            let b=unit_loss("b20r20",Some((0.05,None)),total-len,len,total,POLICY).unwrap();
+            assert_eq!(a,b);
+            assert_eq!(a,(0.05,Some(root_epsilon*(len as f64/total as f64))));
+            if total==33_554_432 {assert!(root_k>MAX_PLAN_K);}
+        }
+        let base=unit_loss("g4",None,0,100,1000,None).unwrap();
+        assert_eq!(base.0,0.04354000000000002);
+    }
+    #[test]
+    fn segmented_draws_are_offset_bound_across_layout_retries() {
+        let a=risk_admission(&RiskState::default());let root_draw=draw(19);
+        let first=plan_at_unit_admission(256,2,"b20r20",root_draw,a,0,113920,1_048_576).unwrap();
+        let retry=plan_at_unit_admission(83,2,"b20r20",root_draw,a,0,113920,1_048_576).unwrap();
+        let later=plan_at_unit_admission(256,2,"b20r20",root_draw,a,113920,113920,1_048_576).unwrap();
+        assert_eq!(first.mix_draw,draw(root_draw^0x554e495400000000));
+        assert_eq!(first.mix_draw,retry.mix_draw);
+        assert_ne!(first.mix_draw,later.mix_draw);
+        assert_ne!(first.mix_draw,root_draw,"segmented offset zero is not the ordinary domain");
+        assert_ne!(first.mix_draw,draw(root_draw^0x5441494c5f525356),"tail domain remains separate");
+    }
+    #[test]
+    fn root_snapshot_and_original_evidence_survive_later_risk_and_tu() {
+        let state=RiskState::default();
+        risk_rate(&state,80_000_000,100_000_000,'G',100_000_000);
+        let a=risk_admission(&state);let d=draw(29);
+        let original=plan_at_unit_admission(256,2,"b20r20",d,a,0,113920,33_554_432).unwrap();
+        let mut row=OwnerEvidence{k:256,current_k:256,selector:2,segment_offset:0,unit_len:113920,root_total:33_554_432,
+            mix_draw:original.mix_draw,risk:a.risk,p_eff:a.p_eff,..Default::default()};
+        assert_eq!(original,plan_from_evidence(&row,"b20r20").unwrap());
+        for i in 0..5000 {rand_resolved(&state,true,i%3==0);}
+        risk_rate(&state,120_000_000,100_000_000,'G',100_000_000);
+        risk_rtt(&state,200_000_000,100_000_000);
+        let fresh=risk_admission(&state);
+        if risk_config().is_some() {assert!(fresh.p_eff>a.p_eff);}
+        row.current_k=1000;row.restarts=3;
+        assert_eq!(original,plan_from_evidence(&row,"b20r20").unwrap());
+        assert_eq!(original,plan_at_unit_admission(256,2,"b20r20",d,a,0,113920,33_554_432).unwrap());
+        // A nonzero offset must not cause evidence replay to hash the actual draw twice.
+        let later=plan_at_unit_admission(256,2,"b20r20",d,a,113920,113920,33_554_432).unwrap();
+        row.segment_offset=113920;row.mix_draw=later.mix_draw;
+        assert_eq!(later,plan_from_evidence(&row,"b20r20").unwrap());
+        row.unit_len=0;assert!(plan_from_evidence(&row,"b20r20").is_err());
+    }
+    #[test]
+    fn invalid_extents_and_epsilon_return_errors() {
+        let a=risk_admission(&RiskState::default());
+        for (offset,len,total) in [(0,0,0),(0,0,1),(0,1,0),(0,2,1),(1,1,1),(u32::MAX,1,u32::MAX),(u32::MAX-1,3,u32::MAX)] {
+            assert!(plan_at_unit_admission(2,2,"b20r20",0,a,offset,len,total).is_err());
+            assert!(unit_loss("b20r20",Some((0.001,Some(ROOT_EPS))),offset,len,total,POLICY).is_err());
+        }
+        for epsilon in [0.,-0.001,f64::NAN,f64::INFINITY,1.01] {
+            assert!(unit_loss("b20r20",Some((0.001,Some(epsilon))),0,100,1000,POLICY).is_err());
+            assert!(plan_with_policy(2,2,"b20r20",0,Some((0.001,Some(epsilon))),POLICY).is_err());
+        }
+        for p in [0.,-0.001,1.,f64::NAN,f64::INFINITY] {
+            assert!(unit_loss("b20r20",Some((p,Some(ROOT_EPS))),0,100,1000,POLICY).is_err());
+        }
+        for policy in [Some((0.001,0.,1.)),Some((0.001,f64::NAN,1.)),Some((0.001,100.,f64::INFINITY))] {
+            assert!(unit_loss("b20r20",None,0,100,1000,policy).is_err());
+        }
+        assert!(plan_at_unit_admission(0,2,"b20r20",0,a,0,100,1000).is_err());
+        assert!(plan_at_unit_admission(MAX_PLAN_K+1,2,"b20r20",0,a,0,100,1000).is_err());
+        assert!(plan_at_unit_admission(2,0,"b20r20",0,a,0,100,1000).is_err());
+        assert!(plan_with_policy(2,2,"b20r20",0,Some((0.001,None)),Some((0.001,f64::NAN,1.))).is_err());
     }
 }

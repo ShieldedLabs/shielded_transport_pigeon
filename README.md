@@ -40,13 +40,21 @@ Version **0.3.0** replaces the 0.2 application API with a caller-driven pump and
 three SPSC rings. This is a breaking API release. The library does not start
 network or FEC threads. Move the pump to an application-owned thread if desired.
 The package version and wire-profile version are separate. Current main uses
-**wire profile 4**, incompatible with profiles 2 and 3, including the published
-0.3.0 version-2 profile. Both peers must be updated together: mismatched
-handshake declarations are rejected. Profile 4 retains the bitmap ACK and
-445-byte minimum FEC symbol for 512-byte MTU recovery, and adds the exact sampled
-UDP payload size inside the unchanged 152-byte ACK. Known size mismatches are
-rejected before receipt, congestion or MTU feedback is admitted. This is not a
-new package release.
+**wire profile 5** (research, unreleased), incompatible with profiles 2 through 4,
+including the published 0.3.0 version-2 profile; no published package version
+contains it. Both peers must be updated together: mismatched handshake
+declarations are rejected. Profile 5 keeps profile 4's bitmap ACK, 32-byte
+declaration and 445-byte minimum FEC symbol for 512-byte MTU recovery, and the
+exact sampled UDP payload size inside the unchanged 152-byte ACK; known size
+mismatches are rejected before receipt, congestion or MTU feedback is admitted.
+It changes large-message segmentation: the declared 2 MiB maximum is a per-unit
+maximum, and a large message is sent as disjoint immutable coded byte extents
+whose boundaries the sender chooses, not a balanced layout (see PROTOCOL.md).
+Every extent is at least 446 bytes. While the initial TU assessment is
+unresolved, the sender sizes new units from an estimated one-flight exposure
+(pacing rate, measured RTT or unresolved DATA, and a repair-inclusive upper train
+size), at most 113920 bytes. This is a sizing estimate, not a delivery bound.
+This is not a new package release.
 
 ## Application API
 
@@ -117,7 +125,10 @@ implemented on the same public rings; it is not another library API.
 - Peer discovery, authorization and deciding which public keys to trust belong
   to the application. The supported authenticated profiles use Noise IK and
   require the responder's static public key. Developer plaintext is not secure.
-- Directional UDP transmission units start at 1204 bytes. Default-on recovery
+- Directional UDP transmission units start at 512 bytes in profile 5. The first
+  larger trial is 1204; only an exact, fresh, promoted success of that trial
+  permits one prompt 1452 trial that skips just the 500 ms floor. Otherwise,
+  coarse search follows. Default-on recovery
   alternates generic 512-byte and current-TU best-effort padding probes on a
   250 ms schedule, independent of application message sizes or queued work.
   Recent repeated current-TU failures alongside repeated fresh small-packet
@@ -153,9 +164,11 @@ implemented on the same public rings; it is not another library API.
 The 0.3.0 release passed the default and research-feature test suites,
 including encrypted loopback, lifecycle/backpressure and pump-deadline tests.
 The deterministic FEC planning golden hash is unchanged. Tests are not an
-independent interoperability or security audit.
+independent interoperability or security audit. These results predate wire
+profile 5 and do not cover it; this document set reports no profile-5 test or
+performance result.
 
-On a Ryzen 5 5500U Linux host using HPET, three interleaved loopback runs measured
+For 0.3.0, on a Ryzen 5 5500U Linux host using HPET, three interleaved loopback runs measured
 about **309,000 100-byte messages/s** with 8192 in flight and **246 MB/s** for
 1 MiB messages with eight in flight. Each endpoint's pump ran on its own thread.
 These are machine-specific application-payload rates, not WAN guarantees; bulk

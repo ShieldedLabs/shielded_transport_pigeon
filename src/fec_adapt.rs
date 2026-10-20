@@ -710,6 +710,9 @@ impl FecAdaptiveState {
     pub(crate) fn set_empirical_for_test(&mut self,on:bool) {self.empirical_tail=on;}
     pub fn repair_cap_percent(&self) -> u32 { self.repair_cap_percent }
     pub(crate) fn target_selector(&self)->u32 { self.target_validation }
+    /// RESEARCH adaptive exposure E: committed unresolved physical DATA packets
+    /// (read-only view of the span ledger; no second counter).
+    pub(crate) fn unresolved_data_packets(&self) -> u64 { self.span.unresolved_data_packets() }
     #[cfg(test)]
     pub(crate) fn set_target_for_test(&mut self,selector:u32) { self.set_cost_smooth_for_test();self.target_validation=selector; }
 

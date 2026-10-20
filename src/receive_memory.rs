@@ -68,6 +68,17 @@ impl Reservation {
         if !self.budget.acquire(bytes - self.bytes) { return false; }
         self.bytes = bytes; true
     }
+    pub(crate) fn bytes(&self) -> usize { self.bytes }
+    /// Take over a donor lease on the SAME budget without release/reacquire:
+    /// the combined charge never has a gap and needs no new admission. A
+    /// different budget or an overflowing sum refuses and returns the donor intact.
+    pub(crate) fn absorb(&mut self, mut donor: Reservation) -> Result<(), Reservation> {
+        if !Arc::ptr_eq(&self.budget, &donor.budget) { return Err(donor); }
+        let Some(bytes) = self.bytes.checked_add(donor.bytes) else { return Err(donor); };
+        self.bytes = bytes;
+        donor.bytes = 0; // its Drop releases nothing
+        Ok(())
+    }
 }
 impl Drop for Reservation {
     fn drop(&mut self) { self.budget.release(self.bytes); }
@@ -109,6 +120,25 @@ mod tests {
         assert_eq!(peer.worker_peak(), 1);
         let inline = ReceiveMemoryBudget::connection_with_limit(&process, 100).with_worker_limit(0);
         assert!(!inline.acquire_worker());
+    }
+    #[test]
+    fn absorb_moves_same_budget_charge_without_gap_and_refuses_mismatch() {
+        let process = ReceiveMemoryBudget::new(300);
+        let peer = ReceiveMemoryBudget::connection_with_limit(&process, 200);
+        let mut root = peer.reserve(50).unwrap();
+        let donor = peer.reserve(150).unwrap();
+        let (used, peak, process_peak) = (peer.used(), peer.peak(), process.peak());
+        assert!(root.absorb(donor).is_ok());
+        assert_eq!(root.bytes(), 200);
+        // No release/reacquire: counts and peaks unchanged, budget still full.
+        assert_eq!((peer.used(), peer.peak(), process.used(), process.peak()), (used, peak, 200, process_peak));
+        assert!(peer.reserve(1).is_none());
+        let other = ReceiveMemoryBudget::connection_with_limit(&process, 100);
+        let foreign = other.reserve(60).unwrap();
+        let foreign = root.absorb(foreign).unwrap_err();
+        assert_eq!((root.bytes(), foreign.bytes(), peer.used(), other.used(), process.used()), (200, 60, 200, 60, 260));
+        drop(foreign); drop(root);
+        assert_eq!((peer.used(), other.used(), process.used()), (0, 0, 0));
     }
     #[test]
     fn shared_budget_never_overcommits() {

@@ -1,21 +1,26 @@
-# STP wire protocol, version 4
+# STP wire protocol, version 5 (research, unreleased)
 
-This document specifies the incompatible version-4 transport implemented by
-`shielded_transport_pigeon`. It does not change the crate's package version.
+This document specifies the incompatible version-5 transport (immutable
+adaptive coded-unit extents) of `shielded_transport_pigeon`. It does not change
+the crate's package version. Status: unreleased research profile; this document
+states no test, interoperability or performance result.
 All STP framing integers are unsigned little-endian; offsets below are byte
 offsets. Public keys and Noise messages are byte strings with the encodings
 specified by Noise, not little-endian STP integers. One UDP payload is one STP
-packet. There is no compatibility with versions 1, 2 or 3.
+packet. There is no compatibility with versions 1 through 4.
 
 The words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** specify
 requirements for this interoperable wire profile. Statements explicitly labelled
 "this implementation", "local", or "sender policy" describe the shipped Rust
-implementation, not additional peer-negotiated requirements. Wire version 4 is
+implementation, not additional peer-negotiated requirements. Wire version 5 is
 independent of the crate version and the application API. It retains version 3's
-445-byte minimum FEC symbol, bitmap ACK and whole-duplication framing. The
-unchanged 152-byte ACK now includes its sampled nonce's exact UDP payload size.
-Both endpoints MUST reject a mismatched profile; they cannot silently
-reinterpret the old ACK encoding.
+445-byte minimum FEC symbol, bitmap ACK and whole-duplication framing, and
+version 4's 152-byte ACK carrying its sampled nonce's exact UDP payload size.
+Version 5 changes only segmented roots: the declared maximum coded unit is a
+per-unit maximum, not a balanced layout, and kind 6 units are validated as
+immutable extents ("Wirehair symbol and segmentation validation"). The
+declaration stays 32 bytes. Both endpoints MUST reject a mismatched profile;
+they cannot silently reinterpret the old ACK or segmentation encodings.
 
 An independent implementation needs this document, the Noise specification for
 the selected suite, and the exact vendored Wirehair codec pinned below. No Rust
@@ -221,9 +226,9 @@ inbound traffic or ACK-of-ACK as round-trip confirmation.
 
 | Offset | Width | Field | This implementation sends |
 |---|---:|---|---|
-| 0 | 2 | protocol version | 4 |
+| 0 | 2 | protocol version | 5 |
 | 2 | 2 | declaration length, including these four bytes | 32 |
-| 4 | 4 | maximum coded unit / balanced segmentation layout | 2097152 (2 MiB) |
+| 4 | 4 | maximum coded-unit bytes (a per-unit maximum, not a segmentation layout) | 2097152 (2 MiB) |
 | 8 | 4 | Wirehair grouped-codec maximum source blocks per group | 32000 |
 | 12 | 2 | minimum full repair-symbol bytes | 445 |
 | 14 | 2 | maximum Noise ciphertext record bytes | 65535 |
@@ -232,10 +237,10 @@ inbound traffic or ACK-of-ACK as round-trip confirmation.
 | 24 | 4 | maximum previous-key retention, microseconds | 10000000 |
 | 28 | 4 | per-space replay/receipt support capacity, packets | 262144 |
 
-Version 4 of this implementation requires exact agreement on every declared
+Version 5 of this implementation requires exact agreement on every declared
 field except maximum application-message size, which may differ and must be
 in 1..1073741824. In particular it rejects, rather than silently reinterprets,
-a different coded-unit or grouped-codec layout. These are declared profile
+a different maximum coded unit or grouped-codec parameter. These are declared profile
 parameters, not tuning knobs hidden from the peer. A future implementation can
 support additional profiles by explicit validation/selection; it must not use
 its own layout constants to reinterpret a peer's different declaration.
@@ -343,7 +348,9 @@ a plain extent exceeding the declared maximum, or plain u32 extent overflow
 removes the association (the current API labels this `TimedOut`; there is no
 wire reason). Other invalid FEC layouts, symbol lengths or role conflicts are
 skipped. A plain extent above 2 MiB but within the declared maximum fails
-reassembly admission and withholds the ACK. These choices are implementation
+reassembly admission and withholds the ACK. A kind 6 unit that violates the
+extent rules, or overlaps a different already-admitted extent of its root, is
+likewise refused before receipt and withholds the ACK. These choices are implementation
 error policy, not messages a peer must send. Compliant senders MUST respect
 all declared bounds and the consistency rules below.
 
@@ -464,7 +471,7 @@ Receiver rules:
   sees every physical loss.
 
 Both peers must implement these flags. This is an incompatible framing
-extension introduced within version 2's frame-kind byte and retained in version 4;
+extension introduced within version 2's frame-kind byte and retained in versions 4 and 5;
 it adds no header bytes.
 
 Plain fragmented messages and coded units have connection-direction-scoped
@@ -571,16 +578,48 @@ but cannot rebind a retained ID to another role/layout. Deferred completion is
 delivered only for its exact still-live decoder instance and connection
 generation, once; a Done slot is not live.
 
-Version 4 retains the explicitly declared balanced segmentation layout. For
-`total > max_unit`, let `groups = ceil(total / max_unit)` and
-`unit_span = ceil(total / groups)`. Unit offsets must be multiples of
-`unit_span`, below total; `unit_len = min(unit_span, total - unit_offset)`.
-`total <= receiver maximum <= 1 GiB`. The transmitted unit length and offset
-are validated against this **declared** layout, not an undeclared receiver
-constant. Completion requires the entire contiguous root message, once, and
-nonconflicting total/root metadata. A sender's restarted unit uses a fresh
-unit ID, preserving the root and byte range. Changing this layout is a new
-negotiated profile/version, not a local tuning change.
+Version 5 replaces version 4's balanced offset rule with immutable extents. The
+former requirement that kind 6 offsets be multiples of
+`unit_span = ceil(total / ceil(total / max_unit))` with
+`unit_len = min(unit_span, total - unit_offset)` is **no longer normative**, and
+a receiver MUST NOT enforce a global uniform span. A segmented root of `total`
+bytes (`total <= receiver maximum <= 1 GiB`) is covered by disjoint **extents**
+`[offset, offset + len)`, one coded unit each; `unit_offset` is the offset and
+the unit's length `len` is its FEC message length. Every extent MUST satisfy
+(all arithmetic checked):
+
+- `446 <= len < total`. The 446-byte minimum (one byte above the 445-byte
+  minimum symbol) applies to **every** extent, including the one ending at
+  `total`. A root therefore has at most `floor(total / 446)` extents, and only a
+  root of at least 892 bytes can be split. A root that needs no split is an
+  ordinary kind 4 unit.
+- `offset + len <= total`.
+- `len <= 2097152`, the declared per-unit maximum (and the unit remains one
+  codec, so at most 4713 source blocks).
+
+Extents of one root are immutable and pairwise disjoint; boundaries are chosen
+by the sender (policy below) and are not derived from the declaration. The
+receiver keeps a per-root ledger of admitted extents:
+
+- An extent identical in `(offset, len)` to an admitted one is accepted (a
+  restart under a fresh unit ID, or a duplicate).
+- Any other overlap with an admitted extent, including the same offset with a
+  different length, is refused before receipt: the packet's positive receipt is
+  withheld and nothing is bound. Conflicting total/root metadata is discarded
+  as above.
+- The ledger persists, completed extents included, until the root is done. It
+  is charged to the receiver's existing memory accounting and grows only after
+  the larger charge is granted, within the unchanged hard caps; a refused
+  charge binds nothing. The 446-byte minimum bounds the ledger to
+  `floor(total / 446)` entries. This document specifies no exact maximum
+  metadata size.
+- Completion requires every byte of `[0, total)` to be covered by completed
+  extents, once, with nonconflicting total/root metadata. A completed root is
+  not redelivered.
+
+A sender's restarted unit uses a fresh unit ID, preserving its root, offset and
+length. Changing these extent rules is a new negotiated profile/version, not a
+local tuning change.
 
 ## Fixed-size arbitrary-window ACK
 
@@ -740,13 +779,14 @@ Invalid tags elicit neither ACKs nor frame allocation.
 
 The minimum supported recovered UDP TU is **512 bytes**. Its largest symbol
 header leaves `512 - 14 - 16 - 37 = 445` bytes, exactly the declared repair
-minimum. At the unchanged initial TU of 1204, that width is 1137 bytes. Receiver
+minimum. At TU 1204 that width is 1137 bytes; a profile-5 sender starts at TU 512
+(width 445). Receiver
 source-block and memory admission bounds derive from the 445-byte floor, not
 from the initial TU; the maximum 2 MiB unit has at most 4713 source blocks.
 
 TU is directional and measured in **UDP payload bytes**, excluding UDP/IP
-headers. It starts at 1204; there is no explicit MTU frame or negotiated common
-TU. All data receivers MUST accept valid current-profile packets independently
+headers. A profile-5 sender starts at 512 (versions 2-4 started at 1204); there
+is no explicit MTU frame or negotiated common TU. All data receivers MUST accept valid current-profile packets independently
 of their own send TU. The implementation admits non-ACK plaintext down to 482
 bytes and never emits trimmed ordinary data. Local upward discovery searches up
 to 9216 bytes using best-effort (BE) all-`ff` padding probes. Only an exact new
@@ -776,8 +816,8 @@ an unsettled expired bound, coarse search retains
 `max(500 ms, min(30 s, failures² * 250 ms))` backoff; it never slows interior
 refinement. These are issuance deadlines once locally eligible, not ACK-arrival
 guarantees. Both issuance and pump wakeups use the same candidate/deadline plan,
-independent of CC/application occupancy. Success never bypasses the last
-accepted attempt's 500 ms floor.
+independent of CC/application occupancy. Outside the one-time startup exception
+specified below, success never bypasses the last accepted attempt's 500 ms floor.
 Only an **effective** shrink resets the failure count and seeds a bound from
 the old effective TU, not from an unrelated upward probe. During the ten-second
 post-recovery hold, strictly interior candidates below that live failed-size
@@ -833,6 +873,20 @@ Default-on local size-recovery policy:
   from its full shared source under a fresh unit ID if its symbol no longer fits;
   preserve segmented root/offset, and never reopen a sealed root or mutate an
   existing unit's layout. Already-forgotten messages are not made reliable.
+- Startup trial and initial unit assessment (profile-5 sender policy; nothing
+  here is transmitted). A new connection starts at TU 512. Its first generic
+  larger-size trial is 1204, issued at the ordinary first-issuance deadline with
+  no extra delay (startup state Candidate, then Issued when that attempt is
+  issued). Only a fresh, accepted success of that exact 1204 attempt that is
+  promoted allows **one** prompt 1452 attempt once 1204 is effective; it bypasses
+  only the 500 ms accepted-attempt floor (hold, failed-size bounds and every
+  other eligibility rule still apply). Afterwards, and in every other case,
+  ordinary coarse search applies. The initial *assessment* is **unresolved**
+  while the state is Candidate or Issued. It settles once, when the 1204 trial
+  reaches an outcome and any promotion it caused is effective (no larger TU still
+  deferred behind a pending ciphertext or duplication copy); a failed trial, a
+  cancellation, outage entry, or an effective shrink also ends it. Nothing
+  re-arms the assessment for the connection.
 - During outage, either generic probe class also records an outage probe, so its
   fresh positive receipt can satisfy the existing outage-resumption rule without
   postponing independently backed-off current-TU outage probes.
@@ -841,8 +895,14 @@ This is a conservative classifier, not proof of a path failure. Old unconfirmed
 ordinary sends alone cannot trigger idle/drain fallback, but recent repeated
 size-selective loss can. Sustained occasional positive progress at the larger
 size can delay or prevent downshift even under severe size-selective loss.
-A successful small proof does not guarantee future delivery. History overwrite and local backpressure may delay recovery; paths
-below 512 bytes are unsupported. The
+A successful size proof does not guarantee future delivery at that size. The
+one-second minimum B is an evidence-aging floor, not a fallback deadline:
+repeated current-TU attempts must each mature, and the decision still waits for
+a fresh small receipt. A change in size-selective delivery can therefore cause
+an interval of application loss after a valid promotion; starting at 512 does
+not prevent that later failure. Shrink does not retransmit already-forgotten
+unreliable messages. History overwrite and local backpressure may further delay
+recovery; paths below 512 bytes are unsupported. The
 history uses 96 KiB per connected peer on Linux x64, charged in the 608 KiB
 connection-bookkeeping reservation separately from the derived receive-data cap.
 The 32-entry outage ledger and generic RTT/count state add 416 inline bytes on
@@ -893,7 +953,7 @@ is not rate-limited. The initial 391-byte request/94-byte response is not
 large-response reflection; retransmitted responses before confirmation can
 exceed the original request cumulatively. Stateless return-routability retry
 cookies and an aggregate pre-confirmation response budget are **not** part of
-version 4. No current anti-spoofing/strict anti-amplification guarantee is
+versions 4 or 5. No current anti-spoofing/strict anti-amplification guarantee is
 claimed; adding such a handshake exchange requires a separately specified
 compatible mechanism or a new profile/version.
 
@@ -904,12 +964,36 @@ counts, gaps and rate; the clear epoch reveals update cadence, including the
 cross-address correlation and leaks those key bits. ACKs are intentionally
 identifiable by their fixed size, and their cadence exposes receive timing.
 Probe sizes, handshake sizes, DSCP, outage/idle timing and IP/UDP endpoints
-are also observable. Version 4 does not provide traffic-flow confidentiality,
+are also observable. Version 5 does not provide traffic-flow confidentiality,
 constant-rate cover traffic, unlinkable connection identifiers or epoch-age
 jitter. These residual surfaces are deployment threat-model considerations,
 not removed by encrypting/padding message frames.
 
 ## Implementation and verification boundaries
+
+Receiver admission and assembly remain subject to the unchanged memory caps.
+An extent that cannot be charged is refused and its receipt withheld. Completed
+unit buffers transfer into root assembly together with their memory charges;
+assembly does not make a second unit copy. If a contiguous join cannot grow its
+destination buffer, its charged parts remain owned for a later retry. Periodic
+maintenance retries a root before applying that root's inactivity expiry and
+checks the caller's work budget between roots: the first root of each
+maintenance entry is prepaid, so a deadline that already passed still advances
+one root, and every later root first takes a fresh monotonic clock sample.
+Erased incomplete work is never reported complete, and a completed root is never
+redelivered. A single root join remains an indivisible work item; no hard
+wall-clock latency bound is claimed.
+
+The receive budget counts charged allocations (decoders, unit buffers, root
+ledgers and part tables), not process RSS. Each connection's fixed 1024-slot
+reassembly ring is allocated outside that dynamic budget; profile 5's cached
+per-root part sums add about 16 KiB to it on 64-bit targets. Extent and part
+lookups are binary searches; finding and removing the next contiguous part is
+O(1), excluding the copy of its bytes. Inserting a unit in the middle of a
+root's ledger or part table shifts a vector. A peer that
+sends a large root's units in an adversarial order can therefore force O(n²)
+element moves for n <= `floor(total / 446)` extents, within the memory caps. The
+sender's per-root unit plan is updated in O(log n) per unit.
 
 FEC job quotas, slot counts, sender retention, congestion/loss estimators,
 ACK batching cadence and native socket limits are implementation policies,
@@ -1014,6 +1098,59 @@ Give-up and suspension (CUBIC coexistence). State: `ineffective`,
    beta_delay as above and `pending = now`. A delay event rejected by the
    guard adds no strike.
 
+#### Segmented unit selection (profile-5 sender policy)
+
+Local policy; the wire requires only the extent rules above. A root that fits
+the unit cap C is one ordinary kind 4 unit and is not segmented. Let W be the
+current segment symbol width (current TU payload minus the 37-byte kind 6
+header, at least 445). C is:
+
+- **2097152** once the initial TU assessment has settled;
+- **113920** (= 445 * 256) while it is unresolved and the P4 budget base is
+  inactive (no frozen root risk exists);
+- otherwise, while unresolved, the **exposure cap** below.
+
+Exposure cap. Each send tick copies one connection snapshot to every queue: R,
+the last allowed congestion-control pacing rate (0 before the first CC pass);
+T, the mean of ACK-measured RTT samples, absent while none is valid; Q =
+max(1, queues holding unsent work); and E, the committed but unresolved DATA
+packets in the repair span ledger. With
+
+    k0 = max(2, ceil(892 / W)),   k_max = max(k0, floor(113920 / W))
+    B0 = ceil(R × T / Q)  packets  (T valid),   else  B0 = ceil(E / Q)
+    B  = max(B0, U(k0))
+
+C = k × W for the largest k in [k0, k_max] with U(k) <= B; if U(k0) is
+unavailable, C = k0 × W. U(k) is an upper bound on a new unit's initial packet
+train: K = k source packets plus its repairs. With target validation off it is
+`k + min(k, 2)`. With target validation on it is k plus the smallest reserve r
+whose modeled binomial miss probability for K = k at the root's frozen p_eff is
+at most the smallest possible unit share, ε_root × 446 / total (frozen EPS, or
+ε_root from K_up below). No admission, draw or zero band is applied; it is meant to
+be no smaller than a unit's actual initial train. U(k) is unavailable if the frozen risk is
+missing or the computation fails, and such a k does not fit. The search assumes
+U is non-decreasing in k. 113920 remains the largest cap of the unresolved phase.
+B is a one-flight estimate from a mean RTT and the current rate, not a strict
+all-path RTT bound, and U(k) sizes units; neither is a delivery or miss bound.
+A root of at least 892 bytes that may exceed the smallest cap k0 × W freezes its
+single root risk admission, draw and ordinal before the split decision; every
+unit, restart and whole-root start of that message reuses it.
+
+C is recomputed from the current snapshot and width whenever a new unit starts.
+With `R` bytes remaining, the next unit has length
+
+    g   = max(1, min(ceil(R / C), floor(R / 446)))
+    len = ceil(R / g)                  (balanced, floor-aware partition of R)
+
+so every unit, including the last, is at least 446 bytes. Each unit's symbol
+width is `min(W, max(len - 1, 445))`, fixed when the unit starts. This clamp
+gives every unit K >= 2; a same-range restart after a TU shrink applies the same
+clamp. A unit already admitted is immutable: changes to C affect only the
+unstarted remainder. There is no hold or admission timeout waiting for the
+assessment, and no upward recode: a started unit is never re-split or re-encoded
+at a wider symbol to exploit TU growth (a same-range restart after a TU shrink
+remains as described above).
+
 #### Proactive coded parity (P4 target policy)
 
 Race policy P4 (message-bound repair), interleave width 1, no slipstream,
@@ -1043,6 +1180,57 @@ admission sequence; it does not depend on timing or outcomes.
 
 The risk admission (p_eff, ε) is evaluated **once** at a logical root's first
 admission and frozen for all its groups, segments and replans.
+
+##### Segmented roots (profile 5)
+
+A root sent as several kind 6 units keeps the single frozen root risk admission
+and root draw. Each unit extent `[offset, offset + len)` of a root of `total`
+bytes receives, when it is first admitted:
+
+    ε_root = EPS                                  (EPS set)
+           = p_eff / (1 + (K_up / H)^E)           (EPS off; uncapped, no 32000 limit)
+    K_up   = n + floor((total - n) / 445),   n = max(1, floor(total / 446))
+    ε_unit = ε_root × len / total
+    draw   = D(root_draw XOR (0x554e495400000000 OR offset))
+
+where 0x554e4954 is ASCII "UNIT" and `offset` is the unit's start offset as a
+32-bit value. With EPS off, K_up is the largest possible total source-symbol
+count over any partition of the root into units of at least 446 bytes at
+symbol widths of at least 445 bytes. n such units hold at most
+`n + floor((total - n) / 445)` symbols; this grows with n and is attained by
+n - 1 minimum units plus the remainder. K_up is therefore independent of layout
+and TU (a whole unsplit root uses the same formula with n = 1 when
+total < 446). ε is allocated by byte length, so a unit's share does not depend
+on its K or width. The unit draw depends only on the root draw and the
+immutable offset: not on unit number, TU, timing or outcomes. A unit that is the
+whole root (`len = total`) uses the root draw and exactly the pre-unit plan. Each
+unit's plan is the Selector 2 plan above for its own K and codec groups at
+ε_unit. These shares of any disjoint cover of `[0, total)` sum to ε_root.
+
+Model statement, not a guarantee: *if* every unit meets its modeled share ε_unit,
+the union bound gives a modeled probability of at most ε_root that some unit
+misses, whatever boundaries were chosen, because shares are allocated by the
+byte length of immutable extents. This is conditional on the per-unit model.
+Selector 2 is a mixture over an ensemble of draws, not an absolute per-draw
+target: a particular draw gets r or r - 1. The draws are deterministic
+pseudorandom values and boundaries may depend on outcomes (TU assessment,
+feedback); neither proves independence conditional on every history, so they do
+**not** establish a physical delivery guarantee. The model also assumes
+independent packet loss at p_eff and ideal rank; Wirehair may need more than K
+equations and real loss is correlated.
+
+##### TU-shrink replanning
+
+When a still-active unit restarts at a smaller TU its symbol count K grows. The
+sender replans for the current K using the same frozen root risk admission,
+the same ε_unit share and the same unit draw as above, rather than keeping the
+old proactive count. The cumulative repair allowance retains every repair already charged to the
+old layout, without refund. The new layout reserves its full proactive plan
+again within that same remaining allowance, not merely the difference between
+the old and new proactive counts; previously emitted equations are not useful
+to its new decoder. The 1:1 loss top-up is preserved only while the owner is
+open, the end-of-message tail is applied once at the final tail, and nothing is
+added after the owner is sealed.
 
 Loss top-up: while an owner is still sending, its planned repairs are
 `proactive + tail_added + one replacement per known lost own DATA packet`
@@ -1091,6 +1279,17 @@ final segment is emitted (before sealing):
 `added` repairs are added to the owner's plan (kt = 0 gives 0). The 1:1
 loss top-up continues to apply afterwards.
 
+K here is the root's source-symbol count in its first admitted layout; a later
+same-range restart at a smaller TU does not change it (it is not the then-current
+K). For kt <= 32000 the plan is the ordinary one above. For a larger segmented
+root kt may exceed 32000. It is bounded by K_up at the 1 GiB maximum root,
+4,814,984. The reserve then uses the same pooled binomial model over the one
+exposure kt, not chunked per codec, evaluated by a bounded-term CDF that expands
+outward from the mode and stops each direction when the omitted-mass bound falls
+below EPSILON/4 of the accumulated normalization. Floating-point error is
+additional, so this is not a formal probability certificate. The ordinary
+per-codec 32000 cap and admission planning are unchanged.
+
 #### Whole-message duplication
 
 When the stepped risk is 1, every datagram containing whole frames is
@@ -1120,4 +1319,5 @@ padding collision, full nonces across enormous gaps, arbitrary ACK bases and
 repeated deep-window feedback, rekey budget boundaries/reordering, parameter
 mismatches, malformed-input bounds, and encrypted UDP size capture. Tests are
 implementation evidence, not a cryptographic proof or cross-implementation
-interoperability result. Performance at 1 Tbit/s is not claimed.
+interoperability result. Performance at 1 Tbit/s is not claimed. This
+profile-5 document reports no test, build or performance result.

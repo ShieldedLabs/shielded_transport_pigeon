@@ -92,8 +92,20 @@ pub(crate) struct Recovery {
     boundary_after: u64,
     boundary_failures: u64,
     last_large_progress: u64,
+    startup: Startup,
 }
+/// RESEARCH: startup-only TU bootstrap. A new connection starts at SMALL and
+/// offers one 1204 probe. Only that exact attempt's fresh accepted success
+/// permits one prompt 1452 probe without the 500 ms floor. Nothing re-arms it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Startup { Candidate, Issued, Prompt, Done }
+pub(crate) const STARTUP_TU: u64 = 1204;
+const STARTUP_PROMPT_TU: u64 = 1452;
 impl Recovery {
+    /// The only constructor that arms the startup candidate.
+    pub(crate) fn new_connection(now: u64) -> Self {
+        Self { startup: Startup::Candidate, ..Self::new(now) }
+    }
     pub(crate) fn new(now: u64) -> Self {
         Self {
             records: vec![Sent::EMPTY; RECORDS].into_boxed_slice(),
@@ -109,6 +121,7 @@ impl Recovery {
             boundary_after: 0,
             boundary_failures: 0,
             last_large_progress: now,
+            startup: Startup::Done,
         }
     }
     pub(crate) fn sent(
@@ -202,12 +215,41 @@ impl Recovery {
     }
     pub(crate) fn upward_plan(&self, current: u64, last: u64, failures: u64,
         now: u64) -> Option<(u64, u64)> {
-        settled_boundary_plan(current, self.recent_upper, self.boundary_after,
+        let (size, due) = settled_boundary_plan(current, self.recent_upper, self.boundary_after,
             self.upward_after, last).or_else(|| {
                 upward_plan(current, self.recent_upper, self.upper_until,
                     self.upward_after, last, failures, now)
-            })
+            })?;
+        Some(match self.startup {
+            // Size only: the due is the ordinary first-issuance deadline.
+            Startup::Candidate if current == SMALL && last == 0 => (STARTUP_TU, due),
+            // One prompt rung once 1204 is actually effective; the hold still applies.
+            Startup::Prompt if current == STARTUP_TU && size == STARTUP_PROMPT_TU =>
+                (size, self.upward_after.max(last)),
+            _ => (size, due),
+        })
     }
+    pub(crate) fn startup_state(&self) -> Startup { self.startup }
+    /// RESEARCH adaptive units: the initial 1204 trial has neither succeeded nor
+    /// failed yet. Done (cancel/outage/shrink) and Prompt both settle it.
+    pub(crate) fn assessment_unresolved(&self) -> bool {
+        matches!(self.startup, Startup::Candidate | Startup::Issued)
+    }
+    /// Call only when an attempt is actually being issued (after the due check).
+    /// A Prompt is consumed by the next issuance whatever its cadence.
+    pub(crate) fn upward_issued(&mut self, size: u64) {
+        self.startup = if self.startup == Startup::Candidate && size == STARTUP_TU {
+            Startup::Issued
+        } else { Startup::Done };
+    }
+    /// Outcome of the issued attempt; only an accepted, fresh, promoted 1204 arms Prompt.
+    pub(crate) fn upward_finished(&mut self, size: u64, promoted: bool) {
+        if self.startup == Startup::Issued {
+            self.startup = if promoted && size == STARTUP_TU { Startup::Prompt } else { Startup::Done };
+        }
+    }
+    /// Outage entry clears probe identity without an outcome: no late proof may arm Prompt.
+    pub(crate) fn startup_cancel(&mut self) { self.startup = Startup::Done; }
     fn arm_boundary(&mut self, current: u64, now: u64) {
         if self.recent_upper > current && self.recent_upper - current <= MIN_GAIN {
             if self.boundary_after == 0 {
@@ -237,6 +279,7 @@ impl Recovery {
     }
     pub(crate) fn effective_tu(&mut self, old: u64, new: u64, now: u64) {
         if new < old {
+            self.startup = Startup::Done;
             self.recent_upper = old;
             self.upper_until = now.saturating_add(UPPER_LIFETIME);
             self.boundary_after = 0;
@@ -321,6 +364,7 @@ impl Recovery {
         self.generic_cursor = 0;
         self.generic_count = 0;
         self.last_large_progress = now;
+        self.startup = Startup::Done;
     }
 }
 
