@@ -3729,6 +3729,7 @@ pub struct ConnectionStateConnected {
     delay_event_window:DelayEventWindow,
     delay_giveup:DelayGiveupState,
     delay_curve_beta:Option<f64>,
+    fresh_hold:FreshHold,
     pub RTT_mean: u16,
     pub RTT_mean_cursor: u64, // RTT_sample_cursor value RTT_mean was last computed from
 
@@ -3822,6 +3823,7 @@ pub fn new_connection_state_connected(cipher: Option<ConnectionCipherTriplet>, m
         delay_event_window:DelayEventWindow::default(),
         delay_giveup:DelayGiveupState::default(),
         delay_curve_beta:None,
+        fresh_hold:FreshHold::NONE,
         RTT_mean: u16::MAX,
         RTT_mean_cursor: 0,
         ack_arrival_times: [0; 16],
@@ -6845,7 +6847,8 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                 else if old_k > 0 && new_k > 0 {
                                     // Move the anchor so the rate is continuous across the change in K.
                                     // No age can reach the old rate only on an unrampable curve: keep the anchor.
-                                    if let Some(hi) = rtt_reanchor_age(current_t, state.congestion_event_rate_upps, old_k, new_k, &connection_curve_policy(state,&cc), state.cc_startup_done) {
+                                    if let Some(hi) = rtt_reanchor_age_hold(current_t, state.congestion_event_rate_upps, old_k, new_k, &connection_curve_policy(state,&cc), state.cc_startup_done, state.fresh_hold) {
+                                        state.fresh_hold = fresh_hold_reanchored(state.fresh_hold, current_t, hi);
                                         state.congestion_event_time_ns = current_time_now_ns.saturating_sub(hi);
                                         if state.is_app_limited {
                                             state.app_limit_time_offset = hi;
@@ -6955,9 +6958,9 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                         let (allowed_bandwidth_upps, cubic_mode) = if state.is_app_limited {
                             // Freeze at the exact active age, including during recovery.
                             // A minimum age of two RTTs would spuriously grow an idle curve.
-                            (connection_rate(state.app_limit_time_offset, state.congestion_event_rate_upps, time_to_bandwidth_recovery, &connection_curve_policy(state,&cc), state.cc_startup_done).0, 'A')
+                            (state_rate(state, state.app_limit_time_offset, time_to_bandwidth_recovery, &connection_curve_policy(state,&cc), state.cc_startup_done).0, 'A')
                         } else {
-                            connection_rate(current_time_now_ns - state.congestion_event_time_ns, state.congestion_event_rate_upps, time_to_bandwidth_recovery, &connection_curve_policy(state,&cc), state.cc_startup_done)
+                            state_rate(state, current_time_now_ns - state.congestion_event_time_ns, time_to_bandwidth_recovery, &connection_curve_policy(state,&cc), state.cc_startup_done)
                         };
                         // A local pacing ceiling is not evidence of network congestion.
                         let allowed_bandwidth_upps = local_rate_limit(allowed_bandwidth_upps.max(cc.rate_floor_upps), max_pps);
@@ -7305,18 +7308,26 @@ fn cubic_rate(t_ns: u64, r_max: u64, k_ns: u64) -> (u64, char) {
 
 /// Internal evaluation with the fixed policy (no application tuning API).
 pub(crate) fn cubic_rate_with_options(t_ns: u64, r_max: u64, k_ns: u64, cc: &CongestionPolicy) -> (u64, char) {
+    cubic_rate_additive(t_ns, t_ns, r_max, k_ns, cc)
+}
+
+// FreshHold: the min_growth additive term uses its own age `add_ns`
+// (== t_ns for every ordinary epoch, which is bit-exact with the original).
+fn cubic_rate_additive(t_ns: u64, add_ns: u64, r_max: u64, k_ns: u64, cc: &CongestionPolicy) -> (u64, char) {
     if k_ns == 0 { return (r_max.min(MAX_CC_RATE_UPPS), 'R'); }
     let t = t_ns as f64;
+    let a = add_ns as f64;
     let r = r_max as f64;
     let k = k_ns as f64;
     let drop = r * (1.0 - cc.beta);
     let rtt_seconds = k / (cc.recovery_rtts as f64 * 1e9);
     let floor = cc.min_growth_uppsps;
     let ceiling = cc.max_growth_uppsps;
-    let min_growth = floor / 1e9 * t;
+    let min_growth = floor / 1e9 * a;
     let linear_cap_slope = ceiling / 1e9;
     let finish = |rate: u64, mode| {
-        let absolute = r * cc.beta + (floor + ceiling) / 1e9 * t;
+        // t-a == 0.0 for ordinary epochs: x - 0.0 == x exactly.
+        let absolute = r * cc.beta + (floor + ceiling) / 1e9 * t - floor / 1e9 * (t - a);
         let relative = r * cc.beta * (cc.relative_growth_per_rtt * t / (rtt_seconds * 1e9)).exp() + min_growth;
         (rate.min(relative.min(absolute) as u64).min(MAX_CC_RATE_UPPS), mode)
     };
@@ -7570,6 +7581,7 @@ fn resume_outage(state: &mut ConnectionStateConnected, buf: &mut SendQueues,
     state.cc_startup_done = short;
 
     { state.delay_curve_beta=None; }
+    fresh_hold_clear(state);
     if !short {
     state.RTT_sample_sums.fill(0);
     state.RTT_sample_counts.fill(0);
@@ -7865,12 +7877,65 @@ fn connection_curve_policy(state:&ConnectionStateConnected, cc:&CongestionPolicy
 }
 
 fn connection_rate(t_ns: u64, anchor_upps: u64, k_ns: u64, cc: &CongestionPolicy, startup_done: bool) -> (u64, char) {
+    connection_rate_add(t_ns, t_ns, anchor_upps, k_ns, cc, startup_done)
+}
+
+// FRESHHOLD: `add_ns` is the additive (min_growth) age; startup ignores it.
+fn connection_rate_add(t_ns: u64, add_ns: u64, anchor_upps: u64, k_ns: u64, cc: &CongestionPolicy, startup_done: bool) -> (u64, char) {
     if !startup_done {
         let rtt_ns = k_ns / cc.recovery_rtts;
         // The sentinel RTT means no sample yet: never ramp on an unknown path.
         let exponent = if rtt_ns == u16::MAX as u64 * 100_000 { 0.0 } else { cc.startup_multiplier.ln() * t_ns as f64 / rtt_ns.max(100_000) as f64 };
         ((anchor_upps as f64 * exponent.min(30.0).exp()).min(MAX_CC_RATE_UPPS as f64) as u64, 'I')
-    } else { cubic_rate_with_options(t_ns, anchor_upps, k_ns, cc) }
+    } else { cubic_rate_additive(t_ns, add_ns, anchor_upps, k_ns, cc) }
+}
+
+// FreshHold state. phase: 0 none (ordinary, add=t),
+// 1 hold (add=0; barrier_ns = frozen fresh barrier, absolute), 2 released
+// (release_coord_ns = SIGNED active-age coordinate of the release, negative after a
+// reanchor whose new base age is below the carried credit; release_wall_ns = absolute
+// time of the true release, gating historical send-time queries).
+// The fresh-subset min sample (send strictly > barrier) of the current window is
+// tracked; MAX = none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FreshHold { phase:u8, barrier_ns:u64, release_coord_ns:i128, release_wall_ns:u64, min_sample_ns:u64 }
+
+impl FreshHold {
+    const NONE: FreshHold = FreshHold { phase:0, barrier_ns:0, release_coord_ns:0, release_wall_ns:0, min_sample_ns:u64::MAX };
+    // Additive age at active curve age t: max(0, t - release_coord) in exact i128.
+    fn add(&self, t:u64) -> u64 {
+        match self.phase {
+            1 => 0,
+            2 => (t as i128 - self.release_coord_ns).clamp(0, u64::MAX as i128) as u64,
+            _ => t,
+        }
+    }
+    // Mapping for a historical query about a packet sent at absolute time sent_ns:
+    // sent at/before the true release => it was sent under HOLD (zero additive).
+    fn for_send(&self, sent_ns:u64) -> FreshHold {
+        if self.phase==2 && sent_ns<=self.release_wall_ns { FreshHold { phase:1, ..*self } } else { *self }
+    }
+}
+
+// Released: keep additive age == credit exactly at the new active age hi (signed
+// coordinate, no clamp, no credit created or destroyed). Hold/none unchanged.
+fn fresh_hold_reanchored(h:FreshHold, current_t:u64, hi:u64) -> FreshHold {
+    if h.phase!=2 { return h; }
+    FreshHold { release_coord_ns:hi as i128 - h.add(current_t) as i128, ..h }
+}
+
+fn state_rate(state:&ConnectionStateConnected, t_ns:u64, k_ns:u64, cc:&CongestionPolicy, startup_done:bool) -> (u64, char) {
+    connection_rate_add(t_ns, state.fresh_hold.add(t_ns), state.congestion_event_rate_upps, k_ns, cc, startup_done)
+}
+
+// Discovery: rate at a historical send, gated by the true release wall time.
+fn state_rate_sent(state:&ConnectionStateConnected, sent_ns:u64, t_ns:u64, k_ns:u64, cc:&CongestionPolicy, startup_done:bool) -> (u64, char) {
+    connection_rate_add(t_ns, state.fresh_hold.for_send(sent_ns).add(t_ns), state.congestion_event_rate_upps, k_ns, cc, startup_done)
+}
+
+// Ordinary accepted loss / ECN path / outage resume: return to ordinary additive age.
+fn fresh_hold_clear(state:&mut ConnectionStateConnected) {
+    state.fresh_hold=FreshHold::NONE;
 }
 
 // Age on the new-K curve that first reaches the old-K rate at `current_t`, searched
@@ -7879,8 +7944,18 @@ fn connection_rate(t_ns: u64, anchor_upps: u64, k_ns: u64, cc: &CongestionPolicy
 // original bound or lo - 1 does not. None means no u64 age reaches it, which with a
 // growing startup multiplier only occurs on the flat no-sample sentinel curve.
 fn rtt_reanchor_age(current_t: u64, anchor_upps: u64, old_k: u64, new_k: u64, cc: &CongestionPolicy, startup_done: bool) -> Option<u64> {
-    let (old_rate, _) = connection_rate(current_t, anchor_upps, old_k, cc, startup_done);
-    let reaches = |t| connection_rate(t, anchor_upps, new_k, cc, startup_done).0 >= old_rate;
+    rtt_reanchor_age_hold(current_t, anchor_upps, old_k, new_k, cc, startup_done, FreshHold::NONE)
+}
+
+// FRESHHOLD: phase none keeps the original identity mapping (add=t) exactly. Hold
+// (add=0) and released search with the additive credit FIXED at its current value;
+// the caller then translates the release coordinate (fresh_hold_reanchored) so the
+// new base age creates no additive credit.
+fn rtt_reanchor_age_hold(current_t: u64, anchor_upps: u64, old_k: u64, new_k: u64, cc: &CongestionPolicy, startup_done: bool, hold: FreshHold) -> Option<u64> {
+    let credit = hold.add(current_t);
+    let add = |t: u64| if hold.phase == 0 { t } else { credit };
+    let (old_rate, _) = connection_rate_add(current_t, add(current_t), anchor_upps, old_k, cc, startup_done);
+    let reaches = |t| connection_rate_add(t, add(t), anchor_upps, new_k, cc, startup_done).0 >= old_rate;
     let mut lo = if new_k >= old_k { current_t } else { 0u64 };
     let mut hi = if new_k >= old_k { current_t.saturating_mul(2).saturating_add(new_k) } else { current_t };
     while !reaches(hi) {
@@ -8012,10 +8087,10 @@ fn cc_trace_context(state: &ConnectionStateConnected, now: u64, cc: &CongestionP
     let k = cc.recovery_rtts * rtt_ns;
     let age = if state.is_app_limited { state.app_limit_time_offset }
         else { now.saturating_sub(state.congestion_event_time_ns) };
-    let (rate, mode) = connection_rate(age, state.congestion_event_rate_upps, k, cc, state.cc_startup_done);
+    let (rate, mode) = state_rate(state, age, k, cc, state.cc_startup_done);
     let capped = |r: u64| state.delivery_growth.bound(local_rate_limit(r.max(cc.rate_floor_upps), max_pps));
     let rate = capped(rate);
-    let next = capped(connection_rate(age.saturating_add(1_000_000), state.congestion_event_rate_upps, k, cc, state.cc_startup_done).0);
+    let next = capped(state_rate(state, age.saturating_add(1_000_000), k, cc, state.cc_startup_done).0);
     crate::loss_trace::CcContext { pps: rate as f64 / 1_000_000.0,
         slope_ppsps: if state.is_app_limited { 0.0 } else { next.saturating_sub(rate) as f64 / 1000.0 },
         rtt_ns, feedback_ns: rtt_ns.saturating_add((rtt_ns / 16).max(1_000_000))
@@ -8345,7 +8420,22 @@ fn close_delay_event(state:&mut ConnectionStateConnected, now:u64, c:DelayEventC
     let closed_sample=if c.giveup>0 && state.delay_event_window.deadline_ns.is_some_and(|d|now>=d) {
         state.delay_event_window.min_sample_ns
     } else { None };
+    let fh_closing=state.fresh_hold.phase==1 && state.delay_event_window.deadline_ns.is_some_and(|d|now>=d);
     let event=state.delay_event_window.close(now,state.target_min_rtt_ns,srtt,c);
+    // FRESHHOLD: a real close during HOLD resolves only on a nonempty fresh subset
+    // (send > frozen barrier), LOW or HIGH; the resolving window is consumed whole.
+    if fh_closing {
+        let fresh=state.fresh_hold.min_sample_ns!=u64::MAX;
+        state.fresh_hold.min_sample_ns=u64::MAX;
+        if fresh {
+            let age=if state.is_app_limited { state.app_limit_time_offset } else { now.saturating_sub(state.congestion_event_time_ns) };
+            state.fresh_hold=FreshHold { phase:2, release_coord_ns:age as i128, release_wall_ns:now, ..FreshHold::NONE };
+            return false;
+        }
+        // Stale-only/empty closes during HOLD are consumed too: no recut can replace
+        // the frozen barrier before a fresh resolution (giveup/effect accounting skipped).
+        return false;
+    }
     #[cfg(any(test,feature="research_target_validation"))]
     if c.effect.is_some() && delay_effect_update(state,now,closed_sample,event.is_some(),c,srtt) {
         return false;
@@ -8405,6 +8495,8 @@ fn close_delay_event(state:&mut ConnectionStateConnected, now:u64, c:DelayEventC
     (state.ecn_congestion_received,state.ecn_oldest_seq,state.ecn_oldest_send_time)=saved;
     if accepted {
         state.stats.delay_events_accepted+=1;
+        // FRESHHOLD enter (apply_ecn_congestion already cleared any prior phase).
+        state.fresh_hold=FreshHold { phase:1, barrier_ns:now.saturating_add((state.RTT_mean as f64*100_000.0*cc.event_guard_rtts) as u64), ..FreshHold::NONE };
         if let Some(beta)=c.beta {
             state.delay_curve_beta=Some(beta);
             state.stats.delay_cuts_beta_override+=1;
@@ -8430,6 +8522,9 @@ fn observe_delay_event(state:&mut ConnectionStateConnected, now:u64, sample:u64,
     close_delay_event(state,now,c,cc,max_pps);
     let srtt=if state.RTT_sample_cursor==0 {sample} else {state.RTT_mean as u64*100_000};
     state.delay_event_window.observe(now,sample,seq,sent,srtt,c);
+    // FRESHHOLD: track the fresh subset's min sample (send strictly > frozen barrier).
+    let h=&mut state.fresh_hold;
+    if h.phase==1 && sent>h.barrier_ns && sample<h.min_sample_ns { h.min_sample_ns=sample; }
 }
 
 #[cfg(test)]
@@ -8484,7 +8579,7 @@ mod delay_event_tests {
         delay.delay_event_window.observe(1000*MS,200*MS,4,800*MS,100*MS,c);
         ce.ecn_congestion_received=true; ce.ecn_oldest_seq=4; ce.ecn_oldest_send_time=800*MS;
         assert!(apply_ecn_congestion(&mut ce,1100*MS,&cc,None));
-        assert!(close_delay_event(&mut delay,1100*MS,c,&cc,None));
+        assert!(close_ref(&mut delay,1100*MS,c,&cc,None));
         assert_eq!((delay.congestion_event_time_ns,delay.congestion_event_rate_upps,delay.cc_startup_done,delay.app_limit_time_offset),
             (ce.congestion_event_time_ns,ce.congestion_event_rate_upps,ce.cc_startup_done,ce.app_limit_time_offset));
         let k=cc.recovery_rtts*100*MS;
@@ -8496,12 +8591,67 @@ mod delay_event_tests {
         // A later persistent window whose sample was sent inside the event guard
         // still raises, but is consumed without a second cut or exposure event.
         delay.delay_event_window.observe(1101*MS,200*MS,5,1120*MS,100*MS,c);
-        assert!(!close_delay_event(&mut delay,1200*MS,c,&cc,None));
+        assert!(!close_ref(&mut delay,1200*MS,c,&cc,None));
         assert_eq!((delay.stats.delay_events_raised,delay.stats.delay_events_accepted),(2,1));
         assert_eq!(delay.congestion_event_time_ns,1100*MS);
         assert_eq!(delay.accepted_cc_events.len(),1);
-        assert!(!close_delay_event(&mut delay,1300*MS,c,&cc,None));
+        assert!(!close_ref(&mut delay,1300*MS,c,&cc,None));
         assert_eq!(delay.stats.delay_events_raised,2);
+    }
+    #[test]
+    fn candidate_hold_consumption_preserves_pending_ce_on_stale_empty_and_release() {
+        // Actual candidate (HOLD live): the guard-window sample (sent 1120 <= frozen barrier
+        // 1150) is stale, the next close is empty, and a later fresh HIGH only releases.
+        // None of these may clear or overwrite a pending real CE.
+        let c=config(); let cc=crate::ship::CC; let mut d=state();
+        d.ecn_congestion_received=true; d.ecn_oldest_seq=999; d.ecn_oldest_send_time=777*MS;
+        let pending=|d:&ConnectionStateConnected|(d.ecn_congestion_received,d.ecn_oldest_seq,d.ecn_oldest_send_time);
+        observe_delay_event(&mut d,1000*MS,200*MS,4,800*MS,Some(c),&cc,None);
+        assert!(close_delay_event(&mut d,1100*MS,c,&cc,None));
+        assert_eq!((d.fresh_hold.phase,d.fresh_hold.barrier_ns),(1,1150*MS));
+        assert_eq!(pending(&d),(true,999,777*MS));
+        observe_delay_event(&mut d,1101*MS,200*MS,5,1120*MS,Some(c),&cc,None); // stale
+        assert!(!close_delay_event(&mut d,1200*MS,c,&cc,None));
+        assert_eq!((d.fresh_hold.phase,d.stats.delay_events_raised,d.stats.delay_events_accepted),(1,1,1));
+        assert_eq!(pending(&d),(true,999,777*MS));
+        assert!(!close_delay_event(&mut d,1300*MS,c,&cc,None)); // empty
+        assert_eq!(d.fresh_hold.phase,1);
+        assert_eq!(pending(&d),(true,999,777*MS));
+        observe_delay_event(&mut d,1301*MS,200*MS,6,1200*MS,Some(c),&cc,None); // fresh HIGH -> release
+        assert!(!close_delay_event(&mut d,1400*MS,c,&cc,None));
+        assert_eq!((d.fresh_hold.phase,d.stats.delay_events_raised,d.stats.delay_events_accepted),(2,1,1));
+        assert_eq!(pending(&d),(true,999,777*MS));
+        assert_eq!(d.congestion_event_time_ns,1100*MS);
+        assert_eq!(d.accepted_cc_events.len(),1);
+    }
+    #[test]
+    fn candidate_hold_with_giveup_still_suspends_after_m_fresh_ineffective_cuts() {
+        // Actual candidate HOLD + giveup>0 (no neutralisation): persistent fresh HIGH gives
+        // cut, release, cut, ...; a release window never adds a strike, never raises, never
+        // suspends; suspension still happens after exactly M ineffective accepted cuts.
+        let cc=crate::ship::CC;
+        for m in [1u64,2,3] {
+            let c=DelayEventConfig { giveup:m,..config() }; let mut s=state();
+            s.ecn_congestion_received=true; s.ecn_oldest_seq=999; s.ecn_oldest_send_time=777*MS;
+            for j in 0..=2*m {
+                let start=1000+1000*j;
+                let r=fresh_high_contract_step(&mut s,(start+100)*MS,&cc,|s|window_live(s,start,200,c));
+                let g=&s.delay_giveup;
+                if j==2*m {
+                    assert!(!r); assert!(g.suspended);
+                    assert_eq!((g.ineffective,s.stats.delay_suspensions,s.stats.delay_events_suppressed),(m,1,1));
+                    assert_eq!(s.stats.delay_events_accepted,m);
+                } else if j%2==0 {
+                    assert!(r,"m={m} j={j}"); assert!(!g.suspended);
+                    assert_eq!(g.ineffective,j/2);
+                } else {
+                    assert!(!r,"m={m} j={j}"); assert!(!g.suspended);
+                    assert_eq!(s.fresh_hold.phase,2);
+                    assert_eq!((g.ineffective,s.stats.delay_events_raised,s.stats.delay_suspensions),((j-1)/2,(j+1)/2,0));
+                }
+                assert_eq!((s.ecn_congestion_received,s.ecn_oldest_seq,s.ecn_oldest_send_time),(true,999,777*MS));
+            }
+        }
     }
     #[test]
     fn off_is_exact_connection_state_noop_and_does_not_read_parameters() {
@@ -8533,6 +8683,30 @@ mod delay_event_tests {
             assert!(std::panic::catch_unwind(||parse(&pairs)).is_err(),"{}={bad}",base[i].0);
         }
     }
+    // TEST-ONLY BASELINE-REFERENCE NEUTRALISATION (not a runtime/production flag; production
+    // has no FreshHold disable). The legacy give-up/hold/effect/CE-guard contracts below were
+    // written against a path where every persistent-HIGH window is a cut candidate. To keep
+    // their exact original numbers as coverage of that INDEPENDENT mechanism, these helpers run
+    // the real candidate close path and then explicitly reset fresh_hold to FreshHold::NONE
+    // (HOLD entry neutralised after each close). Candidate behaviour with HOLD live is covered
+    // separately (candidate_* tests below and cc_freshhold_tests).
+    fn neutralize_fresh_hold_test_only(s:&mut ConnectionStateConnected) { s.fresh_hold=FreshHold::NONE; }
+    fn close_ref(s:&mut ConnectionStateConnected, now:u64, c:DelayEventConfig, cc:&CongestionPolicy, max_pps:Option<u64>) -> bool {
+        let r=close_delay_event(s,now,c,cc,max_pps); neutralize_fresh_hold_test_only(s); r
+    }
+    fn window_ref(s:&mut ConnectionStateConnected, start_ms:u64, sample_ms:u64, c:DelayEventConfig) -> bool {
+        let start=start_ms*MS;
+        s.delay_event_window.observe(start,sample_ms*MS,start_ms,start.saturating_sub(sample_ms*MS),100*MS,c);
+        close_ref(s,start+c.interval_ns(100*MS),c,&crate::ship::CC,None)
+    }
+    // Candidate path through the REAL ingress (observe_delay_event, which also tracks the
+    // FreshHold fresh-subset min). The legacy `window` below writes the window directly and so
+    // can never resolve a HOLD; it is kept only for tests that passed unchanged.
+    fn window_live(s:&mut ConnectionStateConnected, start_ms:u64, sample_ms:u64, c:DelayEventConfig) -> bool {
+        let start=start_ms*MS;
+        observe_delay_event(s,start,sample_ms*MS,start_ms,start.saturating_sub(sample_ms*MS),Some(c),&crate::ship::CC,None);
+        close_delay_event(s,start+c.interval_ns(100*MS),c,&crate::ship::CC,None)
+    }
     fn window(s:&mut ConnectionStateConnected, start_ms:u64, sample_ms:u64, c:DelayEventConfig) -> bool {
         let start=start_ms*MS;
         s.delay_event_window.observe(start,sample_ms*MS,start_ms,start.saturating_sub(sample_ms*MS),100*MS,c);
@@ -8543,17 +8717,17 @@ mod delay_event_tests {
         for m in [1,2,3] {
             let c=DelayEventConfig { giveup:m,..config() }; let mut s=state();
             for i in 0..m {
-                assert!(window(&mut s,1000+i*1000,200,c));
+                assert!(window_ref(&mut s,1000+i*1000,200,c));
                 assert_eq!(s.delay_giveup.ineffective,i);
                 assert!(!s.delay_giveup.suspended);
             }
             let cc_before=(s.congestion_event_time_ns,s.congestion_event_rate_upps,s.cc_startup_done,s.app_limit_time_offset);
-            assert!(!window(&mut s,1000+m*1000,200,c));
+            assert!(!window_ref(&mut s,1000+m*1000,200,c));
             assert!(s.delay_giveup.suspended);
             assert_eq!(s.delay_giveup.ineffective,m);
             assert_eq!((s.stats.delay_events_raised,s.stats.delay_events_accepted),(m,m));
             assert_eq!((s.stats.delay_suspensions,s.stats.delay_rearms,s.stats.delay_events_suppressed),(1,0,1));
-            assert!(!window(&mut s,2000+m*1000,200,c));
+            assert!(!window_ref(&mut s,2000+m*1000,200,c));
             assert_eq!(s.stats.delay_events_suppressed,2);
             assert_eq!(s.stats.delay_suspensions,1);
             assert_eq!(s.accepted_cc_events.len(),m as usize);
@@ -8568,43 +8742,43 @@ mod delay_event_tests {
     #[test]
     fn giveup_rearms_on_drained_window_at_threshold_then_can_suspend_again() {
         let c=DelayEventConfig { giveup:1,..config() }; let mut s=state();
-        assert!(window(&mut s,1000,200,c));
-        assert!(!window(&mut s,2000,200,c));
+        assert!(window_ref(&mut s,1000,200,c));
+        assert!(!window_ref(&mut s,2000,200,c));
         // An empty closed window is NOT drain evidence.
-        assert!(!close_delay_event(&mut s,2200*MS,c,&crate::ship::CC,None));
+        assert!(!close_ref(&mut s,2200*MS,c,&crate::ship::CC,None));
         assert!(s.delay_giveup.suspended); assert_eq!(s.stats.delay_rearms,0);
-        assert!(!window(&mut s,3000,150,c)); // <= threshold includes equality
+        assert!(!window_ref(&mut s,3000,150,c)); // <= threshold includes equality
         assert!(!s.delay_giveup.suspended); assert_eq!(s.delay_giveup.ineffective,0);
         assert_eq!((s.stats.delay_suspensions,s.stats.delay_rearms,s.stats.delay_events_suppressed),(1,1,1));
-        assert!(!window(&mut s,4000,100,c)); assert_eq!(s.stats.delay_rearms,1);
-        assert!(window(&mut s,5000,200,c));
-        assert!(!window(&mut s,6000,200,c));
+        assert!(!window_ref(&mut s,4000,100,c)); assert_eq!(s.stats.delay_rearms,1);
+        assert!(window_ref(&mut s,5000,200,c));
+        assert!(!window_ref(&mut s,6000,200,c));
         assert_eq!((s.stats.delay_suspensions,s.stats.delay_rearms,s.stats.delay_events_suppressed),(2,1,2));
     }
     #[test]
     fn giveup_effective_event_resets_consecutive_ineffective_count() {
         let c=DelayEventConfig { giveup:2,..config() }; let mut s=state();
-        assert!(window(&mut s,1000,200,c));
-        assert!(window(&mut s,2000,200,c)); assert_eq!(s.delay_giveup.ineffective,1);
-        assert!(!window(&mut s,3000,120,c));
+        assert!(window_ref(&mut s,1000,200,c));
+        assert!(window_ref(&mut s,2000,200,c)); assert_eq!(s.delay_giveup.ineffective,1);
+        assert!(!window_ref(&mut s,3000,120,c));
         assert_eq!(s.delay_giveup.ineffective,0); assert_eq!(s.delay_giveup.pending_event_ns,None);
-        assert!(window(&mut s,4000,200,c));
-        assert!(window(&mut s,5000,200,c)); // only one consecutive ineffective event
+        assert!(window_ref(&mut s,4000,200,c));
+        assert!(window_ref(&mut s,5000,200,c)); // only one consecutive ineffective event
         assert_eq!(s.delay_giveup.ineffective,1); assert!(!s.delay_giveup.suspended);
         assert_eq!((s.stats.delay_suspensions,s.stats.delay_rearms),(0,0));
     }
     #[test]
     fn giveup_waits_for_guard_and_does_not_count_empty_windows_or_rejected_events() {
         let c=DelayEventConfig { giveup:2,interval_rtts:0.2,..config() }; let mut s=state();
-        assert!(window(&mut s,1000,200,c)); // accepted at 1020 ms; guard ends at 1070
-        assert!(!window(&mut s,1020,200,c));
-        assert!(!window(&mut s,1040,200,c));
+        assert!(window_ref(&mut s,1000,200,c)); // accepted at 1020 ms; guard ends at 1070
+        assert!(!window_ref(&mut s,1020,200,c));
+        assert!(!window_ref(&mut s,1040,200,c));
         assert_eq!(s.delay_giveup.ineffective,0);
-        assert!(!close_delay_event(&mut s,1080*MS,c,&crate::ship::CC,None)); // empty
+        assert!(!close_ref(&mut s,1080*MS,c,&crate::ship::CC,None)); // empty
         assert_eq!(s.delay_giveup.ineffective,0);
-        assert!(!window(&mut s,1080,200,c)); // first nonempty post-guard, rejected evidence
+        assert!(!window_ref(&mut s,1080,200,c)); // first nonempty post-guard, rejected evidence
         assert_eq!(s.delay_giveup.ineffective,1); assert_eq!(s.delay_giveup.pending_event_ns,None);
-        assert!(!window(&mut s,1100,200,c)); // another rejected event, no second strike
+        assert!(!window_ref(&mut s,1100,200,c)); // another rejected event, no second strike
         assert_eq!(s.delay_giveup.ineffective,1); assert!(!s.delay_giveup.suspended);
         assert_eq!(s.stats.delay_events_accepted,1);
     }
@@ -8660,11 +8834,11 @@ mod delay_event_tests {
             for (start,sample,seq,sent) in [(1000,200,4,800),(1101,200,5,1120),(1201,120,6,1081)] {
                 for s in [&mut actual,&mut reference] { s.delay_event_window.observe(start*MS,sample*MS,seq,sent*MS,100*MS,c); }
                 let close=(start/100+1)*100*MS;
-                assert_eq!(close_delay_event(&mut actual,close,c,&crate::ship::CC,None),original_close(&mut reference,close,c));
+                assert_eq!(close_ref(&mut actual,close,c,&crate::ship::CC,None),original_close(&mut reference,close,c));
                 // Exact full-state serialization includes CC, evidence, window and all counters.
                 assert_eq!(format!("{actual:?}"),format!("{reference:?}"));
             }
-            assert_eq!(close_delay_event(&mut actual,1400*MS,c,&crate::ship::CC,None),original_close(&mut reference,1400*MS,c));
+            assert_eq!(close_ref(&mut actual,1400*MS,c,&crate::ship::CC,None),original_close(&mut reference,1400*MS,c));
             assert_eq!(format!("{actual:?}"),format!("{reference:?}"));
         }
     }
@@ -8674,21 +8848,21 @@ mod delay_event_tests {
     #[test]
     fn hold_blocks_early_low_windows_and_still_needs_drain_after_expiry() {
         let c=hold_config(10.,40.); let mut s=state();
-        assert!(window(&mut s,1000,200,c));
-        assert!(!window(&mut s,2000,200,c)); // suspend at 2100; hold until 3100
+        assert!(window_ref(&mut s,1000,200,c));
+        assert!(!window_ref(&mut s,2000,200,c)); // suspend at 2100; hold until 3100
         assert_eq!(s.delay_giveup.hold_until_ns,Some(3100*MS));
         let cc_before=(s.congestion_event_time_ns,s.congestion_event_rate_upps,s.cc_startup_done,s.accepted_cc_events.clone());
-        assert!(!window(&mut s,2200,150,c));
-        assert!(!window(&mut s,2900,100,c));
+        assert!(!window_ref(&mut s,2200,150,c));
+        assert!(!window_ref(&mut s,2900,100,c));
         assert!(s.delay_giveup.suspended);
         assert_eq!(s.stats.delay_hold_blocked_rearms,2);
         assert_eq!(s.stats.delay_rearms,0);
         assert_eq!((s.congestion_event_time_ns,s.congestion_event_rate_upps,s.cc_startup_done,s.accepted_cc_events.clone()),cc_before);
-        assert!(!close_delay_event(&mut s,3100*MS,c,&crate::ship::CC,None)); // empty at expiry
+        assert!(!close_ref(&mut s,3100*MS,c,&crate::ship::CC,None)); // empty at expiry
         assert!(s.delay_giveup.suspended);
-        assert!(!window(&mut s,3200,200,c)); // high after expiry still cannot rearm
+        assert!(!window_ref(&mut s,3200,200,c)); // high after expiry still cannot rearm
         assert!(s.delay_giveup.suspended);
-        assert!(!window(&mut s,3400,150,c));
+        assert!(!window_ref(&mut s,3400,150,c));
         assert!(!s.delay_giveup.suspended);
         assert_eq!(s.stats.delay_rearms,1);
         assert_eq!(s.delay_giveup.consecutive_suspensions,1);
@@ -8698,18 +8872,18 @@ mod delay_event_tests {
     fn hold_doubles_across_rearms_and_caps_without_repeated_suspension_entries() {
         let c=hold_config(100.,250.); let mut s=state(); let mut start=1000;
         for (count,rtts) in [(1,100),(2,200),(3,250),(4,250)] {
-            assert!(window(&mut s,start,200,c));
-            assert!(!window(&mut s,start+1000,200,c));
+            assert!(window_ref(&mut s,start,200,c));
+            assert!(!window_ref(&mut s,start+1000,200,c));
             let suspended_at=start+1100;
             let deadline=suspended_at+rtts*100;
             assert_eq!(s.delay_giveup.consecutive_suspensions,count);
             assert_eq!(s.stats.delay_suspensions,count);
             assert_eq!(s.delay_giveup.hold_until_ns,Some(deadline*MS));
-            assert!(!window(&mut s,suspended_at,200,c));
+            assert!(!window_ref(&mut s,suspended_at,200,c));
             assert_eq!(s.delay_giveup.consecutive_suspensions,count);
-            assert!(!window(&mut s,deadline-200,150,c)); // closes 100 ms early
+            assert!(!window_ref(&mut s,deadline-200,150,c)); // closes 100 ms early
             assert!(s.delay_giveup.suspended);
-            assert!(!window(&mut s,deadline-100,150,c)); // equality rearms
+            assert!(!window_ref(&mut s,deadline-100,150,c)); // equality rearms
             assert!(!s.delay_giveup.suspended);
             start=deadline+1000; // next suspension well inside the clean period
         }
@@ -8722,38 +8896,38 @@ mod delay_event_tests {
     #[test]
     fn hold_clean_period_resets_only_after_rearm_and_does_not_slide_on_low_windows() {
         let c=hold_config(10.,40.); let mut s=state();
-        assert!(window(&mut s,1000,200,c));
-        assert!(!window(&mut s,2000,200,c));
-        assert!(!window(&mut s,3000,150,c)); // rearm at 3100; clean until 7100
+        assert!(window_ref(&mut s,1000,200,c));
+        assert!(!window_ref(&mut s,2000,200,c));
+        assert!(!window_ref(&mut s,3000,150,c)); // rearm at 3100; clean until 7100
         assert_eq!(s.delay_giveup.clean_until_ns,Some(7100*MS));
-        assert!(!window(&mut s,3200,100,c));
+        assert!(!window_ref(&mut s,3200,100,c));
         assert_eq!(s.delay_giveup.clean_until_ns,Some(7100*MS));
-        assert!(!close_delay_event(&mut s,7099*MS,c,&crate::ship::CC,None));
+        assert!(!close_ref(&mut s,7099*MS,c,&crate::ship::CC,None));
         assert_eq!(s.delay_giveup.consecutive_suspensions,1);
-        assert!(!close_delay_event(&mut s,7100*MS,c,&crate::ship::CC,None));
+        assert!(!close_ref(&mut s,7100*MS,c,&crate::ship::CC,None));
         assert_eq!(s.delay_giveup.consecutive_suspensions,0);
         assert_eq!(s.delay_giveup.clean_until_ns,None);
-        assert!(window(&mut s,8000,200,c));
-        assert!(!window(&mut s,9000,200,c));
+        assert!(window_ref(&mut s,8000,200,c));
+        assert!(!window_ref(&mut s,9000,200,c));
         assert_eq!(s.delay_giveup.consecutive_suspensions,1);
         assert_eq!(s.delay_giveup.hold_until_ns,Some(10100*MS));
     }
     #[test]
     fn hold_deadlines_freeze_rtt_at_each_transition() {
         let c=hold_config(10.,40.); let mut s=state();
-        assert!(window(&mut s,1000,200,c));
-        assert!(!window(&mut s,2000,200,c));
+        assert!(window_ref(&mut s,1000,200,c));
+        assert!(!window_ref(&mut s,2000,200,c));
         s.RTT_mean=2000;
-        assert!(!window(&mut s,2900,150,c));
+        assert!(!window_ref(&mut s,2900,150,c));
         assert_eq!(s.delay_giveup.hold_until_ns,Some(3100*MS));
-        assert!(!window(&mut s,3000,150,c));
+        assert!(!window_ref(&mut s,3000,150,c));
         // The window also lengthened to 200 ms at the previous close.
-        assert!(!close_delay_event(&mut s,3200*MS,c,&crate::ship::CC,None));
+        assert!(!close_ref(&mut s,3200*MS,c,&crate::ship::CC,None));
         assert_eq!(s.delay_giveup.clean_until_ns,Some(11200*MS));
         s.RTT_mean=1000;
-        assert!(!close_delay_event(&mut s,11199*MS,c,&crate::ship::CC,None));
+        assert!(!close_ref(&mut s,11199*MS,c,&crate::ship::CC,None));
         assert_eq!(s.delay_giveup.consecutive_suspensions,1);
-        assert!(!close_delay_event(&mut s,11200*MS,c,&crate::ship::CC,None));
+        assert!(!close_ref(&mut s,11200*MS,c,&crate::ship::CC,None));
         assert_eq!(s.delay_giveup.consecutive_suspensions,0);
     }
     #[test]
@@ -8858,11 +9032,11 @@ mod delay_event_tests {
                     s.delay_event_window.observe(start*MS,sample*MS,start,(start-sample)*MS,100*MS,c);
                 }
                 let now=(start+100)*MS;
-                assert_eq!(close_delay_event(&mut actual,now,c,&crate::ship::CC,None),
+                assert_eq!(close_ref(&mut actual,now,c,&crate::ship::CC,None),
                     frozen_close(&mut reference,now,c,&crate::ship::CC,None));
                 assert_eq!(format!("{actual:?}"),format!("{reference:?}"));
             }
-            assert_eq!(close_delay_event(&mut actual,10000*MS,c,&crate::ship::CC,None),
+            assert_eq!(close_ref(&mut actual,10000*MS,c,&crate::ship::CC,None),
                 frozen_close(&mut reference,10000*MS,c,&crate::ship::CC,None));
             assert_eq!(format!("{actual:?}"),format!("{reference:?}"));
             assert_eq!(actual.stats.delay_hold_blocked_rearms,0);
@@ -8918,10 +9092,10 @@ mod delay_event_tests {
     fn effect_fraction_drop_within_limit_including_deadline_equality_is_effective() {
         for start in [1080,1250] { // closes at 1100 or exact deadline 1270
             let c=effect_config(); let mut s=state();
-            assert!(window(&mut s,1000,200,c)); // accepted1020, guard1070, deadline1270
+            assert!(window_ref(&mut s,1000,200,c)); // accepted1020, guard1070, deadline1270
             let p=s.delay_giveup.pending_effect.as_ref().unwrap();
             assert_eq!((p.excess_ns,p.guard_until_ns,p.deadline_ns),(100*MS,1070*MS,1270*MS));
-            assert!(!window(&mut s,start,150,c)); // q=50, exactly 50% drop
+            assert!(!window_ref(&mut s,start,150,c)); // q=50, exactly 50% drop
             assert_eq!((s.stats.delay_effective,s.stats.delay_ineffective),(1,0));
             assert!(s.delay_giveup.pending_effect.is_none()); assert!(!s.delay_giveup.suspended);
         }
@@ -8930,13 +9104,13 @@ mod delay_event_tests {
     fn effect_fraction_late_drain_is_ineffective_but_still_rearms_subject_to_hold() {
         for hold in [None,Some(DelayHoldConfig { rtts:10.,max_rtts:40. })] {
             let c=DelayEventConfig {hold,..effect_config()};let mut s=state();
-            assert!(window(&mut s,1000,200,c));
-            assert!(!window(&mut s,1300,100,c)); // drains only after deadline
+            assert!(window_ref(&mut s,1000,200,c));
+            assert!(!window_ref(&mut s,1300,100,c)); // drains only after deadline
             assert_eq!((s.stats.delay_effective,s.stats.delay_ineffective),(0,1));
             assert_eq!(s.stats.delay_suspensions,1);
             assert_eq!(s.delay_giveup.suspended,hold.is_some());
             assert_eq!(s.stats.delay_rearms,if hold.is_some(){0}else{1});
-            assert!(!window(&mut s,2500,100,c));
+            assert!(!window_ref(&mut s,2500,100,c));
             assert!(!s.delay_giveup.suspended); assert_eq!(s.stats.delay_rearms,1);
             assert_eq!(s.stats.delay_ineffective,1);
         }
@@ -8958,12 +9132,12 @@ mod delay_event_tests {
     #[test]
     fn effect_fraction_low_but_insufficient_or_inside_guard_cannot_cancel_experiment() {
         let c=DelayEventConfig {effect:Some(DelayEffectConfig {frac:0.8,rtts:2.}),..effect_config()};
-        let mut s=state(); assert!(window(&mut s,1000,200,c));
-        assert!(!window(&mut s,1020,100,c)); // sufficient but closes inside guard
+        let mut s=state(); assert!(window_ref(&mut s,1000,200,c));
+        assert!(!window_ref(&mut s,1020,100,c)); // sufficient but closes inside guard
         assert!(s.delay_giveup.pending_effect.is_some());
-        assert!(!window(&mut s,1080,130,c)); // low, but only 70% drop < 80%
+        assert!(!window_ref(&mut s,1080,130,c)); // low, but only 70% drop < 80%
         assert!(s.delay_giveup.pending_effect.is_some());
-        assert!(!close_delay_event(&mut s,1271*MS,c,&crate::ship::CC,None));
+        assert!(!close_ref(&mut s,1271*MS,c,&crate::ship::CC,None));
         assert_eq!(s.stats.delay_ineffective,1);
     }
     #[test]
@@ -9007,11 +9181,11 @@ mod delay_event_tests {
                 for s in [&mut actual,&mut reference] {
                     s.delay_event_window.observe(start*MS,sample*MS,start,(start-sample)*MS,100*MS,c);
                 }
-                assert_eq!(close_delay_event(&mut actual,(start+100)*MS,c,&crate::ship::CC,None),
+                assert_eq!(close_ref(&mut actual,(start+100)*MS,c,&crate::ship::CC,None),
                     frozen_pre_dbeta_close(&mut reference,(start+100)*MS,c,&crate::ship::CC,None));
                 assert_eq!(format!("{actual:?}"),format!("{reference:?}"));
             }
-            assert_eq!(close_delay_event(&mut actual,10000*MS,c,&crate::ship::CC,None),
+            assert_eq!(close_ref(&mut actual,10000*MS,c,&crate::ship::CC,None),
                 frozen_pre_dbeta_close(&mut reference,10000*MS,c,&crate::ship::CC,None));
             assert_eq!(format!("{actual:?}"),format!("{reference:?}"));
         }}
@@ -9137,9 +9311,10 @@ fn apply_ecn_congestion(state: &mut ConnectionStateConnected, now: u64, cc: &Con
     let curve=connection_curve_policy(state,cc);
     let send_dt = state.ecn_oldest_send_time - state.congestion_event_time_ns;
     let send_t_factor = send_dt as f64 / k as f64;
-    let (_, send_mode) = connection_rate(send_dt, state.congestion_event_rate_upps, k, &curve, state.cc_startup_done);
+    let ev_sent = state.ecn_oldest_send_time;
+    let (_, send_mode) = state_rate_sent(state, ev_sent, send_dt, k, &curve, state.cc_startup_done);
     let discover_dt = if send_mode == 'P' { (k + send_dt) / 2 } else { send_dt };
-    let mut discovered = connection_rate(discover_dt, state.congestion_event_rate_upps, k, &curve, state.cc_startup_done).0;
+    let mut discovered = state_rate_sent(state, ev_sent, discover_dt, k, &curve, state.cc_startup_done).0;
     if send_mode == 'I' {
         discovered = connection_rate(send_dt.saturating_sub((state.RTT_mean as f64 * 100_000.0 * cc.startup_backoff_rtts) as u64), state.congestion_event_rate_upps, k, &curve, false).0;
     } else if send_mode == 'G' || send_mode == 'S' {
@@ -9152,6 +9327,7 @@ fn apply_ecn_congestion(state: &mut ConnectionStateConnected, now: u64, cc: &Con
     state.cc_startup_done = true;
 
     { state.delay_curve_beta=None; }
+    fresh_hold_clear(state);
 
     crate::target_validation::risk_congestion(&state.target_state,state.congestion_event_rate_upps, if state.RTT_mean==u16::MAX {0}else{state.RTT_mean as u64*100_000}, cc.event_guard_rtts, cc.recovery_rtts, true);
     println!("congestion event ECN CE ...  rate discovered: {} pps  sent:{send_mode}@{send_t_factor:.2}", state.congestion_event_rate_upps as f64 / 1000000.0);
@@ -9304,13 +9480,13 @@ fn apply_loss_congestion(state: &mut ConnectionStateConnected, send_time: u64, c
     let curve=connection_curve_policy(state,cc);
     let send_dt = send_time - state.congestion_event_time_ns;
     let send_t_factor = send_dt as f64 / time_to_bandwidth_recovery as f64;
-    let (_, send_mode) = connection_rate(send_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery, &curve, state.cc_startup_done);
+    let (_, send_mode) = state_rate_sent(state, send_time, send_dt, time_to_bandwidth_recovery, &curve, state.cc_startup_done);
     let now_dt = current_time_now_ns - state.congestion_event_time_ns;
     let now_t_factor = now_dt as f64 / time_to_bandwidth_recovery as f64;
-    let (_, now_mode) = connection_rate(now_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery, &curve, state.cc_startup_done);
+    let (_, now_mode) = state_rate(state, now_dt, time_to_bandwidth_recovery, &curve, state.cc_startup_done);
     // R: use rate at send time.
     // P/G/S: blend 50% toward R/P boundary rate.
-    let mut discovered = connection_rate(send_dt, state.congestion_event_rate_upps, time_to_bandwidth_recovery, &curve, state.cc_startup_done).0;
+    let mut discovered = state_rate_sent(state, send_time, send_dt, time_to_bandwidth_recovery, &curve, state.cc_startup_done).0;
     if send_mode == 'I' {
         discovered = connection_rate(send_dt.saturating_sub((rtt_ns as f64 * cc.startup_backoff_rtts) as u64), state.congestion_event_rate_upps, time_to_bandwidth_recovery, &curve, false).0;
     } else if send_mode != 'R' {
@@ -9324,6 +9500,7 @@ fn apply_loss_congestion(state: &mut ConnectionStateConnected, send_time: u64, c
     state.cc_startup_done = true;
 
     { state.delay_curve_beta=None; }
+    fresh_hold_clear(state);
 
     crate::target_validation::risk_congestion(&state.target_state,state.congestion_event_rate_upps, if state.RTT_mean==u16::MAX {0}else{state.RTT_mean as u64*100_000}, cc.event_guard_rtts, cc.recovery_rtts, false);
     println!("congestion event PACKET DROPPED {} ...  rate discovered: {} pps  now:{now_mode}@{now_t_factor:.2} sent:{send_mode}@{send_t_factor:.2}", state.packets_waiting_ack_tail, state.congestion_event_rate_upps as f64 / 1000000.0);
@@ -19202,6 +19379,53 @@ mod ring_active_retry_regression {
 #[path = "mtu_recovery_tests.rs"]
 mod mtu_recovery_tests;
 
+// TEST-ONLY persistent-fresh-HIGH contract for the FRESHHOLD candidate (actual
+// mechanism, HOLD live). Deliberately NOT a monotone "rate never increases per window"
+// or beta^ceil(K/2) bound: nonlinear recovery and between-window growth of the curve
+// remain, so such a bound is false. Instead each step is checked against the REAL
+// immediate command (fresh_hold_test_snap raw_upps at the close instant), pre vs post:
+//   accepted cut  => post < pre (strict reduction; floor exception only if pre is already
+//                    at the rate floor, which the callers here never reach) and HOLD entered;
+//   HOLD release  => no upward discontinuity (post <= pre), no cut;
+//   while HOLD    => additive age is 0 at every probed age (add=0);
+//   HOLD is finite: the very next fresh window (HIGH or LOW) releases it;
+//   a fresh HIGH outside HOLD recuts.
+// Returns the accepted flag per window so callers assert the exact cadence.
+#[cfg(test)]
+#[derive(Clone,Copy)]
+struct FreshHoldTestSnap { origin_ns:u64, anchor_upps:u64, age_ns:u64, raw_upps:u64 }
+// TEST-ONLY: the real immediate command at `now` (same age/curve/state_rate mapping as the
+// send loop). Not compiled into production.
+#[cfg(test)]
+fn fresh_hold_test_snap(state:&ConnectionStateConnected, now:u64, cc:&CongestionPolicy) -> FreshHoldTestSnap {
+    let curve=connection_curve_policy(state,cc);
+    let k=curve.recovery_rtts*(state.RTT_mean as u64*100_000);
+    let age=if state.is_app_limited { state.app_limit_time_offset } else { now.saturating_sub(state.congestion_event_time_ns) };
+    let raw=state_rate(state,age,k,&curve,state.cc_startup_done).0;
+    FreshHoldTestSnap { origin_ns:state.congestion_event_time_ns, anchor_upps:state.congestion_event_rate_upps, age_ns:age, raw_upps:raw }
+}
+#[cfg(test)]
+fn fresh_high_contract_step(s:&mut ConnectionStateConnected, close_ns:u64, cc:&CongestionPolicy,
+    f:impl FnOnce(&mut ConnectionStateConnected)->bool) -> bool {
+    let phase0=s.fresh_hold.phase;
+    let pre=fresh_hold_test_snap(s,close_ns,cc);
+    if phase0==1 {
+        for age in [0,pre.age_ns/2,pre.age_ns,pre.age_ns.saturating_mul(4)] { assert_eq!(s.fresh_hold.add(age),0,"add must be 0 while HOLD"); }
+    }
+    let accepted=f(s);
+    let post=fresh_hold_test_snap(s,close_ns,cc);
+    if accepted {
+        assert_eq!(s.fresh_hold.phase,1,"accepted cut must enter HOLD");
+        assert!(post.raw_upps<pre.raw_upps,"accepted cut must reduce the real immediate command: pre={} post={}",pre.raw_upps,post.raw_upps);
+        assert_eq!(s.fresh_hold.add(post.age_ns),0);
+    } else if phase0==1 {
+        assert_eq!(s.fresh_hold.phase,2,"next fresh window must release HOLD (finite HOLD)");
+        assert!(post.raw_upps<=pre.raw_upps,"release alone must not raise the command: pre={} post={}",pre.raw_upps,post.raw_upps);
+        assert_eq!((post.origin_ns,post.anchor_upps),(pre.origin_ns,pre.anchor_upps),"release is not a cut");
+    }
+    accepted
+}
+
 #[cfg(test)]
 mod cc_vultr_min2000_db50_nogiveup_tests {
     //! VULTR MIN2000-DB50-NOGIVEUP research candidate: on top of the frozen
@@ -19233,6 +19457,13 @@ mod cc_vultr_min2000_db50_nogiveup_tests {
             None => s.delay_event_window.deadline_ns = Some(close),
         }
         close_delay_event(s, close, c, &cc, None)
+    }
+    // Candidate path through the REAL ingress (observe_delay_event tracks the FreshHold
+    // fresh-subset min; the direct-write `window` above can never resolve a HOLD).
+    fn window_live(s: &mut ConnectionStateConnected, start_ms: u64, sample_ms: u64, c: DelayEventConfig) -> bool {
+        let cc = crate::ship::CC;
+        observe_delay_event(s, start_ms * MS, sample_ms * MS, 1000 + start_ms, (start_ms - 200) * MS, Some(c), &cc, None);
+        close_delay_event(s, start_ms * MS + c.interval_ns(100 * MS), c, &cc, None)
     }
 
     #[test]
@@ -19269,23 +19500,33 @@ mod cc_vultr_min2000_db50_nogiveup_tests {
         let cc = crate::ship::CC;
         let c = delay_event_config().unwrap();
         let mut s = state();
+        // FRESHHOLD candidate: every window's sample is fresh (sent after the frozen barrier),
+        // so the exact cadence is cut, release, cut, release, ... (release consumes the window).
+        let mut got = Vec::new();
         for i in 0..8u64 {
             let start = 1000 + 1000 * i;
-            assert!(window(&mut s, start, Some(200), c), "window {i} not accepted");
-            assert_eq!(s.congestion_event_time_ns, start * MS + c.interval_ns(100 * MS));
-            assert_eq!(s.delay_curve_beta, Some(0.5));
-            let k = cc.recovery_rtts * 100 * MS;
-            let anchor = s.congestion_event_rate_upps;
-            let r0 = connection_rate(0, anchor, k, &connection_curve_policy(&s, &cc), true).0;
-            assert!(r0.abs_diff((0.5 * anchor as f64) as u64) <= 2, "i={i} r0={r0} anchor={anchor}");
+            let close = start * MS + c.interval_ns(100 * MS);
+            let accepted = fresh_high_contract_step(&mut s, close, &cc, |s| window_live(s, start, 200, c));
+            got.push(accepted);
+            if accepted {
+                assert_eq!(s.congestion_event_time_ns, close);
+                assert_eq!(s.delay_curve_beta, Some(0.5));
+                let k = cc.recovery_rtts * 100 * MS;
+                let anchor = s.congestion_event_rate_upps;
+                let r0 = connection_rate(0, anchor, k, &connection_curve_policy(&s, &cc), true).0;
+                assert!(r0.abs_diff((0.5 * anchor as f64) as u64) <= 2, "i={i} r0={r0} anchor={anchor}");
+            }
         }
-        assert_eq!((s.stats.delay_events_raised, s.stats.delay_events_accepted, s.stats.delay_cuts_beta_override), (8, 8, 8));
+        assert_eq!(got, vec![true, false, true, false, true, false, true, false]);
+        assert_eq!((s.stats.delay_events_raised, s.stats.delay_events_accepted, s.stats.delay_cuts_beta_override), (4, 4, 4));
         assert_eq!((s.stats.delay_suspensions, s.stats.delay_events_suppressed, s.stats.delay_rearms, s.stats.delay_hold_blocked_rearms), (0, 0, 0, 0));
         assert_eq!(format!("{:?}", s.delay_giveup), format!("{:?}", DelayGiveupState::default()));
         // Same sequence under the frozen db50 base (giveup 3 + hold) suspends and suppresses.
         let base = DelayEventConfig::parse(db50_base).unwrap();
         let mut b = state();
-        for i in 0..8u64 { window(&mut b, 1000 + 1000 * i, Some(200), base); }
+        // Actual candidate HOLD + giveup 3 through the real ingress: cuts at windows 0,2,4,
+        // strikes resolved at 2,4,6 (release windows add none), suspension at window 6.
+        for i in 0..8u64 { window_live(&mut b, 1000 + 1000 * i, 200, base); }
         assert_eq!(b.stats.delay_events_accepted, 3);
         assert_eq!(b.stats.delay_suspensions, 1);
         assert!(b.stats.delay_events_suppressed > 0 && b.delay_giveup.suspended);
@@ -19384,8 +19625,15 @@ mod cc_vultr_min2000_db50_nogiveup_tests {
         let k = cc.recovery_rtts * 100 * MS;
         for loss in [false, true] {
             let mut s = state();
-            for i in 0..5u64 { assert!(window(&mut s, 1000 + 1000 * i, Some(200), c), "window {i}"); }
-            assert_eq!((s.stats.delay_events_accepted, s.stats.delay_suspensions), (5, 0));
+            // FRESHHOLD candidate cadence on persistent fresh HIGH: cut, release, cut, release, cut.
+            let mut got = Vec::new();
+            for i in 0..5u64 {
+                let start = 1000 + 1000 * i;
+                got.push(fresh_high_contract_step(&mut s, start * MS + c.interval_ns(100 * MS), &cc, |s| window_live(s, start, 200, c)));
+            }
+            assert_eq!(got, vec![true, false, true, false, true], "loss={loss}");
+            assert_eq!((s.stats.delay_events_accepted, s.stats.delay_suspensions), (3, 0));
+            assert_eq!(s.fresh_hold.phase, 1);
             assert_eq!(s.delay_curve_beta, Some(0.5));
             let (at, now) = (6800 * MS, 7000 * MS);
             if loss { assert!(apply_loss_congestion(&mut s, at, now, &cc, None)); }
@@ -19563,6 +19811,13 @@ mod cc_vultr_dmin10_tests {
         }
         close_delay_event(s, close, c, &crate::ship::CC, None)
     }
+    // Candidate path through the REAL ingress (observe_delay_event tracks the FreshHold
+    // fresh-subset min; the direct-write `window` above can never resolve a HOLD).
+    fn window_live(s: &mut ConnectionStateConnected, start_ms: u64, sample_ns: u64, c: DelayEventConfig) -> bool {
+        let close = start_ms * MS + c.interval_ns(srtt(s));
+        observe_delay_event(s, start_ms * MS, sample_ns, 1000 + start_ms, (start_ms - 200) * MS, Some(c), &crate::ship::CC, None);
+        close_delay_event(s, close, c, &crate::ship::CC, None)
+    }
 
     #[test]
     fn cc_dmin10_runtime_delta_is_only_delay_min_ms_5_to_10() {
@@ -19616,7 +19871,17 @@ mod cc_vultr_dmin10_tests {
         assert!(window(&mut s, 2000, Some(18 * MS + 1), c), "10 ms + 1 ns excess must cut");
         assert_eq!((s.stats.delay_events_raised, s.stats.delay_events_accepted, s.stats.delay_cuts_beta_override), (1, 1, 1));
         assert_eq!(s.delay_curve_beta, Some(0.5));
-        assert!(window(&mut s, 3000, Some(30 * MS), c));
+        // FRESHHOLD: the next fresh HIGH is inside HOLD and only releases it (no cut).
+        let cc = crate::ship::CC;
+        let close = |st: u64, s: &ConnectionStateConnected| st * MS + c.interval_ns(srtt(s));
+        let t = close(3000, &s);
+        assert!(!fresh_high_contract_step(&mut s, t, &cc, |s| window_live(s, 3000, 30 * MS, c)));
+        assert_eq!((s.stats.delay_events_raised, s.stats.delay_events_accepted, s.fresh_hold.phase), (1, 1, 2));
+        // Outside HOLD the threshold is again exact: =10 ms does not cut, 10 ms + 1 ns does.
+        assert!(!window_live(&mut s, 4000, 18 * MS, c), "exactly 10 ms excess must not cut outside HOLD");
+        assert_eq!(s.stats.delay_events_accepted, 1);
+        let t = close(5000, &s);
+        assert!(fresh_high_contract_step(&mut s, t, &cc, |s| window_live(s, 5000, 18 * MS + 1, c)), "10 ms + 1 ns outside HOLD must cut");
         assert_eq!(s.stats.delay_events_accepted, 2);
     }
 
@@ -19658,18 +19923,501 @@ mod cc_vultr_dmin10_tests {
         let cc = crate::ship::CC;
         let c = cur();
         let mut s = state(8);
+        // FRESHHOLD candidate: exact cadence cut, release, ... on persistent fresh HIGH.
+        let mut got = Vec::new();
         for i in 0..8u64 {
             let start = 1000 + 1000 * i;
-            assert!(window(&mut s, start, Some(40 * MS), c), "window {i} not accepted");
-            assert_eq!(s.congestion_event_time_ns, start * MS + c.interval_ns(srtt(&s)));
-            assert_eq!(s.delay_curve_beta, Some(0.5));
-            let k = cc.recovery_rtts * srtt(&s);
-            let anchor = s.congestion_event_rate_upps;
-            let r0 = connection_rate(0, anchor, k, &connection_curve_policy(&s, &cc), true).0;
-            assert!(r0.abs_diff((0.5 * anchor as f64) as u64) <= 2, "i={i} r0={r0} anchor={anchor}");
+            let close = start * MS + c.interval_ns(srtt(&s));
+            let accepted = fresh_high_contract_step(&mut s, close, &cc, |s| window_live(s, start, 40 * MS, c));
+            got.push(accepted);
+            if accepted {
+                assert_eq!(s.congestion_event_time_ns, close);
+                assert_eq!(s.delay_curve_beta, Some(0.5));
+                let k = cc.recovery_rtts * srtt(&s);
+                let anchor = s.congestion_event_rate_upps;
+                let r0 = connection_rate(0, anchor, k, &connection_curve_policy(&s, &cc), true).0;
+                assert!(r0.abs_diff((0.5 * anchor as f64) as u64) <= 2, "i={i} r0={r0} anchor={anchor}");
+            }
         }
-        assert_eq!((s.stats.delay_events_raised, s.stats.delay_events_accepted, s.stats.delay_cuts_beta_override), (8, 8, 8));
+        assert_eq!(got, vec![true, false, true, false, true, false, true, false]);
+        assert_eq!((s.stats.delay_events_raised, s.stats.delay_events_accepted, s.stats.delay_cuts_beta_override), (4, 4, 4));
         assert_eq!((s.stats.delay_suspensions, s.stats.delay_events_suppressed, s.stats.delay_rearms, s.stats.delay_hold_blocked_rearms), (0, 0, 0, 0));
         assert_eq!(format!("{:?}", s.delay_giveup), format!("{:?}", DelayGiveupState::default()));
     }
+}
+
+// FreshHold regression/contract tests (cfg(test) only).
+#[cfg(test)]
+mod cc_freshhold_tests {
+    use super::*;
+    const MS:u64=1_000_000;
+    // Verbatim pre-FreshHold (main 595c710) curve + reanchor, renamed.
+fn base_cubic_rate_with_options(t_ns: u64, r_max: u64, k_ns: u64, cc: &CongestionPolicy) -> (u64, char) {
+    if k_ns == 0 { return (r_max.min(MAX_CC_RATE_UPPS), 'R'); }
+    let t = t_ns as f64;
+    let r = r_max as f64;
+    let k = k_ns as f64;
+    let drop = r * (1.0 - cc.beta);
+    let rtt_seconds = k / (cc.recovery_rtts as f64 * 1e9);
+    let floor = cc.min_growth_uppsps;
+    let ceiling = cc.max_growth_uppsps;
+    let min_growth = floor / 1e9 * t;
+    let linear_cap_slope = ceiling / 1e9;
+    let finish = |rate: u64, mode| {
+        let absolute = r * cc.beta + (floor + ceiling) / 1e9 * t;
+        let relative = r * cc.beta * (cc.relative_growth_per_rtt * t / (rtt_seconds * 1e9)).exp() + min_growth;
+        (rate.min(relative.min(absolute) as u64).min(MAX_CC_RATE_UPPS), mode)
+    };
+
+    // R: p^2 recovery from r*BETA up to r*cc.rate_rp
+    let r_rp = r * cc.rate_rp; // rate at R→P
+    let r_drop = r_rp - r * cc.beta; // total recovery range
+    if t <= k {
+        let p = 1.0 - t / k;
+        let rate = r_rp - r_drop * p * p + min_growth;
+        return finish((rate.max(r * cc.beta)) as u64, 'R');
+    }
+
+    let dt = t - k;
+    let t_pg = (cc.time_pg - 1.0) * k; // duration of P phase
+    let t_gs = (cc.time_gs - 1.0) * k; // duration of P+G phase (from end of R)
+
+    let r_pg = r * cc.rate_pg; // rate at P→G
+    let r_gs = r * cc.rate_gs; // rate at G→S
+
+    // P: linear from r_rp to r_pg
+    let p_slope = (r_pg - r_rp) / t_pg; // derivative at P exit = G entry
+
+    if dt <= t_pg {
+        let rate = r_rp + p_slope * dt + min_growth;
+        let capped = r_rp + linear_cap_slope * dt + min_growth;
+        let rate = rate.min(capped);
+        let rate = if rate.is_finite() { rate } else { r };
+        return finish(rate as u64, 'P');
+    }
+
+    // G: quadratic from (t_pg, r_pg), entry derivative = p_slope
+    // rate = r_pg + p_slope*(dt-t_pg) + a*(dt-t_pg)^2
+    // At dt=t_gs: rate = r_gs → solve for a
+    let g_dt = t_gs - t_pg; // duration of G phase
+    let a = (r_gs - r_pg - p_slope * g_dt) / (g_dt * g_dt);
+
+    if dt <= t_gs {
+        let u = dt - t_pg;
+        let rate = r_pg + p_slope * u + a * u * u + min_growth;
+        let capped = r + linear_cap_slope * dt + min_growth;
+        let rate = rate.min(capped);
+        let rate = if rate.is_finite() { rate } else { r };
+        return finish(rate as u64, 'G');
+    }
+
+    // S: p^10 explosive ramp from G→S point
+    // Entry derivative = p_slope + 2*a*g_dt (G exit derivative)
+    let g_exit_slope = p_slope + 2.0 * a * g_dt;
+    // p^10 with time constant chosen so entry derivative matches G exit:
+    // d/dt(amplitude * (u/k_s)^10) at u=0 = 0, so we add a linear term
+    // rate = r_gs + g_exit_slope*(dt-t_gs) + amplitude * ((dt-t_gs)/k_s)^10
+    let k_s = k * 3.0; // startup time constant
+    let s_amplitude = drop * 10.0; // aggressive startup amplitude
+    let u = dt - t_gs;
+    let ps = u / k_s;
+    let ps2 = ps * ps;
+    let ps5 = ps2 * ps2 * ps;
+    let rate = r_gs + g_exit_slope * u + s_amplitude * ps5 * ps5 + min_growth;
+    let capped = r + linear_cap_slope * dt + min_growth;
+    let uncapped = rate;
+    let rate = rate.min(capped);
+    let rate = if rate.is_finite() { rate } else { r };
+    let mode = if uncapped > capped { 'L' } else { 'S' };
+    finish(rate as u64, mode)
+}
+fn base_rtt_reanchor_age(current_t: u64, anchor_upps: u64, old_k: u64, new_k: u64, cc: &CongestionPolicy, startup_done: bool) -> Option<u64> {
+    let (old_rate, _) = base_connection_rate(current_t, anchor_upps, old_k, cc, startup_done);
+    let reaches = |t| base_connection_rate(t, anchor_upps, new_k, cc, startup_done).0 >= old_rate;
+    let mut lo = if new_k >= old_k { current_t } else { 0u64 };
+    let mut hi = if new_k >= old_k { current_t.saturating_mul(2).saturating_add(new_k) } else { current_t };
+    while !reaches(hi) {
+        if hi == u64::MAX { return None; }
+        lo = hi + 1;
+        hi = hi.saturating_add(hi.max(1));
+    }
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if reaches(mid) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    Some(hi)
+}
+    fn base_connection_rate(t_ns: u64, anchor_upps: u64, k_ns: u64, cc: &CongestionPolicy, startup_done: bool) -> (u64, char) {
+        if !startup_done {
+            let rtt_ns = k_ns / cc.recovery_rtts;
+            let exponent = if rtt_ns == u16::MAX as u64 * 100_000 { 0.0 } else { cc.startup_multiplier.ln() * t_ns as f64 / rtt_ns.max(100_000) as f64 };
+            ((anchor_upps as f64 * exponent.min(30.0).exp()).min(MAX_CC_RATE_UPPS as f64) as u64, 'I')
+        } else { base_cubic_rate_with_options(t_ns, anchor_upps, k_ns, cc) }
+    }
+
+    fn rel(c:u64) -> FreshHold { FreshHold{phase:2,release_coord_ns:c as i128,..FreshHold::NONE} }
+    // Released state compared without the wall stamp.
+    fn relc(h:FreshHold) -> FreshHold { FreshHold{release_wall_ns:0,..h} }
+    fn config() -> DelayEventConfig { DelayEventConfig { k:0.5,min_ms:10.,max_ms:100.,interval_rtts:1.,giveup:0,hold:None,beta:None,effect:None } }
+    fn state() -> ConnectionStateConnected {
+        let ConnectionState::Connected(mut s)=new_connection_state_connected(None,0,1,MS) else {unreachable!()};
+        s.RTT_mean=1000; s.RTT_sample_cursor=1; s.target_min_rtt_ns=100*MS;
+        s.congestion_event_rate_upps=2_000_000_000; s.stats.cc_rate_upps=2_000_000_000;
+        s.congestion_event_time_ns=100*MS; s.cc_startup_done=true;
+        s
+    }
+    fn hold(barrier_ms:u64) -> FreshHold { FreshHold{phase:1,barrier_ns:barrier_ms*MS,..FreshHold::NONE} }
+    fn smp(s:&mut ConnectionStateConnected, now:u64, sample:u64, seq:u64, sent:u64) {
+        observe_delay_event(s,now*MS,sample*MS,seq,sent*MS,Some(config()),&crate::ship::CC,None);
+    }
+    fn tick(s:&mut ConnectionStateConnected, now:u64) -> bool { close_delay_event(s,now*MS,config(),&crate::ship::CC,None) }
+    // Accepted native cut at 1100ms (evidence sent 900ms); barrier = 1100 + 0.5*100 = 1150ms; next deadline 1200ms.
+    fn entered() -> ConnectionStateConnected {
+        let mut s=state();
+        smp(&mut s,1000,200,1,900); assert!(tick(&mut s,1100));
+        assert_eq!(s.fresh_hold,hold(1150),"accepted native cut enters HOLD with the frozen barrier");
+        // Close the (empty) window opened at the cut so the next one spans 1200..1300ms.
+        assert!(!tick(&mut s,1200));
+        s
+    }
+
+    #[test]
+    fn freshhold_accepted_native_enters_rejected_leaves_unchanged() {
+        assert_eq!(crate::ship::CC.event_guard_rtts,0.5);
+        let s=entered();
+        assert_eq!(s.fresh_hold,hold(1150));
+        assert_eq!(s.congestion_event_time_ns,1100*MS); assert_eq!(s.stats.delay_events_accepted,1);
+        // Rejected native (guard) from released state: unchanged.
+        let mut s=state(); s.congestion_event_time_ns=1100*MS;
+        let rel=rel(7*MS); s.fresh_hold=rel;
+        smp(&mut s,1150,200,2,1120); assert!(!tick(&mut s,1250));
+        assert_eq!(s.fresh_hold,rel); assert_eq!(s.stats.delay_events_accepted,0);
+        // Rejected physical ECN (not past guard) leaves released state too.
+        s.ecn_congestion_received=true; s.ecn_oldest_seq=3; s.ecn_oldest_send_time=1120*MS;
+        assert!(!apply_ecn_congestion(&mut s,1300*MS,&crate::ship::CC,None)); assert_eq!(s.fresh_hold,rel);
+        // Rejected loss (send before guard) leaves it unchanged.
+        assert!(!apply_loss_congestion(&mut s,1120*MS,1300*MS,&crate::ship::CC,None)); assert_eq!(s.fresh_hold,rel);
+    }
+
+    #[test]
+    fn freshhold_stale_empty_pending_do_not_release_then_fresh_low_releases() {
+        let mut s=entered();
+        assert!(!tick(&mut s,1200));                     // empty window closes: no release
+        smp(&mut s,1250,110,2,1150);                     // send == barrier: stale (strict)
+        smp(&mut s,1260,120,3,1100);
+        assert_eq!(s.fresh_hold,hold(1150),"stale samples are not tracked");
+        assert!(!tick(&mut s,1300));                     // stale-only LOW
+        smp(&mut s,1310,300,4,1149);
+        assert!(!tick(&mut s,1400));                     // stale-only HIGH: consumed, no release, no cut
+        assert_eq!(s.fresh_hold,hold(1150));
+        assert_eq!((s.stats.delay_events_accepted,s.stats.delay_events_raised),(1,1));
+        smp(&mut s,1410,110,5,1300);
+        assert!(!tick(&mut s,1450));                     // unterminated window: pending
+        assert_eq!(s.fresh_hold.phase,1); assert_eq!(s.fresh_hold.min_sample_ns,110*MS);
+        assert!(!tick(&mut s,1500));                     // fresh LOW resolves: release, no cut
+        assert_eq!(s.fresh_hold.release_wall_ns,1500*MS);
+        assert_eq!(relc(s.fresh_hold),rel(400*MS));      // active age 1500-1100
+        assert_eq!((s.stats.delay_events_accepted,s.stats.delay_events_raised),(1,1));
+        // Released state persists across later clean windows.
+        smp(&mut s,1510,105,6,1505); assert!(!tick(&mut s,1600));
+        assert!(!tick(&mut s,1700));
+        assert_eq!(relc(s.fresh_hold),rel(400*MS));
+    }
+
+    #[test]
+    fn freshhold_fresh_high_releases_consumes_window_then_later_high_cuts() {
+        let mut s=entered();
+        smp(&mut s,1210,250,2,1160);
+        assert!(!tick(&mut s,1300));                     // fresh HIGH resolves: release only
+        assert_eq!(s.stats.delay_events_accepted,1); assert_eq!(s.congestion_event_time_ns,1100*MS);
+        assert_eq!(relc(s.fresh_hold),rel(200*MS)); assert_eq!(s.fresh_hold.release_wall_ns,1300*MS);
+        // The resolving window was consumed: the very next HIGH window cuts (new native epoch),
+        // clearing the released state and entering a new HOLD.
+        smp(&mut s,1310,250,3,1260);
+        assert!(tick(&mut s,1400));
+        assert_eq!(s.stats.delay_events_accepted,2); assert_eq!(s.fresh_hold,hold(1450));
+    }
+
+    // Regression: origin moved backward (reanchor) so a stale HIGH owner
+    // (sent 1140 <= frozen barrier 1150) would pass the ordinary mutable guard.
+    #[test]
+    fn freshhold_stale_high_after_origin_backdate_cannot_recut() {
+        let mut s=entered();
+        s.congestion_event_time_ns=1000*MS;            // backdated origin: guard now 1050
+        smp(&mut s,1210,300,7,1140);
+        assert!(1140*MS>s.congestion_event_time_ns+50*MS, "would pass ordinary guard");
+        assert!(!tick(&mut s,1300));
+        assert_eq!(s.fresh_hold,hold(1150));
+        assert_eq!((s.stats.delay_events_accepted,s.stats.delay_events_raised),(1,1));
+        // Only a later fresh window resolves; only windows after that can cut.
+        smp(&mut s,1310,300,8,1160); assert!(!tick(&mut s,1400));
+        assert_eq!(s.fresh_hold.phase,2);
+        smp(&mut s,1410,300,9,1405); assert!(tick(&mut s,1500));
+        assert_eq!(s.fresh_hold,hold(1550));
+    }
+
+    // Stated limitation, precise contract (replaces the old "8 persistent HIGH windows => 8 cuts"
+    // identity): persistent HIGH still cycles; resolving windows never recut.
+    #[test]
+    fn freshhold_persistent_high_cycle_release_never_recuts() {
+        let mut s=entered();
+        let mut got=Vec::new(); let mut phases=Vec::new();
+        for w in 0..8u64 {
+            let start=1200+100*w;
+            let before=s.fresh_hold;
+            smp(&mut s,start+10,300,10+w,start+5);
+            let r=tick(&mut s,start+100);
+            got.push(r); phases.push(s.fresh_hold.phase);
+            match (before.phase,r) {
+                (1,false) if s.fresh_hold.phase==1 => assert_eq!(s.fresh_hold,before,"stale window consumed, barrier frozen"),
+                (1,false) => assert_eq!(s.fresh_hold.phase,2,"release"),
+                (2,true) => assert_eq!(s.fresh_hold,hold(start+150),"cut clears release, enters HOLD"),
+                other => panic!("unexpected transition {other:?} w={w}"),
+            }
+        }
+        // release(no cut), cut, stale-consumed (owner sent <= new barrier), release, cut, stale, release, cut
+        assert_eq!(got,vec![false,true,false,false,true,false,false,true]);
+        assert_eq!(phases,vec![2,1,1,2,1,1,2,1]);
+        assert_eq!(s.stats.delay_events_accepted,4);
+    }
+
+    #[test]
+    fn freshhold_mixed_stale_fresh_min_tracks_fresh_subset_only() {
+        let mut s=entered();
+        smp(&mut s,1205,105,10,1140);   // stale overall min (LOW)
+        smp(&mut s,1210,180,11,1160);
+        smp(&mut s,1220,170,12,1170);   // fresh min
+        smp(&mut s,1230,170,13,1175);   // tie
+        smp(&mut s,1240,300,14,1145);   // stale last sender (window evidence)
+        assert_eq!((s.delay_event_window.evidence_seq,s.delay_event_window.min_sample_ns),(14,Some(105*MS)));
+        assert_eq!(s.fresh_hold.min_sample_ns,170*MS);
+        assert!(!tick(&mut s,1300));    // fresh subset HIGH resolves despite stale-low overall min
+        assert_eq!(s.fresh_hold.phase,2); assert_eq!(s.fresh_hold.release_wall_ns,1300*MS);
+        assert_eq!(s.stats.delay_events_accepted,1);
+    }
+
+    #[test]
+    fn freshhold_release_continuity_all_phases_both_envelopes_no_bank() {
+        let cc=crate::ship::CC; let r=2_000_000_000u64; let k=cc.recovery_rtts*100*MS;
+        let floor=cc.min_growth_uppsps; let mut modes=std::collections::BTreeSet::new();
+        for tr_q in [0u64,1,3,9,12,20,40,80] {
+            let tr=k*tr_q/4;
+            let h=rel(tr);
+            // Release instant: identical to HOLD (no retroactive bank).
+            assert_eq!(cubic_rate_additive(tr,h.add(tr),r,k,&cc),cubic_rate_additive(tr,0,r,k,&cc));
+            let mut t=tr;
+            while t<=tr+12*k {
+                let (held,m)=cubic_rate_additive(t,0,r,k,&cc); modes.insert(m);
+                let (rel,m2)=cubic_rate_additive(t,h.add(t),r,k,&cc); assert_eq!(m,m2);
+                let (ord,_)=cubic_rate_additive(t,t,r,k,&cc);
+                assert!(rel>=held && rel<=ord, "t={t} tr={tr} held={held} rel={rel} ord={ord}");
+                let budget=(floor/1e9*(t-tr) as f64) as u64+2;
+                assert!(rel-held<=budget, "bank t={t} tr={tr} {} > {budget}",rel-held);
+                // Both envelopes carry the additive age only.
+                let rb=r as f64*cc.beta;
+                assert!(held as f64<=rb+cc.max_growth_uppsps/1e9*t as f64+1.0, "abs env t={t}");
+                let rtt_s=k as f64/(cc.recovery_rtts as f64*1e9);
+                assert!(held as f64<=rb*(cc.relative_growth_per_rtt*t as f64/(rtt_s*1e9)).exp()+1.0, "rel env t={t}");
+                assert!(rel as f64<=rb*(cc.relative_growth_per_rtt*t as f64/(rtt_s*1e9)).exp()+floor/1e9*(t-tr) as f64+1.0);
+                t+=k/16;
+            }
+        }
+        for m in ['R','P','G'] { assert!(modes.contains(&m),"{modes:?}"); }
+        assert!(modes.contains(&'S')||modes.contains(&'L'),"{modes:?}");
+    }
+
+    #[test]
+    fn freshhold_legacy_always_permitted_exact_rates_vs_baseline() {
+        let cc=crate::ship::CC; let s=state();
+        assert_eq!(s.fresh_hold,FreshHold::NONE);
+        for r in [1_000_000u64,2_000_000_000,37_123_456_789,crate::ship::CC.rate_floor_upps] {
+            for rtt in [1u64,100,1577] {
+                let k=cc.recovery_rtts*rtt*MS;
+                let mut t=0u64;
+                while t<30*k {
+                    assert_eq!(cubic_rate_with_options(t,r,k,&cc),base_cubic_rate_with_options(t,r,k,&cc));
+                    assert_eq!(cubic_rate_additive(t,FreshHold::NONE.add(t),r,k,&cc),base_cubic_rate_with_options(t,r,k,&cc));
+                    for sd in [false,true] {
+                        assert_eq!(connection_rate(t,r,k,&cc,sd),base_connection_rate(t,r,k,&cc,sd));
+                        assert_eq!(connection_rate_add(t,t,r,k,&cc,sd),base_connection_rate(t,r,k,&cc,sd));
+                    }
+                    t+=k/7+13;
+                }
+                for (ct,nk) in [(k/3,k*2),(k*4,k/2),(k*11,k*3)] {
+                    assert_eq!(rtt_reanchor_age_hold(ct,r,k,nk,&cc,true,FreshHold::NONE),base_rtt_reanchor_age(ct,r,k,nk,&cc,true));
+                    assert_eq!(rtt_reanchor_age(ct,r,k,nk,&cc,true),base_rtt_reanchor_age(ct,r,k,nk,&cc,true));
+                }
+            }
+        }
+        // state_rate for phase none equals the legacy anchor/age call.
+        assert_eq!(state_rate(&s,123*MS,900*MS,&cc,true),base_connection_rate(123*MS,s.congestion_event_rate_upps,900*MS,&cc,true));
+    }
+
+    #[test]
+    fn freshhold_trace_context_and_send_time_rate_use_additive_age() {
+        let cc=crate::ship::CC; let k=cc.recovery_rtts*100*MS;
+        let mut s=state(); s.congestion_event_time_ns=0;
+        s.fresh_hold=rel(5*k);
+        let now=6*k;
+        let (rate,_)=state_rate(&s,now,k,&cc,true);
+        assert_eq!(rate,cubic_rate_additive(now,k,s.congestion_event_rate_upps,k,&cc).0);
+        assert_ne!(rate,connection_rate(now,s.congestion_event_rate_upps,k,&cc,true).0);
+        // +1ms trace probe uses the same mapping.
+        assert_eq!(state_rate(&s,now+MS,k,&cc,true).0,cubic_rate_additive(now+MS,k+MS,s.congestion_event_rate_upps,k,&cc).0);
+        s.fresh_hold.phase=1;
+        assert_eq!(state_rate(&s,now,k,&cc,true).0,cubic_rate_additive(now,0,s.congestion_event_rate_upps,k,&cc).0);
+    }
+
+    // Discovery reconstruction: evidence sent before/at release gets zero additive; after gets t-t_release.
+    // Evaluated before the accepted cut clears the state.
+    #[test]
+    fn freshhold_discovery_historical_send_ecn_and_loss() {
+        let cc=crate::ship::CC; let k=cc.recovery_rtts*100*MS;
+        let mk=|phase:u8|{ let mut s=state(); s.congestion_event_time_ns=0; s.stats.cc_rate_upps=0;
+            s.fresh_hold=if phase==2 {rel(k)} else {FreshHold{phase,barrier_ns:if phase==1 {10*k} else {0},..FreshHold::NONE}}; s };
+        for (sent,expect_eq_hold) in [(k-MS,true),(k,true),(k+k/2,false)] {
+            // physical ECN
+            let run_ecn=|phase:u8|{ let mut s=mk(phase); s.ecn_congestion_received=true; s.ecn_oldest_seq=9; s.ecn_oldest_send_time=sent;
+                assert!(apply_ecn_congestion(&mut s,4*k,&cc,None)); s };
+            let (rel,hold,none)=(run_ecn(2),run_ecn(1),run_ecn(0));
+            assert_eq!(rel.fresh_hold,FreshHold::NONE); assert_eq!(hold.fresh_hold,FreshHold::NONE);
+            assert_eq!(rel.congestion_event_rate_upps==hold.congestion_event_rate_upps,expect_eq_hold,"ecn sent={sent}");
+            if !expect_eq_hold { assert!(rel.congestion_event_rate_upps>hold.congestion_event_rate_upps && rel.congestion_event_rate_upps<none.congestion_event_rate_upps); }
+            // loss
+            let run_loss=|phase:u8|{ let mut s=mk(phase); assert!(apply_loss_congestion(&mut s,sent,4*k,&cc,None)); s };
+            let (rel,hold,none)=(run_loss(2),run_loss(1),run_loss(0));
+            assert_eq!(rel.fresh_hold,FreshHold::NONE); assert_eq!(hold.fresh_hold,FreshHold::NONE);
+            assert_eq!(rel.congestion_event_rate_upps==hold.congestion_event_rate_upps,expect_eq_hold,"loss sent={sent}");
+            if !expect_eq_hold { assert!(rel.congestion_event_rate_upps>hold.congestion_event_rate_upps && rel.congestion_event_rate_upps<none.congestion_event_rate_upps); }
+        }
+        // Native discovery path (close_delay_event -> apply_ecn_congestion) uses the same mapping:
+        // released state, evidence sent before release vs. hold state gives the same new anchor.
+        let native=|phase:u8|{ let mut s=mk(phase);
+            smp(&mut s,(4*k)/MS,250,2,(k-MS)/MS); assert!(tick(&mut s,(4*k)/MS+100)); s };
+        // (HOLD itself cannot natively recut, so compare with the physical-ECN path on HOLD.)
+        let mut e=mk(1); e.ecn_congestion_received=true; e.ecn_oldest_seq=2; e.ecn_oldest_send_time=k-MS;
+        assert!(apply_ecn_congestion(&mut e,4*k+100*MS,&cc,None));
+        assert_eq!(native(2).congestion_event_rate_upps,e.congestion_event_rate_upps);
+        assert_eq!(native(2).fresh_hold.phase,1);
+    }
+
+    #[test]
+    fn freshhold_outage_resume_clears() {
+        for h in [rel(3*MS),hold(5)] {
+            let mut s=state(); let mut b=SendQueues::new(1,(100000,1000000,1000000));
+            s.fresh_hold=h;
+            s.outage.since_ns=Some(1000*MS);
+            resume_outage(&mut s,&mut b,&mut [],1500*MS,None);
+            assert_eq!(s.fresh_hold,FreshHold::NONE);
+        }
+    }
+
+    #[test]
+    fn freshhold_app_limited_release_has_no_idle_credit() {
+        let mut s=entered();
+        smp(&mut s,1210,150,2,1160);
+        s.is_app_limited=true; s.app_limit_time_offset=60*MS;   // paused at active age 60ms
+        assert!(!tick(&mut s,1300));
+        assert_eq!(relc(s.fresh_hold),rel(60*MS)); assert_eq!(s.fresh_hold.release_wall_ns,1300*MS);
+        assert_eq!(s.fresh_hold.add(s.app_limit_time_offset),0);   // frozen while app-limited
+        assert_eq!(s.fresh_hold.add(60*MS+25*MS),25*MS);            // prospective after resume
+    }
+
+    #[test]
+    fn freshhold_reanchor_fixed_credit_and_translation() {
+        let cc=crate::ship::CC; let r=2_000_000_000u64;
+        // Reviewer counterexample: K 900->450ms, age 1000ms, released at 100ms (credit 900ms).
+        {
+            let h=rel(100*MS); let credit=h.add(1000*MS); assert_eq!(credit,900*MS);
+            let old=connection_rate_add(1000*MS,credit,r,900*MS,&cc,true).0;
+            let hi=rtt_reanchor_age_hold(1000*MS,r,900*MS,450*MS,&cc,true,h).unwrap();
+            let h2=fresh_hold_reanchored(h,1000*MS,hi);
+            assert!(h2.release_coord_ns<0,"{h2:?} hi={hi}");
+            assert_eq!(h2.add(hi),credit);
+            let new=connection_rate_add(hi,h2.add(hi),r,450*MS,&cc,true).0;
+            assert!(new>=old && new-old<=old/1000+2,"no down/up jump {old}->{new}");
+        }
+        for k in [900*MS,9*MS] {
+            for (ct,nk) in [(4*k,2*k),(4*k,k/2),(4*k,k/4),(12*k,8*k),(k/2,3*k),(10*k,k/4),(k*10/9,k/2)] {
+                for h in [rel(ct/10),rel(ct/2),rel(ct),FreshHold{phase:1,barrier_ns:5,..FreshHold::NONE}] {
+                    let credit=h.add(ct);
+                    let old=connection_rate_add(ct,credit,r,k,&cc,true).0;
+                    let Some(hi)=rtt_reanchor_age_hold(ct,r,k,nk,&cc,true,h) else { panic!("unreachable ct={ct} nk={nk}") };
+                    let h2=fresh_hold_reanchored(h,ct,hi);
+                    if h.phase==1 { assert_eq!(h2,h); }   // barrier frozen, unaffected
+                    assert_eq!(h2.add(hi),credit,"exact credit ct={ct} nk={nk} {h:?}");
+                    let new=connection_rate_add(hi,h2.add(hi),r,nk,&cc,true).0;
+                    assert!(new>=old,"continuity ct={ct} nk={nk} {new}<{old}");
+                    if hi>0 { assert!(connection_rate_add(hi-1,credit,r,nk,&cc,true).0<old,"minimal (no up-jump) ct={ct} nk={nk}"); }
+                    // Prospective growth continues at 1:1 after the translation.
+                    if h.phase==2 { assert_eq!(h2.add(hi+7*MS),credit+7*MS); }
+                }
+            }
+        }
+        // Repeated reanchors (K shrinking/growing) drive the coordinate negative; credit exact each time.
+        let mut h=rel(50*MS); let mut t=1000*MS; let mut k=900*MS;
+        for nk in [450*MS,225*MS,900*MS,112*MS,1800*MS,300*MS] {
+            let credit=h.add(t);
+            let hi=rtt_reanchor_age_hold(t,r,k,nk,&cc,true,h).unwrap();
+            h=fresh_hold_reanchored(h,t,hi);
+            assert_eq!(h.add(hi),credit);
+            t=hi+20*MS; k=nk;
+        }
+        assert!(h.release_coord_ns<0 || h.add(0)==0);
+    }
+
+    // Wall-clock release boundary survives origin translation: historical sends
+    // before/at the true release get zero additive, after get the mapped credit.
+    #[test]
+    fn freshhold_wall_release_boundary_after_translation() {
+        let cc=crate::ship::CC; let k=cc.recovery_rtts*100*MS;
+        let mk=|phase:u8|{ let mut s=state(); s.congestion_event_time_ns=0; s.stats.cc_rate_upps=0;
+            s.fresh_hold=if phase==2 { FreshHold{phase:2,release_coord_ns:-(k as i128),release_wall_ns:2*k,..FreshHold::NONE} }
+                else { FreshHold{phase:1,barrier_ns:100*k,..FreshHold::NONE} }; s };
+        // Coordinate says add>0 at every age, but sends at/before wall 2k were under HOLD.
+        assert!(mk(2).fresh_hold.add(k/2)>0);
+        for (sent,eq) in [(2*k-MS,true),(2*k,true),(2*k+MS,false)] {
+            let ecn=|phase:u8|{ let mut s=mk(phase); s.ecn_congestion_received=true; s.ecn_oldest_seq=9; s.ecn_oldest_send_time=sent;
+                assert!(apply_ecn_congestion(&mut s,4*k,&cc,None)); s.congestion_event_rate_upps };
+            assert_eq!(ecn(2)==ecn(1),eq,"ecn sent={sent}");
+            let loss=|phase:u8|{ let mut s=mk(phase); assert!(apply_loss_congestion(&mut s,sent,4*k,&cc,None)); s.congestion_event_rate_upps };
+            assert_eq!(loss(2)==loss(1),eq,"loss sent={sent}");
+        }
+        assert_eq!(mk(2).fresh_hold.for_send(2*k).add(3*k),0);
+        assert_eq!(mk(2).fresh_hold.for_send(2*k+1).add(3*k),4*k);
+    }
+
+    #[test]
+    fn freshhold_state_size_and_unchanged_reservation_budget() {
+        // Explicit new-state contract. Pre-FreshHold exact ConnectionStateConnected sizes
+        // (x86_64 linux) are feature-specific: default 44784, research 44824 (the research
+        // feature already carried a pre-existing +40, see mtu_recovery_tests outage ledger).
+        // FreshHold is 48B with align 16 (i128 release coordinate), which raises Connected's
+        // alignment to 16, so its size is (baseline + 48) rounded up to a multiple of 16:
+        // default 44784+48=44832 (already 16-aligned, +0 pad); research 44824+48=44872 -> 44880
+        // (+8 alignment padding). The 512KiB connection reservation is unchanged and must hold.
+        let sz=std::mem::size_of::<ConnectionStateConnected>();
+        let al=std::mem::align_of::<ConnectionStateConnected>();
+        let research=cfg!(feature="research_target_validation");
+        let baseline:usize=if research { 44824 } else { 44784 };
+        let unpadded=baseline+FRESHHOLD_STATE_DELTA;
+        let pad=sz as i64-unpadded as i64;
+        assert_eq!(std::mem::size_of::<FreshHold>(),FRESHHOLD_STATE_DELTA);
+        assert_eq!(std::mem::align_of::<FreshHold>(),16);
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            assert_eq!(al,16);
+            assert_eq!(sz%al,0);
+            assert_eq!(sz,(unpadded+al-1)/al*al,"Connected = baseline+FreshHold rounded to align 16");
+            assert_eq!(sz,if research { 44880 } else { 44832 });
+            assert_eq!(pad,if research { 8 } else { 0 });
+        }
+        assert!(sz<512<<10);
+        assert_eq!(RECEIVE_CONNECTION_BYTES, (512 << 10) + crate::mtu_recovery::HISTORY_BYTES);
+    }
+    const FRESHHOLD_STATE_DELTA:usize=48; // FreshHold 48B (i128 coord, align 16)
 }

@@ -1694,8 +1694,25 @@ fn outage_proof_ledger_memory_delta_fits_existing_connection_reservation() {
             "raw RTT/count, recent search upper/expiry, independent boundary clock/backoff");
         // Preserve the 416-byte outage/RTT delta; bracket and boundary state
         // add 32 and replace the old 8-byte additive-search step.
+        // FreshHold: +48 bytes for ConnectionStateConnected::fresh_hold
+        // (FreshHold, align 16 via its i128 coordinate). Pre-FreshHold exact sizes were
+        // default 44784 / research 44824. FreshHold raises Connected's alignment from 8 to
+        // 16, so the total rounds up to a multiple of 16: default 44832 (+0 pad), research
+        // 44872 -> 44880 (+8 alignment padding).
+        let fresh_hold_added = 48;
+        assert_eq!(std::mem::size_of::<FreshHold>(), fresh_hold_added);
+        assert_eq!(std::mem::align_of::<FreshHold>(), 16);
+        assert_eq!(std::mem::align_of::<ConnectionStateConnected>(), 16);
+        let pre_fresh_hold = baseline + added + recovery_state_added - 8;
+        assert_eq!(pre_fresh_hold,
+            if cfg!(feature = "research_target_validation") { 44824 } else { 44784 });
+        let align_pad = if cfg!(feature = "research_target_validation") { 8 } else { 0 };
+        assert_eq!((pre_fresh_hold + fresh_hold_added + 15) / 16 * 16,
+            pre_fresh_hold + fresh_hold_added + align_pad);
         assert_eq!(std::mem::size_of::<ConnectionStateConnected>(),
-            baseline + added + recovery_state_added - 8);
+            pre_fresh_hold + fresh_hold_added + align_pad);
+        assert_eq!(std::mem::size_of::<ConnectionStateConnected>(),
+            if cfg!(feature = "research_target_validation") { 44880 } else { 44832 });
     }
     assert!(std::mem::size_of::<ConnectionStateConnected>() < 512 << 10);
     assert_eq!(RECEIVE_CONNECTION_BYTES, (512 << 10) + crate::mtu_recovery::HISTORY_BYTES);
