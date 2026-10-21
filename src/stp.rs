@@ -19257,7 +19257,7 @@ mod cc_vultr_min2000_db50_nogiveup_tests {
         assert_eq!(format!("{c:?}"), format!("{:?}", delay_event_config().unwrap()));
         assert_eq!((c.giveup, c.beta), (0, Some(0.5)));
         assert!(c.hold.is_none() && c.effect.is_none());
-        assert_eq!((c.k, c.min_ms, c.max_ms, c.interval_rtts), (0.5, 5.0, 50.0, 1.0));
+        assert_eq!((c.k, c.min_ms, c.max_ms, c.interval_rtts), (0.5, 10.0, 50.0, 1.0));
         let base = DelayEventConfig::parse(db50_base).unwrap();
         assert_eq!(base.giveup, 3);
         assert!(base.hold.is_some());
@@ -19353,7 +19353,7 @@ mod cc_vultr_min2000_db50_nogiveup_tests {
         assert_eq!((crate::ship::ACK.every_packets, crate::ship::ACK.max_delay_us), (8, 10_000));
         let pinned = [("STP_CC_DELAY_BETA", "0.5"), ("STP_CC_DELAY_EVENT", "1"), ("STP_CC_DELAY_GIVEUP", "0"),
             ("STP_CC_DELAY_HOLD_MAX_RTTS", "256"), ("STP_CC_DELAY_HOLD_RTTS", "16"), ("STP_CC_DELAY_INTERVAL_RTTS", "1"),
-            ("STP_CC_DELAY_K", "0.5"), ("STP_CC_DELAY_MAX_MS", "50"), ("STP_CC_DELAY_MIN_MS", "5")];
+            ("STP_CC_DELAY_K", "0.5"), ("STP_CC_DELAY_MAX_MS", "50"), ("STP_CC_DELAY_MIN_MS", "10")];
         for (k, v) in pinned { assert_eq!(frozen(k).as_deref(), Some(v), "{k}"); }
     }
 
@@ -19524,5 +19524,152 @@ mod delivery_growth_closed_loop_tests {
             }}
         }
         assert!(failures.is_empty(), "{failures:#?}");
+    }
+}
+
+/// Vultr low-RTT delay-threshold tuning relative to c81a952 and the frozen
+/// min2000-db50-nogiveup benchmark baseline: exactly one shipped runtime value
+/// changed, FROZEN_POLICY STP_CC_DELAY_MIN_MS "5" -> "10". The 8 ms baseline and
+/// 16 ms window minimum are illustrative fixtures, NOT a replay of an observed trace.
+#[cfg(test)]
+mod cc_vultr_dmin10_tests {
+    use super::*;
+    const MS: u64 = 1_000_000;
+    fn frozen(name: &str) -> Option<String> {
+        crate::ship::FROZEN_POLICY.iter().find(|(k, _)| *k == name).map(|(_, v)| v.to_string())
+    }
+    fn min5_base(name: &str) -> Option<String> {
+        if name == "STP_CC_DELAY_MIN_MS" { return Some("5".into()); }
+        frozen(name)
+    }
+    fn base5() -> DelayEventConfig { DelayEventConfig::parse(min5_base).unwrap() }
+    fn cur() -> DelayEventConfig { delay_event_config().unwrap() }
+    // Connected, post-startup state with true baseline base_ms and SRTT 2*base_ms.
+    fn state(base_ms: u64) -> ConnectionStateConnected {
+        let ConnectionState::Connected(mut s) = new_connection_state_connected(None, 0, 1, MS) else { unreachable!() };
+        s.RTT_mean = (2 * base_ms * 10) as u16; s.RTT_sample_cursor = 1; s.target_min_rtt_ns = base_ms * MS;
+        s.congestion_event_rate_upps = 2_000_000_000; s.stats.cc_rate_upps = 2_000_000_000;
+        s.congestion_event_time_ns = 100 * MS; s.cc_startup_done = true;
+        s
+    }
+    fn srtt(s: &ConnectionStateConnected) -> u64 { s.RTT_mean as u64 * 100_000 }
+    // One window starting at start_ms with min sample sample_ns (None = empty), closed at its deadline.
+    fn window(s: &mut ConnectionStateConnected, start_ms: u64, sample_ns: Option<u64>, c: DelayEventConfig) -> bool {
+        let r = srtt(s);
+        let close = start_ms * MS + c.interval_ns(r);
+        match sample_ns {
+            Some(m) => s.delay_event_window.observe(start_ms * MS, m, 1000 + start_ms, (start_ms - 200) * MS, r, c),
+            None => s.delay_event_window.deadline_ns = Some(close),
+        }
+        close_delay_event(s, close, c, &crate::ship::CC, None)
+    }
+
+    #[test]
+    fn cc_dmin10_runtime_delta_is_only_delay_min_ms_5_to_10() {
+        let actual = crate::ship::FROZEN_POLICY;
+        assert_eq!(actual.len(), 41);
+        assert_eq!(crate::ship::policy_var("STP_CC_DELAY_MIN_MS").unwrap(), "10");
+        let pinned = [("STP_CC_DELAY_BETA", "0.5"), ("STP_CC_DELAY_EVENT", "1"), ("STP_CC_DELAY_GIVEUP", "0"),
+            ("STP_CC_DELAY_HOLD_MAX_RTTS", "256"), ("STP_CC_DELAY_HOLD_RTTS", "16"), ("STP_CC_DELAY_INTERVAL_RTTS", "1"),
+            ("STP_CC_DELAY_K", "0.5"), ("STP_CC_DELAY_MAX_MS", "50"), ("STP_CC_DELAY_MIN_MS", "10")];
+        for (k, v) in pinned { assert_eq!(frozen(k).as_deref(), Some(v), "{k}"); }
+        let (c, b) = (cur(), base5());
+        assert_eq!((c.k, c.min_ms, c.max_ms, c.interval_rtts, c.giveup, c.beta), (0.5, 10.0, 50.0, 1.0, 0, Some(0.5)));
+        assert_eq!(b.min_ms, 5.0);
+        assert!(c.hold.is_none() && c.effect.is_none());
+        assert_eq!(format!("{:?}", DelayEventConfig { min_ms: 10.0, ..b }), format!("{c:?}"));
+        // CC unchanged from the frozen min2000 base, field by field.
+        assert_eq!(format!("{:?}", crate::ship::CC), format!("{:?}", CongestionPolicy {
+            beta: 0.8, recovery_rtts: 9, rate_rp: 0.92, rate_pg: 1.02, rate_gs: 2.0, time_pg: 6.0, time_gs: 10.0,
+            loss_threshold: 2, loss_timeout_rtts: 2.0, event_guard_rtts: 0.5,
+            rate_floor_upps: 100_000_000, initial_rate_upps: 100_000_000,
+            min_growth_uppsps: 2_000_000_000.0, max_growth_uppsps: 1_000_000_000.0,
+            relative_growth_per_rtt: 0.015, startup_multiplier: 1.05, startup_backoff_rtts: 1.0,
+        }));
+        assert_eq!((crate::ship::ACK.every_packets, crate::ship::ACK.max_delay_us), (8, 10_000));
+    }
+
+    #[test]
+    fn cc_dmin10_threshold_floor_5_vs_10_on_8ms_baseline_16ms_window() {
+        let (c, b) = (cur(), base5());
+        assert_eq!(b.threshold_ns(8 * MS), 5e6);
+        assert_eq!(c.threshold_ns(8 * MS), 10e6);
+        // Illustrative: baseline 8 ms, window minimum 16 ms => 8 ms excess.
+        let mut old = state(8);
+        assert!(window(&mut old, 1000, Some(16 * MS), b), "min5 must cut 8 ms excess");
+        assert_eq!((old.stats.delay_events_raised, old.stats.delay_events_accepted), (1, 1));
+        assert_eq!(old.delay_curve_beta, Some(0.5));
+        let mut new = state(8);
+        let before = (new.congestion_event_rate_upps, new.congestion_event_time_ns);
+        assert!(!window(&mut new, 1000, Some(16 * MS), c), "min10 must not cut 8 ms excess");
+        assert_eq!((new.stats.delay_events_raised, new.stats.delay_events_accepted), (0, 0));
+        assert_eq!((new.congestion_event_rate_upps, new.congestion_event_time_ns), before);
+        assert_eq!(new.delay_curve_beta, None);
+    }
+
+    #[test]
+    fn cc_dmin10_native_cut_fires_above_10ms_excess_not_at_10() {
+        let c = cur();
+        let mut s = state(8);
+        assert!(!window(&mut s, 1000, Some(18 * MS), c), "exactly 10 ms excess must not cut");
+        assert_eq!(s.stats.delay_events_raised, 0);
+        assert!(window(&mut s, 2000, Some(18 * MS + 1), c), "10 ms + 1 ns excess must cut");
+        assert_eq!((s.stats.delay_events_raised, s.stats.delay_events_accepted, s.stats.delay_cuts_beta_override), (1, 1, 1));
+        assert_eq!(s.delay_curve_beta, Some(0.5));
+        assert!(window(&mut s, 3000, Some(30 * MS), c));
+        assert_eq!(s.stats.delay_events_accepted, 2);
+    }
+
+    #[test]
+    fn cc_dmin10_empty_and_low_windows_do_not_cut() {
+        let c = cur();
+        let mut s = state(8);
+        let before = (s.congestion_event_rate_upps, s.congestion_event_time_ns);
+        for (i, sample) in [None, Some(8 * MS), Some(12 * MS), None, Some(16 * MS), Some(18 * MS), None].into_iter().enumerate() {
+            assert!(!window(&mut s, 1000 + 1000 * i as u64, sample, c), "window {i} {sample:?}");
+        }
+        assert_eq!((s.congestion_event_rate_upps, s.congestion_event_time_ns), before);
+        assert_eq!((s.stats.delay_events_raised, s.stats.delay_events_accepted, s.stats.delay_suspensions), (0, 0, 0));
+        assert_eq!(s.delay_curve_beta, None);
+    }
+
+    #[test]
+    fn cc_dmin10_london40_and_singapore180_thresholds_unchanged() {
+        let (c, b) = (cur(), base5());
+        assert_eq!((c.threshold_ns(40 * MS), b.threshold_ns(40 * MS)), (20e6, 20e6));
+        assert_eq!((c.threshold_ns(180 * MS), b.threshold_ns(180 * MS)), (50e6, 50e6));
+        // Every baseline >= 20 ms is unaffected; below it min10 is never more sensitive.
+        for base_us in (0..=400_000u64).step_by(250) {
+            let (t10, t5) = (c.threshold_ns(base_us * 1000), b.threshold_ns(base_us * 1000));
+            if base_us >= 20_000 { assert_eq!(t10, t5, "base_us={base_us}"); } else { assert!(t10 >= t5, "base_us={base_us}"); }
+        }
+        for (base_ms, thr_ms) in [(40u64, 20u64), (180, 50)] {
+            for cfg in [c, b] {
+                let mut s = state(base_ms);
+                assert!(!window(&mut s, 1000, Some((base_ms + thr_ms) * MS), cfg), "base {base_ms} at threshold");
+                assert!(window(&mut s, 2000, Some((base_ms + thr_ms) * MS + 1), cfg), "base {base_ms} above threshold");
+                assert_eq!((s.stats.delay_events_raised, s.stats.delay_events_accepted), (1, 1));
+            }
+        }
+    }
+
+    #[test]
+    fn cc_dmin10_persistent_high_windows_still_cut_with_giveup_zero() {
+        let cc = crate::ship::CC;
+        let c = cur();
+        let mut s = state(8);
+        for i in 0..8u64 {
+            let start = 1000 + 1000 * i;
+            assert!(window(&mut s, start, Some(40 * MS), c), "window {i} not accepted");
+            assert_eq!(s.congestion_event_time_ns, start * MS + c.interval_ns(srtt(&s)));
+            assert_eq!(s.delay_curve_beta, Some(0.5));
+            let k = cc.recovery_rtts * srtt(&s);
+            let anchor = s.congestion_event_rate_upps;
+            let r0 = connection_rate(0, anchor, k, &connection_curve_policy(&s, &cc), true).0;
+            assert!(r0.abs_diff((0.5 * anchor as f64) as u64) <= 2, "i={i} r0={r0} anchor={anchor}");
+        }
+        assert_eq!((s.stats.delay_events_raised, s.stats.delay_events_accepted, s.stats.delay_cuts_beta_override), (8, 8, 8));
+        assert_eq!((s.stats.delay_suspensions, s.stats.delay_events_suppressed, s.stats.delay_rearms, s.stats.delay_hold_blocked_rearms), (0, 0, 0, 0));
+        assert_eq!(format!("{:?}", s.delay_giveup), format!("{:?}", DelayGiveupState::default()));
     }
 }

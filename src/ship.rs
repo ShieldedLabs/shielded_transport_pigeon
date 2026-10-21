@@ -93,7 +93,7 @@ pub(crate) const FROZEN_POLICY: &[(&str, &str)] = &[
     ("STP_CC_DELAY_INTERVAL_RTTS", "1"),
     ("STP_CC_DELAY_K", "0.5"),
     ("STP_CC_DELAY_MAX_MS", "50"),
-    ("STP_CC_DELAY_MIN_MS", "5"),
+    ("STP_CC_DELAY_MIN_MS", "10"),
     ("STP_P4_BASE_PARITY_MODEL", "0"),
     ("STP_P4_BUDGET_BASE", "1"),
     ("STP_P4_COST_SMOOTH", "1"),
