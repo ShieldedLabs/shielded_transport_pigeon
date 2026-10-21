@@ -13628,37 +13628,55 @@ mod review2_tests {
     #[test]
     fn review2_ackhole_repeated_cuts_no_panic() {
         let cc = &crate::ship::CC;
-        let mut s = connected();
-        s.RTT_mean = 100;
-        s.cc_startup_done = true;
-        s.congestion_event_rate_upps = 2_000_000_000;
-        let mut now = 10_000_000_000u64;
-        s.congestion_event_time_ns = now - 10_000_000;
-        let mut cuts = 0u32;
-        for _round in 0..50u64 {
-            let hole = s.send_sequence_number;
-            // 0ad3b9d shares the two-loss RTT cohort: exercise two holes, not one.
-            // Six sends also close the send-time bucket holding the first holes.
-            for _ in 0..6 { s.account_send(now); now += 1_000_000; }
-            s.packets_in_flight += 6;
-            for i in 2..6u64 {
-                let bit = (hole + i) % PACKETS_WAITING_ACK_CAPACITY;
-                s.packets_waiting_ack_field[(bit / 64) as usize] &= !(1u64 << (bit % 64));
-                s.packets_in_flight -= 1;
-                s.ack_hole.acknowledged(hole + i);
+        // Exercise both delivery-floor-limited and unconstrained commands. The
+        // historical anchor may rise after recovery; an accepted loss must cut
+        // the effective command at the same instant, unless already at floor.
+        for ceiling in [cc.rate_floor_upps, MAX_CC_RATE_UPPS] {
+            let mut s = connected();
+            s.delivery_growth = DeliveryGrowth::new(0, ceiling);
+            s.RTT_mean = 100;
+            s.cc_startup_done = true;
+            s.congestion_event_rate_upps = 2_000_000_000;
+            let mut now = 10_000_000_000u64;
+            s.congestion_event_time_ns = now - 10_000_000;
+            let mut cuts = 0u32;
+            let mut strict = 0u32;
+            for _round in 0..50u64 {
+                let hole = s.send_sequence_number;
+                // Two holes share the loss cohort; six sends close its bucket.
+                for _ in 0..6 {
+                    s.stats.cc_rate_upps = (cc_trace_context(&s, now, cc, None).pps * 1e6).round() as u64;
+                    s.delivery_growth.last_rate_upps = s.stats.cc_rate_upps;
+                    s.account_send(now);
+                    now += 1_000_000;
+                }
+                s.packets_in_flight += 6;
+                for i in 2..6u64 {
+                    let bit = (hole + i) % PACKETS_WAITING_ACK_CAPACITY;
+                    s.packets_waiting_ack_field[(bit / 64) as usize] &= !(1u64 << (bit % 64));
+                    s.packets_in_flight -= 1;
+                    s.ack_hole.acknowledged(hole + i);
+                }
+                let accepted = s.congestion_event_time_ns;
+                for advance in [0, 2_000_000, 0, 2_000_000] {
+                    now += advance;
+                    let before = cc_trace_context(&s, now, cc, None).pps;
+                    let event_time = s.congestion_event_time_ns;
+                    observe_ack_hole(&mut s, now, cc, None);
+                    if s.congestion_event_time_ns != event_time {
+                        let after = cc_trace_context(&s, now, cc, None).pps;
+                        assert!(after <= before, "loss raised command: {before} -> {after}");
+                        assert!(after < before || after == cc.rate_floor_upps as f64 / 1e6);
+                        strict += u32::from(after < before);
+                    }
+                }
+                cuts += u32::from(s.congestion_event_time_ns != accepted);
+                now += 100_000_000;
             }
-            let before = s.congestion_event_rate_upps;
-            for _ in 0..2 {
-                observe_ack_hole(&mut s, now, cc, None);
-                now += 2_000_000;
-                observe_ack_hole(&mut s, now, cc, None);
-            }
-            if s.congestion_event_rate_upps != before { cuts += 1; }
-            assert!(s.congestion_event_rate_upps <= before);
-            now += 100_000_000;
+            assert!(cuts >= 40, "expected persistent hole pattern to cut repeatedly, got {cuts} cuts");
+            if ceiling == MAX_CC_RATE_UPPS { assert!(strict > 0, "no strict cuts above floor"); }
+            assert_eq!(std::mem::size_of_val(&s.ack_hole), std::mem::size_of::<AckHole>());
         }
-        assert!(cuts >= 40, "expected persistent hole pattern to cut repeatedly, got {cuts} cuts");
-        assert_eq!(std::mem::size_of_val(&s.ack_hole), std::mem::size_of::<AckHole>());
     }
 
     #[test]
