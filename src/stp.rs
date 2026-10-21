@@ -10012,46 +10012,56 @@ mod congestion_tests {
         }
     }
 
+    /// Preserve the legacy min25 replay as an explicit reference, through all curve
+    /// phases. A steeper current curve may legitimately meet the delivery ceiling;
+    /// after that, replaying its unlimited proposal as delivery is counterfactual.
+    /// Current-policy safety and progress use actual-command feedback in
+    /// delivery_growth_closed_loop_tests below (a model, not the socket pump).
     #[test]
-    fn delivery_growth_clean_ramp_is_unchanged_in_every_curve_phase() {
-        let cc = crate::ship::CC;
-        for rtt in [20_000_000, 40_000_000, 200_000_000, 600_000_000] {
-            for done in [false, true] {
-                let mut g = DeliveryGrowth::new(0, cc.rate_floor_upps);
-                let k = rtt * cc.recovery_rtts;
-                let anchor = if done { 10_000_000_000 } else { cc.initial_rate_upps };
-                // Loss/ECN do not reset delivery history. Establish the receipts
-                // that authorized a post-loss sender's pre-cut command, rather
-                // than fabricating a high last command with no delivery proof.
-                let origin = if done {
-                    let feedback = rtt + crate::ship::ACK.max_delay_us as u64 * 1000;
-                    for window in 1..=2 {
-                        g.acknowledged(window * feedback,
-                            rate_mul_div(anchor, feedback, 1_000_000_000_000_000),
-                            rtt, rtt, cc.rate_floor_upps);
-                    }
-                    g.limit(anchor);
-                    2 * feedback
-                } else {
-                    // The first positive ACK establishes the RTT and starts
-                    // active curve time. Subsequent receipts lag sends.
-                    g.acknowledged(rtt, 1, rtt, rtt, cc.rate_floor_upps);
-                    rtt
-                };
-                let mut ack_credit = 0f64;
-                for tick in 1..=4000 {
-                    let age: u64 = tick * 1_000_000;
-                    let now = origin + age;
-                    let old = connection_rate(age.saturating_sub(rtt), anchor, k, &cc, done).0;
-                    ack_credit += old as f64 / 1_000_000_000.0;
-                    let packets = ack_credit as u64;
-                    ack_credit -= packets as f64;
-                    g.acknowledged(now, packets, rtt, rtt, cc.rate_floor_upps);
-                    let proposed = connection_rate(age, anchor, k, &cc, done).0;
-                    assert_eq!(g.limit(proposed), proposed, "RTT {rtt}, phase {done}, time {now}");
-                }
-            }
+    fn reference_min25_open_loop_replay_never_clips_through_s_or_l() {
+        const MS: u64 = 1_000_000;
+        const RTTS: [u64; 4] = [20_000_000, 40_000_000, 200_000_000, 600_000_000];
+        fn with_min(min_growth_uppsps: f64) -> CongestionPolicy { CongestionPolicy { min_growth_uppsps, ..crate::ship::CC } }
+        fn horizon(rtt: u64, cc: &CongestionPolicy) -> u64 {
+            (4_000 * MS).max((cc.time_gs + 1.0) as u64 * rtt * cc.recovery_rtts)
         }
+        let cc = with_min(25_000_000.0);
+        let mut failures = Vec::new();
+        for rtt in RTTS { for done in [false, true] {
+            let mut g = DeliveryGrowth::new(0, cc.rate_floor_upps);
+            let k = rtt * cc.recovery_rtts;
+            let anchor = if done { 10_000_000_000 } else { cc.initial_rate_upps };
+            let origin = if done {
+                let feedback = rtt + crate::ship::ACK.max_delay_us as u64 * 1000;
+                for window in 1..=2 {
+                    g.acknowledged(window * feedback, rate_mul_div(anchor, feedback, 1_000_000_000_000_000),
+                        rtt, rtt, cc.rate_floor_upps);
+                }
+                g.limit(anchor);
+                2 * feedback
+            } else { g.acknowledged(rtt, 1, rtt, rtt, cc.rate_floor_upps); rtt };
+            let ticks = if done { horizon(rtt, &cc) } else { 4_000 * MS } / MS;
+            let (mut phases, mut first, mut ack_credit) = (String::new(), None, 0f64);
+            for tick in 1..=ticks {
+                let age = tick * MS;
+                let now = origin + age;
+                let old = connection_rate(age.saturating_sub(rtt), anchor, k, &cc, done).0;
+                ack_credit += old as f64 / 1_000_000_000.0;
+                let packets = ack_credit as u64;
+                ack_credit -= packets as f64;
+                g.acknowledged(now, packets, rtt, rtt, cc.rate_floor_upps);
+                let (proposed, mode) = connection_rate(age, anchor, k, &cc, done);
+                if !phases.contains(mode) { phases.push(mode); }
+                let limited = g.limit(proposed);
+                if limited != proposed && first.is_none() { first = Some((now, limited, proposed)); }
+            }
+            println!("DGSUP ref25-openloop rtt_ms={} done={done} horizon_s={:.2} phases={phases} first_clip={first:?}",
+                rtt / MS, (ticks * MS) as f64 / 1e9);
+            let phases_ok = if done { ['R', 'P', 'G'].iter().all(|m| phases.contains(*m)) && (phases.contains('S') || phases.contains('L')) }
+                else { phases == "I" };
+            if first.is_some() || !phases_ok { failures.push((rtt, done, phases, first)); }
+        }}
+        assert!(failures.is_empty(), "{failures:?}");
     }
 
     #[test]
@@ -10773,7 +10783,7 @@ mod congestion_tests {
                     let rate = cubic_rate(t, r, k).0;
                     assert!(rate >= previous);
                     // Arithmetic reordering can differ by one millionth of a pps.
-                    assert!(rate <= (r as f64 * cc.beta + 1025e6 * t as f64 / 1e9) as u64 + 1,
+                    assert!(rate <= (r as f64 * cc.beta + (cc.min_growth_uppsps + cc.max_growth_uppsps) * t as f64 / 1e9) as u64 + 1,
                         "r={r} rtt={rtt} t={t} rate={rate}");
                     previous = rate;
                 }
@@ -19191,3 +19201,328 @@ mod ring_active_retry_regression {
 #[cfg(test)]
 #[path = "mtu_recovery_tests.rs"]
 mod mtu_recovery_tests;
+
+#[cfg(test)]
+mod cc_vultr_min2000_db50_nogiveup_tests {
+    //! VULTR MIN2000-DB50-NOGIVEUP research candidate: on top of the frozen
+    //! min4000-db50-nogiveup runtime exactly one shipped value differs:
+    //! CC.min_growth_uppsps 4_000_000_000.0 -> 2_000_000_000.0. FROZEN_POLICY is
+    //! identical to that base (STP_CC_DELAY_GIVEUP "0"; db50 base had "3").
+    use super::*;
+    const MS: u64 = 1_000_000;
+    fn frozen(name: &str) -> Option<String> {
+        crate::ship::FROZEN_POLICY.iter().find(|(k, _)| *k == name).map(|(_, v)| v.to_string())
+    }
+    fn db50_base(name: &str) -> Option<String> {
+        if name == "STP_CC_DELAY_GIVEUP" { return Some("3".into()); }
+        frozen(name)
+    }
+    fn state() -> ConnectionStateConnected {
+        let ConnectionState::Connected(mut s) = new_connection_state_connected(None, 0, 1, MS) else { unreachable!() };
+        s.RTT_mean = 1000; s.RTT_sample_cursor = 1; s.target_min_rtt_ns = 100 * MS;
+        s.congestion_event_rate_upps = 2_000_000_000; s.stats.cc_rate_upps = 2_000_000_000;
+        s.congestion_event_time_ns = 100 * MS; s.cc_startup_done = true;
+        s
+    }
+    // One window starting at start_ms with min sample sample_ms (None = empty), closed at its deadline.
+    fn window(s: &mut ConnectionStateConnected, start_ms: u64, sample_ms: Option<u64>, c: DelayEventConfig) -> bool {
+        let cc = crate::ship::CC;
+        let close = start_ms * MS + c.interval_ns(100 * MS);
+        match sample_ms {
+            Some(m) => s.delay_event_window.observe(start_ms * MS, m * MS, 1000 + start_ms, (start_ms - 200) * MS, 100 * MS, c),
+            None => s.delay_event_window.deadline_ns = Some(close),
+        }
+        close_delay_event(s, close, c, &cc, None)
+    }
+
+    #[test]
+    fn cc_vultr_nogiveup_exact_policy_only_giveup_zero() {
+        let cc = crate::ship::CC;
+        assert_eq!(cc.min_growth_uppsps, 2_000_000_000.0);
+        assert_eq!(cc.max_growth_uppsps, 1_000_000_000.0);
+        assert_eq!((cc.rate_floor_upps, cc.initial_rate_upps, cc.beta), (100_000_000, 100_000_000, 0.8));
+        let actual = crate::ship::FROZEN_POLICY;
+        assert_eq!(actual.len(), 41);
+        let changed: Vec<_> = actual.iter().filter(|(k, v)| db50_base(k).as_deref() != Some(*v)).collect();
+        assert_eq!(changed, vec![&("STP_CC_DELAY_GIVEUP", "0")]);
+        assert_eq!(crate::ship::policy_var("STP_CC_DELAY_GIVEUP").unwrap(), "0");
+        assert_eq!(crate::ship::policy_var("STP_CC_DELAY_BETA").unwrap(), "0.5");
+        assert_eq!(crate::ship::policy_var("STP_CC_DELAY_HOLD_RTTS").unwrap(), "16");
+        assert_eq!(crate::ship::policy_var("STP_CC_DELAY_HOLD_MAX_RTTS").unwrap(), "256");
+    }
+
+    #[test]
+    fn cc_vultr_nogiveup_parsed_giveup_zero_hold_none() {
+        let c = DelayEventConfig::parse(frozen).expect("delay event enabled");
+        assert_eq!(format!("{c:?}"), format!("{:?}", delay_event_config().unwrap()));
+        assert_eq!((c.giveup, c.beta), (0, Some(0.5)));
+        assert!(c.hold.is_none() && c.effect.is_none());
+        assert_eq!((c.k, c.min_ms, c.max_ms, c.interval_rtts), (0.5, 5.0, 50.0, 1.0));
+        let base = DelayEventConfig::parse(db50_base).unwrap();
+        assert_eq!(base.giveup, 3);
+        assert!(base.hold.is_some());
+        assert_eq!(format!("{:?}", DelayEventConfig { giveup: 0, hold: None, ..base }), format!("{c:?}"));
+    }
+
+    #[test]
+    fn cc_vultr_nogiveup_persistent_high_windows_keep_cutting_without_suspension() {
+        let cc = crate::ship::CC;
+        let c = delay_event_config().unwrap();
+        let mut s = state();
+        for i in 0..8u64 {
+            let start = 1000 + 1000 * i;
+            assert!(window(&mut s, start, Some(200), c), "window {i} not accepted");
+            assert_eq!(s.congestion_event_time_ns, start * MS + c.interval_ns(100 * MS));
+            assert_eq!(s.delay_curve_beta, Some(0.5));
+            let k = cc.recovery_rtts * 100 * MS;
+            let anchor = s.congestion_event_rate_upps;
+            let r0 = connection_rate(0, anchor, k, &connection_curve_policy(&s, &cc), true).0;
+            assert!(r0.abs_diff((0.5 * anchor as f64) as u64) <= 2, "i={i} r0={r0} anchor={anchor}");
+        }
+        assert_eq!((s.stats.delay_events_raised, s.stats.delay_events_accepted, s.stats.delay_cuts_beta_override), (8, 8, 8));
+        assert_eq!((s.stats.delay_suspensions, s.stats.delay_events_suppressed, s.stats.delay_rearms, s.stats.delay_hold_blocked_rearms), (0, 0, 0, 0));
+        assert_eq!(format!("{:?}", s.delay_giveup), format!("{:?}", DelayGiveupState::default()));
+        // Same sequence under the frozen db50 base (giveup 3 + hold) suspends and suppresses.
+        let base = DelayEventConfig::parse(db50_base).unwrap();
+        let mut b = state();
+        for i in 0..8u64 { window(&mut b, 1000 + 1000 * i, Some(200), base); }
+        assert_eq!(b.stats.delay_events_accepted, 3);
+        assert_eq!(b.stats.delay_suspensions, 1);
+        assert!(b.stats.delay_events_suppressed > 0 && b.delay_giveup.suspended);
+    }
+
+    #[test]
+    fn cc_vultr_nogiveup_low_and_empty_windows_do_not_cut() {
+        let c = delay_event_config().unwrap();
+        let mut s = state();
+        let before = (s.congestion_event_rate_upps, s.congestion_event_time_ns);
+        assert!(!window(&mut s, 1000, Some(140), c)); // excess 40ms <= 50ms threshold
+        assert!(!window(&mut s, 2000, None, c));      // empty window
+        // Not yet closed: no event before a fresh window's deadline.
+        s.delay_event_window = DelayEventWindow::default();
+        s.delay_event_window.observe(3000 * MS, 200 * MS, 4000, 2800 * MS, 100 * MS, c);
+        assert!(!close_delay_event(&mut s, 3000 * MS + c.interval_ns(100 * MS) - 1, c, &crate::ship::CC, None));
+        assert_eq!((s.congestion_event_rate_upps, s.congestion_event_time_ns), before);
+        assert_eq!((s.stats.delay_events_raised, s.stats.delay_events_accepted), (0, 0));
+        assert_eq!(s.delay_curve_beta, None);
+        assert!(close_delay_event(&mut s, 3000 * MS + c.interval_ns(100 * MS), c, &crate::ship::CC, None));
+        assert_eq!((s.stats.delay_events_accepted, s.stats.delay_suspensions), (1, 0));
+    }
+
+    #[test]
+    fn cc_vultr_nogiveup_loss_and_ecn_still_use_beta_point8() {
+        let cc = crate::ship::CC;
+        let c = delay_event_config().unwrap();
+        let k = cc.recovery_rtts * 100 * MS;
+        for loss in [false, true] {
+            let mut s = state();
+            assert!(window(&mut s, 1000, Some(200), c));
+            assert_eq!(s.delay_curve_beta, Some(0.5));
+            if loss { assert!(apply_loss_congestion(&mut s, 1800 * MS, 2000 * MS, &cc, None)); }
+            else {
+                s.ecn_congestion_received = true; s.ecn_oldest_send_time = 1800 * MS;
+                assert!(apply_ecn_congestion(&mut s, 2000 * MS, &cc, None));
+            }
+            assert_eq!(s.delay_curve_beta, None);
+            assert_eq!(format!("{:?}", connection_curve_policy(&s, &cc)), format!("{cc:?}"));
+            assert_eq!(connection_rate(0, s.congestion_event_rate_upps, k, &connection_curve_policy(&s, &cc), true).0,
+                (s.congestion_event_rate_upps as f64 * 0.8) as u64);
+        }
+    }
+
+    /// Frozen min4000-db50-nogiveup base CC (binary 1302cbee...), written out field by field.
+    fn base4k_cc() -> CongestionPolicy {
+        CongestionPolicy {
+            beta: 0.8, recovery_rtts: 9, rate_rp: 0.92, rate_pg: 1.02, rate_gs: 2.0, time_pg: 6.0, time_gs: 10.0,
+            loss_threshold: 2, loss_timeout_rtts: 2.0, event_guard_rtts: 0.5,
+            rate_floor_upps: 100_000_000, initial_rate_upps: 100_000_000,
+            min_growth_uppsps: 4_000_000_000.0, max_growth_uppsps: 1_000_000_000.0,
+            relative_growth_per_rtt: 0.015, startup_multiplier: 1.05, startup_backoff_rtts: 1.0,
+        }
+    }
+
+    #[test]
+    fn cc_vultr_min2000_runtime_is_base4k_with_only_min_growth_halved() {
+        let cc = crate::ship::CC;
+        assert_eq!(format!("{cc:?}"), format!("{:?}", CongestionPolicy { min_growth_uppsps: 2_000_000_000.0, ..base4k_cc() }));
+        assert_eq!(format!("{:?}", CongestionPolicy { min_growth_uppsps: 4_000_000_000.0, ..cc }), format!("{:?}", base4k_cc()));
+        // Non-CC shipped policies identical to the base.
+        let f = crate::ship::FEC;
+        assert_eq!((f.eps, f.min_loss, f.initial_loss, f.max_redundancy, f.extra_blocks, f.bucket_ns, f.min_packets, f.slot_ns, f.slots, f.window_ns),
+            (0.5, 0.005, 0.01, 1.0, 1, 1_000_000_000, 500, 60_000_000_000, 10, 600_000_000_000));
+        assert_eq!((crate::ship::ACK.every_packets, crate::ship::ACK.max_delay_us), (8, 10_000));
+        let pinned = [("STP_CC_DELAY_BETA", "0.5"), ("STP_CC_DELAY_EVENT", "1"), ("STP_CC_DELAY_GIVEUP", "0"),
+            ("STP_CC_DELAY_HOLD_MAX_RTTS", "256"), ("STP_CC_DELAY_HOLD_RTTS", "16"), ("STP_CC_DELAY_INTERVAL_RTTS", "1"),
+            ("STP_CC_DELAY_K", "0.5"), ("STP_CC_DELAY_MAX_MS", "50"), ("STP_CC_DELAY_MIN_MS", "5")];
+        for (k, v) in pinned { assert_eq!(frozen(k).as_deref(), Some(v), "{k}"); }
+    }
+
+    #[test]
+    fn cc_vultr_min2000_growth_is_slower_than_base4k_by_at_most_the_floor_delta() {
+        let cc = crate::ship::CC;
+        let b = base4k_cc();
+        let k = cc.recovery_rtts * 100 * MS;
+        let anchor = 2_000_000_000u64;
+        assert_eq!(connection_rate(0, anchor, k, &cc, true).0, connection_rate(0, anchor, k, &b, true).0);
+        let mut strictly = 0;
+        for t_ms in [10u64, 100, 300, 600, 900, 1500, 3000] {
+            let t = t_ms * MS;
+            let (r2, r4) = (connection_rate(t, anchor, k, &cc, true).0, connection_rate(t, anchor, k, &b, true).0);
+            assert!(r2 <= r4, "t={t_ms}ms r2={r2} r4={r4}");
+            assert!(r4 - r2 <= (2_000_000_000.0 * t as f64 / 1e9) as u64 + 2, "t={t_ms}ms gap {}", r4 - r2);
+            if r2 < r4 { strictly += 1; }
+            // Parameterized compounded bound with this candidate's min+max growth.
+            assert!(r2 <= (anchor as f64 * cc.beta + (cc.min_growth_uppsps + cc.max_growth_uppsps) * t as f64 / 1e9) as u64 + 1);
+        }
+        assert!(strictly >= 5, "min growth 2000 not visible in the curve: {strictly}");
+    }
+
+    #[test]
+    fn cc_vultr_min2000_repeated_native_cuts_then_loss_and_ecn_clear_to_beta_point8() {
+        let cc = crate::ship::CC;
+        let c = delay_event_config().unwrap();
+        let k = cc.recovery_rtts * 100 * MS;
+        for loss in [false, true] {
+            let mut s = state();
+            for i in 0..5u64 { assert!(window(&mut s, 1000 + 1000 * i, Some(200), c), "window {i}"); }
+            assert_eq!((s.stats.delay_events_accepted, s.stats.delay_suspensions), (5, 0));
+            assert_eq!(s.delay_curve_beta, Some(0.5));
+            let (at, now) = (6800 * MS, 7000 * MS);
+            if loss { assert!(apply_loss_congestion(&mut s, at, now, &cc, None)); }
+            else {
+                s.ecn_congestion_received = true; s.ecn_oldest_send_time = at;
+                assert!(apply_ecn_congestion(&mut s, now, &cc, None));
+            }
+            assert_eq!(s.delay_curve_beta, None);
+            let p = connection_curve_policy(&s, &cc);
+            assert_eq!((p.beta, p.min_growth_uppsps), (0.8, 2_000_000_000.0));
+            assert_eq!(connection_rate(0, s.congestion_event_rate_upps, k, &p, true).0, (s.congestion_event_rate_upps as f64 * 0.8) as u64);
+        }
+    }
+}
+
+/// Clean-path delivery-growth model: actual-command feedback, synthetic batched
+/// ACKs, fixed RTT and 1 ms send batches. This is not a full socket-pump test.
+#[cfg(test)]
+mod delivery_growth_closed_loop_tests {
+    use super::*;
+    const MS: u64 = 1_000_000;
+    const RTTS: [u64; 4] = [20_000_000, 40_000_000, 200_000_000, 600_000_000];
+    fn with_min(min_growth_uppsps: f64) -> CongestionPolicy { CongestionPolicy { min_growth_uppsps, ..crate::ship::CC } }
+    fn horizon(rtt: u64, cc: &CongestionPolicy) -> u64 {
+        (4_000 * MS).max((cc.time_gs + 1.0) as u64 * rtt * cc.recovery_rtts)
+    }
+
+    #[derive(Debug, Default)]
+    struct Run { binds: u64, max_short_upps: u64, last_bind_ms: Option<u64>, final_cmd: u64, final_prop: u64, violations: u64, first: Option<String> }
+
+    /// Clean-path closed loop driven by the ACTUAL sent command. Synthetic ACK batches,
+    /// not the pump: aggregate 1 ms send entries (count and send time, not per-packet
+    /// memory), one-way rtt/2 each way, receiver ACKs at >= every_packets or max_delay,
+    /// DG fed now - oldest admitted send as latency (fresh and shadow admission).
+    fn closed_loop(cc: &CongestionPolicy, rtt: u64, done: bool) -> Run {
+        let (floor, k) = (cc.rate_floor_upps, rtt * cc.recovery_rtts);
+        let ack_delay = crate::ship::ACK.max_delay_us as u64 * 1000;
+        let every = crate::ship::ACK.every_packets as u64;
+        let feedback = rtt + ack_delay;
+        let anchor = if done { 10_000_000_000 } else { cc.initial_rate_upps };
+        let mut g = DeliveryGrowth::new(0, floor);
+        let (mut flight, mut history) = (VecDeque::<(u64, u64)>::new(), VecDeque::<(u64, u64)>::new());
+        let (mut rx, mut rx_count, mut rx_first) = (Vec::<(u64, u64)>::new(), 0u64, 0u64);
+        let mut returning = VecDeque::<(u64, Vec<(u64, u64)>)>::new();
+        // done=true: ACTUAL anchor-rate sends and ACKs through this same path for two
+        // feedback windows plus one rtt before the cut, so pre-cut flight is real and no
+        // ACK count is fabricated. done=false: first packet at t=0; curve time starts at
+        // the first positive ACK, as in the runtime.
+        let pre = if done { 2 * feedback + rtt } else { 0 };
+        let mut origin = if done { pre } else { u64::MAX };
+        let (mut credit, mut previous, mut max_delivered_cmd) = if done { (0.0, anchor, 0) } else { (1.0, floor, 0) };
+        // Command <= max(previous, 2*max(floor, M) + 2e15/feedback): delivered packets
+        // were sent in an interval no longer than elapsed >= feedback at commands <= M,
+        // so their count is <= M*elapsed + 1 (credit carry < 1 packet); x2 headroom.
+        let allowance = 2 * 1_000_000_000_000_000 / feedback;
+        let window = rtt + 2 * feedback + ack_delay;
+        let (mut run, mut last_increase, mut t) = (Run::default(), pre, 0);
+        while t <= origin.saturating_add(horizon(rtt, cc)) {
+            while let Some(&(sent, packets)) = flight.front() {
+                if sent + rtt / 2 > t { break; }
+                flight.pop_front();
+                if rx.is_empty() { rx_first = t; }
+                rx.push((sent, packets));
+                rx_count += packets;
+            }
+            if rx_count >= every || (rx_count > 0 && t - rx_first >= ack_delay) {
+                returning.push_back((t + rtt - rtt / 2, std::mem::take(&mut rx)));
+                rx_count = 0;
+            }
+            while returning.front().is_some_and(|(arrive, _)| *arrive <= t) {
+                let (_, batch) = returning.pop_front().unwrap();
+                let (mut fresh, mut shadow) = ((0, 0), (0, 0));
+                for &(sent, packets) in &batch {
+                    if let Some(l) = g.receipt_latency(t, sent) { fresh = (fresh.0 + packets, fresh.1.max(l)); }
+                    if let Some(l) = g.shadow_receipt_latency(t, sent) { shadow = (shadow.0 + packets, shadow.1.max(l)); }
+                }
+                g.acknowledged_samples(t, fresh, shadow, rtt, floor);
+                if fresh.0 > 0 && origin == u64::MAX { origin = t; }
+            }
+            while history.front().is_some_and(|&(sent, _)| sent + rtt <= t) {
+                max_delivered_cmd = max_delivered_cmd.max(history.pop_front().unwrap().1);
+            }
+            if t < pre && t + MS >= pre { assert_eq!(g.limit(anchor), anchor, "pre-cut fixture: DG must admit the anchor"); }
+            let proposed = if t < pre { anchor } else { connection_rate(t.saturating_sub(origin), anchor, k, cc, done).0 };
+            let command = if t < pre { anchor } else { g.limit(proposed) };
+            let bound = previous.max(2 * floor.max(max_delivered_cmd) + allowance);
+            let mut bad = None;
+            if command > proposed { bad = Some("above proposal"); }
+            if command < previous && !(done && t == origin) { bad = Some("clean-path cut"); }
+            if command > bound { bad = Some("above causal delivery bound"); }
+            if command > previous { last_increase = t; }
+            if command < proposed {
+                run.binds += 1;
+                run.max_short_upps = run.max_short_upps.max(proposed - command);
+                run.last_bind_ms = Some(t.saturating_sub(origin) / MS);
+                if t - last_increase > window { bad = Some("limited without increase"); }
+            }
+            if let Some(why) = bad {
+                run.violations += 1;
+                if run.first.is_none() {
+                    run.first = Some(format!("{why} t={t} cmd={command} prop={proposed} prev={previous} bound={bound} since_inc={}", t - last_increase));
+                }
+            }
+            (previous, run.final_cmd, run.final_prop) = (command, command, proposed);
+            history.push_back((t, command));
+            credit += command as f64 / 1e9;
+            let p = credit as u64;
+            credit -= p as f64;
+            if p > 0 { flight.push_back((t, p)); }
+            t += MS;
+        }
+        run
+    }
+
+    /// Reference, current policy and a synthetic steep curve exercise both free and limited growth.
+    #[test]
+    fn closed_loop_actual_command_clean_path_safety_and_progress() {
+        let mut failures = Vec::new();
+        for (name, cc) in [("reference25", with_min(25_000_000.0)), ("current", crate::ship::CC),
+            ("synthetic50000", with_min(50_000_000_000.0))] {
+            for rtt in RTTS { for done in [false, true] {
+                let r = closed_loop(&cc, rtt, done);
+                let rejoin = match r.last_bind_ms {
+                    None => "never_bound".to_string(),
+                    Some(_) if r.final_cmd < r.final_prop => "NOT_REJOINED_AT_HORIZON".to_string(),
+                    Some(ms) => format!("rejoined_at_ms={}", ms + 1),
+                };
+                println!("DGSUP closed {name} rtt_ms={} done={done} horizon_s={:.2} binds_ms={} max_shortfall_pps={:.3} {rejoin} final_cmd_pps={:.3} final_prop_pps={:.3} violations={} first={:?}",
+                    rtt / MS, horizon(rtt, &cc) as f64 / 1e9, r.binds, r.max_short_upps as f64 / 1e6, r.final_cmd as f64 / 1e6,
+                    r.final_prop as f64 / 1e6, r.violations, r.first);
+                if r.violations > 0 { failures.push(format!("{name} rtt={rtt} done={done}: {:?}", r.first)); }
+                if name == "reference25" && r.binds > 0 { failures.push(format!("reference25 bound rtt={rtt} done={done}")); }
+                if name == "synthetic50000" && rtt == 600_000_000 && done && r.binds == 0 {
+                    failures.push("synthetic50000 600ms done=true never bound: progress check vacuous".to_string());
+                }
+            }}
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+}

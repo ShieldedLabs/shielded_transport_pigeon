@@ -18,7 +18,7 @@ pub(crate) const CC: crate::stp::CongestionPolicy = crate::stp::CongestionPolicy
     event_guard_rtts: 0.5,
     rate_floor_upps: 100_000_000,
     initial_rate_upps: 100_000_000,
-    min_growth_uppsps: 25_000_000.0,
+    min_growth_uppsps: 2_000_000_000.0,
     max_growth_uppsps: 1_000_000_000.0,
     relative_growth_per_rtt: 0.015,
     startup_multiplier: 1.05,
@@ -85,9 +85,9 @@ mod tests {
 /// exposure scale (not the older g4 emulator's 1000/3). Applications do not
 /// configure transport policy. Only the research feature permits overrides.
 pub(crate) const FROZEN_POLICY: &[(&str, &str)] = &[
-    ("STP_CC_DELAY_BETA", "0.95"),
+    ("STP_CC_DELAY_BETA", "0.5"),
     ("STP_CC_DELAY_EVENT", "1"),
-    ("STP_CC_DELAY_GIVEUP", "3"),
+    ("STP_CC_DELAY_GIVEUP", "0"),
     ("STP_CC_DELAY_HOLD_MAX_RTTS", "256"),
     ("STP_CC_DELAY_HOLD_RTTS", "16"),
     ("STP_CC_DELAY_INTERVAL_RTTS", "1"),
