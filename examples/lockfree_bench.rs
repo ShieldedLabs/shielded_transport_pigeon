@@ -2,65 +2,13 @@
 #[path = "support/lockfree_common.rs"]
 mod common;
 #[cfg(target_os = "linux")]
+#[path = "support/linux_cpu.rs"]
+mod linux_cpu;
+#[cfg(target_os = "linux")]
 mod linux {
     use super::common::*;
-    use std::io::Write;
-    use std::os::fd::AsRawFd;
+    use super::linux_cpu::{QuietStdout, libc, process_cpu_ns as cpu_ns};
     use std::time::{Duration, Instant};
-    #[allow(non_camel_case_types, dead_code)]
-    mod libc {
-        use std::os::raw::{c_int, c_long};
-        pub const STDOUT_FILENO: c_int = 1;
-        pub const CLOCK_PROCESS_CPUTIME_ID: c_int = 2;
-        pub type time_t = c_long;
-        #[repr(C)]
-        pub struct timespec {
-            pub tv_sec: time_t,
-            pub tv_nsec: c_long,
-        }
-        pub const _SC_CLK_TCK: c_int = 2;
-        unsafe extern "C" {
-            pub fn dup(fd: c_int) -> c_int;
-            pub fn dup2(old: c_int, new: c_int) -> c_int;
-            pub fn close(fd: c_int) -> c_int;
-            pub fn clock_gettime(clk: c_int, ts: *mut timespec) -> c_int;
-            pub fn sysconf(name: c_int) -> c_long;
-        }
-    }
-    struct QuietStdout(i32);
-    impl QuietStdout {
-        fn new() -> Self {
-            std::io::stdout().flush().unwrap();
-            let null = std::fs::OpenOptions::new()
-                .write(true)
-                .open("/dev/null")
-                .unwrap();
-            let saved = unsafe { libc::dup(libc::STDOUT_FILENO) };
-            assert!(saved >= 0);
-            assert!(unsafe { libc::dup2(null.as_raw_fd(), libc::STDOUT_FILENO) } >= 0);
-            Self(saved)
-        }
-    }
-    impl Drop for QuietStdout {
-        fn drop(&mut self) {
-            std::io::stdout().flush().unwrap();
-            unsafe {
-                libc::dup2(self.0, libc::STDOUT_FILENO);
-                libc::close(self.0);
-            }
-        }
-    }
-    fn cpu_ns() -> u64 {
-        let mut ts = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        assert_eq!(
-            unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts) },
-            0
-        );
-        ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
-    }
     fn cpu_ticks() -> u64 {
         let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
         let fields: Vec<_> = stat
