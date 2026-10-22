@@ -19,7 +19,8 @@ pub struct BitmapAck {
     /// Exact UDP payload size of sample_seq, including STP framing and authentication.
     pub sample_udp_payload_bytes: u16,
     pub delay_us: u32,
-    /// Cumulative number of unique CE-marked data/probe/keepalive packets, saturating at u64::MAX (close before exhaustion).
+    /// Cumulative unique data-class packets marked by kernel CE or receiver overload.
+    /// A packet contributes at most once, saturating at u64::MAX (close before exhaustion).
     pub ce_count: u64,
     pub bitmap: [u64; 15],
 }

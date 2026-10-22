@@ -152,7 +152,15 @@ handle are `Send`; the single-owner app handle is deliberately **not Sync**.
   `Connected`. Every processed connect has one outcome, including duplicate,
   invalid and cancelled requests. Frozen handshake timeout is 30 seconds.
 - A full receive ring drops/counts **data**, so a stalled app cannot prevent
-  ACK/socket servicing. It also refuses inbound handshakes: neither new hello
+  ACK/socket servicing. While full, every outgoing ACK requests IP ECN CE
+  (best-effort OS/path support), and each newly admitted data-class packet adds
+  authenticated cumulative CE feedback, coalesced with kernel CE. This signals
+  the shared application bottleneck before a large message completes, using the
+  existing sender congestion cut/guard; draining stops new overload marks.
+  `ConnectionStats::rx_app_overload_ce_marks` counts synthetic packet marks,
+  not dropped messages; `ack_app_overload_ce_sent` counts successful ACK sends
+  requesting local overload CE, not proof of OS/path preservation. It also
+  refuses inbound handshakes: neither new hello
   state nor handshake completion is admitted without a slot for `Connected`;
   frozen peer retry logic can retry once space returns. Must-deliver lifecycle
   events are held pump-side pending (bounded by live/pending associations),

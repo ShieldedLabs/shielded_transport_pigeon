@@ -3862,6 +3862,9 @@ pub struct ConnectionStats {
     /// ACK UDP datagrams and UDP payload bytes (prefix and authentication tag included).
     pub ack_packets_sent: u64,
     pub ack_bytes_sent: u64,
+    /// Successfully emitted ACKs requesting IP CE because the shared app receive
+    /// ring was full at this send attempt (not proof the OS/path preserved CE).
+    pub ack_app_overload_ce_sent: u64,
     pub ack_packets_received: u64,
     pub ack_delay_us_max: u32,
     pub rtt_samples: u64,
@@ -3910,6 +3913,9 @@ pub struct ConnectionStats {
     // ---- receiver message reassembly (a message can be lost after all its packets were acked) ----
     /// Messages completed (plain reassembly or FEC decode) and handed to the receive queue.
     pub rx_messages_completed: u64,
+    /// Unique admitted data-class packets synthetically CE-marked while the app
+    /// receive ring was full. Kernel CE on the same packet is not counted twice.
+    pub rx_app_overload_ce_marks: u64,
     /// Partial messages discarded because a newer package took their slot, and the message bytes
     /// they had received (plain: bytes held; FEC: blocks x block size).
     pub rx_partial_evicted: u64,
@@ -5188,6 +5194,12 @@ struct RingState {
     connects: HashMap<ConnectionKey, STPAddress>,
     pending: VecDeque<RingEvent>,
 }
+// Fullness is a level on the shared application queue, not a completed-message
+// event. Sample at receipt and again at each actual ACK send; never wait for app.
+fn application_receive_full(port: &Port) -> bool {
+    port.native.get().is_some_and(|n| !n.events.has_space())
+}
+
 impl RingState {
     fn connected(&mut self, port: &Port, address: STPAddress, hash: [u8; 64]) -> bool {
         let Some(n) = port.native.get() else { return true; };
@@ -6333,7 +6345,10 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                 // Mixed/non-padding feedback retains the legacy active path until
                                 // every scheduled receipt-window repeat has been sent.
                                 state.observe_feedback_payload(payload);
-                                state.ack_receiver.receive_with_rtt(nonce, timestamp_ns, ecn_marked, &mut state.ack_timer, state.stats.rtt_us, buf_len);
+                                let app_full = application_receive_full(&thread_inner);
+                                let unique = state.ack_receiver.receive_with_rtt(nonce, timestamp_ns, ecn_marked || app_full,
+                                    &mut state.ack_timer, state.stats.rtt_us, buf_len);
+                                if unique && app_full && !ecn_marked { state.stats.rx_app_overload_ce_marks += 1; }
                             }
 
 //////// END ORDINARY PACKET HANDLING  ////////////////////////////////////////////////////////////////////
@@ -6474,10 +6489,12 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                 t.set_cc(connection_tracking_data.two_byte_send_prefix,
                                     cc_trace_context(state, current_time_now_ns, &cc, max_pps));
                             }
+                            let ack_overload = pending.kind == PendingSendKind::Ack && application_receive_full(&thread_inner);
                             let sent = udp_send_with_congestion_and_dscp(socket,
                                 connection_tracking_data.other_ip, connection_tracking_data.other_port,
-                                &pending.bytes, pending.dscp, false);
+                                &pending.bytes, pending.dscp, ack_overload);
                             if let Some(sent) = sent {
+                                if ack_overload { state.stats.ack_app_overload_ce_sent += 1; }
                                 #[cfg(feature = "research_cohort_observer")]
                                 crate::cohort_observe::observe_commit(pending.kind as usize, &pending.bytes);
                                 commit_connected_send(state, &mut connection_tracking_data.unreliable_send_buffer,
@@ -6497,7 +6514,10 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                 let encoded = a.encode();
                                 let Some(o) = seal_connected_packet(&mut state.cipher, connection_tracking_data.two_byte_send_prefix,
                                     virtual_nonce, &encoded, &mut packet_memory_send[..], current_time_now_ns) else { return false; };
-                                let sent = udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_send[..o], Dscp::Af21, false);
+                                let ack_overload = application_receive_full(&thread_inner);
+                                let sent = udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port,
+                                    &packet_memory_send[..o], Dscp::Af21, ack_overload);
+                                if sent.is_some() && ack_overload { state.stats.ack_app_overload_ce_sent += 1; }
                                 if !finish_connected_send(state, &mut connection_tracking_data.unreliable_send_buffer,
                                     PendingSendKind::Ack, sent, current_time_now_ns, &packet_memory_send[..o], &[], Dscp::Af21,
                                     connection_tracking_data.two_byte_send_prefix, loss_trace.as_mut()) { return true; }
@@ -6616,7 +6636,7 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                         let time_to_bandwidth_recovery = cc.recovery_rtts * (state.RTT_mean as u64 * 100_000);
 
 
-                        // ECN congestion event: the receiver saw CE-marked packets and relayed it via the ack's IP header
+                        // Kernel CE or receiver application pressure, via ACK IP CE or authenticated cumulative CE.
                         let (ce_seq, ce_sent) = (state.ecn_oldest_seq, state.ecn_oldest_send_time);
                         if apply_ecn_congestion(state, current_time_now_ns, &cc, max_pps) {
                             accept_cc_event(state, &mut connection_tracking_data.unreliable_send_buffer,
