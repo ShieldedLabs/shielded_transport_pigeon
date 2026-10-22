@@ -15,19 +15,16 @@
 //! |-----------------------------------|----------------------------------------|
 //! | `wirehair_init()`                 | [`init`] (always `Success`)            |
 //! | `wirehair_encoder_create`         | [`encoder_create`] (borrows via `Arc`) |
-//! | `wirehair_encoder_create_owned`   | [`encoder_create_owned`] (copies)      |
 //! | `wirehair_encode`                 | [`Codec::wirehair_encode`]             |
-//! | `wirehair_encoder_detach_input`   | [`Codec::detach_input`]                |
-//! | `wirehair_decoder_create`         | [`decoder_create`]                     |
 //! | `wirehair_decoder_create_limited` | [`decoder_create_limited`]             |
 //! | `wirehair_decode`                 | [`Codec::wirehair_decode`]             |
 //! | `wirehair_recover`                | [`Codec::wirehair_recover`]            |
-//! | `wirehair_recover_block_ex`       | [`Codec::wirehair_recover_block`]      |
-//! | `wirehair_decoder_becomes_encoder`| [`Codec::becomes_encoder`]             |
 //! | `wirehair_free`                   | `drop`                                 |
 //!
 //! Where the C API returns a NULL codec, the Rust constructors return `Err(result)` with
-//! the code the `_ex` variants report.
+//! the code the `_ex` variants report. The C entry points STP never calls (owned-copy
+//! encoder, unlimited decoder, input detach, single-block recovery, decoder-to-encoder
+//! conversion and the seed-search matrix-only feeds) are not ported.
 
 pub mod codec;
 pub mod gf256;
@@ -105,21 +102,6 @@ pub fn encoder_create_profile(
     create_encoder(InputSource::Shared { data: message, start, len }, block_bytes, profile)
 }
 
-/// `wirehair_encoder_create_owned`: copies the message into codec-owned storage.
-pub fn encoder_create_owned(message: &[u8], block_bytes: u32) -> Result<Codec, WirehairResult> {
-    encoder_create_owned_profile(message, block_bytes, WireProfile::LegacyCurrent)
-}
-
-/// `wirehair_encoder_create_owned` with an explicit wire profile.
-pub fn encoder_create_owned_profile(message: &[u8], block_bytes: u32, profile: WireProfile) -> Result<Codec, WirehairResult> {
-    create_encoder(InputSource::Owned(message.to_vec()), block_bytes, profile)
-}
-
-/// `wirehair_decoder_create` (no memory limit).
-pub fn decoder_create(message_bytes: u64, block_bytes: u32) -> Result<Codec, WirehairResult> {
-    decoder_create_profile(message_bytes, block_bytes, u64::MAX, WireProfile::LegacyCurrent)
-}
-
 /// `wirehair_decoder_create_limited`: the decoder refuses any arena allocation that
 /// would bring input + workspace + GE bytes above `memory_limit` (result `Oom`).
 pub fn decoder_create_limited(message_bytes: u64, block_bytes: u32, memory_limit: u64) -> Result<Codec, WirehairResult> {
@@ -181,23 +163,6 @@ impl Codec {
     /// `wirehair_recover`: `out.len()` must equal the message length.
     pub fn wirehair_recover(&mut self, out: &mut [u8]) -> WirehairResult {
         self.reconstruct_output(out)
-    }
-
-    /// `wirehair_recover_block_ex`: reconstructs original block `block_id`.
-    pub fn wirehair_recover_block(&self, block_id: u32, out: &mut [u8]) -> Result<u32, WirehairResult> {
-        if block_id > 0xffff {
-            return Err(WirehairResult::InvalidInput);
-        }
-        let cap = out.len().min(u32::MAX as usize) as u32;
-        match self.reconstruct_block(block_id as u16, out, cap) {
-            (WirehairResult::Success, n) => Ok(n),
-            (r, _) => Err(r),
-        }
-    }
-
-    /// `wirehair_decoder_becomes_encoder`.
-    pub fn becomes_encoder(&mut self) -> WirehairResult {
-        self.initialize_encoder_from_decoder()
     }
 }
 

@@ -65,21 +65,6 @@ impl WirehairResult {
     pub fn code(self) -> i32 {
         self as i32
     }
-    pub fn as_str(self) -> &'static str {
-        match self {
-            WirehairResult::Success => "Wirehair_Success",
-            WirehairResult::NeedMore => "Wirehair_NeedMore",
-            WirehairResult::BadDenseSeed => "Wirehair_BadDenseSeed",
-            WirehairResult::BadPeelSeed => "Wirehair_BadPeelSeed",
-            WirehairResult::BadInputSmallN => "Wirehair_BadInput_SmallN",
-            WirehairResult::BadInputLargeN => "Wirehair_BadInput_LargeN",
-            WirehairResult::ExtraInsufficient => "Wirehair_ExtraInsufficient",
-            WirehairResult::InvalidInput => "Wirehair_InvalidInput",
-            WirehairResult::Oom => "Wirehair_OOM",
-            WirehairResult::UnsupportedPlatform => "Wirehair_UnsupportedPlatform",
-            WirehairResult::Error => "Wirehair_Error",
-        }
-    }
 }
 
 use WirehairResult as R;
@@ -2317,31 +2302,10 @@ impl Codec {
     pub fn set_wire_profile(&mut self, profile: WireProfile) {
         self.wire_profile = profile;
     }
-    pub fn wire_profile(&self) -> WireProfile {
-        self.wire_profile
-    }
     /// Testing hook: fail the countdown-th arena allocation (0 = next one); -1 disables.
     #[cfg(test)]
     pub fn set_allocation_failure_countdown_for_testing(&mut self, countdown: i64) {
         self.testing_allocation_failure_countdown = countdown;
-    }
-    pub fn p_seed(&self) -> u32 {
-        self.p_seed
-    }
-    pub fn c_seed(&self) -> u32 {
-        self.d_seed
-    }
-    pub fn block_count(&self) -> u32 {
-        self.block_count as u32
-    }
-    pub fn block_bytes(&self) -> u32 {
-        self.block_bytes as u32
-    }
-    pub fn final_bytes(&self) -> u32 {
-        self.output_final_bytes
-    }
-    pub fn mode(&self) -> Mode {
-        self.mode
     }
     pub fn can_encode(&self) -> bool {
         self.mode == Mode::Encoder || self.mode == Mode::Converted
@@ -2349,51 +2313,6 @@ impl Codec {
     pub fn can_decode(&self) -> bool {
         self.mode == Mode::Decoder || self.mode == Mode::DecodeComplete
     }
-    pub fn can_recover(&self) -> bool {
-        self.mode == Mode::DecodeComplete
-    }
-    #[doc(hidden)]
-    pub fn testing_decoder_row_count(&self) -> u32 {
-        self.row_count as u32
-    }
-    #[doc(hidden)]
-    pub fn testing_decoder_rank(&self) -> u32 {
-        self.next_pivot
-    }
-    #[doc(hidden)]
-    pub fn testing_received_packet_count(&self) -> u32 {
-        self.received_packet_count
-    }
-    #[doc(hidden)]
-    pub fn testing_received_packet_limit(&self) -> u32 {
-        self.received_packet_limit
-    }
-    #[doc(hidden)]
-    pub fn testing_received_packet_slots(&self) -> u32 {
-        self.received_packet_slots
-    }
-    #[doc(hidden)]
-    pub fn testing_received_packet_memory_bytes(&self) -> u64 {
-        self.received_packet_slots as u64 * RECEIVED_PACKET_RECORD_BYTES
-    }
-    #[doc(hidden)]
-    pub fn testing_input_allocated_bytes(&self) -> u64 {
-        self.input_allocated
-    }
-    #[doc(hidden)]
-    pub fn testing_input_attached(&self) -> bool {
-        !self.input.is_none()
-    }
-    #[doc(hidden)]
-    pub fn testing_recovery_ready(&self) -> bool {
-        self.recovery_ready
-    }
-    /// Total bytes the C++ arena accounting currently charges against the memory limit.
-    #[doc(hidden)]
-    pub fn testing_allocated_bytes(&self) -> u64 {
-        self.input_allocated + self.workspace_allocated + self.ge_allocated
-    }
-
     /// Internal state snapshot for differential testing against the C++ oracle:
     /// [input, workspace, ge allocated, next_pivot, row_count, mode, received count,
     /// received slots, defer_count, dense_count, p_seed, d_seed, recovery_rows,
@@ -2420,12 +2339,6 @@ impl Codec {
             self.decode_complete as u64,
             self.decode_failed as u64,
         ]
-    }
-
-    /// Raw recovery block arena (differential testing only).
-    #[doc(hidden)]
-    pub fn testing_recovery_blocks(&self) -> &[u8] {
-        &self.recovery_blocks
     }
 
     fn testing_allow_allocation(&mut self) -> bool {
@@ -2784,40 +2697,6 @@ impl Codec {
         gf256::add2_mem(out, mix1, mix2);
     }
 
-    /// C++ ReconstructBlock. Returns (result, bytes written).
-    pub fn reconstruct_block(&self, block_id: u16, block_out: &mut [u8], output_capacity: u32) -> (WirehairResult, u32) {
-        if block_id >= self.block_count {
-            return (R::InvalidInput, 0);
-        }
-        if self.mode != Mode::DecodeComplete {
-            return (if self.mode == Mode::Decoder { R::NeedMore } else { R::InvalidInput }, 0);
-        }
-        if self.decode_failed {
-            return (R::InvalidInput, 0);
-        }
-        if !self.decode_complete {
-            return (R::NeedMore, 0);
-        }
-        let block_bytes =
-            if block_id as u32 + 1 == self.block_count as u32 { self.output_final_bytes } else { self.block_bytes as u32 };
-        // Safe Rust cannot write past the slice: the effective capacity is bounded by it.
-        let capacity = output_capacity.min(block_out.len().min(u32::MAX as usize) as u32);
-        if capacity < block_bytes {
-            return (R::InvalidInput, 0);
-        }
-        let n = block_bytes as usize;
-
-        let original_row = self.original_row[block_id as usize];
-        if original_row != LIST_TERM {
-            let off = original_row as usize * self.block_bytes;
-            block_out[..n].copy_from_slice(&self.input.bytes()[off..off + n]);
-            return (R::Success, block_bytes);
-        }
-
-        self.generate_row(block_id as u32, block_out, n);
-        (R::Success, block_bytes)
-    }
-
     /// C++ ReconstructOutput.
     pub fn reconstruct_output(&mut self, message_out: &mut [u8]) -> WirehairResult {
         let message_bytes = message_out.len() as u64;
@@ -2955,29 +2834,6 @@ impl Codec {
         }
     }
 
-    /// C++ EncodeFeedMatrixOnly (offline seed search hook).
-    #[doc(hidden)]
-    pub fn encode_feed_matrix_only(&mut self) -> WirehairResult {
-        if self.input.is_none() {
-            if !self.allocate_input() {
-                return R::Oom;
-            }
-            if let InputSource::Owned(v) = &mut self.input {
-                v.fill(0);
-            }
-        }
-        for id in 0..self.block_count {
-            if !self.opportunistic_peeling(id, id as u32) {
-                return R::BadPeelSeed;
-            }
-        }
-        match self.solve_matrix() {
-            R::Success => R::Success,
-            R::NeedMore => R::BadPeelSeed,
-            r => r,
-        }
-    }
-
     /// C++ Encode: returns bytes written, 0 on failure.
     pub fn encode(&self, block_id: u32, block_out: &mut [u8], out_buffer_bytes: u32) -> u32 {
         // recovery_ready: a staged encoder (initialized, not yet fed) has nothing to send.
@@ -3003,15 +2859,6 @@ impl Codec {
 
         self.generate_row(block_id, block_out, n);
         copy_bytes
-    }
-
-    pub fn detach_input(&mut self) -> WirehairResult {
-        if !self.can_encode() || !self.recovery_ready {
-            return R::InvalidInput;
-        }
-        self.free_input();
-        self.original_out_of_order = true;
-        R::Success
     }
 }
 
@@ -3051,29 +2898,6 @@ impl Codec {
         }
         self.mode = Mode::Decoder;
         result
-    }
-
-    pub fn initialize_encoder_from_decoder(&mut self) -> WirehairResult {
-        if self.mode != Mode::DecodeComplete || self.row_count < self.block_count {
-            return R::InvalidInput;
-        }
-        if self.all_original {
-            let mut result = self.solve_matrix();
-            if result != R::Success {
-                if result == R::NeedMore {
-                    result = R::BadPeelSeed;
-                }
-                self.mode = Mode::Failed;
-                return result;
-            }
-            self.generate_recovery_blocks();
-        }
-        self.input_final_bytes = self.output_final_bytes;
-        for id in 0..self.block_count as usize {
-            self.original_row[id] = LIST_TERM;
-        }
-        self.mode = Mode::Converted;
-        R::Success
     }
 
     /// C++ DecodeFeed; `block_in.len()` is the C++ `block_bytes` argument.
@@ -3189,54 +3013,6 @@ impl Codec {
         } else if result != R::NeedMore {
             self.decode_failed = true;
             self.mode = Mode::Failed;
-        }
-        result
-    }
-
-    /// C++ DecodeFeedMatrixOnly (payload-free seed validation hook).
-    #[doc(hidden)]
-    pub fn decode_feed_matrix_only(&mut self, block_id: u32) -> WirehairResult {
-        if self.row_count == 0 {
-            if let InputSource::Owned(v) = &mut self.input {
-                v.fill(0);
-            }
-        }
-        if self.decode_complete {
-            return R::Success;
-        }
-        if self.decode_failed {
-            return R::InvalidInput;
-        }
-        if block_id >= self.block_count as u32 {
-            self.all_original = false;
-        }
-        let row_i = self.row_count;
-        if row_i >= self.block_count {
-            let result = self.resume_solve_matrix_internal(block_id, None, false);
-            if result == R::Success {
-                self.decode_complete = true;
-            }
-            return result;
-        }
-        if !self.opportunistic_peeling(row_i, block_id) {
-            return R::NeedMore;
-        }
-        self.row_count += 1;
-        if self.row_count != self.block_count {
-            return R::NeedMore;
-        }
-        if self.all_original {
-            if !self.is_all_original_data() {
-                self.all_original = false;
-                self.decode_failed = true;
-                return R::InvalidInput;
-            }
-            self.decode_complete = true;
-            return R::Success;
-        }
-        let result = self.solve_matrix();
-        if result == R::Success {
-            self.decode_complete = true;
         }
         result
     }
