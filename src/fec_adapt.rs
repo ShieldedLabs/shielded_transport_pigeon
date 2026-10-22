@@ -35,15 +35,13 @@ research_settings! {
     RESEARCH_EMPIRICAL_TAIL, research_p4_empirical_tail_calibration, 0;
 }
 /// Accepts exactly the decimal spelling of one of `accepted`; `None` means `default`.
-fn choice(
-    value: Option<&str>,
-    default: &str,
-    accepted: &[u32],
-    error: &str,
-) -> Result<u32, String> {
-    let value = value.unwrap_or(default);
-    let found = accepted.iter().copied().find(|v| v.to_string() == value);
-    found.ok_or_else(|| error.to_string())
+macro_rules! choice {
+    ($value:expr, $default:expr, &[$($accepted:literal),+], $error:expr $(,)?) => {
+        match ($value).unwrap_or($default) {
+            $(stringify!($accepted) => Ok($accepted),)+
+            _ => Err(($error).to_string()),
+        }
+    };
 }
 /// The P4 experiments stack: each one requires P4 at width 1 without slipstream and every
 /// earlier experiment in `earlier` left at 0.
@@ -60,7 +58,7 @@ pub(crate) fn parse_event_repair(
     slipstream: bool,
     bonus: u32,
 ) -> Result<u32, String> {
-    let q = choice(
+    let q = choice!(
         value,
         "0",
         &[0, 5, 10],
@@ -79,7 +77,7 @@ pub(crate) fn parse_base_parity_model(
     bonus: u32,
     event: u32,
 ) -> Result<u32, String> {
-    let m = choice(
+    let m = choice!(
         value,
         "0",
         &[0, 1],
@@ -99,7 +97,7 @@ pub(crate) fn parse_budget_base(
     event: u32,
     base: u32,
 ) -> Result<u32, String> {
-    let m = choice(value, "0", &[0, 1], "STP_P4_BUDGET_BASE must be 0 or 1")?;
+    let m = choice!(value, "0", &[0, 1], "STP_P4_BUDGET_BASE must be 0 or 1")?;
     if m != 0 && !p4_isolated(policy, width, slipstream, &[bonus, event, base]) {
         return Err("STP_P4_BUDGET_BASE requires P4, STP_P4_INTERLEAVE_WIDTH=1, STP_P4_SLIPSTREAM=0, STP_P4_MEDIUM_BONUS_PERCENT=0, STP_P4_EVENT_REPAIR=0, STP_P4_BASE_PARITY_MODEL=0".to_string());
     }
@@ -108,7 +106,7 @@ pub(crate) fn parse_budget_base(
 /// Unlike the other knobs this one has no default: it must be set explicitly.
 fn parse_target_validation(value: Option<&str>) -> Result<u32, String> {
     let error = "STP_P4_TARGET_VALIDATION must be explicitly 0, 1 or 2";
-    choice(
+    choice!(
         Some(value.ok_or_else(|| error.to_string())?),
         "",
         &[0, 1, 2],
@@ -116,7 +114,7 @@ fn parse_target_validation(value: Option<&str>) -> Result<u32, String> {
     )
 }
 fn parse_cost_smooth(value: Option<&str>) -> Result<u32, String> {
-    choice(value, "0", &[0, 1], "STP_P4_COST_SMOOTH must be 0 or 1")
+    choice!(value, "0", &[0, 1], "STP_P4_COST_SMOOTH must be 0 or 1")
 }
 pub(crate) fn parse_repair_cap_percent(
     value: Option<&str>,
@@ -129,7 +127,7 @@ pub(crate) fn parse_repair_cap_percent(
     budget: u32,
 ) -> Result<u32, String> {
     let error = "STP_P4_REPAIR_CAP_PERCENT must be 15 or 25";
-    let cap = choice(value, "15", &[15, 25, 0], error)?;
+    let cap = choice!(value, "15", &[15, 25, 0], error)?;
     if cap != 15 && !(p4_isolated(policy, width, slipstream, &[bonus, event, base]) && budget == 1)
     {
         return Err("STP_P4_REPAIR_CAP_PERCENT=25 requires P4, STP_P4_INTERLEAVE_WIDTH=1, STP_P4_SLIPSTREAM=0, STP_P4_MEDIUM_BONUS_PERCENT=0, STP_P4_EVENT_REPAIR=0, STP_P4_BASE_PARITY_MODEL=0, STP_P4_BUDGET_BASE=1".to_string());
@@ -149,7 +147,7 @@ pub(crate) fn parse_empirical_tail(
     cap: u32,
 ) -> Result<u32, String> {
     let error = "STP_P4_EMPIRICAL_TAIL_CALIBRATION must be 0 or 1";
-    let q = choice(value, "0", &[0, 1], error)?;
+    let q = choice!(value, "0", &[0, 1], error)?;
     if !(p4_isolated(policy, width, slipstream, &[bonus, event, base])
         && budget == 1
         && (cap == 25 || cap == 0))
