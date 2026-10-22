@@ -1138,13 +1138,7 @@ pub struct EventRepairInfo {
 impl EventRepairInfo {
     pub fn merge(&mut self, o: EventRepairInfo) {
         let mut of = self.counter_overflow.max(o.counter_overflow);
-        let mut add = |a: &mut u64, b: u64| {
-            *a = a.checked_add(b).unwrap_or_else(|| {
-                of = 1;
-                u64::MAX
-            });
-        };
-        macro_rules! add { ($($f:ident),*) => { $(add(&mut self.$f, o.$f);)* }; }
+        macro_rules! add { ($($f:ident),*) => { $(self.$f = self.$f.checked_add(o.$f).unwrap_or_else(|| { of = 1; u64::MAX });)* }; }
         add!(
             accepted_early,
             accepted_timeout,
