@@ -798,27 +798,18 @@ impl Codec {
             let dst = pitch * rows[row_idx] as usize;
             row_idx += 1;
             xor_words(&mut self.ge_matrix[dst..dst + pitch], temp_row);
-            tools::shuffle_deck16(&mut prng, &mut bits, dense_count as u32);
             let loop_count = dense_count >> 1;
-            for ii in 0..loop_count {
-                let bit0 = bits[ii] as usize;
-                let bit1 = bits[set_count + ii] as usize;
-                self.dense_flip(temp_row, column_i, bit0, max_x);
-                self.dense_flip(temp_row, column_i, bit1, max_x);
-                let dst = pitch * rows[row_idx] as usize;
-                row_idx += 1;
-                xor_words(&mut self.ge_matrix[dst..dst + pitch], temp_row);
-            }
-            tools::shuffle_deck16(&mut prng, &mut bits, dense_count as u32);
-            let second_loop_count = loop_count - 1 + (dense_count & 1);
-            for ii in 0..second_loop_count {
-                let bit0 = bits[ii] as usize;
-                let bit1 = bits[set_count + ii] as usize;
-                self.dense_flip(temp_row, column_i, bit0, max_x);
-                self.dense_flip(temp_row, column_i, bit1, max_x);
-                let dst = pitch * rows[row_idx] as usize;
-                row_idx += 1;
-                xor_words(&mut self.ge_matrix[dst..dst + pitch], temp_row);
+            for count in [loop_count, loop_count - 1 + (dense_count & 1)] {
+                tools::shuffle_deck16(&mut prng, &mut bits, dense_count as u32);
+                for ii in 0..count {
+                    let bit0 = bits[ii] as usize;
+                    let bit1 = bits[set_count + ii] as usize;
+                    self.dense_flip(temp_row, column_i, bit0, max_x);
+                    self.dense_flip(temp_row, column_i, bit1, max_x);
+                    let dst = pitch * rows[row_idx] as usize;
+                    row_idx += 1;
+                    xor_words(&mut self.ge_matrix[dst..dst + pitch], temp_row);
+                }
             }
             column_i += dense_count;
         }
@@ -1223,18 +1214,9 @@ impl Codec {
                 }
             }
             row_idx += 1;
-            tools::shuffle_deck16(&mut prng, &mut bits, dense_count as u32);
             let loop_count = dense_count >> 1;
-            let second_loop_count = loop_count - 1 + (dense_count & 1);
-            for half in 0..2 {
-                if half == 1 {
-                    tools::shuffle_deck16(&mut prng, &mut bits, dense_count as u32);
-                }
-                let count = if half == 0 {
-                    loop_count
-                } else {
-                    second_loop_count
-                };
+            for count in [loop_count, loop_count - 1 + (dense_count & 1)] {
+                tools::shuffle_deck16(&mut prng, &mut bits, dense_count as u32);
                 for ii in 0..count {
                     let bit0 = bits[ii] as usize;
                     let bit1 = bits[set_count + ii] as usize;
@@ -1723,13 +1705,6 @@ fn is_dense_count_valid(dense_count: u32) -> bool {
     dense_count > 0 && dense_count as usize <= CAT_MAX_DENSE_ROWS
 }
 impl Codec {
-    #[doc(hidden)]
-    pub fn override_seeds(&mut self, dense_count: u16, p_seed: u16, d_seed: u16) {
-        self.dense_count = dense_count;
-        self.p_seed = p_seed as u32;
-        self.d_seed = d_seed as u32;
-        self.seed_override = true;
-    }
     fn choose_matrix(&mut self, message_bytes: u64, block_bytes: u32) -> WirehairResult {
         let seed_override = self.seed_override;
         self.seed_override = false;
@@ -2037,6 +2012,25 @@ impl Codec {
         seen_rows >= self.block_count as u32
     }
 }
+/// Resizes every `(field, type, len)` buffer in place when none must grow (and `fresh` is
+/// false); otherwise frees the group and allocates all of it, installing the buffers only when
+/// every allocation succeeded. Yields `(reused, ok)`.
+macro_rules! reuse_or_allocate {
+    ($this:ident, $fresh:expr, $free:ident, $(($field:ident, $ty:ty, $len:expr)),+ $(,)?) => {{
+        let reused = !$fresh $(&& reuse_resize(&mut $this.$field, $len))+;
+        let ok = reused || {
+            $this.$free();
+            match ($(try_zeroed::<$ty>($len),)+) {
+                ($(Some($field),)+) => {
+                    $($this.$field = $field;)+
+                    true
+                }
+                _ => false,
+            }
+        };
+        (reused, ok)
+    }};
+}
 fn try_zeroed<T: Clone + Default>(n: usize) -> Option<Vec<T>> {
     let mut v = Vec::new();
     v.try_reserve_exact(n).ok()?;
@@ -2239,36 +2233,18 @@ impl Codec {
                 return false;
             }
         }
-        let reused = !fresh
-            && reuse_resize(&mut self.compress_matrix, compress_matrix_words as usize)
-            && reuse_resize(&mut self.ge_matrix, ge_matrix_words as usize)
-            && reuse_resize(&mut self.heavy_matrix, heavy_bytes as usize)
-            && reuse_resize(&mut self.pivots, pivot_count as usize)
-            && reuse_resize(&mut self.ge_row_map, pivot_count as usize)
-            && reuse_resize(&mut self.ge_col_map, ge_cols as usize);
         let charged = if fresh { size_bytes } else { self.ge_allocated };
-        let ok = reused || {
-            self.free_matrix();
-            match (
-                try_zeroed::<u64>(compress_matrix_words as usize),
-                try_zeroed::<u64>(ge_matrix_words as usize),
-                try_zeroed::<u8>(heavy_bytes as usize),
-                try_zeroed::<u16>(pivot_count as usize),
-                try_zeroed::<u16>(pivot_count as usize),
-                try_zeroed::<u16>(ge_cols as usize),
-            ) {
-                (Some(c), Some(g), Some(h), Some(p), Some(rm), Some(cm)) => {
-                    self.compress_matrix = c;
-                    self.ge_matrix = g;
-                    self.heavy_matrix = h;
-                    self.pivots = p;
-                    self.ge_row_map = rm;
-                    self.ge_col_map = cm;
-                    true
-                }
-                _ => false,
-            }
-        };
+        let (_, ok) = reuse_or_allocate!(
+            self,
+            fresh,
+            free_matrix,
+            (compress_matrix, u64, compress_matrix_words as usize),
+            (ge_matrix, u64, ge_matrix_words as usize),
+            (heavy_matrix, u8, heavy_bytes as usize),
+            (pivots, u16, pivot_count as usize),
+            (ge_row_map, u16, pivot_count as usize),
+            (ge_col_map, u16, ge_cols as usize),
+        );
         if !ok {
             self.free_matrix();
             return false;
@@ -2339,58 +2315,31 @@ impl Codec {
             }
         }
         let rb_len = (recovery_rows as u64 * self.block_bytes as u64) as usize;
-        let reused = !fresh
-            && reuse_resize(&mut self.recovery_blocks, rb_len)
-            && reuse_resize(&mut self.peel_rows, row_count as usize)
-            && reuse_resize(&mut self.peel_cols, column_count as usize)
-            && reuse_resize(&mut self.peel_col_refs, column_count as usize)
-            && reuse_resize(&mut self.peel_avalanche, column_count as usize)
-            && reuse_resize(&mut self.original_row, column_count as usize)
-            && reuse_resize(&mut self.copied_original, row_count as usize)
-            && reuse_resize(&mut self.received_packets, received_packet_slots as usize);
-        if reused {
-            self.received_packets.fill(ReceivedPacketRecord::default());
-        }
         let charged = if fresh {
             size_bytes
         } else {
             self.workspace_allocated
         };
-        let ok = reused || {
-            self.free_workspace();
-            match (
-                try_zeroed::<u8>(rb_len),
-                try_zeroed::<PeelRow>(row_count as usize),
-                try_zeroed::<PeelColumn>(column_count as usize),
-                try_zeroed::<PeelRefs>(column_count as usize),
-                try_zeroed::<PeelAvalancheFrame>(column_count as usize),
-                try_zeroed::<u16>(column_count as usize),
-                try_zeroed::<u8>(row_count as usize),
-                try_zeroed::<ReceivedPacketRecord>(received_packet_slots as usize),
-            ) {
-                (
-                    Some(rb),
-                    Some(pr),
-                    Some(pc),
-                    Some(refs),
-                    Some(av),
-                    Some(orow),
-                    Some(co),
-                    Some(rp),
-                ) => {
-                    self.recovery_blocks = rb;
-                    self.peel_rows = pr;
-                    self.peel_cols = pc;
-                    self.peel_col_refs = refs;
-                    self.peel_avalanche = av;
-                    self.original_row = orow;
-                    self.copied_original = co;
-                    self.received_packets = rp;
-                    true
-                }
-                _ => false,
-            }
-        };
+        let (reused, ok) = reuse_or_allocate!(
+            self,
+            fresh,
+            free_workspace,
+            (recovery_blocks, u8, rb_len),
+            (peel_rows, PeelRow, row_count as usize),
+            (peel_cols, PeelColumn, column_count as usize),
+            (peel_col_refs, PeelRefs, column_count as usize),
+            (peel_avalanche, PeelAvalancheFrame, column_count as usize),
+            (original_row, u16, column_count as usize),
+            (copied_original, u8, row_count as usize),
+            (
+                received_packets,
+                ReceivedPacketRecord,
+                received_packet_slots as usize
+            ),
+        );
+        if reused {
+            self.received_packets.fill(ReceivedPacketRecord::default());
+        }
         if !ok {
             self.free_workspace();
             return false;

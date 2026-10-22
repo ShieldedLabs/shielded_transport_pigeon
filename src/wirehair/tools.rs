@@ -82,15 +82,6 @@ impl PcgRandom {
 pub fn rol64(n: u64, r: u32) -> u64 {
     n.rotate_left(r)
 }
-#[inline(always)]
-pub fn ror64(n: u64, r: u32) -> u64 {
-    n.rotate_right(r)
-}
-#[inline(always)]
-pub fn nonzero_lowest_bit_index64(x: u64) -> u32 {
-    debug_assert!(x != 0);
-    x.trailing_zeros()
-}
 pub fn floor_square_root16(x: u16) -> u16 {
     let nonzero_bits: u32 = if x < 0x100 {
         6

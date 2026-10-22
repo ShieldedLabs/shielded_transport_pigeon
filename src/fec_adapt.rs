@@ -14,10 +14,44 @@ static RESEARCH_POLICY: std::sync::OnceLock<RepairPolicy> = std::sync::OnceLock:
 static RESEARCH_INTERLEAVE_WIDTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static RESEARCH_SLIPSTREAM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 static RESEARCH_MEDIUM_BONUS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-static RESEARCH_EVENT_REPAIR: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-#[doc(hidden)]
-pub fn research_p4_event_repair() -> u32 {
-    RESEARCH_EVENT_REPAIR.get().copied().unwrap_or(0)
+/// Each research knob is published once by `initialize_research_policy`; its hidden getter
+/// reports the default until then.
+macro_rules! research_settings {
+    ($($slot:ident, $getter:ident, $default:expr;)*) => {$(
+        static $slot: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        #[doc(hidden)]
+        pub fn $getter() -> u32 {
+            $slot.get().copied().unwrap_or($default)
+        }
+    )*};
+}
+research_settings! {
+    RESEARCH_EVENT_REPAIR, research_p4_event_repair, 0;
+    RESEARCH_BASE_PARITY, research_p4_base_parity_model, 0;
+    RESEARCH_BUDGET_BASE, research_p4_budget_base, 0;
+    RESEARCH_TARGET_VALIDATION, research_p4_target_validation, 0;
+    RESEARCH_COST_SMOOTH, research_p4_cost_smooth, 0;
+    RESEARCH_REPAIR_CAP_PERCENT, research_p4_repair_cap_percent, 15;
+    RESEARCH_EMPIRICAL_TAIL, research_p4_empirical_tail_calibration, 0;
+}
+/// Accepts exactly the decimal spelling of one of `accepted`; `None` means `default`.
+fn choice(
+    value: Option<&str>,
+    default: &str,
+    accepted: &[u32],
+    error: &str,
+) -> Result<u32, String> {
+    let value = value.unwrap_or(default);
+    let found = accepted.iter().copied().find(|v| v.to_string() == value);
+    found.ok_or_else(|| error.to_string())
+}
+/// The P4 experiments stack: each one requires P4 at width 1 without slipstream and every
+/// earlier experiment in `earlier` left at 0.
+fn p4_isolated(policy: RepairPolicy, width: usize, slipstream: bool, earlier: &[u32]) -> bool {
+    policy == RepairPolicy::MessageBound
+        && width == 1
+        && !slipstream
+        && earlier.iter().all(|&v| v == 0)
 }
 pub(crate) fn parse_event_repair(
     value: Option<&str>,
@@ -26,21 +60,16 @@ pub(crate) fn parse_event_repair(
     slipstream: bool,
     bonus: u32,
 ) -> Result<u32, String> {
-    let q = match value.unwrap_or("0") {
-        "0" => 0,
-        "5" => 5,
-        "10" => 10,
-        _ => return Err("STP_P4_EVENT_REPAIR must be 0, 5 or 10".to_string()),
-    };
-    if q != 0 && (policy != RepairPolicy::MessageBound || width != 1 || slipstream || bonus != 0) {
+    let q = choice(
+        value,
+        "0",
+        &[0, 5, 10],
+        "STP_P4_EVENT_REPAIR must be 0, 5 or 10",
+    )?;
+    if q != 0 && !p4_isolated(policy, width, slipstream, &[bonus]) {
         return Err("STP_P4_EVENT_REPAIR requires P4, STP_P4_INTERLEAVE_WIDTH=1, STP_P4_SLIPSTREAM=0, STP_P4_MEDIUM_BONUS_PERCENT=0".to_string());
     }
     Ok(q)
-}
-static RESEARCH_BASE_PARITY: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-#[doc(hidden)]
-pub fn research_p4_base_parity_model() -> u32 {
-    RESEARCH_BASE_PARITY.get().copied().unwrap_or(0)
 }
 pub(crate) fn parse_base_parity_model(
     value: Option<&str>,
@@ -50,26 +79,16 @@ pub(crate) fn parse_base_parity_model(
     bonus: u32,
     event: u32,
 ) -> Result<u32, String> {
-    let m = match value.unwrap_or("0") {
-        "0" => 0,
-        "1" => 1,
-        _ => return Err("STP_P4_BASE_PARITY_MODEL must be 0 or 1".to_string()),
-    };
-    if m != 0
-        && (policy != RepairPolicy::MessageBound
-            || width != 1
-            || slipstream
-            || bonus != 0
-            || event != 0)
-    {
+    let m = choice(
+        value,
+        "0",
+        &[0, 1],
+        "STP_P4_BASE_PARITY_MODEL must be 0 or 1",
+    )?;
+    if m != 0 && !p4_isolated(policy, width, slipstream, &[bonus, event]) {
         return Err("STP_P4_BASE_PARITY_MODEL requires P4, STP_P4_INTERLEAVE_WIDTH=1, STP_P4_SLIPSTREAM=0, STP_P4_MEDIUM_BONUS_PERCENT=0, STP_P4_EVENT_REPAIR=0".to_string());
     }
     Ok(m)
-}
-static RESEARCH_BUDGET_BASE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-#[doc(hidden)]
-pub fn research_p4_budget_base() -> u32 {
-    RESEARCH_BUDGET_BASE.get().copied().unwrap_or(0)
 }
 pub(crate) fn parse_budget_base(
     value: Option<&str>,
@@ -80,52 +99,24 @@ pub(crate) fn parse_budget_base(
     event: u32,
     base: u32,
 ) -> Result<u32, String> {
-    let m = match value.unwrap_or("0") {
-        "0" => 0,
-        "1" => 1,
-        _ => return Err("STP_P4_BUDGET_BASE must be 0 or 1".to_string()),
-    };
-    if m != 0
-        && (policy != RepairPolicy::MessageBound
-            || width != 1
-            || slipstream
-            || bonus != 0
-            || event != 0
-            || base != 0)
-    {
+    let m = choice(value, "0", &[0, 1], "STP_P4_BUDGET_BASE must be 0 or 1")?;
+    if m != 0 && !p4_isolated(policy, width, slipstream, &[bonus, event, base]) {
         return Err("STP_P4_BUDGET_BASE requires P4, STP_P4_INTERLEAVE_WIDTH=1, STP_P4_SLIPSTREAM=0, STP_P4_MEDIUM_BONUS_PERCENT=0, STP_P4_EVENT_REPAIR=0, STP_P4_BASE_PARITY_MODEL=0".to_string());
     }
     Ok(m)
 }
-static RESEARCH_TARGET_VALIDATION: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-#[doc(hidden)]
-pub fn research_p4_target_validation() -> u32 {
-    RESEARCH_TARGET_VALIDATION.get().copied().unwrap_or(0)
-}
+/// Unlike the other knobs this one has no default: it must be set explicitly.
 fn parse_target_validation(value: Option<&str>) -> Result<u32, String> {
-    match value {
-        Some("0") => Ok(0),
-        Some("1") => Ok(1),
-        Some("2") => Ok(2),
-        _ => Err("STP_P4_TARGET_VALIDATION must be explicitly 0, 1 or 2".into()),
-    }
-}
-static RESEARCH_COST_SMOOTH: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-#[doc(hidden)]
-pub fn research_p4_cost_smooth() -> u32 {
-    RESEARCH_COST_SMOOTH.get().copied().unwrap_or(0)
+    let error = "STP_P4_TARGET_VALIDATION must be explicitly 0, 1 or 2";
+    choice(
+        Some(value.ok_or_else(|| error.to_string())?),
+        "",
+        &[0, 1, 2],
+        error,
+    )
 }
 fn parse_cost_smooth(value: Option<&str>) -> Result<u32, String> {
-    match value.unwrap_or("0") {
-        "0" => Ok(0),
-        "1" => Ok(1),
-        _ => Err("STP_P4_COST_SMOOTH must be 0 or 1".into()),
-    }
-}
-static RESEARCH_REPAIR_CAP_PERCENT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-#[doc(hidden)]
-pub fn research_p4_repair_cap_percent() -> u32 {
-    RESEARCH_REPAIR_CAP_PERCENT.get().copied().unwrap_or(15)
+    choice(value, "0", &[0, 1], "STP_P4_COST_SMOOTH must be 0 or 1")
 }
 pub(crate) fn parse_repair_cap_percent(
     value: Option<&str>,
@@ -137,30 +128,15 @@ pub(crate) fn parse_repair_cap_percent(
     base: u32,
     budget: u32,
 ) -> Result<u32, String> {
-    let cap = match value.unwrap_or("15") {
-        "15" => 15,
-        "25" => 25,
-        "0" => 0,
-        _ => return Err("STP_P4_REPAIR_CAP_PERCENT must be 15 or 25".to_string()),
-    };
-    if cap != 15
-        && (policy != RepairPolicy::MessageBound
-            || width != 1
-            || slipstream
-            || bonus != 0
-            || event != 0
-            || base != 0
-            || budget != 1)
+    let error = "STP_P4_REPAIR_CAP_PERCENT must be 15 or 25";
+    let cap = choice(value, "15", &[15, 25, 0], error)?;
+    if cap != 15 && !(p4_isolated(policy, width, slipstream, &[bonus, event, base]) && budget == 1)
     {
         return Err("STP_P4_REPAIR_CAP_PERCENT=25 requires P4, STP_P4_INTERLEAVE_WIDTH=1, STP_P4_SLIPSTREAM=0, STP_P4_MEDIUM_BONUS_PERCENT=0, STP_P4_EVENT_REPAIR=0, STP_P4_BASE_PARITY_MODEL=0, STP_P4_BUDGET_BASE=1".to_string());
     }
     Ok(cap)
 }
-static RESEARCH_EMPIRICAL_TAIL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-#[doc(hidden)]
-pub fn research_p4_empirical_tail_calibration() -> u32 {
-    RESEARCH_EMPIRICAL_TAIL.get().copied().unwrap_or(0)
-}
+/// The prerequisites apply even when calibration is 0.
 pub(crate) fn parse_empirical_tail(
     value: Option<&str>,
     policy: RepairPolicy,
@@ -172,19 +148,11 @@ pub(crate) fn parse_empirical_tail(
     budget: u32,
     cap: u32,
 ) -> Result<u32, String> {
-    let q = match value.unwrap_or("0") {
-        "0" => 0,
-        "1" => 1,
-        _ => return Err("STP_P4_EMPIRICAL_TAIL_CALIBRATION must be 0 or 1".into()),
-    };
-    if policy != RepairPolicy::MessageBound
-        || width != 1
-        || slipstream
-        || bonus != 0
-        || event != 0
-        || base != 0
-        || budget != 1
-        || (cap != 25 && cap != 0)
+    let error = "STP_P4_EMPIRICAL_TAIL_CALIBRATION must be 0 or 1";
+    let q = choice(value, "0", &[0, 1], error)?;
+    if !(p4_isolated(policy, width, slipstream, &[bonus, event, base])
+        && budget == 1
+        && (cap == 25 || cap == 0))
     {
         return Err(
             "empirical calibration requires P4/W1/SS0/bonus0/event0/model0/budget_base1/cap25"

@@ -672,13 +672,3 @@ pub fn memswap(x: &mut [u8], y: &mut [u8]) {
     }
     x.swap_with_slice(&mut y[..n]);
 }
-#[allow(unused_imports)]
-pub use self::{
-    add as gf256_add, add_mem as gf256_add_mem, add_multi_mem as gf256_add_multi_mem,
-    add2_mem as gf256_add2_mem, addset_mem as gf256_addset_mem,
-    addset_multi_mem as gf256_addset_multi_mem, div as gf256_div, div_mem as gf256_div_mem,
-    div_mem_inplace as gf256_div_mem_inplace, inv as gf256_inv, memswap as gf256_memswap,
-    mul as gf256_mul, mul_mem as gf256_mul_mem, mul_mem_inplace as gf256_mul_mem_inplace,
-    muladd_mem as gf256_muladd_mem, muladd_multi_mem as gf256_muladd_multi_mem,
-    mulset_multi_mem as gf256_mulset_multi_mem, sqr as gf256_sqr,
-};

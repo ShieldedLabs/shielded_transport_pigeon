@@ -31,13 +31,6 @@ pub const WIREHAIR_VERSION: i32 = 2;
 pub const WIREHAIR_LEGACY_PROFILE_PRE_FIXUP: u64 = 0xe1b9_f77f_1c90_f680;
 pub const WIREHAIR_LEGACY_PROFILE_FIXUPS_2026_07: u64 = 0x4d24_1359_db07_bb07;
 pub const WIREHAIR_LEGACY_PROFILE_CURRENT: u64 = WIREHAIR_LEGACY_PROFILE_FIXUPS_2026_07;
-pub fn wire_profile_from_id(profile_id: u64) -> Option<WireProfile> {
-    match profile_id {
-        WIREHAIR_LEGACY_PROFILE_PRE_FIXUP => Some(WireProfile::LegacyPreFixup),
-        WIREHAIR_LEGACY_PROFILE_CURRENT => Some(WireProfile::LegacyCurrent),
-        _ => None,
-    }
-}
 pub fn init() -> WirehairResult {
     WirehairResult::Success
 }

@@ -1496,13 +1496,3 @@ mod macos {
         (probe_v4_source(), probe_v6_source())
     }
 }
-fn test_network_switch() {
-    let socket = setup_and_bind_udp_socket(0).unwrap();
-    loop {
-        std::thread::yield_now();
-        let time_before = monotonic_clock_ns();
-        let (ipv4, ipv6) = udp_probe_source_addresses(socket);
-        let time_after = monotonic_clock_ns();
-        println!("{:?} {:?} took {} ns", ipv4, ipv6, time_after - time_before);
-    }
-}
