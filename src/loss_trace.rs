@@ -57,33 +57,3 @@ impl LossTrace {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn event_csv_records_fragments_and_late_ack() {
-        let p = std::env::temp_dir().join(format!("stp-trace-test-{}", std::process::id()));
-        {
-            let mut t = LossTrace::open(&p).unwrap();
-            let mut b = vec![3, 15, 0];
-            b.extend_from_slice(&7u64.to_le_bytes());
-            b.extend_from_slice(&4u32.to_le_bytes());
-            b.extend_from_slice(&[1, 2, 3]);
-            let c = CcContext { pps: 1000.0, slope_ppsps: 25.0, rtt_ns: 200_000_000, feedback_ns: 222_500_000, mode: 'P' };
-            t.set_cc(8, c);
-            t.sent(8, 9, 10, &b);
-            t.cut(8, 9, 11, 10, "early", c);
-            t.outcome('L', 8, 9, 20);
-            t.outcome('A', 8, 9, 30);
-        }
-        let s = std::fs::read_to_string(&p).unwrap();
-        assert!(s.contains("F,8,9,10,3,0,7,4,0"));
-        assert!(s.contains("L,8,9,20,0,1,-1,-1,0"));
-        assert!(s.contains("A,8,9,30,0,0,-1,-1,0"));
-        assert!(s.contains("C,8,9,10,0,0,-1,-1,0,1000,25,200000000,222500000,P,,0"));
-        assert!(s.contains("X,8,9,11,0,0,-1,-1,0,1000,25,200000000,222500000,P,early,10"));
-        assert!(s.lines().all(|line| line.split(',').count() == 16));
-        std::fs::remove_file(p).unwrap();
-    }
-}

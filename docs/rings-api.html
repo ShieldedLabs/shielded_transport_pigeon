@@ -358,7 +358,7 @@ worker.<span class="f">join</span>().<span class="f">unwrap</span>();</code></pr
 
 <h3 id="ordering">Ordering guarantees</h3>
 <div class="callout ok">
-<div class="title">Guarantees (each covered by a test in <code>tests/lockfree.rs</code>)</div>
+<div class="title">Guarantees (each was covered by a test in the baseline revision&rsquo;s <code>tests/lockfree.rs</code>, which is no longer shipped)</div>
 <table>
   <tr><th>#</th><th>Guarantee</th><th>Test</th></tr>
   <tr><td>1</td><td>A peer&rsquo;s <code>Connected</code> comes before any <code>Message</code> from it.</td><td><code>lifecycle_order_and_exactly_once_disconnect</code></td></tr>
@@ -386,7 +386,7 @@ worker.<span class="f">join</span>().<span class="f">unwrap</span>();</code></pr
 <h2 id="parking"><span class="num">7</span>Parking &amp; readiness</h2>
 <pre><code><span class="k">pub fn</span> <span class="f">park_until_ready</span>(&amp;<span class="k">mut</span> <span class="k">self</span>) -&gt; <span class="t">bool</span></code></pre>
 <p>This blocks the application thread on a futex generation counter. It returns immediately if there is already a receive event, a finished telemetry snapshot, or space in a ring whose last <code>try_*</code> failed because it was full. Otherwise it sleeps until one of those happens or the endpoint closes. It returns <code>false</code> only when the endpoint is closed or finished <em>and</em> no events remain to drain. Spurious wakes are allowed, so always re-check with <code>try_*</code> after it returns.</p>
-<pre><code><span class="c">// tests/lockfree.rs: park_for_receive_and_close</span>
+<pre><code><span class="c">// from the baseline test park_for_receive_and_close</span>
 <span class="k">loop</span> {
     <span class="k">if let</span> <span class="t">Some</span>(<span class="t">Event</span>::Message { data, .. }) = b.<span class="f">try_recv</span>() { <span class="m">assert_eq!</span>(data, <span class="s">b"park"</span>); <span class="k">break</span>; }
     <span class="m">assert!</span>(b.<span class="f">park_until_ready</span>());
@@ -581,7 +581,7 @@ worker.<span class="f">join</span>().<span class="f">unwrap</span>();</code></pr
 </table>
 
 <footer>
-  Documents the application rings retained in <code>shielded_transport_pigeon 1.0.0 (unreleased)</code>. The performance figures on this page are historical 0.3.0 measurements at baseline <code>45224d0</code>, not results for the dependency-free port. The authoritative sources are <code>src/pump/</code> (<code>mod.rs</code>, <code>lockfree.rs</code>, <code>port.rs</code>, <code>ring.rs</code>), the constructors in <code>src/stp.rs</code>, <code>tests/lockfree.rs</code>, <code>tests/pump.rs</code> and <code>examples/</code>. Protocol details, constants and wire formats are in <code>PROTOCOL.md</code> in the repository.
+  Documents the application rings retained in <code>shielded_transport_pigeon 1.0.0 (unreleased)</code>. The performance figures on this page are historical 0.3.0 measurements at baseline <code>45224d0</code>, not results for the dependency-free port. The authoritative sources are <code>src/pump/</code> (<code>mod.rs</code>, <code>lockfree.rs</code>, <code>port.rs</code>, <code>ring.rs</code>), the constructors in <code>src/stp.rs</code> and <code>examples/</code>. Protocol details, constants and wire formats are in <code>PROTOCOL.md</code> in the repository.
 </footer>
 </main>
 </div>

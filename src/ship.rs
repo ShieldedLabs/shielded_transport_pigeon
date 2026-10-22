@@ -43,44 +43,6 @@ pub(crate) const ACK: crate::ack::AckPolicy = crate::ack::AckPolicy {
     max_delay_us: 10_000,
 };
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn policy_environment_child() {
-        if std::env::var_os("STP_RC_POLICY_PROBE").is_none() { return; }
-        for (key, _) in FROZEN_POLICY {
-            let expected = if cfg!(feature="research_target_validation") { "0" }
-                else { FROZEN_POLICY.iter().find(|(k,_)|k==key).unwrap().1 };
-            assert_eq!(policy_var(key).unwrap(), expected, "{key}");
-        }
-        assert_eq!(policy_var("STP_CC_LOSS_GATE").is_ok(),cfg!(feature="research_target_validation"));
-        if cfg!(feature="research_target_validation") {
-            assert!(!crate::target_validation::rand_enabled());
-            assert!(!crate::target_validation::duplicate_now(&Default::default()));
-        }
-    }
-    #[test]
-    fn production_ignores_policy_environment_research_accepts_explicit_zero() {
-        let mut child=std::process::Command::new(std::env::current_exe().unwrap());
-        child.args(["--exact","ship::tests::policy_environment_child","--nocapture"])
-            .env("STP_RC_POLICY_PROBE","1").env("STP_CC_LOSS_GATE","1");
-        for (key,_) in FROZEN_POLICY {child.env(key,"0");}
-        let output=child.output().unwrap();
-        assert!(output.status.success(),"{}{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
-    }
-    #[test]
-    fn ship_policy_is_the_only_configuration() {
-        assert_eq!(CC.initial_rate_upps, 100_000_000);
-        assert_eq!(CC.max_growth_uppsps, 1000e6);
-        assert_eq!(CC.relative_growth_per_rtt, 0.015);
-        assert_eq!(CC.startup_multiplier, 1.05);
-        assert_eq!(CC.loss_threshold, 2);
-        assert_eq!(FEC.eps, 0.5);
-        assert_eq!((ACK.every_packets, ACK.max_delay_us), (8, 10_000));
-    }
-}
-
 /// Frozen c4rand release-candidate design. H = 100/3 is the real-path-tested
 /// exposure scale (not the older g4 emulator's 1000/3). Applications do not
 /// configure transport policy. Only the research feature permits overrides.

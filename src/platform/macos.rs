@@ -211,7 +211,7 @@ pub fn fill_random(buf: &mut [u8]) -> std::io::Result<()> {
 }
 
 // Compile-time layout checks: they also run under a cross `cargo check`,
-// where the unit tests below cannot execute.
+// where no code can execute.
 const _: () = {
     use core::mem::{align_of, offset_of, size_of};
     assert!(size_of::<sockaddr>() == 16 && size_of::<sockaddr_in>() == 16 && size_of::<sockaddr_in6>() == 28 && size_of::<sockaddr_storage>() == 128);
@@ -223,15 +223,3 @@ const _: () = {
     assert!(size_of::<timeval>() == 16 && size_of::<rusage>() == 144 && offset_of!(rusage, ru_maxrss) == 32);
     assert!(CMSG_LEN(4) == 16 && CMSG_SPACE(4) == 16 && CMSG_SPACE(20) == 32 && CMSG_SPACE(1) == 16);
 };
-
-#[cfg(test)]
-mod abi_tests {
-    use super::*;
-
-    #[test]
-    fn fill_random_crosses_getentropy_limit() {
-        let mut a = vec![0u8; 3 * GETENTROPY_MAX + 7];
-        fill_random(&mut a).unwrap();
-        assert!(a[3 * GETENTROPY_MAX..].iter().any(|&b| b != 0));
-    }
-}

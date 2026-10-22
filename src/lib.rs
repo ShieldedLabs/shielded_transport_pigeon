@@ -39,6 +39,3 @@ pub mod sequence;
 pub mod budget_diagnostic;
 
 pub mod target_validation;
-
-#[cfg(test)]
-extern crate self as stp_core;

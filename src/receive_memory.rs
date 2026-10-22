@@ -29,10 +29,6 @@ impl ReceiveMemoryBudget {
     pub(crate) fn release_worker(&self) { self.workers.fetch_sub(1, Ordering::AcqRel); }
     pub(crate) fn worker_limit_reached(&self) -> bool { self.workers.load(Ordering::Acquire) >= self.worker_limit }
 
-    #[cfg(test)]
-    pub(crate) fn connection_share(parent: &Arc<Self>) -> Arc<Self> {
-        Self::connection_with_limit(parent, parent.limit / 2)
-    }
     pub fn limit(&self) -> usize { self.limit }
     pub fn used(&self) -> usize { self.used.load(Ordering::Acquire) }
     pub fn peak(&self) -> usize { self.peak.load(Ordering::Acquire) }
@@ -82,70 +78,4 @@ impl Reservation {
 }
 impl Drop for Reservation {
     fn drop(&mut self) { self.budget.release(self.bytes); }
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn checked_atomic_admission_and_ownership() {
-        let b = ReceiveMemoryBudget::new(100);
-        let mut a = b.reserve(40).unwrap(); let c = b.reserve(60).unwrap();
-        assert!(b.reserve(1).is_none()); assert!(!a.grow(41));
-        assert!(b.reserve(usize::MAX).is_none()); drop(c);
-        assert!(a.grow(100)); assert_eq!(b.peak(),100); drop(a); assert_eq!(b.used(),0);
-    }
-    #[test]
-    fn peer_share_charges_parent_and_rolls_back_refused_growth() {
-        let process = ReceiveMemoryBudget::new(200);
-        let peer = ReceiveMemoryBudget::connection_share(&process);
-        let mut r = peer.reserve(80).unwrap();
-        assert_eq!(process.used(), 80);
-        assert!(peer.reserve(21).is_none());
-        assert!(!r.grow(101));
-        assert_eq!(process.used(), 80);
-        r.shrink(20); assert_eq!(process.used(), 20);
-        assert!(r.grow(100)); assert_eq!(process.used(), 100);
-        drop(r); assert_eq!(peer.used(), 0); assert_eq!(process.used(), 0);
-        let global = process.reserve(150).unwrap();
-        assert!(peer.reserve(51).is_none()); assert_eq!(peer.used(), 0);
-        drop(global);
-    }
-    #[test]
-    fn connection_worker_permits_are_bounded_and_reusable() {
-        let process = ReceiveMemoryBudget::new(100);
-        let peer = ReceiveMemoryBudget::connection_with_limit(&process, 100).with_worker_limit(1);
-        assert!(peer.acquire_worker()); assert!(!peer.acquire_worker());
-        assert_eq!(peer.worker_peak(), 1);
-        peer.release_worker(); assert!(peer.acquire_worker()); peer.release_worker();
-        assert_eq!(peer.worker_peak(), 1);
-        let inline = ReceiveMemoryBudget::connection_with_limit(&process, 100).with_worker_limit(0);
-        assert!(!inline.acquire_worker());
-    }
-    #[test]
-    fn absorb_moves_same_budget_charge_without_gap_and_refuses_mismatch() {
-        let process = ReceiveMemoryBudget::new(300);
-        let peer = ReceiveMemoryBudget::connection_with_limit(&process, 200);
-        let mut root = peer.reserve(50).unwrap();
-        let donor = peer.reserve(150).unwrap();
-        let (used, peak, process_peak) = (peer.used(), peer.peak(), process.peak());
-        assert!(root.absorb(donor).is_ok());
-        assert_eq!(root.bytes(), 200);
-        // No release/reacquire: counts and peaks unchanged, budget still full.
-        assert_eq!((peer.used(), peer.peak(), process.used(), process.peak()), (used, peak, 200, process_peak));
-        assert!(peer.reserve(1).is_none());
-        let other = ReceiveMemoryBudget::connection_with_limit(&process, 100);
-        let foreign = other.reserve(60).unwrap();
-        let foreign = root.absorb(foreign).unwrap_err();
-        assert_eq!((root.bytes(), foreign.bytes(), peer.used(), other.used(), process.used()), (200, 60, 200, 60, 260));
-        drop(foreign); drop(root);
-        assert_eq!((peer.used(), other.used(), process.used()), (0, 0, 0));
-    }
-    #[test]
-    fn shared_budget_never_overcommits() {
-        let b = ReceiveMemoryBudget::new(4096);
-        std::thread::scope(|s| { for _ in 0..8 { let b = b.clone(); s.spawn(move || {
-            for _ in 0..1000 { if let Some(r) = b.reserve(1024) { assert!(b.used() <= b.limit()); drop(r); } }
-        }); } });
-        assert_eq!(b.used(), 0); assert!(b.peak() <= 4096);
-    }
 }

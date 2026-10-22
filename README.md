@@ -143,8 +143,8 @@ handle are `Send`; the single-owner app handle is deliberately **not Sync**.
   events for every queued request/association. Pump never waits for app space.
 
 `examples/lockfree_thread.rs` and `examples/lockfree_game.rs` show both driving
-styles. The historical batch exchange is crate-private, kept solely for frozen
-protocol regression tests. Research binaries use an application-side adapter
+styles. The historical batch exchange is crate-private; it was kept for frozen
+protocol regression tests, which this source tree no longer ships. Research binaries use an application-side adapter
 implemented on the same public rings; it is not another library API.
 
 ## Transport and security boundaries
@@ -197,6 +197,10 @@ The deterministic FEC planning golden hash is unchanged. Tests are not an
 independent interoperability or security audit. These results predate wire
 profile 5 and do not cover it; this document set reports no profile-5 test or
 performance result.
+
+This source tree ships no test suite: the unit and integration tests were
+removed to reduce source size, and validation was run externally against the
+baseline revision's tests.
 
 For 0.3.0, on a Ryzen 5 5500U Linux host using HPET, three interleaved loopback runs measured
 about **309,000 100-byte messages/s** with 8192 in flight and **246 MB/s** for

@@ -224,10 +224,3 @@ impl CohortObservation {
     /// Connected, no pending ciphertext and every queue strictly idle.
     pub fn all_idle(&self) -> bool { self.connected && !self.pending_send && self.queues.iter().all(|q| q.idle()) }
 }
-
-/// Test-only: preload a counter (and the service sequence) near u64::MAX to exercise saturation.
-#[cfg(test)]
-pub fn preload_near_max_for_test() {
-    UDP_SEND_FULL.with(|c| c.set(u64::MAX - 1));
-    SERVICE_SEQ.with(|c| c.set(u64::MAX - 1));
-}

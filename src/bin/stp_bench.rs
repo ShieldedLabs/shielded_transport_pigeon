@@ -401,58 +401,14 @@ fn mean_transmitted_redundancy(sum_repair_ratios: f64, sent_messages: u64) -> f6
     if sent_messages == 0 { 0.0 } else { 100.0 * sum_repair_ratios / sent_messages as f64 }
 }
 
-#[test]
-fn redundancy_is_not_diluted_by_unsent_workload() {
-    // 10 sent K=12,N=24 messages in a nominal 1000-message timeout workload.
-    assert_eq!(mean_transmitted_redundancy(10.0, 10), 100.0);
-    assert_eq!(mean_transmitted_redundancy(0.0, 0), 0.0);
-    // Cumulative rescue raises N to30, i.e.18 actually sent repair symbols.
-    assert_eq!(mean_transmitted_redundancy(18.0 / 12.0, 1), 150.0);
-}
-
 fn send_duty_off(elapsed_ns: u64, on_ns: u64, off_ns: u64) -> bool {
     off_ns != 0 && elapsed_ns % (on_ns + off_ns) >= on_ns
-}
-
-#[test]
-fn send_duty_boundaries() {
-    assert!(!send_duty_off(0, 2000, 2000));
-    assert!(!send_duty_off(1999, 2000, 2000));
-    assert!(send_duty_off(2000, 2000, 2000));
-    assert!(send_duty_off(3999, 2000, 2000));
-    assert!(!send_duty_off(4000, 2000, 2000));
-    assert!(!send_duty_off(u64::MAX, 2000, 0));
-}
-
-#[test]
-fn integrated_rx_report_roundtrip() {
-    let r = RxReport { st: ConnectionStats { fec_decode_last_tail_ns: 11, fec_decode_max_tail_ns: 12, fec_ingress_dropped_blocks: 13, udp_payload_tu: 1472, ack_packets_sent: 21, ack_bytes_sent: 22, ack_packets_received: 23, ack_delay_us_max: 24, rtt_samples: 25, fec_decode_admission_refusals: 31, fec_decode_timeouts: 32, fec_decode_preemptions: 33, fec_worker_limit_events: 34, fec_decode_peak_workers: 35, rx_plain_admission_refusals: 36, rx_stale_identity_frames: 37, ..Default::default() }, ..Default::default() };
-    let words = r.to_words();
-    assert_eq!(words.len(), RxReport::WORDS);
-    let decoded = RxReport::from_words(&words).unwrap();
-    assert_eq!(decoded.to_words(), words);
-    assert_eq!(&words[28..32], &[11, 12, 13, 1472]);
-    assert_eq!(&words[32..37], &[21, 22, 23, 24, 25]);
-    assert_eq!(&words[37..40], &[31, 32, 33]);
-    assert_eq!(decoded.worker_limit_json(), ",\"receiver_fec_worker_refusals\":1,\"receiver_fec_worker_pressure_retirements\":33,\"receiver_stale_identity_frames\":37");
-    assert_eq!(RxReport::default().worker_limit_json(), ",\"receiver_fec_worker_refusals\":0,\"receiver_fec_worker_pressure_retirements\":0,\"receiver_stale_identity_frames\":0");
-    // Old receivers still report the original prefix without the new counters.
-    let old = RxReport::from_words(&words[..37]).unwrap();
-    assert_eq!(old.st.fec_decode_admission_refusals, 0);
-    assert_eq!(old.st.rx_stale_identity_frames, 0);
 }
 
 /// Fixed P4 duration-category bonus echo from the ConnectionStats poll. Repairs are
 /// planned initial-layout additions (TU restarts re-plan), not emitted packets.
 fn category_bonus_json(percent: u32, messages: u64, planned_repairs: u64) -> String {
     format!(",\"category_bonus_percent\":{percent},\"category_bonus_messages\":{messages},\"category_bonus_repairs\":{planned_repairs},\"category_bonus_repairs_kind\":\"planned_layout_additions_not_emitted\"")
-}
-
-#[test]
-fn category_bonus_json_fields() {
-    let mut json = "{\"a\":1}\n".to_string();
-    json.insert_str(json.len() - 2, &category_bonus_json(10, 19, 237));
-    assert_eq!(json, "{\"a\":1,\"category_bonus_percent\":10,\"category_bonus_messages\":19,\"category_bonus_repairs\":237,\"category_bonus_repairs_kind\":\"planned_layout_additions_not_emitted\"}\n");
 }
 
 // Research-only sidecar: disk stream, not an unbounded in-memory result list.

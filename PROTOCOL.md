@@ -1317,7 +1317,7 @@ Constants: RAND_MULT = 2, RAND_HALF = 4000 packets, RAND_MAX = 0.05.
 - `p_base` is computed at each root admission and frozen with it. On a clean
   link it stays at P = 0.001.
 
-Tests cover every frame kind, unknown-kind skipping, the former all-ones
+The baseline revision's tests (no longer shipped) covered every frame kind, unknown-kind skipping, the former all-ones
 padding collision, full nonces across enormous gaps, arbitrary ACK bases and
 repeated deep-window feedback, rekey budget boundaries/reordering, parameter
 mismatches, malformed-input bounds, and encrypted UDP size capture. Tests are

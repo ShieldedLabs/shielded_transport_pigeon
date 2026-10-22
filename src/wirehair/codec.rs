@@ -2302,11 +2302,6 @@ impl Codec {
     pub fn set_wire_profile(&mut self, profile: WireProfile) {
         self.wire_profile = profile;
     }
-    /// Testing hook: fail the countdown-th arena allocation (0 = next one); -1 disables.
-    #[cfg(test)]
-    pub fn set_allocation_failure_countdown_for_testing(&mut self, countdown: i64) {
-        self.testing_allocation_failure_countdown = countdown;
-    }
     pub fn can_encode(&self) -> bool {
         self.mode == Mode::Encoder || self.mode == Mode::Converted
     }

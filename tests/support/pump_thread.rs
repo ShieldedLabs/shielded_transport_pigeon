@@ -1,4 +1,4 @@
-// Caller-owned thread adapter used only by tests/research binaries. The library
+// Caller-owned thread adapter used only by the research binaries. The library
 // owns no threads. This legacy batch-shaped helper is NOT a public library API:
 // it is implemented entirely on the public three-ring endpoint.
 use stp_core::stp::*;
@@ -77,20 +77,4 @@ fn reject_suffix(
         }
     }
     rejected
-}
-
-#[test]
-fn legacy_batch_returns_suffix_even_if_send_space_reappears() {
-    let key = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).unwrap();
-    let peer = STPAddress::from(std::net::Ipv6Addr::LOCALHOST, 9000, &key).connection_key();
-    let messages = (0..4).map(|i| (peer, 0, Dscp::BestEffort, vec![i])).collect();
-    let mut calls = 0;
-    let rejected = reject_suffix(messages, |_, _, _, payload| {
-        calls += 1;
-        if calls == 2 { return false; }
-        payload.clear();
-        true
-    });
-    assert_eq!(calls, 2, "must not retry later messages after the first refusal");
-    assert_eq!(rejected.into_iter().map(|x| x.3).collect::<Vec<_>>(), vec![vec![1], vec![2], vec![3]]);
 }

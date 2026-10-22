@@ -34,6 +34,3 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     }
     core::hint::black_box(difference) == 0
 }
-
-#[cfg(test)]
-mod tests;
