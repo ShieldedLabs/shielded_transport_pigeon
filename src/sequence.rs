@@ -97,11 +97,12 @@ mod tests {
         assert_eq!(r.candidate(to_wire((1 << 31)-2)), original);
     }
     fn cipher_pair() -> (crate::stp::ConnectionCipherTriplet, crate::stp::ConnectionCipherTriplet) {
-        let params: snow::params::NoiseParams = "Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
-        let ka = snow::Builder::new(params.clone()).generate_keypair().unwrap();
-        let kb = snow::Builder::new(params.clone()).generate_keypair().unwrap();
-        let mut a = snow::Builder::new(params.clone()).local_private_key(&ka.private).unwrap().remote_public_key(&kb.public).unwrap().build_initiator().unwrap();
-        let mut b = snow::Builder::new(params).local_private_key(&kb.private).unwrap().build_responder().unwrap();
+        use crate::stp::*;
+        let params = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
+        let ka = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).unwrap();
+        let kb = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).unwrap();
+        let mut a = crate::helpers::noise_initiator(params, &[], &ka.private, &kb.public).unwrap();
+        let mut b = crate::helpers::noise_responder(params, &[], &kb.private).unwrap();
         let mut enc = [0; 1024]; let mut dec = [0; 1024];
         let n = a.write_message(&[], &mut enc).unwrap(); b.read_message(&enc[..n], &mut dec).unwrap();
         let n = b.write_message(&[], &mut enc).unwrap(); a.read_message(&enc[..n], &mut dec).unwrap();

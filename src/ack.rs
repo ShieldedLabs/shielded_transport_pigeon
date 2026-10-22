@@ -394,8 +394,8 @@ mod tests {
             let server = new_keypair_from_connect_magic1(magic).unwrap();
             let params = crypto_string_from_connect_magic1(magic).unwrap();
             let prologue = magic.to_le_bytes();
-            let mut c = snow::Builder::new(params.parse().unwrap()).prologue(&prologue[..6]).unwrap().local_private_key(&client.private).unwrap().remote_public_key(&server.public).unwrap().build_initiator().unwrap();
-            let mut s = snow::Builder::new(params.parse().unwrap()).prologue(&prologue[..6]).unwrap().local_private_key(&server.private).unwrap().build_responder().unwrap();
+            let mut c = crate::helpers::noise_initiator(params, &prologue[..6], &client.private, &server.public).unwrap();
+            let mut s = crate::helpers::noise_responder(params, &prologue[..6], &server.private).unwrap();
             let mut packet = [0; 1024]; let mut payload = [0; 1024];
             let n = c.write_message(&build_magic2_client_block(), &mut packet).unwrap();
             assert_eq!(n+6, 391);

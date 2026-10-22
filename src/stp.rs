@@ -3,13 +3,12 @@
 #[cfg(feature = "research_budget_diagnostic")]
 use crate::budget_diagnostic as diag;
 use std::collections::{HashMap, VecDeque};
-use rand::SeedableRng;
-use static_assertions::const_assert;
+use crate::crypto::{noise as snow, blake3};
 
 
 #[test]
 pub fn ack_test() {
-    use rand::Rng;
+    use crate::random::Rng;
 
     println!("Begin the ack test!");
 
@@ -31,7 +30,7 @@ pub fn ack_test() {
     // Layout: [id: u32 LE][len: u32 LE][blake3 hash: 32 bytes][random payload]
     const NUM_MESSAGES: u32 = 50;
     const HEADER_SIZE: usize = 4 + 4 + 32; // id + len + hash
-    let mut rng = rand::rng();
+    let mut rng = crate::random::rng();
     let mut messages: Vec<Vec<u8>> = Vec::new();
 
     for id in 0..NUM_MESSAGES {
@@ -362,8 +361,9 @@ pub fn new_keypair_from_connect_magic1(magic1: u64) -> Option<IdentityKeyPair> {
         return Some(ret);
     }
     if let Some(crypto_string) = crypto_string_from_connect_magic1(magic1) {
-        let kp = snow::Builder::new(crypto_string.parse().ok()?).generate_keypair().ok()?;
-        Some(IdentityKeyPair { magic1, private: kp.private, public: kp.public })
+        let private = crate::helpers::crypto_random().ok()?;
+        let public = snow::public_key(&private);
+        Some(IdentityKeyPair { magic1, private: private.to_vec(), public: public.to_vec() })
     } else { None }
 }
 
@@ -374,16 +374,16 @@ pub fn new_keypair_from_connect_magic1_with_seed(magic1: u64, seed: [u8; 32]) ->
         return Some(ret);
     }
     if let Some(crypto_string) = crypto_string_from_connect_magic1(magic1) {
-        use rand::SeedableRng;
-        let mut rng = rand_chacha::ChaCha20Rng::from_seed(seed);
-        let kp = snow::Builder::with_resolver(crypto_string.parse().ok()?, Box::new(SnowRngResolver { rng: RustIsBadRngWrapper(rng) })).generate_keypair().ok()?;
-        Some(IdentityKeyPair { magic1, private: kp.private, public: kp.public })
+        let mut rng = crate::crypto::rng::ChaCha20Rng::from_seed(seed);
+        let mut private = [0; 32];
+        rng.fill_bytes(&mut private);
+        let public = snow::public_key(&private);
+        Some(IdentityKeyPair { magic1, private: private.to_vec(), public: public.to_vec() })
     } else { None }
 }
 
 pub fn b64(s: &[u8]) -> String {
-    use base64::Engine;
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(s)
+    crate::encoding::encode(s)
 }
 
 pub fn fmt_magic1_pubkey_b64(magic1: u64, key: &Vec<u8>) -> String {
@@ -408,7 +408,6 @@ impl STPAddress {
 
     // Parse [ip]:port:magic1:key
     pub fn parse(addr: &str) -> Option<STPAddress> {
-        use base64::Engine;
         let     addr           = addr.strip_prefix('[')?;
         let     (ip_str, rest) = addr.split_once("]:")?;
         let     ip: Ipv6Addr   = ip_str.parse().ok()?;
@@ -416,8 +415,8 @@ impl STPAddress {
         let     port: u16      = parts.next()?.parse().ok()?;
         let     b64_magic1     = parts.next()?; if b64_magic1.contains('=') { return None; }
         let     b64_key        = parts.next()?; if b64_key   .contains('=') { return None; }
-        let     magic1_bytes   = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(b64_magic1).ok()?; if magic1_bytes.len() != 6 { return None; }
-        let     key            = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(b64_key).ok()?;    if key.len() < MIN_PUBLIC_KEY_SIZE || key.len() > MAX_PUBLIC_KEY_SIZE { return None; }
+        let     magic1_bytes   = crate::encoding::decode(b64_magic1)?; if magic1_bytes.len() != 6 { return None; }
+        let     key            = crate::encoding::decode(b64_key)?;    if key.len() < MIN_PUBLIC_KEY_SIZE || key.len() > MAX_PUBLIC_KEY_SIZE { return None; }
         let mut buf            = [0u8; 8]; buf[..6].copy_from_slice(&magic1_bytes);
         let     magic1         = u64::from_le_bytes(buf); if magic1 & 1 == 0 { return None; }
         Some(STPAddress { ip, port, magic1, key })
@@ -4449,11 +4448,9 @@ pub fn connect_to_endpoint(
     } else {
         let mut hello_packet_payload = vec![0u8; 1024];
         store_u48(&mut hello_packet_payload[0..6], my_connect_keypair.magic1);
-        let mut handshake = snow::Builder::new(crypto_string_from_connect_magic1(my_connect_keypair.magic1).unwrap().parse().unwrap())
-            .prologue(&hello_packet_payload[0..6]).unwrap()
-            .local_private_key(&my_connect_keypair.private[..]).unwrap()
-            .remote_public_key(&endpoint.key[..]).unwrap()
-            .build_initiator().unwrap();
+        let mut handshake = noise_initiator(
+            crypto_string_from_connect_magic1(my_connect_keypair.magic1).unwrap(),
+            &hello_packet_payload[0..6], &my_connect_keypair.private, &endpoint.key).unwrap();
 
         let handshake_size = handshake.write_message(&magic2_block, &mut hello_packet_payload[6..]).unwrap();
         hello_packet_payload.truncate(6+handshake_size);
@@ -5819,12 +5816,8 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                 if current_time_now_ns.saturating_sub(cpu_read_ns) >= 100_000_000 {
                     cpu_read_ns = current_time_now_ns;
                     #[cfg(target_os = "linux")]
-                    unsafe {
-                        let mut ru: libc::rusage = std::mem::zeroed();
-                        if libc::getrusage(libc::RUSAGE_THREAD, &mut ru) == 0 {
-                            let us = |t: libc::timeval| t.tv_sec as u64 * 1_000_000 + t.tv_usec as u64;
-                            network_cpu = (us(ru.ru_utime), us(ru.ru_stime));
-                        }
+                    if let Some(cpu) = crate::platform::sys::thread_cpu_time_us() {
+                        network_cpu = cpu;
                     }
                 }
                 resp.connection_stats = connections_map.iter().filter_map(|(key, value)| match &value.connection_state {
@@ -6004,10 +5997,8 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                             for key_i in 0..my_keypairs.len() {
                                 let my_kp = &my_keypairs[key_i];
                                 if my_kp.magic1 == magic1 {
-                                    let mut new_handshake = snow::Builder::new(crypto_string.parse().unwrap())
-                                        .prologue(&packet_memory_encrypted[0..6]).unwrap()
-                                        .local_private_key(&my_kp.private).unwrap()
-                                        .build_responder().unwrap();
+                                    let mut new_handshake = noise_responder(crypto_string,
+                                        &packet_memory_encrypted[0..6], &my_kp.private).unwrap();
                                     let read_message_maybe = new_handshake.read_message(&packet_memory_encrypted[6..buf_len], &mut packet_memory_recv[..]);
                                     if let Ok(magic2_block_len) = read_message_maybe {
                                         if let Some(client_key) = new_handshake.get_remote_static() {
@@ -11029,7 +11020,7 @@ mod precise_pacing_tests {
 #[cfg(test)]
 mod fec_send_tests {
     use super::*;
-    use rand::{Rng, RngCore};
+    use crate::random::{Rng, RngCore};
 
     /// Parsed fragment: (package_id, Some((message_len, block_bytes, block_id)) for FEC or None for plain, is_fin, offset, data)
     type Frag = (u64, Option<(usize, usize, u32)>, bool, u32, Vec<u8>);
@@ -11067,7 +11058,7 @@ mod fec_send_tests {
 
     fn msg(len: usize) -> Vec<u8> {
         let mut v = vec![0u8; len];
-        rand::rng().fill_bytes(&mut v);
+        crate::random::rng().fill_bytes(&mut v);
         v
     }
 
@@ -11892,8 +11883,8 @@ mod traffic_class_tests {
         let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         receiver.set_read_timeout(Some(std::time::Duration::from_secs(1))).unwrap();
         let fd = receiver.as_raw_fd();
-        let enabled: libc::c_int = 1;
-        unsafe { assert_eq!(libc::setsockopt(fd, libc::IPPROTO_IP, libc::IP_RECVTOS, &enabled as *const _ as *const _, 4), 0); }
+        let enabled: crate::platform::sys::c_int = 1;
+        unsafe { assert_eq!(crate::platform::sys::setsockopt(fd, crate::platform::sys::IPPROTO_IP, crate::platform::sys::IP_RECVTOS, &enabled as *const _ as *const _, 4), 0); }
         let sender = setup_and_bind_udp_socket(0).unwrap();
         let mut s = SendQueues::baseline_for_test(1, (1000000, 100000, 100000));
         for class in [Dscp::BestEffort, Dscp::Af11, Dscp::Af21, Dscp::Ef] {
@@ -11906,16 +11897,16 @@ mod traffic_class_tests {
             let mut buf = [0u8; 1500];
             let mut cbuf = [0u64; 16]; // ancillary alignment
             unsafe {
-                let mut iov = libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() };
-                let mut msg: libc::msghdr = std::mem::zeroed();
+                let mut iov = crate::platform::sys::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() };
+                let mut msg: crate::platform::sys::msghdr = std::mem::zeroed();
                 msg.msg_iov = &mut iov; msg.msg_iovlen = 1;
                 msg.msg_control = cbuf.as_mut_ptr().cast(); msg.msg_controllen = std::mem::size_of_val(&cbuf);
-                assert_eq!(libc::recvmsg(fd, &mut msg, 0), n as isize);
-                let mut c = libc::CMSG_FIRSTHDR(&msg);
+                assert_eq!(crate::platform::sys::recvmsg(fd, &mut msg, 0), n as isize);
+                let mut c = crate::platform::sys::CMSG_FIRSTHDR(&msg);
                 let mut tos = None;
                 while !c.is_null() {
-                    if (*c).cmsg_level == libc::IPPROTO_IP && (*c).cmsg_type == libc::IP_TOS { tos = Some(*libc::CMSG_DATA(c)); }
-                    c = libc::CMSG_NXTHDR(&msg, c);
+                    if (*c).cmsg_level == crate::platform::sys::IPPROTO_IP && (*c).cmsg_type == crate::platform::sys::IP_TOS { tos = Some(*crate::platform::sys::CMSG_DATA(c)); }
+                    c = crate::platform::sys::CMSG_NXTHDR(&msg, c);
                 }
                 assert_eq!(tos.unwrap() >> 2, class as u8);
             }
@@ -14007,11 +13998,11 @@ mod local_backpressure_tests {
 
     #[test]
     fn refused_ack_skips_nonce_and_refreshes_authenticated_delay() {
-        let params: snow::params::NoiseParams = "Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
-        let ka = snow::Builder::new(params.clone()).generate_keypair().unwrap();
-        let kb = snow::Builder::new(params.clone()).generate_keypair().unwrap();
-        let mut a = snow::Builder::new(params.clone()).local_private_key(&ka.private).unwrap().remote_public_key(&kb.public).unwrap().build_initiator().unwrap();
-        let mut b = snow::Builder::new(params).local_private_key(&kb.private).unwrap().build_responder().unwrap();
+        let params = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
+        let ka = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).unwrap();
+        let kb = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).unwrap();
+        let mut a = noise_initiator(params, &[], &ka.private, &kb.public).unwrap();
+        let mut b = noise_responder(params, &[], &kb.private).unwrap();
         let mut enc = [0; 1024]; let mut dec = [0; 1024];
         let n = a.write_message(&[], &mut enc).unwrap(); b.read_message(&enc[..n], &mut dec).unwrap();
         let n = b.write_message(&[], &mut enc).unwrap(); a.read_message(&enc[..n], &mut dec).unwrap();
@@ -14498,11 +14489,11 @@ mod wire_v2_tests {
     use super::*;
 
     pub(super) fn ciphers() -> (ConnectionCipherTriplet, ConnectionCipherTriplet) {
-        let params: snow::params::NoiseParams = "Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
-        let ka = snow::Builder::new(params.clone()).generate_keypair().unwrap();
-        let kb = snow::Builder::new(params.clone()).generate_keypair().unwrap();
-        let mut a = snow::Builder::new(params.clone()).local_private_key(&ka.private).unwrap().remote_public_key(&kb.public).unwrap().build_initiator().unwrap();
-        let mut b = snow::Builder::new(params).local_private_key(&kb.private).unwrap().build_responder().unwrap();
+        let params = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
+        let ka = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).unwrap();
+        let kb = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).unwrap();
+        let mut a = noise_initiator(params, &[], &ka.private, &kb.public).unwrap();
+        let mut b = noise_responder(params, &[], &kb.private).unwrap();
         let mut enc = [0; 1024]; let mut dec = [0; 1024];
         let n = a.write_message(&[], &mut enc).unwrap(); b.read_message(&enc[..n], &mut dec).unwrap();
         let n = b.write_message(&[], &mut enc).unwrap(); a.read_message(&enc[..n], &mut dec).unwrap();
@@ -17239,9 +17230,9 @@ mod cohort_observer_tests {
         // Synthetic commit without any native attempt (as STP_TEST_DROP does) -> unmatched.
         co::observe_commit(KIND_DATA, &pkt(2, 1200));
         // Legitimate oversized MTU probe EMSGSIZE: tolerated, counted for the probe kind only.
-        co::udp_send_tolerated(&pkt(3, 9000), libc::EMSGSIZE); co::observe_commit(MTU_PROBE, &pkt(3, 9000));
+        co::udp_send_tolerated(&pkt(3, 9000), crate::platform::sys::EMSGSIZE); co::observe_commit(MTU_PROBE, &pkt(3, 9000));
         // Invalid: a Data packet whose send failed with a tolerated errno.
-        co::udp_send_tolerated(&pkt(4, 1200), libc::EMSGSIZE); co::observe_commit(KIND_DATA, &pkt(4, 1200));
+        co::udp_send_tolerated(&pkt(4, 1200), crate::platform::sys::EMSGSIZE); co::observe_commit(KIND_DATA, &pkt(4, 1200));
         // Different bytes / length than the attempt -> unmatched.
         co::udp_send_full(&pkt(5, 1200)); co::observe_commit(KIND_DATA, &pkt(6, 1200));
         co::udp_send_full(&pkt(7, 1200)); co::observe_commit(KIND_DATA, &pkt(7, 1199));
@@ -17259,8 +17250,8 @@ mod cohort_observer_tests {
         assert_eq!(b.udp_send_tolerated_by_errno[0] - a.udp_send_tolerated_by_errno[0], 2);
         assert_eq!(b.udp_send_tolerated_total() - a.udp_send_tolerated_total(), 2);
         assert!(!b.counter_overflow);
-        assert_eq!(co::TOLERATED_ERRNO_NAMES[co::tolerated_index(libc::EAFNOSUPPORT)], "EAFNOSUPPORT");
-        assert_eq!(co::TOLERATED_ERRNO_NAMES[co::tolerated_index(libc::ECONNREFUSED)], "ECONNREFUSED");
+        assert_eq!(co::TOLERATED_ERRNO_NAMES[co::tolerated_index(crate::platform::sys::EAFNOSUPPORT)], "EAFNOSUPPORT");
+        assert_eq!(co::TOLERATED_ERRNO_NAMES[co::tolerated_index(crate::platform::sys::ECONNREFUSED)], "ECONNREFUSED");
     }
 
     #[test]
@@ -18898,7 +18889,7 @@ mod budget_diagnostic_tests {
         let p=s.pending_send.take().unwrap();assert_eq!(p.bytes,bytes);assert_eq!(p.plaintext,plain);
         co::udp_send_full(&p.bytes);co::observe_commit(1,&p.bytes);
         commit_connected_send(&mut s,&mut b,p.kind,3_000_000_000,p.bytes.len(),&p.plaintext,0,None);
-        co::udp_send_tolerated(&bytes,libc::EMSGSIZE);co::observe_commit(1,&bytes);
+        co::udp_send_tolerated(&bytes,crate::platform::sys::EMSGSIZE);co::observe_commit(1,&bytes);
         commit_connected_send(&mut s,&mut b,PendingSendKind::Data,4_000_000_000,bytes.len(),&plain,0,None);
         co::observe_commit(1,&bytes); // consumed token: synthetic/stale, never native-full
         commit_connected_send(&mut s,&mut b,PendingSendKind::Data,5_000_000_000,bytes.len(),&plain,0,None);
@@ -20393,17 +20384,16 @@ fn base_rtt_reanchor_age(current_t: u64, anchor_upps: u64, old_k: u64, new_k: u6
 
     #[test]
     fn freshhold_state_size_and_unchanged_reservation_budget() {
-        // Explicit new-state contract. Pre-FreshHold exact ConnectionStateConnected sizes
-        // (x86_64 linux) are feature-specific: default 44784, research 44824 (the research
-        // feature already carried a pre-existing +40, see mtu_recovery_tests outage ledger).
-        // FreshHold is 48B with align 16 (i128 release coordinate), which raises Connected's
-        // alignment to 16, so its size is (baseline + 48) rounded up to a multiple of 16:
-        // default 44784+48=44832 (already 16-aligned, +0 pad); research 44824+48=44872 -> 44880
-        // (+8 alignment padding). The 512KiB connection reservation is unchanged and must hold.
+        // Historical pre-FreshHold sizes: default 44784, research 44824.
+        // Internalizing crypto shrinks ConnectionCipherTriplet from 432 to 360
+        // bytes (Snow transport 120 -> in-crate 97, plus alignment). Subtract
+        // that independently measured 72 before adding the unchanged 48-byte
+        // FreshHold and rounding Connected to alignment 16. Reservation is unchanged.
         let sz=std::mem::size_of::<ConnectionStateConnected>();
         let al=std::mem::align_of::<ConnectionStateConnected>();
         let research=cfg!(feature="research_target_validation");
-        let baseline:usize=if research { 44824 } else { 44784 };
+        let historical_baseline:usize=if research { 44824 } else { 44784 };
+        let baseline=historical_baseline-72;
         let unpadded=baseline+FRESHHOLD_STATE_DELTA;
         let pad=sz as i64-unpadded as i64;
         assert_eq!(std::mem::size_of::<FreshHold>(),FRESHHOLD_STATE_DELTA);
@@ -20413,8 +20403,10 @@ fn base_rtt_reanchor_age(current_t: u64, anchor_upps: u64, old_k: u64, new_k: u6
             assert_eq!(al,16);
             assert_eq!(sz%al,0);
             assert_eq!(sz,(unpadded+al-1)/al*al,"Connected = baseline+FreshHold rounded to align 16");
-            assert_eq!(sz,if research { 44880 } else { 44832 });
-            assert_eq!(pad,if research { 8 } else { 0 });
+            assert_eq!(std::mem::size_of::<ConnectionCipherTriplet>(),360);
+            assert_eq!(std::mem::size_of::<Option<ConnectionCipherTriplet>>(),360);
+            assert_eq!(sz,if research { 44800 } else { 44768 });
+            assert_eq!(pad,if research { 0 } else { 8 });
         }
         assert!(sz<512<<10);
         assert_eq!(RECEIVE_CONNECTION_BYTES, (512 << 10) + crate::mtu_recovery::HISTORY_BYTES);

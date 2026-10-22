@@ -529,9 +529,12 @@ instead discard conflicting fragments or permanently erase that incomplete ID.
 
 ### Wirehair symbol and segmentation validation
 
-The normative codec/reference is the exact `third_party/wirehair` source tree
-at STP commit `4bdea0bde6a8794ee0f7606bdb62f657bc2a36a9`, Git tree object
-`3d8e99a30a94ac1d0fd66762baef5eeb3d791a45`. Its coefficient/seed generation,
+The normative codec/reference remains the historical `third_party/wirehair`
+source tree at STP commit `4bdea0bde6a8794ee0f7606bdb62f657bc2a36a9`, Git tree
+object `3d8e99a30a94ac1d0fd66762baef5eeb3d791a45`, available in Git history.
+The current implementation is the in-crate Rust module `src/wirehair/`, not a
+C++ build dependency; this language port does not select a new wire profile.
+The reference's coefficient/seed generation,
 GF(256) arithmetic, peel/dense/heavy construction and repair-ID interpretation
 are part of the codec, not implementation-selected random choices. This pins
 the complete reference, including the bundled fixup tables; merely agreeing

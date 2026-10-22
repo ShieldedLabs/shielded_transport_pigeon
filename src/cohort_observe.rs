@@ -118,12 +118,13 @@ pub fn fec_repair_skipped(skipped: u64) {
 /// Index into TOLERATED_ERRNO_NAMES. Unknown errnos cannot reach here (the native send panics
 /// on them); they map to the last slot defensively rather than being dropped.
 pub fn tolerated_index(errno: i32) -> usize {
-    #[cfg(unix)]
+    // On Windows, sys::E* are the Winsock codes (WSAEMSGSIZE 10040, ...) for the same categories.
+    #[cfg(any(unix, windows))]
     {
-        [libc::EMSGSIZE, libc::ENETUNREACH, libc::EHOSTUNREACH, libc::ENETDOWN, libc::ECONNREFUSED, libc::EHOSTDOWN, libc::EAFNOSUPPORT]
+        [crate::platform::sys::EMSGSIZE, crate::platform::sys::ENETUNREACH, crate::platform::sys::EHOSTUNREACH, crate::platform::sys::ENETDOWN, crate::platform::sys::ECONNREFUSED, crate::platform::sys::EHOSTDOWN, crate::platform::sys::EAFNOSUPPORT]
             .iter().position(|e| *e == errno).unwrap_or(6)
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     { let _ = errno; 6 }
 }
 

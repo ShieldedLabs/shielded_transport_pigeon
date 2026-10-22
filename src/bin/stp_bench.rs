@@ -57,6 +57,9 @@ use pump_thread::*;
 use shielded_transport_pigeon::stp::*;
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
+use shielded_transport_pigeon::random as rand;
+use shielded_transport_pigeon::random as rand_chacha;
+use shielded_transport_pigeon::blake3;
 use rand::{Rng, RngCore, SeedableRng};
 use rand::seq::SliceRandom;
 
@@ -184,6 +187,18 @@ impl RxReport {
         st.rx_plain_admission_refusals = w.get(42).copied().unwrap_or(0);
         st.rx_stale_identity_frames = w.get(43).copied().unwrap_or(0);
         Some(RxReport { st, th, cpu_user_us: w[21], cpu_sys_us: w[22] })
+    }
+}
+
+#[allow(non_camel_case_types, dead_code)]
+mod libc {
+    use std::os::raw::{c_int, c_long};
+    pub const STDOUT_FILENO: c_int = 1;
+    pub const RUSAGE_SELF: c_int = 0;
+    #[repr(C)] #[derive(Clone, Copy)] pub struct timeval { pub tv_sec: c_long, pub tv_usec: c_long }
+    #[repr(C)] pub struct rusage { pub ru_utime: timeval, pub ru_stime: timeval, pub rest: [c_long; 14] }
+    unsafe extern "C" {
+        pub fn getrusage(who: c_int, ru: *mut rusage) -> c_int;
     }
 }
 

@@ -158,45 +158,21 @@ impl std::fmt::Debug for BytesPerSecond {
     }
 }
 
-use rand::Rng;
-use rand::SeedableRng;
-use snow::resolvers::CryptoResolver;
-use rand_chacha::ChaCha20Rng;
+// The Noise implementation is part of this crate, not a separate dependency.
+pub use crate::crypto::noise;
 
-#[derive(Clone)]
-pub struct RustIsBadRngWrapper(pub ChaCha20Rng);
-impl snow::types::Random for RustIsBadRngWrapper {
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), snow::Error> {
-        self.0.fill(dest);
-        println!("Rust is bad wrapper debug: {:?}", dest);
-        Ok(())
-    }
-}
-pub struct SnowRngResolver {
-    pub rng: RustIsBadRngWrapper,
+pub(crate) fn crypto_random() -> Result<[u8; 32], noise::Error> {
+    let mut bytes = [0u8; 32];
+    crate::platform::fill_random(&mut bytes).map_err(|_| noise::Error::Rng)?;
+    Ok(bytes)
 }
 
-impl SnowRngResolver {
-    pub fn seed_from_u64(seed: u64) -> SnowRngResolver {
-        SnowRngResolver { rng: RustIsBadRngWrapper(ChaCha20Rng::seed_from_u64(seed)) }
-    }
-    pub fn seed_from_32_bytes(seed: [u8; 32]) -> SnowRngResolver {
-        SnowRngResolver { rng: RustIsBadRngWrapper(ChaCha20Rng::from_seed(seed)) }
-    }
+/// Construct an IK initiator with a fresh operating-system-seeded ephemeral key.
+#[doc(hidden)]
+pub fn noise_initiator(protocol: &str, prologue: &[u8], private: &[u8], remote: &[u8]) -> Result<noise::HandshakeState, noise::Error> {
+    noise::HandshakeState::initiator(protocol, prologue, private, remote, crypto_random()?)
 }
 
-impl CryptoResolver for SnowRngResolver {
-    fn resolve_rng(&self) -> Option<Box<dyn snow::types::Random>> {
-        Some(Box::new(self.rng.clone()))
-    }
-    fn resolve_dh(&self, choice: &snow::params::DHChoice) -> Option<Box<dyn snow::types::Dh>> {
-        snow::resolvers::DefaultResolver::resolve_dh(&snow::resolvers::DefaultResolver, choice)
-    }
-    fn resolve_hash(&self, choice: &snow::params::HashChoice) -> Option<Box<dyn snow::types::Hash>> {
-        snow::resolvers::DefaultResolver::resolve_hash(&snow::resolvers::DefaultResolver, choice)
-    }
-    fn resolve_cipher(&self, choice: &snow::params::CipherChoice) -> Option<Box<dyn snow::types::Cipher>> {
-        snow::resolvers::DefaultResolver::resolve_cipher(&snow::resolvers::DefaultResolver, choice)
-    }
+pub(crate) fn noise_responder(protocol: &str, prologue: &[u8], private: &[u8]) -> Result<noise::HandshakeState, noise::Error> {
+    noise::HandshakeState::responder(protocol, prologue, private, crypto_random()?)
 }
-

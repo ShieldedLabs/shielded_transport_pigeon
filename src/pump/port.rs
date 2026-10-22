@@ -22,7 +22,7 @@ impl Ready {
         self.generation.fetch_add(1, Ordering::SeqCst);
         if self.waiters.load(Ordering::SeqCst) != 0 {
             #[cfg(target_os = "linux")]
-            unsafe { libc::syscall(libc::SYS_futex, self.generation.as_ptr(), libc::FUTEX_WAKE | libc::FUTEX_PRIVATE_FLAG, i32::MAX); }
+            crate::platform::sys::futex_wake_all(&self.generation);
         }
     }
     /// Initialize observed to zero. Spurious wakeups and 2^32 generation wrap apply.
@@ -33,7 +33,7 @@ impl Ready {
             let current = self.generation.load(Ordering::SeqCst);
             if current != wanted { *observed = current as u64; break; }
             #[cfg(target_os = "linux")]
-            unsafe { libc::syscall(libc::SYS_futex, self.generation.as_ptr(), libc::FUTEX_WAIT | libc::FUTEX_PRIVATE_FLAG, wanted, std::ptr::null::<libc::timespec>()); }
+            crate::platform::sys::futex_wait(&self.generation, wanted);
             #[cfg(not(target_os = "linux"))]
             std::thread::sleep(std::time::Duration::from_millis(1));
         }

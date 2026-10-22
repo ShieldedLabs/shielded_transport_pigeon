@@ -13,6 +13,14 @@
 #![allow(deprecated)]
 
 mod ship;
+mod encoding;
+mod crypto;
+mod wirehair;
+#[doc(hidden)]
+pub mod blake3 { pub use crate::crypto::blake3::*; }
+mod platform;
+#[doc(hidden)]
+pub mod random;
 mod mtu_recovery;
 pub mod ack;
 pub mod pump;

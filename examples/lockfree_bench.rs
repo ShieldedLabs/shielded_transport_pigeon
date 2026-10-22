@@ -1,13 +1,36 @@
 //! Encrypted IPv6 loopback, decimal MB, process-wide CPU and peak RSS.
 //! Run three independent processes; report medians of the CSV metric values.
+//!
+//! Linux-only: reads /proc and uses Linux libc ABI values (CLOCK_PROCESS_CPUTIME_ID 2,
+//! _SC_CLK_TCK 2). Other targets build a stub that exits 2; the portable
+//! benchmark is `portable_smoke`. The body is not re-indented inside `mod linux`.
+#[cfg(target_os = "linux")]
 #[path = "support/lockfree_common.rs"]
 mod common;
-use common::*;
+#[cfg(target_os = "linux")]
+mod linux {
+use super::common::*;
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 // Frozen core emits handshake diagnostics on stdout. Suppress only this
 // process's diagnostics while measuring so the benchmark emits valid CSV.
+#[allow(non_camel_case_types, dead_code)]
+mod libc {
+    use std::os::raw::{c_int, c_long};
+    pub const STDOUT_FILENO: c_int = 1;
+    pub const CLOCK_PROCESS_CPUTIME_ID: c_int = 2;
+    pub type time_t = c_long;
+    #[repr(C)] pub struct timespec { pub tv_sec: time_t, pub tv_nsec: c_long }
+    pub const _SC_CLK_TCK: c_int = 2;
+    unsafe extern "C" {
+        pub fn dup(fd: c_int) -> c_int;
+        pub fn dup2(old: c_int, new: c_int) -> c_int;
+        pub fn close(fd: c_int) -> c_int;
+        pub fn clock_gettime(clk: c_int, ts: *mut timespec) -> c_int;
+        pub fn sysconf(name: c_int) -> c_long;
+    }
+}
 struct QuietStdout(i32);
 impl QuietStdout {
     fn new() -> Self {
@@ -47,7 +70,7 @@ fn cpu_ticks() -> u64 {
         .collect();
     fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap()
 }
-fn main() {
+pub fn main() {
     let quiet = QuietStdout::new();
     let (pa, mut a, _) = setup();
     let (pb, mut b, address) = setup();
@@ -134,4 +157,14 @@ fn main() {
     println!("post_idle_p99,{:.3},us", latency_us[98]);
     println!("post_idle_max,{:.3},us", latency_us[99]);
     println!("peak_rss,{rss_kib},KiB");
+}
+} // mod linux
+
+#[cfg(target_os = "linux")]
+fn main() { linux::main() }
+
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    eprintln!("this benchmark is Linux-only (/proc, /dev/null, Linux clock ids); use the portable_smoke example on this target");
+    std::process::exit(2);
 }

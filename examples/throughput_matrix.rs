@@ -9,6 +9,12 @@
 //! Porting: everything API-specific lives in `mod api` directly below. The
 //! harness only uses: Ep, Peer, AppEvent, setup(), connect(), try_send(),
 //! poll(), park(), request_stats().
+//!
+//! Linux-only: reads /proc and uses Linux libc ABI values (CLOCK_PROCESS_CPUTIME_ID 2,
+//! gettid, /proc/self/task/*/schedstat). Other targets build a stub that exits 2; the portable
+//! benchmark is `portable_smoke`. The body is not re-indented inside `mod linux`.
+#[cfg(target_os = "linux")]
+mod linux {
 use std::collections::VecDeque;
 use std::io::Write;
 use std::os::fd::AsRawFd;
@@ -99,6 +105,21 @@ mod api {
 // ============================ END API ADAPTER ===============================
 use api::{AppEvent, Ep, Peer, Stats};
 
+#[allow(non_camel_case_types, dead_code)]
+mod libc {
+    use std::os::raw::{c_int, c_long};
+    pub const STDOUT_FILENO: c_int = 1;
+    pub const CLOCK_PROCESS_CPUTIME_ID: c_int = 2;
+    pub type time_t = c_long;
+    #[repr(C)] pub struct timespec { pub tv_sec: time_t, pub tv_nsec: c_long }
+    unsafe extern "C" {
+        pub fn dup(fd: c_int) -> c_int;
+        pub fn dup2(old: c_int, new: c_int) -> c_int;
+        pub fn close(fd: c_int) -> c_int;
+        pub fn clock_gettime(clk: c_int, ts: *mut timespec) -> c_int;
+        pub fn gettid() -> c_int;
+    }
+}
 struct QuietStdout(i32);
 impl QuietStdout {
     fn new() -> Self {
@@ -410,7 +431,7 @@ fn run_cell(cell: &Cell, a: Ep, b: Ep, peer: Peer, pumps: (i32, i32), pat: &Arc<
     (a, b, ro.latencies_us)
 }
 
-fn main() {
+pub fn main() {
     let args: Vec<String> = std::env::args().collect();
     let arg = |k: &str| args.iter().position(|a| a == k).map(|i| args[i + 1].clone());
     let only = arg("--only");
@@ -479,4 +500,14 @@ fn main() {
     drop(quiet);
     println!("metric,payload,mode,value,unit");
     for l in &csv.0 { println!("{l}"); }
+}
+} // mod linux
+
+#[cfg(target_os = "linux")]
+fn main() { linux::main() }
+
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    eprintln!("this benchmark is Linux-only (/proc, /dev/null, Linux clock ids); use the portable_smoke example on this target");
+    std::process::exit(2);
 }

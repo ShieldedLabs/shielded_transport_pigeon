@@ -13,12 +13,10 @@ struct Peer { socket: UdpSocket, cipher: ConnectionCipherTriplet, prefix: u16, s
 impl Peer {
     fn connect(server: &IdentityKeyPair, port: u16) -> Option<Self> {
         let magic = server.magic1;
-        let params = crypto_string_from_connect_magic1(magic).unwrap().parse().unwrap();
+        let params = crypto_string_from_connect_magic1(magic).unwrap();
         let key = new_keypair_from_connect_magic1(magic).unwrap();
         let prologue = &magic.to_le_bytes()[..6];
-        let mut hs = snow::Builder::new(params).prologue(prologue).unwrap()
-            .local_private_key(&key.private).unwrap().remote_public_key(&server.public).unwrap()
-            .build_initiator().unwrap();
+        let mut hs = shielded_transport_pigeon::helpers::noise_initiator(&params, prologue, &key.private, &server.public).unwrap();
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         socket.connect(("127.0.0.1", port)).unwrap();
         socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();

@@ -179,8 +179,15 @@ fn game_loop_driving_delivers_and_orders_events() {
 
 #[test]
 fn handle_is_send_but_not_sync() {
-    static_assertions::assert_impl_all!(LockfreeEndpoint: Send);
-    static_assertions::assert_not_impl_any!(LockfreeEndpoint: Sync);
+    fn require_send<T: Send>() {}
+    require_send::<LockfreeEndpoint>();
+    // If the handle became Sync, both implementations would apply and the
+    // inferred marker would be ambiguous (a compile-time, dependency-free check).
+    trait NotSync<Marker> { fn check() {} }
+    impl<T: ?Sized> NotSync<()> for T {}
+    struct IsSync;
+    impl<T: ?Sized + Sync> NotSync<IsSync> for T {}
+    let _ = <LockfreeEndpoint as NotSync<_>>::check;
 }
 
 #[test]

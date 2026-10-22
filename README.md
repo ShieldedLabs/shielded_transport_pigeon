@@ -23,22 +23,52 @@ message once its planned send work is finished. Delivery is not guaranteed.
 ## Build and run
 
 ```sh
-cargo add shielded_transport_pigeon@0.3
+cargo add shielded_transport_pigeon --git https://github.com/ShieldedLabs/shielded_transport_pigeon
 cargo run --release --example lockfree_thread
 cargo run --release --example lockfree_game
 ```
 
-Building requires Rust with edition 2024 support, a C++11 compiler and a native
-C/C++ toolchain: the crate builds the vendored Wirehair codec. Wirehair's
-BSD-3-Clause license is included in `third_party/wirehair/LICENSE`; STP is MIT.
-Linux is the platform exercised by the release tests and benchmarks. Other
-platform branches exist but are not release-tested here.
+Building requires Rust with edition 2024 support. STP is a single crate with
+**zero Cargo dependencies**, including build and development dependencies, and
+no build script or C++ compiler requirement. Wirehair, the cryptographic
+primitives, address encoding and platform bindings are in-crate Rust modules.
+The standard library and operating-system APIs are still required. Wirehair's
+BSD-3-Clause license is in `src/wirehair/LICENSE`; upstream cryptographic notices
+and licenses are beside the implementations in `src/crypto/`. STP itself is MIT.
+
+For an Actually Portable Executable, use the separate
+[Cargo Cosmo](https://github.com/ShieldedLabs/cargo_cosmo) **10.0.0** toolchain,
+which supplies zero-dependency shim injection. Both `cosmo-build` and
+`cosmo-compat` 10.0.0 are published; versions through 9.0.1 do not provide this
+complete integration:
+
+```sh
+cargo cosmo build --release --example portable_smoke
+sh target/cosmo/release/portable_smoke.com
+```
+
+The smoke example opens a fresh encrypted connection and validates one 20 MB
+response over both IPv4 and IPv6. Cargo Cosmo supplies Cosmopolitan Libc and its
+ABI shim at the executable link; neither is a Cargo dependency of STP. Applications
+using `cosmo-build` can instead configure that tool in their own executable crate,
+without adding it to this library. A fat APE contains x86-64 and AArch64 code;
+building both architectures is not evidence of runtime testing on every OS.
+Linux is the runtime validation host available here. macOS and Windows require
+their own runtime qualification; cross-target compilation alone is not a pass.
+
+Native Linux obtains secrets using blocking `getrandom(2)` and fails closed if
+it is unavailable or blocked (including kernels older than 3.17). It never
+substitutes a clock, deterministic seed, or uninitialized `/dev/urandom` fallback.
 
 ## Compatibility
 
-Version **0.3.0** replaces the 0.2 application API with a caller-driven pump and
-three SPSC rings. This is a breaking API release. The library does not start
-network or FEC threads. Move the pump to an application-owned thread if desired.
+The **unreleased 1.0.0** source internalizes Wirehair and the former crate
+dependencies. Package versions advance by majors only. This migration keeps
+the wire profile, congestion control, repair policy and application rings of
+main `1e00403`; low-level third-party types are no longer part of the crate API.
+The published **0.3.0** introduced the caller-driven pump and three SPSC rings,
+replacing the 0.2 application API. The library does not start network or FEC
+threads. Move the pump to an application-owned thread if desired.
 The package version and wire-profile version are separate. Current main uses
 **wire profile 5** (research, unreleased), incompatible with profiles 2 through 4,
 including the published 0.3.0 version-2 profile; no published package version
