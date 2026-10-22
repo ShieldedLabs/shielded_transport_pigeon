@@ -65,11 +65,11 @@ pub(crate) struct Port {
     app: Mutex<()>, pub(crate) exchange: Mutex<()>,
     pub(crate) stop: AtomicBool, pub(crate) exited: AtomicBool,
     pub(crate) wake: Arc<NetworkWake>, pub(crate) ready: Arc<Ready>,
-    pub(crate) native: OnceLock<NativePort>, max_payload: usize,
+    pub(crate) native: OnceLock<NativePort>, max_payload: usize, send_queues: usize,
 }
 impl Port {
-    pub(crate) fn new(max_payload: usize) -> Arc<Self> {
-        Arc::new(Self { reference: OnceLock::new(), outstanding: AtomicBool::new(false), app: Mutex::new(()), exchange: Mutex::new(()), stop: AtomicBool::new(false), exited: AtomicBool::new(false), wake: Arc::new(NetworkWake::new().expect("create pump command wakeup")), ready: Arc::new(Ready::default()), native: OnceLock::new(), max_payload })
+    pub(crate) fn new(max_payload: usize, send_queues: usize) -> Arc<Self> {
+        Arc::new(Self { reference: OnceLock::new(), outstanding: AtomicBool::new(false), app: Mutex::new(()), exchange: Mutex::new(()), stop: AtomicBool::new(false), exited: AtomicBool::new(false), wake: Arc::new(NetworkWake::new().expect("create pump command wakeup")), ready: Arc::new(Ready::default()), native: OnceLock::new(), max_payload, send_queues })
     }
     pub(crate) fn is_reference(&self) -> bool { self.native.get().is_none() }
     pub(crate) fn wants_snapshot(&self) -> bool { self.is_reference() }

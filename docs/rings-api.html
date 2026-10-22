@@ -174,7 +174,7 @@ footer { margin-top: 60px; padding-top: 18px; border-top: 1px solid var(--line);
   <div class="wire"></div>
   <div class="box"><div class="bt">UDP socket</div><div class="bd">owned by the pump<br>closed on drop</div></div>
 </div>
-<p class="dcap">The application thread is the only producer of the send and control rings and the only consumer of the receive ring; the pump is the other end of each. Each ring operation is a constant-time ownership move with no retry loop, allocation or lock. Wakeups go through an eventfd (pump side) and a futex generation counter (application side).</p>
+<p class="dcap">The application thread is the only producer of the send and control rings and the only consumer of the receive ring; the pump is the other end of each. Each ring operation is a constant-time ownership move with no retry loop, allocation or lock. The one exception is <code>try_send</code>&rsquo;s first send to a new (peer, queue) pair, which allocates that pair&rsquo;s <a href="#queued">queued-bytes</a> counter (amortized O(1)). Wakeups go through an eventfd (pump side) and a futex generation counter (application side).</p>
 
 <!-- ============================================================ -->
 <div class="callout warn"><div class="title">Wire profile 6: update both peers together</div>
@@ -320,6 +320,22 @@ worker.<span class="f">join</span>().<span class="f">unwrap</span>();</code></pr
 </table>
 <p><code>queue</code> picks one of the connection&rsquo;s <code>send_queue_count</code> FIFO queues (default 1), which share bandwidth by equal-weight byte service. <code>class</code> is a <code>Dscp</code> traffic class (<code>BestEffort</code>, <code>Af11</code>, <code>Af21</code>, <code>Ef</code>). It never changes FIFO or round-robin scheduling, or congestion control.</p>
 <div class="callout warn"><div class="title">Wait for Connected</div><p>A send to a peer whose handshake has not completed is dropped as unknown. Start sending to a peer after you see its <code>Event::Connected</code>.</p></div>
+<h3 id="queued">Queued payload bytes</h3>
+<pre><code><span class="k">pub fn</span> <span class="f">queued_send_bytes</span>(&amp;<span class="k">self</span>, peer: <span class="t">ConnectionKey</span>, queue: <span class="t">usize</span>) -&gt; <span class="t">u64</span></code></pre>
+<p>Payload bytes you have handed to <code>try_send</code> for this peer and queue that are not yet transmitted. Use it to hold back your own sends before the shared send ring fills. It is one hash lookup and one atomic load, with no lock, no allocation and no pump round trip. Other peers and queues never affect it.</p>
+<table>
+  <tr><th>Event</th><th>Effect on the count</th></tr>
+  <tr><td><code>try_send</code> returns <code>true</code></td><td>Adds <code>payload.len()</code> immediately, before the pump can see the message. Empty payloads, payloads above <code>max_message_size</code> and <code>queue &gt;= send_queue_count</code> are never counted.</td></tr>
+  <tr><td><code>try_send</code> returns <code>false</code></td><td>No change.</td></tr>
+  <tr><td>Pump moves the message into the protocol send queue</td><td>No change. The bytes are neither dropped nor counted twice.</td></tr>
+  <tr><td>Pump drops it (unknown, disconnected or handshaking peer)</td><td>Subtracted.</td></tr>
+  <tr><td>The whole message has been framed and the UDP socket accepted the DATA datagram with its last bytes</td><td>Subtracted. A segmented message above the 2&nbsp;MiB codec unit leaves one coded extent at a time. Datagrams the socket refused stay counted until a retry is accepted.</td></tr>
+  <tr><td>Disconnect, liveness timeout or replacement of the connection</td><td>That connection&rsquo;s bytes are subtracted. Bytes still in the ring, or already queued on a new connection with the same <code>ConnectionKey</code>, stay counted.</td></tr>
+  <tr><td><code>close()</code> requested, or the pump has exited</td><td>Returns 0: nothing more will be sent.</td></tr>
+</table>
+<p>It counts message bytes, not packet headers, FEC repair symbols or retransmissions, and a count of 0 does not mean the peer received anything. The core releases a finished message lazily, on that queue&rsquo;s next send pass, so the count can briefly stay above the true backlog. It never drops below it. A pair with nothing queued reads 0. Counters for idle pairs are pruned, so the table only holds pairs with traffic.</p>
+<p>No event or wakeup fires when the count falls. <code>park_until_ready</code> wakes for ring space after a failed <code>try_send</code>, not for a byte threshold. Check the count on your own tick and hold sends while it is above your limit:</p>
+<pre><code><span class="k">if</span> ep.<span class="f">queued_send_bytes</span>(peer, <span class="n">0</span>) &lt; LIMIT { ep.<span class="f">try_send</span>(peer, <span class="n">0</span>, <span class="t">Dscp</span>::BestEffort, &amp;<span class="k">mut</span> msg); } <span class="c">// else: try again next tick</span></code></pre>
 
 <!-- ============================================================ -->
 <h2 id="control"><span class="num">4</span>Control ring <span class="tag">app &rarr; pump</span></h2>
@@ -472,7 +488,7 @@ worker.<span class="f">join</span>().<span class="f">unwrap</span>();</code></pr
 <h2 id="tradeoffs"><span class="num">12</span>Trade-offs &amp; limits</h2>
 <div class="callout warn">
   <div class="title">Head-of-line blocking across peers</div>
-  <p>There is a single FIFO send ring. When the head message&rsquo;s peer has no protocol send credit, it stays at the head, and messages queued behind it for <em>other</em> peers wait until that peer drains or is disconnected. <code>stats().send_head_blocked</code> shows it happening. The test <code>fifo_credit_blocks_other_peer_until_head_disconnects</code> demonstrates it: peer B is rate-limited to 1&nbsp;pps with a 1-byte send buffer, a 1&nbsp;MB message to B blocks a message to C, and disconnecting B releases it. If you mix a slow bulk peer with latency-sensitive ones, gate sends to the slow peer in your app (for example, keep your own per-peer outbox and use protocol telemetry&rsquo;s <code>unreliable_send_free_bytes</code>), or run separate pumps.</p>
+  <p>There is a single FIFO send ring. When the head message&rsquo;s peer has no protocol send credit, it stays at the head, and messages queued behind it for <em>other</em> peers wait until that peer drains or is disconnected. <code>stats().send_head_blocked</code> shows it happening. The test <code>fifo_credit_blocks_other_peer_until_head_disconnects</code> demonstrates it: peer B is rate-limited to 1&nbsp;pps with a 1-byte send buffer, a 1&nbsp;MB message to B blocks a message to C, and disconnecting B releases it. If you mix a slow bulk peer with latency-sensitive ones, gate sends to the slow peer in your app (for example, keep your own per-peer outbox and hold it while <a href="#queued"><code>queued_send_bytes</code></a> is above a limit), or run separate pumps.</p>
 </div>
 <ul>
   <li><strong>No hard real-time bound.</strong> Overshoot is one admission plus one indivisible unit, and a native FEC unit (up to 2&nbsp;MiB) can take a few ms. OS scheduling and allocation are outside the bound.</li>
@@ -560,6 +576,7 @@ worker.<span class="f">join</span>().<span class="f">unwrap</span>();</code></pr
   <tr><td><code>next_wakeup</code></td><td class="sig"><code>fn(&amp;self) -&gt; Option&lt;Instant&gt;</code></td><td><code>None</code> = stopped</td></tr>
   <tr><td colspan="3"><strong><code>LockfreeEndpoint</code></strong> (Send, !Sync)</td></tr>
   <tr><td><code>try_send</code></td><td class="sig"><code>fn(&amp;mut self, ConnectionKey, usize, Dscp, &amp;mut Vec&lt;u8&gt;) -&gt; bool</code></td><td>Moves the Vec only on <code>true</code></td></tr>
+  <tr><td><code>queued_send_bytes</code></td><td class="sig"><code>fn(&amp;self, ConnectionKey, usize) -&gt; u64</code></td><td>Untransmitted payload bytes for that peer and queue; <a href="#queued">details</a></td></tr>
   <tr><td><code>try_control</code></td><td class="sig"><code>fn(&amp;mut self, Control) -&gt; bool</code></td><td></td></tr>
   <tr><td><code>try_connect</code></td><td class="sig"><code>fn(&amp;mut self, STPAddress) -&gt; bool</code></td><td></td></tr>
   <tr><td><code>try_disconnect</code></td><td class="sig"><code>fn(&amp;mut self, ConnectionKey) -&gt; bool</code></td><td></td></tr>

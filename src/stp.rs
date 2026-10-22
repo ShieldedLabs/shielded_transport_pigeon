@@ -615,10 +615,65 @@ fn source_owner_bytes(plain: Option<&(Vec<u8>, u32)>, giant: Option<&SegmentedSe
     bytes + giant.map_or(0, |g| g.message.len().saturating_sub(g.offset))
 }
 
+/// One association's share of a `queued_send_bytes` counter for one queue. It is
+/// queue-global, never swapped with an interleaved MessageSendContext. Admission
+/// takes over the ring's charge without touching the counter. Bytes retired at the
+/// existing `queue_bytes_filled` decrements stay counted until DATA through the
+/// last packet this queue framed into is accepted by the socket; Drop (cancel,
+/// timeout, replacement) uncounts only what this association still owns.
+#[derive(Debug, Default)]
+struct QueuedLedger {
+    cell: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    owned: u64,
+    unretired: u64,
+    staged: u64,
+    staged_seq: u64,
+    framed: Option<u64>,
+    committed: Option<u64>,
+}
+impl QueuedLedger {
+    fn admit(&mut self, charge: crate::pump::port::lockfree::Charge) {
+        let (cell, bytes) = charge.transfer();
+        debug_assert!(self.cell.as_ref().is_none_or(|c| std::sync::Arc::ptr_eq(c, &cell)));
+        self.cell.get_or_insert(cell);
+        self.owned += bytes;
+        self.unretired += bytes;
+    }
+    fn retire(&mut self, len: usize) {
+        let bytes = (len as u64).min(self.unretired);
+        if bytes == 0 { return; }
+        self.unretired -= bytes;
+        match self.framed {
+            // A retirement after its packet already committed must not wait for
+            // DATA that may never come.
+            Some(seq) if self.committed.is_none_or(|c| c < seq) => {
+                self.staged += bytes;
+                self.staged_seq = self.staged_seq.max(seq);
+            }
+            _ => self.release(bytes),
+        }
+    }
+    fn commit(&mut self, seq: u64) {
+        self.committed = Some(seq);
+        if self.staged != 0 && seq >= self.staged_seq {
+            let bytes = std::mem::take(&mut self.staged);
+            self.release(bytes);
+        }
+    }
+    fn release(&mut self, bytes: u64) {
+        self.owned -= bytes;
+        if let Some(cell) = &self.cell { cell.fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed); }
+    }
+}
+impl Drop for QueuedLedger {
+    fn drop(&mut self) { if self.owned != 0 { self.release(self.owned); } }
+}
+
 #[derive(Debug)]
 pub struct UnreliableSendBuffer {
     #[cfg(feature = "research_budget_diagnostic")]
     diagnostic_last: Option<diag::Layout>,
+    queued_ledger: QueuedLedger,
     // A time based capacity constrained by byte counts.
     // The queue should for example probably have a minimum byte size twice that of your largest message.
     pub target_queue_size_us: u32,
@@ -1546,6 +1601,7 @@ impl UnreliableSendBuffer {
         Self {
             #[cfg(feature = "research_budget_diagnostic")]
             diagnostic_last: None,
+            queued_ledger: QueuedLedger::default(),
             target_queue_size_us,
             min_queue_size_bytes,
             max_queue_size_bytes,
@@ -2269,6 +2325,7 @@ impl UnreliableSendBuffer {
             if *start_byte as usize >= msg.len() {
                 let msg_len = msg.len();
                 self.queue_bytes_filled -= msg_len;
+                self.queued_ledger.retire(msg_len);
                 if self.slipstream { self.slipstream_trace_event("end", "plain", "", self.logical_root, self.logical_tag, 0); }
                 self.partial_send_slot = None;
                 self.package_lease = None;
@@ -2283,6 +2340,7 @@ impl UnreliableSendBuffer {
                 let mut finished = self.fec_send_slot.take().unwrap();
                 if rescue.is_none() {
                     self.queue_bytes_filled -= message_len;
+                    self.queued_ledger.retire(message_len);
                     self.package_lease = None;
                     self.send_package_id = self.send_package_id.checked_add(1).expect("message identity exhausted");
                 }
@@ -2922,6 +2980,13 @@ impl SendQueues {
         match self.queues.get_mut(queue) { Some(q) => q.submit_classified_messages(messages), None => messages }
     }
     pub fn free_bytes(&mut self) -> Vec<u64> { self.queues.iter_mut().map(|q| q.free_bytes()).collect() }
+    /// Accepted DATA (or an accepted research copy, which may leave as an outage
+    /// probe) releases staged queued_send_bytes. A planned copy carries the same
+    /// frames, so its own acceptance releases them instead of the original's.
+    fn queued_commit(&mut self, seq: u64) {
+        if self.target_copy_pending() { return; }
+        for q in &mut self.queues { q.queued_ledger.commit(seq); }
+    }
     fn target_copy_pending(&self)->bool {
         {return self.target_duplicate.is_some();}
 
@@ -2974,6 +3039,7 @@ impl SendQueues {
     }
     fn fec_on_data_committed(&mut self, seq: u64, sent: u64) {
         for q in &mut self.queues { q.fec_commit_marks(seq, sent); }
+        self.queued_commit(seq);
     }
     fn fec_prepare_packet(&mut self, seq: u64) {
         for q in &mut self.queues {
@@ -3118,6 +3184,7 @@ impl SendQueues {
                     break;
                 }
                 q.slipstream_emitted(payload.len());
+                q.queued_ledger.framed = Some(self.next_packet_seq);
                 class = q.packet_dscp;
                 self.last_dscp = class.unwrap();
                 self.last_queue = i;
@@ -5270,7 +5337,7 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
 
     let socket = setup_and_bind_udp_socket_on(my_port, bind_ip).expect("Failed to bind socket, try again.");
 
-    let inner = Port::new(max_message_size);
+    let inner = Port::new(max_message_size, send_queue_count);
     let record_fec_messages = options.record_fec_messages;
     let record_loss_episodes = options.record_loss_episodes;
     let mut loss_trace = options.loss_trace.as_deref().map(|p| crate::loss_trace::LossTrace::open(p).expect("open loss trace"));
@@ -5427,7 +5494,9 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                     2 => &n.counters.send_dropped_oversized,
                                     3 => &n.counters.send_dropped_invalid_queue,
                                     _ => {
-                                        let rejected = connections_map.get_mut(&message.peer).unwrap().unreliable_send_buffer.submit_classified_messages(message.queue, vec![(message.class, message.payload)]);
+                                        let buf = &mut connections_map.get_mut(&message.peer).unwrap().unreliable_send_buffer;
+                                        if let Some(charge) = message.charge { buf.queues[message.queue].queued_ledger.admit(charge); }
+                                        let rejected = buf.submit_classified_messages(message.queue, vec![(message.class, message.payload)]);
                                         assert!(rejected.is_empty(), "peeked credit must admit the FIFO head");
                                         &n.counters.sent
                                     }
@@ -7383,6 +7452,7 @@ fn commit_connected_send(state: &mut ConnectionStateConnected, buf: &mut SendQue
         if target_is_copy(plaintext) {
             state.stats.dup_datagrams+=1;state.stats.dup_bytes+=len as u64;
             state.stats.dup_messages+=target_dup_counts(plaintext).0;
+            if kind != PendingSendKind::Data { buf.queued_commit(seq); }
         }
     }
     if kind != PendingSendKind::Data { buf.fec_prepare_packet(seq); }
