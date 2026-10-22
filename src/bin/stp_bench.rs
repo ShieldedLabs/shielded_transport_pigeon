@@ -271,7 +271,7 @@ fn serve(a: &Args) {
         }
         None => *blake3::hash(b"stp_bench default server key").as_bytes(),
     };
-    let kp = new_keypair_from_connect_magic1_with_seed(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, seed).unwrap();
+    let kp = new_keypair_from_connect_magic1_with_seed(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b, seed).unwrap();
     let addr = STPAddress::from(to_v6(advertise), port, &kp);
 
     // General-purpose bench endpoint: explicitly accept the largest supported

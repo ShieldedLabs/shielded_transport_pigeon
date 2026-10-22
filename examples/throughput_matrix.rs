@@ -53,7 +53,7 @@ mod api {
         let probe = std::net::UdpSocket::bind("[::1]:0").unwrap();
         let port = probe.local_addr().unwrap().port();
         drop(probe);
-        let key = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).unwrap();
+        let key = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b).unwrap();
         let address = STPAddress::from(std::net::Ipv6Addr::LOCALHOST, port, &key);
         let (pump, endpoint) = new_pump_with_options(vec![key], port, None, SEND_BUFFER, MAX_MESSAGE,
             NetworkThreadOptions { rings: RingConfig { send: RING_CAPACITY, control: RING_CAPACITY, receive: RING_CAPACITY }, ..Default::default() });

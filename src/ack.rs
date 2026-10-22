@@ -187,9 +187,10 @@ impl AckReceiver {
     fn policy(&self, rtt_us: u64, wire_bytes: usize) -> (u16, u32) {
         let AckPolicy { every_packets, max_delay_us } = crate::ship::ACK;
         let pps = 1_000_000_000 / self.mean_gap_ns.max(1);
-        // 182 bytes is the encrypted UDP ACK size. At least this packet group
+        // Use the encrypted UDP ACK size. At least this packet group
         // is needed for <=2% overhead, except when the delay cap forces a flush.
-        let budget_packets = (182u64 * 50).div_ceil(wire_bytes.max(1) as u64);
+        let ack_bytes = (crate::stp::CONNECTED_HEADER_SIZE + ACK_PAYLOAD_LEN + 16) as u64;
+        let budget_packets = (ack_bytes * 50).div_ceil(wire_bytes.max(1) as u64);
         let minimum = (every_packets as u64).max(budget_packets).clamp(1, 64);
         let n = pps.div_ceil(1000).clamp(minimum, 64);
         let budget_us = n * self.mean_gap_ns / 1000;

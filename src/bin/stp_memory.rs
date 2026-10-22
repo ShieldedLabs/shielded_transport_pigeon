@@ -43,22 +43,29 @@ impl Peer {
             payload[19..21].copy_from_slice(&((w >> 32) as u16).to_le_bytes());
         }
         payload[o..o+bytes.len()].copy_from_slice(bytes);
-        let mut b = vec![0; payload.len()+30];
+        // Raw probes intentionally use epoch zero, not a long-lived transport.
+        assert!(self.seq < shielded_transport_pigeon::sequence::ACK_SPACE - 1);
+        let mut b = vec![0; payload.len()+CONNECTED_HEADER_SIZE+16];
         b[..2].copy_from_slice(&self.prefix.to_le_bytes());
-        b[2..10].copy_from_slice(&shielded_transport_pigeon::sequence::to_wire(self.seq).to_le_bytes());
-        let (ad, body) = b.split_at_mut(14);
+        let low = self.seq as u32 & shielded_transport_pigeon::sequence::COUNTER_MASK;
+        b[2..6].copy_from_slice(&low.to_le_bytes());
+        let (ad, body) = b.split_at_mut(CONNECTED_HEADER_SIZE);
         let n = self.cipher.current.write_message_with_additional_data(self.seq, ad, &payload, body).unwrap();
-        self.socket.send(&b[..n+14]).unwrap(); self.seq += 1;
+        self.socket.send(&b[..n+CONNECTED_HEADER_SIZE]).unwrap(); self.seq += 1;
     }
     fn acked(&self) -> usize {
         self.socket.set_read_timeout(Some(Duration::from_millis(30))).unwrap();
         let mut b = [0;2048]; let mut out = [0;2048]; let mut count = 0;
+        let mut sequences = shielded_transport_pigeon::sequence::ReceiveSequences::default();
         while let Ok(n) = self.socket.recv(&mut b) {
-            if n < 14 { continue; }
-            let wire = u64::from_le_bytes(b[2..10].try_into().unwrap());
-            if !shielded_transport_pigeon::sequence::is_ack_space(wire) { continue; }
-            let nonce = wire;
-            if let Ok(n) = self.cipher.current.read_message_with_additional_data(nonce, &b[..14], &b[14..n], &mut out) {
+            if n != CONNECTED_HEADER_SIZE + shielded_transport_pigeon::ack::ACK_PAYLOAD_LEN + 16 { continue; }
+            let wire = u32::from_le_bytes(b[2..6].try_into().unwrap());
+            if wire >> 31 != 0 { continue; } // Only initial-epoch short probes.
+            let nonce = sequences.compact_candidate(wire, true);
+            if let Ok(n) = self.cipher.current.read_message_with_additional_data(nonce, &b[..CONNECTED_HEADER_SIZE], &b[CONNECTED_HEADER_SIZE..n], &mut out) {
+                if n != shielded_transport_pigeon::ack::ACK_PAYLOAD_LEN { continue; }
+                sequences.authenticated(nonce);
+                if !sequences.commit(nonce) { continue; }
                 if let Some(a) = shielded_transport_pigeon::ack::BitmapAck::decode(&out[..n]) {
                     count = count.max((0..self.seq).filter(|&s| a.contains(s) || a.sample_seq == s).count());
                 }
@@ -77,7 +84,7 @@ fn main() {
     let size: usize = a.get(3).expect("size").parse().unwrap();
     let connections: usize = a.get(4).map_or(1, |v| v.parse().unwrap());
     assert!(size <= MAX_JUMBOGRAM_LEN && count <= 1024 && connections <= 4096);
-    let kp = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).unwrap();
+    let kp = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b).unwrap();
     if mode == "pressure" { pressure(kp, count, size); return; }
     // Reserve an ephemeral port before starting STP, whose API does not expose the bound port.
     let probe = UdpSocket::bind("127.0.0.1:0").unwrap(); let port = probe.local_addr().unwrap().port(); drop(probe);

@@ -6,61 +6,36 @@ use std::collections::{HashMap, VecDeque};
 use crate::{blake3, helpers::noise as snow};
 
 
-// LSB of this 48 bit value must be 1 for this to be recognized as an incoming connect handshake.
-pub const CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s: u64 = 0x7193_c304_f8d5;
-pub const CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b: u64 = 0xbe53_b364_1ce1;
-pub const CONNECT_MAGIC1_PLAIN_TEXT: u64 = 0x5bb2_2856_ae53;
+// magic1 dispatches an entire handshake/address-material interpretation, not
+// just a hash/cipher suite. The current implementations below remain hardcoded
+// two-flight Noise IK with raw 32-byte X25519 address keys (or test plaintext).
+// A future selector may use address material such as a key hash and a different
+// number/size of flights; it must specify resolution, transcript authentication,
+// bounded chunking/reassembly, and immutable flight retransmission. Completion
+// must supply authenticated peer identity, transcript binding and directional
+// packet protection satisfying the full-nonce/rekey contract below. This is a
+// design boundary, not an implemented handshake trait, PQ scheme or discovery.
+// Bit zero of each six-byte selector must be one for ClientHello dispatch.
+pub const CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b: u64 = 0xa891_6e3c_54d7;
+pub const CONNECT_MAGIC1_PLAIN_TEXT: u64 = 0x6d43_b2f8_091b;
 pub fn crypto_string_from_connect_magic1(magic: u64) -> Option<&'static str> {
     match magic {
-        CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s => Some("Noise_IK_25519_ChaChaPoly_BLAKE2s"),
         CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b => Some("Noise_IK_25519_ChaChaPoly_BLAKE2b"),
         CONNECT_MAGIC1_PLAIN_TEXT => Some("plaintext"),
         _ => None,
     }
 }
 
-pub const PROTOCOL_VERSION: u16 = 5; // RESEARCH profile 5: adaptive immutable unit ranges
-pub const TRANSPORT_PARAMETERS_LEN: usize = 32;
-const MAGIC2_LIST_SIZE: usize = 1 + 32 * 8;
-pub const MAGIC2_BLOCK_SIZE: usize = MAGIC2_LIST_SIZE + TRANSPORT_PARAMETERS_LEN;
-const SERVER_HELLO_PAYLOAD_LEN: usize = 8 + TRANSPORT_PARAMETERS_LEN;
+pub const PROTOCOL_VERSION: u16 = 6; // RESEARCH profile 6: compact counters and key phase
+// Profile and fixed wire/resource bounds are selected by magic1, not advertised.
+pub const MAGIC2_BLOCK_SIZE: usize = 1 + 32 * 8;
+const SERVER_HELLO_PAYLOAD_LEN: usize = 8;
 
-fn transport_parameters(max_message_size: usize) -> [u8; TRANSPORT_PARAMETERS_LEN] {
-    let mut p = [0; TRANSPORT_PARAMETERS_LEN];
-    store_u16(&mut p[..2], PROTOCOL_VERSION);
-    store_u16(&mut p[2..4], TRANSPORT_PARAMETERS_LEN as u16);
-    store_u32(&mut p[4..8], FEC_SEGMENT_BYTES as u32);
-    store_u32(&mut p[8..12], crate::fec::GROUP_MAX_BLOCKS as u32);
-    store_u16(&mut p[12..14], FEC_MIN_BLOCK_BYTES as u16);
-    store_u16(&mut p[14..16], 65535);
-    store_u32(&mut p[16..20], crate::ship::ACK.max_delay_us);
-    store_u32(&mut p[20..24], max_message_size as u32);
-    store_u32(&mut p[24..28], (PREVIOUS_KEY_NS / 1000) as u32);
-    store_u32(&mut p[28..32], 262144);
-    p
-}
-fn validate_transport_parameters(p: &[u8]) -> Option<usize> {
-    if p.len() != TRANSPORT_PARAMETERS_LEN || load_u16(&p[..2]) != PROTOCOL_VERSION ||
-        load_u16(&p[2..4]) as usize != p.len() || load_u32(&p[4..8]) as usize != FEC_SEGMENT_BYTES ||
-        load_u32(&p[8..12]) as usize != crate::fec::GROUP_MAX_BLOCKS || load_u16(&p[12..14]) as usize != FEC_MIN_BLOCK_BYTES ||
-        load_u16(&p[14..16]) != 65535 || load_u32(&p[16..20]) != crate::ship::ACK.max_delay_us ||
-        load_u32(&p[24..28]) != (PREVIOUS_KEY_NS / 1000) as u32 || load_u32(&p[28..32]) != 262144 { return None; }
-    let max = load_u32(&p[20..24]) as usize;
-    (max > 0 && max <= MAX_JUMBOGRAM_LEN).then_some(max)
-}
-fn build_server_hello(magic2: u64, max_message_size: usize) -> [u8; SERVER_HELLO_PAYLOAD_LEN] {
-    let mut payload = [0; SERVER_HELLO_PAYLOAD_LEN];
-    store_u64(&mut payload[..8], magic2);
-    payload[8..].copy_from_slice(&transport_parameters(max_message_size));
-    payload
-}
 pub const MAGIC2_APP_CROSSLINK: u64 = 0x5d747212563144d9;
 const SERVER_SUPPORTED_MAGIC2: &[u64] = &[MAGIC2_APP_CROSSLINK];
 
-pub fn build_magic2_client_block() -> [u8; MAGIC2_BLOCK_SIZE] { build_magic2_client_block_for_limit(MAX_JUMBOGRAM_LEN) }
-pub fn build_magic2_client_block_for_limit(max_message_size: usize) -> [u8; MAGIC2_BLOCK_SIZE] {
+pub fn build_magic2_client_block() -> [u8; MAGIC2_BLOCK_SIZE] {
     let mut block = [0u8; MAGIC2_BLOCK_SIZE];
-    block[MAGIC2_LIST_SIZE..].copy_from_slice(&transport_parameters(max_message_size));
     block[0] = 1;
     store_u64(&mut block[1..9], MAGIC2_APP_CROSSLINK);
     block
@@ -70,7 +45,6 @@ pub fn build_magic2_client_block_for_limit(max_message_size: usize) -> [u8; MAGI
 /// Also validates that all slots beyond `count` are zeroed.
 pub fn negotiate_magic2(client_block: &[u8]) -> Option<u64> {
     if client_block.len() != MAGIC2_BLOCK_SIZE { return None; }
-    validate_transport_parameters(&client_block[MAGIC2_LIST_SIZE..])?;
     let count = client_block[0] as usize;
     if count == 0 || count > 32 { return None; }
     // Validate that padding beyond the count is all zeros.
@@ -101,17 +75,14 @@ pub fn validate_magic2(magic2: u64) -> bool {
 
 pub const fn total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(magic: u64) -> Option<usize> {
     match magic {
-        CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s => Some(CONNECTED_HEADER_SIZE+16),
         CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b => Some(CONNECTED_HEADER_SIZE+16),
         CONNECT_MAGIC1_PLAIN_TEXT => Some(CONNECTED_HEADER_SIZE),
         _ => None,
     }
 }
 
-/// Prefix (2), full nonce (8), explicit directional key epoch (4).
-pub const CONNECTED_HEADER_SIZE: usize = 14;
-const REKEY_PACKETS: u64 = 1 << 48;
-const REKEY_BYTES: u64 = 1 << 60;
+/// Prefix (2), low 31 counter bits plus directional key-phase parity (4).
+pub const CONNECTED_HEADER_SIZE: usize = 6;
 const REKEY_AGE_NS: u64 = 600_000_000_000;
 const PREVIOUS_KEY_NS: u64 = 10_000_000_000;
 
@@ -226,7 +197,7 @@ pub const MAX_PUBLIC_KEY_SIZE: usize = 8000;
 
 pub fn new_keypair_from_connect_magic1(magic1: u64) -> Option<IdentityKeyPair> {
     if magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
-        let mut ret = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s)?;
+        let mut ret = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b)?;
         ret.magic1 = CONNECT_MAGIC1_PLAIN_TEXT;
         return Some(ret);
     }
@@ -239,7 +210,7 @@ pub fn new_keypair_from_connect_magic1(magic1: u64) -> Option<IdentityKeyPair> {
 
 pub fn new_keypair_from_connect_magic1_with_seed(magic1: u64, seed: [u8; 32]) -> Option<IdentityKeyPair> {
     if magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
-        let mut ret = new_keypair_from_connect_magic1_with_seed(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, seed)?;
+        let mut ret = new_keypair_from_connect_magic1_with_seed(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b, seed)?;
         ret.magic1 = CONNECT_MAGIC1_PLAIN_TEXT;
         return Some(ret);
     }
@@ -1415,11 +1386,11 @@ pub const STP_EXT_KIND_FEC: u64 = 1;
 const STP_EXT_KIND_SEGMENT_FEC: u64 = 3;
 const STP_SEGMENT_FEC_HEADER_SIZE: usize = 37;
 const FEC_SEGMENT_BYTES: usize = 2 << 20;
-/// Profile-3 minimum: 512-byte recovery TU minus the largest crypto overhead
-/// (14-byte header + 16-byte AEAD tag) and segmented FEC framing.
+/// Retained profile-3 receive floor; compact framing now leaves 453 bytes at TU512.
+/// Keep this declared floor and its resource bounds independent of send width.
 pub const FEC_MIN_BLOCK_BYTES: usize = 445;
 /// Non-ACK plaintext admission floor; both cipher modes can carry recovery probes.
-const MIN_CONNECTED_PAYLOAD: usize = crate::mtu_recovery::SMALL as usize - 30;
+const MIN_CONNECTED_PAYLOAD: usize = crate::mtu_recovery::SMALL as usize - CONNECTED_HEADER_SIZE - 16;
 pub const FEC_MAX_SOURCE_BLOCKS: usize = FEC_SEGMENT_BYTES.div_ceil(FEC_MIN_BLOCK_BYTES);
 
 // Current senders segment every message above 2 MiB. Refuse legacy jumbo codecs
@@ -3311,7 +3282,6 @@ pub struct ConnectionTrackingData {
     // pub reliable_streams: ReliableStreams,
 
     pub unreliable_send_buffer: SendQueues,
-    peer_max_message_size: usize,
     receive_index: ReceiveIndex,
     pub unreliable_reassembly: Vec<ReassemblySlot>,
     pub unreliable_fec: Vec<FecRecvSlot>,
@@ -3336,8 +3306,11 @@ pub struct ConnectionCipherTriplet {
     pub new: snow::StatelessTransportState,
     outgoing_epoch: u32,
     incoming_epoch: u32,
-    outgoing_packets: u64,
-    outgoing_bytes: u64,
+    // Counters here omit ACK_SPACE and are indexed by nonce space, never compared across spaces.
+    incoming_largest: [Option<u64>; 2],
+    incoming_current_min: [Option<u64>; 2],
+    incoming_older_max: [Option<u64>; 2],
+    incoming_previous_floor: [Option<u64>; 2],
     outgoing_started_ns: Option<u64>,
     outgoing_confirmed: bool,
     outgoing_first_data_nonce: Option<u64>,
@@ -3350,7 +3323,9 @@ impl ConnectionCipherTriplet {
         let mut new = current.clone();
         new.rekey_incoming();
         Self { old: None, current, new, outgoing_epoch: 0, incoming_epoch: 0,
-            outgoing_packets: 0, outgoing_bytes: 0, outgoing_started_ns: None,
+            incoming_largest: [None; 2], incoming_current_min: [None; 2], incoming_older_max: [None; 2],
+            incoming_previous_floor: [None; 2],
+            outgoing_started_ns: None,
             outgoing_confirmed: true, outgoing_first_data_nonce: None, previous_until_ns: 0 }
     }
     fn erase_old(&mut self) {
@@ -3371,6 +3346,9 @@ impl ConnectionCipherTriplet {
         self.old = Some(std::mem::replace(&mut self.new, self.current.clone()));
         self.new.rekey_incoming();
         self.incoming_epoch = epoch;
+        self.incoming_previous_floor = self.incoming_older_max;
+        self.incoming_older_max = self.incoming_largest;
+        self.incoming_current_min = [None; 2];
         true
     }
     pub fn advance_outgoing(&mut self) -> bool {
@@ -3380,8 +3358,6 @@ impl ConnectionCipherTriplet {
         self.current.rekey_outgoing();
         self.new.rekey_outgoing();
         self.outgoing_epoch = epoch;
-        self.outgoing_packets = 0;
-        self.outgoing_bytes = 0;
         self.outgoing_started_ns = None;
         self.outgoing_confirmed = false;
         self.outgoing_first_data_nonce = None;
@@ -3392,34 +3368,59 @@ impl ConnectionCipherTriplet {
             self.outgoing_confirmed = true;
         }
     }
-    fn prepare_outgoing(&mut self, now: u64, bytes: usize, nonce: u64) -> Option<u32> {
-        let safety_limit = self.outgoing_packets >= REKEY_PACKETS ||
-            self.outgoing_bytes.saturating_add(bytes as u64) > REKEY_BYTES;
+    fn prepare_outgoing(&mut self, now: u64, nonce: u64) -> Option<u32> {
         let aged = self.outgoing_started_ns.is_some_and(|t| now.saturating_sub(t) >= REKEY_AGE_NS);
-        // Confirmation loss delays an age-only update, never kills a healthy
-        // idle/ACK-only connection. A hard safety budget instead closes cleanly.
-        if safety_limit || (aged && self.outgoing_confirmed) {
-            if !self.advance_outgoing() { return None; }
-        }
+        // Elapsed time is the only rotation trigger. Confirmation loss defers
+        // successive updates; there is no packet/byte budget or budget close.
+        if aged && self.outgoing_confirmed && !self.advance_outgoing() { return None; }
         self.outgoing_started_ns.get_or_insert(now);
-        self.outgoing_packets += 1;
-        self.outgoing_bytes += bytes as u64;
         if !crate::sequence::is_ack_space(nonce) { self.outgoing_first_data_nonce.get_or_insert(nonce); }
         Some(self.outgoing_epoch)
     }
-    fn open(&mut self, nonce: u64, epoch: u32, header: &[u8], ciphertext: &[u8], out: &mut [u8], now: u64) -> Result<usize, snow::Error> {
+    fn record_incoming(&mut self, space: usize, counter: u64, previous: bool) {
+        let largest = &mut self.incoming_largest[space];
+        *largest = Some(largest.unwrap_or(counter).max(counter));
+        if previous {
+            let floor = &mut self.incoming_older_max[space];
+            *floor = Some(floor.unwrap_or(counter).max(counter));
+        } else {
+            let min = &mut self.incoming_current_min[space];
+            *min = Some(min.unwrap_or(counter).min(counter));
+        }
+    }
+    fn open(&mut self, nonce: u64, phase: u32, header: &[u8], ciphertext: &[u8], out: &mut [u8], now: u64) -> Result<usize, snow::Error> {
         self.expire_previous(now);
-        if epoch == self.incoming_epoch {
-            self.current.read_message_with_additional_data(nonce, header, ciphertext, out)
-        } else if self.incoming_epoch.checked_sub(1) == Some(epoch) && now <= self.previous_until_ns {
-            self.old.as_ref().ok_or(snow::Error::Decrypt)?.read_message_with_additional_data(nonce, header, ciphertext, out)
-        } else if self.incoming_epoch.checked_add(1) == Some(epoch) {
-            // Exactly one derivation after one successful AEAD, regardless of header.
-            let n = self.new.read_message_with_additional_data(nonce, header, ciphertext, out)?;
-            if !self.ratchet_forward_incoming() { return Err(snow::Error::Decrypt); }
-            self.previous_until_ns = now.saturating_add(PREVIOUS_KEY_NS);
-            Ok(n)
-        } else { Err(snow::Error::Decrypt) }
+        let space = crate::sequence::is_ack_space(nonce) as usize;
+        let counter = nonce & !crate::sequence::ACK_SPACE;
+        if counter >= crate::sequence::ACK_SPACE - 1 { return Err(snow::Error::Decrypt); }
+        if phase == self.incoming_epoch & 1 {
+            if self.incoming_older_max[space].is_some_and(|floor| counter <= floor) { return Err(snow::Error::Decrypt); }
+            let n = self.current.read_message_with_additional_data(nonce, header, ciphertext, out)?;
+            self.record_incoming(space, counter, false);
+            return Ok(n);
+        }
+        // Previous and next have the same parity. Try only retained previous,
+        // then prederived next, with monotone per-space epoch boundaries.
+        // Stateless AEAD never changes keys/nonce state on either failed trial;
+        // next authenticates the original ciphertext, not the scratch output.
+        if phase <= 1 && now <= self.previous_until_ns &&
+            self.incoming_previous_floor[space].is_none_or(|floor| counter > floor) &&
+            self.incoming_current_min[space].is_none_or(|min| counter < min) {
+            if let Some(old) = &self.old {
+                if let Ok(n) = old.read_message_with_additional_data(nonce, header, ciphertext, out) {
+                    self.record_incoming(space, counter, true);
+                    return Ok(n);
+                }
+            }
+        }
+        if phase > 1 || self.incoming_epoch == u32::MAX ||
+            self.incoming_largest[space].is_some_and(|max| counter <= max) { return Err(snow::Error::Decrypt); }
+        let n = self.new.read_message_with_additional_data(nonce, header, ciphertext, out)?;
+        // All fallible ordering and authentication checks precede promotion.
+        if !self.ratchet_forward_incoming() { return Err(snow::Error::Decrypt); }
+        self.previous_until_ns = now.saturating_add(PREVIOUS_KEY_NS);
+        self.record_incoming(space, counter, false);
+        Ok(n)
     }
 }
 impl Drop for ConnectionCipherTriplet {
@@ -3431,14 +3432,13 @@ impl Drop for ConnectionCipherTriplet {
 }
 
 /// Encrypt once, then retain the exact result across local WouldBlock retries.
-/// None closes the connection before exhaustion or a hard unconfirmed budget.
+/// None closes the connection before actual nonce or epoch exhaustion.
 fn seal_connected_packet(cipher: &mut Option<ConnectionCipherTriplet>, prefix: u16,
     nonce: u64, payload: &[u8], out: &mut [u8], now: u64) -> Option<usize> {
     if nonce == u64::MAX || nonce == crate::sequence::ACK_SPACE - 1 { return None; }
-    let epoch = if let Some(c) = cipher { c.prepare_outgoing(now, payload.len() + 16, nonce)? } else { 0 };
+    let epoch = if let Some(c) = cipher { c.prepare_outgoing(now, nonce)? } else { 0 };
     store_u16(&mut out[..2], prefix);
-    store_u64(&mut out[2..10], nonce);
-    store_u32(&mut out[10..14], epoch);
+    store_u32(&mut out[2..6], (nonce as u32 & crate::sequence::COUNTER_MASK) | ((epoch & 1) << 31));
     let (header, body) = out.split_at_mut(CONNECTED_HEADER_SIZE);
     let n = if let Some(c) = cipher {
         c.current.write_message_with_additional_data(nonce, header, payload, body).ok()?
@@ -4247,7 +4247,7 @@ pub fn connect_to_endpoint(
     let Some(receive_reservation) = budget.reserve(RECEIVE_CONNECTION_BYTES) else { return; };
     assert!(my_connect_keypair.magic1 == endpoint.magic1);
 
-    let magic2_block = build_magic2_client_block_for_limit(max_message_size);
+    let magic2_block = build_magic2_client_block();
     let connection_state = if my_connect_keypair.magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
         let mut hello_packet_payload = vec![0u8; 6 + 32 + MAGIC2_BLOCK_SIZE];
         store_u48(&mut hello_packet_payload[0..6], my_connect_keypair.magic1);
@@ -4285,7 +4285,6 @@ pub fn connect_to_endpoint(
             connection_state,
             handshake_hash: [0u8; 64],
             unreliable_send_buffer: SendQueues::new(send_queue_count, send_buffer_params),
-            peer_max_message_size: 0,
             receive_index: ReceiveIndex::default(),
             unreliable_reassembly: ReassemblySlot::new_ring(1024),
             unreliable_fec: FecRecvSlot::new_ring(1024),
@@ -5418,7 +5417,6 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                             if message.payload.len() > max_message_size { drop_kind = 2; }
                             else if let Some(conn) = connections_map.get_mut(&message.peer).filter(|c| c.is_connected()) {
                                 if message.queue >= conn.unreliable_send_buffer.queues.len() { drop_kind = 3; }
-                                else if message.payload.len() > conn.peer_max_message_size { drop_kind = 2; }
                                 else { fits = message.payload.len() as u64 <= conn.unreliable_send_buffer.queues[message.queue].free_bytes(); }
                             } else { drop_kind = 1; }
                             if fits {
@@ -5505,12 +5503,7 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                             continue;
                         }
                         if !tracking_data.is_connected() { batch } else {
-                            let mut accepted = Vec::with_capacity(batch.len());
-                            for (dscp, message) in batch {
-                                if message.len() <= tracking_data.peer_max_message_size { accepted.push((dscp, message)); }
-                                else { resp.send_unreliable_oversized.push((key, queue, dscp, message)); }
-                            }
-                            tracking_data.unreliable_send_buffer.submit_classified_messages(queue, accepted)
+                            tracking_data.unreliable_send_buffer.submit_classified_messages(queue, batch)
                         }
                     } else {
                         batch
@@ -5648,14 +5641,13 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                             for key_i in 0..my_keypairs.len() {
                                 let my_kp = &my_keypairs[key_i];
                                 if my_kp.magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
-                                    if buf_len >= 6 + 32 + MAGIC2_BLOCK_SIZE {
+                                    if buf_len == 6 + 32 + MAGIC2_BLOCK_SIZE {
                                         let client_key = &packet_memory_encrypted[6..6+32];
                                         let magic2_block = &packet_memory_encrypted[6+32..6+32+MAGIC2_BLOCK_SIZE];
                                         let Some(chosen_magic2) = negotiate_magic2(magic2_block) else {
                                             break;
                                         };
 
-                                        let peer_max_message_size = validate_transport_parameters(&magic2_block[MAGIC2_LIST_SIZE..]).unwrap();
                                         let connection_key = ConnectionKey { ip: other_ip_addr, port: other_port, key_15_bits: load_u16(&client_key[0..2]) << 1 };
                                         if let Some(existing_connection) = connections_map.get_mut(&connection_key) {
                                             if &existing_connection.my_transport_identity_keypair == my_kp && existing_connection.other_transport_identity == client_key {
@@ -5663,10 +5655,9 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                                     if *client_key < *my_kp.public {
                                                         store_u48(&mut packet_memory_send[0..6], 0xffff_ffff_0000 | (load_u16(&my_kp.public[0..2]) << 1) as u64);
                                                         packet_memory_send[6..6+32].copy_from_slice(&my_kp.public[..]);
-                                                        packet_memory_send[6+32..6+32+SERVER_HELLO_PAYLOAD_LEN].copy_from_slice(&build_server_hello(chosen_magic2, max_message_size));
+                                                        packet_memory_send[6+32..6+32+SERVER_HELLO_PAYLOAD_LEN].copy_from_slice(&chosen_magic2.to_le_bytes());
                                                         let hello_packet_payload = Vec::from(&packet_memory_send[0..6+32+SERVER_HELLO_PAYLOAD_LEN]);
 
-                                                        existing_connection.peer_max_message_size = peer_max_message_size;
                                                         existing_connection.connection_state = ConnectionState::SendingServerHelloPlaintext { magic2: chosen_magic2, last_sent_time_ns: 0, hello_packet_payload };
                                                     }
                                                 }
@@ -5677,7 +5668,7 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                             let client_key = Vec::from(client_key);
                                             store_u48(&mut packet_memory_send[0..6], 0xffff_ffff_0000 | (load_u16(&my_kp.public[0..2]) << 1) as u64);
                                             packet_memory_send[6..6+32].copy_from_slice(&my_kp.public[..]);
-                                            packet_memory_send[6+32..6+32+SERVER_HELLO_PAYLOAD_LEN].copy_from_slice(&build_server_hello(chosen_magic2, max_message_size));
+                                            packet_memory_send[6+32..6+32+SERVER_HELLO_PAYLOAD_LEN].copy_from_slice(&chosen_magic2.to_le_bytes());
                                             let hello_packet_payload = Vec::from(&packet_memory_send[0..6+32+SERVER_HELLO_PAYLOAD_LEN]);
 
                                             let my_ip = if other_ip_addr.to_ipv4_mapped().is_some() { Ipv6Addr::UNSPECIFIED } else { Ipv6Addr::UNSPECIFIED };
@@ -5696,7 +5687,6 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                                     connection_state: ConnectionState::SendingServerHelloPlaintext { magic2: chosen_magic2, last_sent_time_ns: 0, hello_packet_payload },
                                                     handshake_hash: [0u8; 64],
                                                     unreliable_send_buffer: SendQueues::new(send_queue_count, send_buffer_params),
-                                                    peer_max_message_size,
                                                     receive_index: ReceiveIndex::default(),
                 unreliable_reassembly: ReassemblySlot::new_ring(1024),
                                                     unreliable_fec: FecRecvSlot::new_ring(1024),
@@ -5720,13 +5710,12 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                                 break;
                                             };
 
-                                            let peer_max_message_size = validate_transport_parameters(&packet_memory_recv[MAGIC2_LIST_SIZE..magic2_block_len]).unwrap();
                                             let connection_key = ConnectionKey { ip: other_ip_addr, port: other_port, key_15_bits: load_u16(&client_key[0..2]) << 1 };
                                             if let Some(existing_connection) = connections_map.get_mut(&connection_key) {
                                                 if &existing_connection.my_transport_identity_keypair == my_kp && existing_connection.other_transport_identity == client_key {
                                                     if let ConnectionState::SendingClientHello { magic1, last_sent_time_ns, hello_packet_payload, handshake } = &mut existing_connection.connection_state {
                                                         if *client_key < *my_kp.public {
-                                                            let chosen_magic2_bytes = build_server_hello(chosen_magic2, max_message_size);
+                                                            let chosen_magic2_bytes = chosen_magic2.to_le_bytes();
                                                             store_u48(&mut packet_memory_send[0..6], 0xffff_ffff_0000 | (load_u16(&my_kp.public[0..2]) << 1) as u64);
                                                             let handshake_size = new_handshake.write_message(&chosen_magic2_bytes, &mut packet_memory_send[6..]).unwrap();
                                                             let hello_packet_payload = Vec::from(&packet_memory_send[0..6+handshake_size]);
@@ -5735,7 +5724,6 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                                             existing_connection.handshake_hash = get_handshake_hash(&new_handshake);
                                                             let cipher = ConnectionCipherTriplet::new_from_old_init_only(new_handshake.into_stateless_transport_mode().expect("Cannot fail given assert above."));
 
-                                                            existing_connection.peer_max_message_size = peer_max_message_size;
                                                         existing_connection.connection_state = ConnectionState::SendingServerHello { cipher, magic1: *magic1, magic2: chosen_magic2, last_sent_time_ns: 0, hello_packet_payload };
                                                         }
                                                     }
@@ -5744,7 +5732,7 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                             else {
                                                 let Some(receive_reservation) = receive_memory.reserve(RECEIVE_CONNECTION_BYTES) else { break; };
                                                 let client_key = Vec::from(client_key);
-                                                let chosen_magic2_bytes = build_server_hello(chosen_magic2, max_message_size);
+                                                let chosen_magic2_bytes = chosen_magic2.to_le_bytes();
                                                 store_u48(&mut packet_memory_send[0..6], 0xffff_ffff_0000 | (load_u16(&my_kp.public[0..2]) << 1) as u64);
                                                 let handshake_size = new_handshake.write_message(&chosen_magic2_bytes, &mut packet_memory_send[6..]).unwrap();
                                                 let hello_packet_payload = Vec::from(&packet_memory_send[0..6+handshake_size]);
@@ -5769,7 +5757,6 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                                         connection_state: ConnectionState::SendingServerHello { cipher, magic1, magic2: chosen_magic2, last_sent_time_ns: 0, hello_packet_payload },
                                                         handshake_hash,
                                                         unreliable_send_buffer: SendQueues::new(send_queue_count, send_buffer_params),
-                                                        peer_max_message_size,
                                                     receive_index: ReceiveIndex::default(),
                 unreliable_reassembly: ReassemblySlot::new_ring(1024),
                                                         unreliable_fec: FecRecvSlot::new_ring(1024),
@@ -5799,8 +5786,6 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                 if first_six_bytes >> 16 == 0xffff_ffff && buf_len == 6 + 32 + SERVER_HELLO_PAYLOAD_LEN {
                                     let server_key = &packet_memory_encrypted[6..6+32];
                                     if server_key == existing_connection.other_transport_identity {
-                                        let Some(peer_max_message_size) = validate_transport_parameters(&packet_memory_encrypted[6+32+8..6+32+SERVER_HELLO_PAYLOAD_LEN]) else { break 'conn; };
-                                        existing_connection.peer_max_message_size = peer_max_message_size;
                                         let server_magic2 = load_u64(&packet_memory_encrypted[6+32..6+32+8]);
                                         if !validate_magic2(server_magic2) {
                                             break 'conn;
@@ -5817,10 +5802,9 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                     if let Ok(payload_len) = handshake.read_message(&packet_memory_encrypted[6..buf_len], &mut packet_memory_recv[..]) {
                                         debug_assert!(handshake.is_handshake_finished());
                                         existing_connection.handshake_hash = get_handshake_hash(handshake);
-                                        if payload_len != SERVER_HELLO_PAYLOAD_LEN || validate_transport_parameters(&packet_memory_recv[8..payload_len]).is_none() {
+                                        if payload_len != SERVER_HELLO_PAYLOAD_LEN {
                                             break 'conn;
                                         }
-                                        existing_connection.peer_max_message_size = validate_transport_parameters(&packet_memory_recv[8..payload_len]).unwrap();
                                         let server_magic2 = load_u64(&packet_memory_recv[0..8]);
                                         if !validate_magic2(server_magic2) {
                                             break 'conn;
@@ -5846,8 +5830,10 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                             }
                             ConnectionState::SendingServerHello { cipher, magic1, magic2, last_sent_time_ns, hello_packet_payload } => {
                                 if buf_len < CONNECTED_HEADER_SIZE { break 'conn; }
-                                let nonce = load_u64(&packet_memory_encrypted[2..10]);
-                                let epoch = load_u32(&packet_memory_encrypted[10..14]);
+                                let wire = load_u32(&packet_memory_encrypted[2..6]);
+                                let is_ack = buf_len == CONNECTED_HEADER_SIZE + crate::ack::ACK_PAYLOAD_LEN + 16;
+                                let nonce = crate::sequence::reconstruct(wire, None, is_ack);
+                                let epoch = wire >> 31;
                                 if cipher.open(nonce, epoch, &packet_memory_encrypted[..CONNECTED_HEADER_SIZE],
                                     &packet_memory_encrypted[CONNECTED_HEADER_SIZE..buf_len], &mut packet_memory_recv[..], timestamp_ns).is_err() {
                                     break 'conn;
@@ -5863,9 +5849,11 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
 //////// BEGIN ORDINARY PACKET HANDLING  ////////////////////////////////////////////////////////////////////
                         if let ConnectionState::Connected(state) = &mut existing_connection.connection_state {
                             if buf_len < CONNECTED_HEADER_SIZE { break 'conn; }
-                            let non_virtual_nonce = load_u64(&packet_memory_encrypted[2..10]);
-                            let nonce = state.receive_sequences.candidate(non_virtual_nonce);
-                            let epoch = load_u32(&packet_memory_encrypted[10..14]);
+                            let wire = load_u32(&packet_memory_encrypted[2..6]);
+                            let tag_len = if state.cipher.is_some() { 16 } else { 0 };
+                            let wire_is_ack = buf_len == CONNECTED_HEADER_SIZE + crate::ack::ACK_PAYLOAD_LEN + tag_len;
+                            let nonce = state.receive_sequences.compact_candidate(wire, wire_is_ack);
+                            let epoch = wire >> 31;
                             let payload;
                             if let Some(cipher) = &mut state.cipher {
                                 let Ok(n) = cipher.open(nonce, epoch, &packet_memory_encrypted[..CONNECTED_HEADER_SIZE],
@@ -5879,7 +5867,8 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                             diag::context(existing_connection.handshake_hash, &existing_connection.my_transport_identity_keypair.public, &existing_connection.other_transport_identity);
                             // Packet TYPE is still determined by authenticated payload SIZE.
                             let is_ack = payload.len() == crate::ack::ACK_PAYLOAD_LEN;
-                            if is_ack != crate::sequence::is_ack_space(non_virtual_nonce) { break 'conn; }
+                            if is_ack != wire_is_ack { break 'conn; }
+                            state.receive_sequences.authenticated(nonce);
                             if !state.receive_sequences.commit(nonce) {
                                 #[cfg(feature = "research_budget_diagnostic")]
                                 if !is_ack { diag::replay(nonce,timestamp_ns,payload); }

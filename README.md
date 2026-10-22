@@ -66,26 +66,54 @@ substitutes a clock, deterministic seed, or uninitialized `/dev/urandom` fallbac
 
 The **unreleased 1.0.0** source internalizes Wirehair, address encoding and
 platform bindings, while using external cryptography crates. Package versions
-advance by majors only. This migration keeps the wire profile, congestion
-control, repair policy and application rings of main `1e00403`.
+advance by majors only. This source keeps the congestion control, repair policy
+and application rings of main `1e00403`, but changes the wire profile as described
+below.
 The published **0.3.0** introduced the caller-driven pump and three SPSC rings,
 replacing the 0.2 application API. The library does not start network or FEC
 threads. Move the pump to an application-owned thread if desired.
 The package version and wire-profile version are separate. Current main uses
-**wire profile 5** (research, unreleased), incompatible with profiles 2 through 4,
+**wire profile 6** (research, unreleased), incompatible with profiles 2 through 5,
 including the published 0.3.0 version-2 profile; no published package version
 contains it. Both peers must be updated together: mismatched handshake
-declarations are rejected. Profile 5 keeps profile 4's bitmap ACK, 32-byte
-declaration and 445-byte minimum FEC symbol for 512-byte MTU recovery, and the
+selectors are rejected. Profile 6 keeps profile 5's bitmap ACK and 445-byte
+minimum FEC symbol for 512-byte MTU recovery, and the
 exact sampled UDP payload size inside the unchanged 152-byte ACK; known size
 mismatches are rejected before receipt, congestion or MTU feedback is admitted.
-It changes large-message segmentation: the declared 2 MiB maximum is a per-unit
+Profile 6 uses a six-byte connected header (prefix + low 31 counter bits +
+one key-phase bit), plus the unchanged 16-byte tag: **22 bytes overhead**.
+Only `Noise_IK_25519_ChaChaPoly_BLAKE2b` is supported for encrypted STP;
+BLAKE2s transport support is removed. The fixed transport declaration is removed:
+client offer/server choice payloads are 257/8 bytes, encrypted hellos 359/62 bytes.
+The new magic1 selectors imply the profile. Constructor message limits remain
+local; the sender no longer learns a peer-specific maximum. Applications must
+coordinate that limit separately if needed.
+ACKs are 174 encrypted UDP bytes (158 in developer plaintext); ACK/data nonce
+spaces stay independent and full nonces never reset at wrap or rekey. Nearest
+reconstruction requires bounded per-space gaps: strictly less than 2^30 counter
+positions is sufficient, not a connection-lifetime limit. Larger gaps, including
+locally burned ACK nonces, can fail closed even while data flows. Updates use
+only 600-second age and peer confirmation, not packet/byte budgets; there is no
+aggregate per-key usage/forgery limit. See PROTOCOL.md for finite-range/tie rules,
+phase resolution, exact exhaustion limits and security assumptions.
+It retains profile 5's large-message segmentation: the declared 2 MiB maximum is a per-unit
 maximum, and a large message is sent as disjoint immutable coded byte extents
 whose boundaries the sender chooses, not a balanced layout (see PROTOCOL.md).
 Every extent is at least 446 bytes. While the initial TU assessment is
 unresolved, the sender sizes new units from an estimated one-flight exposure
 (pacing rate, measured RTT or unresolved DATA, and a repair-inclusive upper train
 size), at most 113920 bytes. This is a sizing estimate, not a delivery bound.
+Low-level API changes: the BLAKE2s selector constant,
+`TRANSPORT_PARAMETERS_LEN` and `build_magic2_client_block_for_limit` are removed,
+not emulated. `build_magic2_client_block` and `MAGIC2_BLOCK_SIZE` now describe only
+the 257-byte offer. `PROTOCOL_VERSION` remains a descriptive profile label, not
+a transmitted field. Public rings and constructor signatures are unchanged.
+`sequence::to_wire` and `ReceiveSequences::candidate` preserve legacy full-nonce
+identity-helper semantics, not compact wire serialization. Receivers use
+`compact_candidate`/`reconstruct`; senders pack low 31 bits plus key phase.
+magic1 is the dispatch boundary for a whole future handshake/address-material
+interpretation, not just a Noise hash; no generic handshake framework, PQ or
+hash-discovery implementation is introduced. See PROTOCOL.md for that boundary.
 This is not a new package release.
 
 ## Application API
@@ -156,8 +184,8 @@ implemented on the same public rings; it is not another library API.
   application configuration; leave them disabled in deployments.
 - Peer discovery, authorization and deciding which public keys to trust belong
   to the application. The supported authenticated profiles use Noise IK and
-  require the responder's static public key. Developer plaintext is not secure.
-- Directional UDP transmission units start at 512 bytes in profile 5. The first
+  require the responder's raw X25519 static public key. Developer plaintext is not secure.
+- Directional UDP transmission units start at 512 bytes in profile 6. The first
   larger trial is 1204; only an exact, fresh, promoted success of that trial
   permits one prompt 1452 trial that skips just the 500 ms floor. Otherwise,
   coarse search follows. Default-on recovery
@@ -196,9 +224,9 @@ implemented on the same public rings; it is not another library API.
 The 0.3.0 release passed the default and research-feature test suites,
 including encrypted loopback, lifecycle/backpressure and pump-deadline tests.
 The deterministic FEC planning golden hash is unchanged. Tests are not an
-independent interoperability or security audit. These results predate wire
-profile 5 and do not cover it; this document set reports no profile-5 test or
-performance result.
+independent interoperability or security audit. These historical results predate profiles 5 and 6 and do not cover them;
+external validation of the current source is not an independent audit or a
+performance claim.
 
 This source tree ships no test suite: the unit and integration tests were
 removed to reduce source size, and validation was run externally against the

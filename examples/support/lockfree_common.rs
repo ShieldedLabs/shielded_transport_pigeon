@@ -6,7 +6,7 @@ pub fn setup() -> (Pump, LockfreeEndpoint, STPAddress) { setup_with(RingConfig::
 pub fn setup_with(rings: RingConfig, maximum: usize) -> (Pump, LockfreeEndpoint, STPAddress) {
     let probe = std::net::UdpSocket::bind("[::1]:0").unwrap();
     let port = probe.local_addr().unwrap().port(); drop(probe);
-    let key = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).unwrap();
+    let key = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b).unwrap();
     let address = STPAddress::from(std::net::Ipv6Addr::LOCALHOST, port, &key);
     let (pump, endpoint) = new_pump_with_options(vec![key], port, None, (1_000_000, 32 << 20, 32 << 20), maximum, NetworkThreadOptions { rings, ..Default::default() });
     (pump, endpoint, address)
