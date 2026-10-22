@@ -4,8 +4,7 @@ struct App { endpoint: LockfreeEndpoint, peers: Vec<(STPAddress, [u8; 64])> }
 pub struct NetworkThreadHandle { app: Mutex<App>, cancel: Arc<AtomicBool>, thread: Option<std::thread::JoinHandle<()>> }
 impl NetworkThreadHandle {
     pub fn shutdown(mut self) { self.stop(); }
-    fn stop(&mut self) {
-        self.cancel.store(true, Ordering::Release); self.app.lock().unwrap().endpoint.close();
+    fn stop(&mut self) { self.cancel.store(true, Ordering::Release); self.app.lock().unwrap().endpoint.close();
         if let Some(thread) = self.thread.take() { thread.join().unwrap(); } } }
 impl Drop for NetworkThreadHandle { fn drop(&mut self) { self.stop(); } }
 pub fn new_network_thread(keys: Vec<IdentityKeyPair>, port: u16, pps: Option<u64>, bounds: (u32,u32,u32), maximum: usize) -> NetworkThreadHandle {
@@ -34,10 +33,8 @@ pub fn service_connections(handle: &NetworkThreadHandle, request: NetworkThreadP
     response.send_unreliable_rejected = reject_suffix(request.send_unreliable, |peer, queue, class, payload| {
         app.endpoint.try_send(peer, queue, class, payload) });
     app.endpoint.request_protocol_stats();
-    loop {
-        drain(&mut app, &mut response);
-        if let Some(mut stats) = app.endpoint.try_protocol_stats() {
-            stats.current_connections = app.peers.clone();
+    loop { drain(&mut app, &mut response);
+        if let Some(mut stats) = app.endpoint.try_protocol_stats() { stats.current_connections = app.peers.clone();
             stats.received_unreliable_messages = response.received_unreliable_messages;
             stats.send_unreliable_rejected = response.send_unreliable_rejected;
             return Some(stats); }
@@ -48,5 +45,6 @@ fn reject_suffix(messages: Vec<(ConnectionKey, usize, Dscp, Vec<u8>)>,
 ) -> Vec<(ConnectionKey, usize, Dscp, Vec<u8>)> {
     let mut rejected = Vec::new(); let mut blocked = false;
     for (peer, queue, class, mut payload) in messages {
-        if blocked || !send(peer, queue, class, &mut payload) { blocked = true; rejected.push((peer, queue, class, payload)); } }
+        if blocked || !send(peer, queue, class, &mut payload) { blocked = true;
+            rejected.push((peer, queue, class, payload)); } }
     rejected }

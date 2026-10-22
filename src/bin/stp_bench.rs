@@ -5,43 +5,44 @@
 //!                   [--timeout 600] [--idle 10] [--out report.json]
 //!                   [--giant 256M|1G] (one whole framed message, binary units)
 //!                   [--giant-warmup S] (wait up to S seconds for TU stabilization; giant default 5)
-//! Report: udp_payload_tu, fec_block_bytes_by_id, receiver_fec_decode_last_tail_ms. Decode tail uses the receiver clock: last
-//! accepted FEC block to delivery, excludes surplus repairs. Giant demo: send --to STPADDR --giant 1G --timeout 600 --idle 30.
-//! Both endpoints must support extended FEC kind 2 for messages above 64000 source blocks.
+//! Report: udp_payload_tu, fec_block_bytes_by_id, receiver_fec_decode_last_tail_ms. Decode tail uses the receiver
+//! clock: last accepted FEC block to delivery, excludes surplus repairs. Giant demo: send --to STPADDR --giant 1G
+//! --timeout 600 --idle 30. Both endpoints must support extended FEC kind 2 for messages above 64000 source blocks.
 //!                   [--loss-trace events.csv] (S/F/L/A sender event CSV; see loss_trace.rs)
 //!
-//! Both: [--queue-us 1000000] [--queue-min 4194304] [--queue-max 67108864] [--max-pps N] (the pre-existing send_buffer_params and
-//! max_pps resource limits). Transport policy is fixed: slow110 loss/ECN packet-rate control, precise pacing, adaptive bitmap
-//! ACKs and grouped Wirehair span-tail FEC with closed-loop top-up. There are no CC, ACK, FEC or pacer tuning flags.
+//! Both: [--queue-us 1000000] [--queue-min 4194304] [--queue-max 67108864] [--max-pps N] (the pre-existing
+//! send_buffer_params and max_pps resource limits). Transport policy is fixed: slow110 loss/ECN packet-rate control,
+//! precise pacing, adaptive bitmap ACKs and grouped Wirehair span-tail FEC with closed-loop top-up. There are no CC,
+//! ACK, FEC or pacer tuning flags.
 //! --queues N: fixed sender magazines; ordinary data ids map to id % N.
 //! --traffic-classes be,af11,af21,ef: one class or one per queue.
 //! --workload bulk|bulk-small|dueling --duration S: saturated 50 MiB trains;
-//! bulk-small adds independent 1000 B Poisson arrivals (--small-rate 20, --small-class ef). With one queue they share its FIFO,
-//! with >=2 queues small messages use queue 1. dueling saturates every configured queue (--bulk-size B can shorten trains). These
-//! modes stop producing at S, then drain accepted messages up to --timeout seconds. Reports include per-queue completion
-//! goodput/last-byte p50,p99, plus fixed-window goodput.
+//! bulk-small adds independent 1000 B Poisson arrivals (--small-rate 20, --small-class ef). With one queue they share
+//! its FIFO, with >=2 queues small messages use queue 1. dueling saturates every configured queue (--bulk-size B can
+//! shorten trains). These modes stop producing at S, then drain accepted messages up to --timeout seconds. Reports
+//! include per-queue completion goodput/last-byte p50,p99, plus fixed-window goodput.
 //! --duration S: saturated measurement for S seconds; requests receiver status while sending.
 //! --send-on-ms N --send-off-ms N: application submission duty cycle (queued packets drain normally).
 //! --loss-episodes 1: record loss episode diagnostics without changing control behaviour.
 //! estimator_series: [seconds, FEC estimate, sample, sent, lost, UDP bytes, RTT us, CC pps, app-limited entries].
 //! --mix classes [--classes "SIZE:COUNT,..."] sends fixed counts per size class (default
-//! 1000:200,65536:200,1048576:50,5242880:20,52428800:5), shuffled by --seed; the report then groups by class instead of size
-//! bucket. Per class: delivery, mean redundancy actually sent. Test loss injection: STP_TEST_DROP_PPM=n in the environment drops
-//! n per million outgoing data packets in that process's network thread; STP_TEST_DROP_SCHEDULE="0:0.5,20:4,24:0.5,@60"
-//! (seconds:percent from network thread start, optional @period repeat) varies it over time, and STP_TEST_DROP_BURST=n makes
-//! drops come in runs of n packets.
+//! 1000:200,65536:200,1048576:50,5242880:20,52428800:5), shuffled by --seed; the report then groups by class instead of
+//! size bucket. Per class: delivery, mean redundancy actually sent. Test loss injection: STP_TEST_DROP_PPM=n in the
+//! environment drops n per million outgoing data packets in that process's network thread;
+//! STP_TEST_DROP_SCHEDULE="0:0.5,20:4,24:0.5,@60" (seconds:percent from network thread start, optional @period repeat)
+//! varies it over time, and STP_TEST_DROP_BURST=n makes drops come in runs of n packets.
 //!
-//! Every message, data or control, is framed `[id u32 LE][total len u32 LE][blake3(payload) 32B][payload]`. Data ids are
-//! 0..count; ids from CTRL_BASE up are control messages:
+//! Every message, data or control, is framed `[id u32 LE][total len u32 LE][blake3(payload) 32B][payload]`. Data ids
+//! are 0..count; ids from CTRL_BASE up are control messages:
 //!   PING        sender -> server  payload [sender_ns u64]
 //!   PONG        server -> sender  payload [sender_ns u64][server_ns u64]
 //!   STATUS_REQ  sender -> server  payload [expected count u32]
 //!   STATUS      server -> sender  payload [n u32] then n x [id u32][ok u8][server_recv_ns u64]
 //!                                 then [m u32] then m x u64 receiver counters (see RxReport)
-//! The sender polls STATUS_REQ every second once all data is queued, and stops when the server has an entry for every id, at
-//! --timeout, or when its send queue has drained and the server's count has not grown for --idle seconds. The unreliable channel
-//! does not retransmit: one lost UDP fragment loses the whole message, so a drained queue plus silence means lost. Control
-//! messages that are lost are simply asked for again.
+//! The sender polls STATUS_REQ every second once all data is queued, and stops when the server has an entry for every
+//! id, at --timeout, or when its send queue has drained and the server's count has not grown for --idle seconds. The
+//! unreliable channel does not retransmit: one lost UDP fragment loses the whole message, so a drained queue plus
+//! silence means lost. Control messages that are lost are simply asked for again.
 extern crate shielded_transport_pigeon as stp_core;
 #[path = "../../tests/support/pump_thread.rs"] mod pump_thread;
 use pump_thread::*; use shielded_transport_pigeon::stp::*; use std::collections::{HashMap, VecDeque};
@@ -79,7 +80,8 @@ impl Args {
         while i < v.len() {
             let Some(k) = v[i].strip_prefix("--") else { die(&format!("unexpected argument {}", v[i])) };
             if !Self::allowed(k) { die(&format!("unknown flag --{k}; transport tuning is not supported")); }
-            let Some(val) = v.get(i + 1) else { die(&format!("--{k} needs a value")) }; m.insert(k.to_string(), val.clone());
+            let Some(val) = v.get(i + 1) else { die(&format!("--{k} needs a value")) };
+            m.insert(k.to_string(), val.clone());
             i += 2; }
         Args(m) }
     fn str(&self, k: &str) -> Option<&str> { self.0.get(k).map(|s| s.as_str()) }
@@ -98,8 +100,7 @@ fn service_connections(handle: &NetworkThreadHandle, request: NetworkThreadPush)
 #[derive(Clone, Copy, Debug, Default)]
 struct RxReport { st: ConnectionStats, th: NetworkThreadStats, cpu_user_us: u64, cpu_sys_us: u64 }
 impl RxReport {
-    fn to_words(&self) -> Vec<u64> {
-        let (s, t) = (&self.st, &self.th);
+    fn to_words(&self) -> Vec<u64> { let (s, t) = (&self.st, &self.th);
         let mut v = vec![s.rx_packets, s.rx_seq_span, s.rx_lost, s.rx_reordered, s.rx_late_beyond_window, s.rx_duplicates, s.rx_bursts];
         v.extend_from_slice(&s.rx_burst_hist);
         v.extend_from_slice(&[t.kernel_rx_drops.unwrap_or(u64::MAX), t.max_loop_gap_ns, t.loop_gaps_over_1ms, t.loop_gaps_over_10ms, t.loop_gaps_over_100ms,
@@ -109,8 +110,8 @@ impl RxReport {
         v.extend_from_slice(&[s.ack_packets_sent, s.ack_bytes_sent, s.ack_packets_received, s.ack_delay_us_max as u64, s.rtt_samples]);
         v.extend_from_slice(&[s.fec_decode_admission_refusals, s.fec_decode_timeouts, s.fec_decode_preemptions, s.fec_worker_limit_events, s.fec_decode_peak_workers, s.rx_plain_admission_refusals, s.rx_stale_identity_frames]);
         v }
-    fn worker_limit_json(&self) -> String {
-        let retired = self.st.fec_decode_preemptions; let refused = self.st.fec_worker_limit_events.saturating_sub(retired);
+    fn worker_limit_json(&self) -> String { let retired = self.st.fec_decode_preemptions;
+        let refused = self.st.fec_worker_limit_events.saturating_sub(retired);
         format!(",\"receiver_fec_worker_refusals\":{refused},\"receiver_fec_worker_pressure_retirements\":{retired},\"receiver_stale_identity_frames\":{}", self.st.rx_stale_identity_frames)
     }
     const WORDS: usize = 44;
@@ -119,13 +120,15 @@ impl RxReport {
         let mut st = ConnectionStats { rx_packets: w[0], rx_seq_span: w[1], rx_lost: w[2], rx_reordered: w[3], rx_late_beyond_window: w[4], rx_duplicates: w[5], rx_bursts: w[6], ..Default::default() };
         st.rx_burst_hist.copy_from_slice(&w[7..14]); st.fec_decode_last_tail_ns = w.get(28).copied().unwrap_or(0);
         st.fec_decode_max_tail_ns = w.get(29).copied().unwrap_or(0);
-        st.fec_ingress_dropped_blocks = w.get(30).copied().unwrap_or(0); st.udp_payload_tu = w.get(31).copied().unwrap_or(0);
+        st.fec_ingress_dropped_blocks = w.get(30).copied().unwrap_or(0);
+        st.udp_payload_tu = w.get(31).copied().unwrap_or(0);
         (st.rx_messages_completed, st.rx_partial_evicted, st.rx_partial_evicted_bytes, st.rx_insert_failures, st.rx_stale_fragments) = (w[23], w[24], w[25], w[26], w[27]);
         let th = NetworkThreadStats { kernel_rx_drops: if w[14] == u64::MAX { None } else { Some(w[14]) }, max_loop_gap_ns: w[15], loop_gaps_over_1ms: w[16],
             loop_gaps_over_10ms: w[17], loop_gaps_over_100ms: w[18], loop_iterations: w[19], recv_queue_dropped_messages: w[20] };
         (st.ack_packets_sent, st.ack_bytes_sent, st.ack_packets_received, st.ack_delay_us_max, st.rtt_samples) = (w[32], w[33], w[34], w[35] as u32, w[36]);
         st.fec_decode_admission_refusals = w.get(37).copied().unwrap_or(0);
-        st.fec_decode_timeouts = w.get(38).copied().unwrap_or(0); st.fec_decode_preemptions = w.get(39).copied().unwrap_or(0);
+        st.fec_decode_timeouts = w.get(38).copied().unwrap_or(0);
+        st.fec_decode_preemptions = w.get(39).copied().unwrap_or(0);
         st.fec_worker_limit_events = w.get(40).copied().unwrap_or(0);
         st.fec_decode_peak_workers = w.get(41).copied().unwrap_or(0);
         st.rx_plain_admission_refusals = w.get(42).copied().unwrap_or(0);
@@ -146,7 +149,8 @@ fn send_buffer_params(a: &Args) -> (u32, u32, u32) {
     (a.num("queue-us", 1_000_000), a.num("queue-min", 4 << 20), a.num("queue-max", 64 << 20)) }
 fn max_pps(a: &Args) -> Option<u64> { a.str("max-pps").map(|s| s.parse().unwrap_or_else(|_| die("bad --max-pps"))) }
 fn load_average() -> String {
-    std::fs::read_to_string("/proc/loadavg").unwrap_or_default().split_whitespace().take(3).collect::<Vec<_>>().join(",") }
+    std::fs::read_to_string("/proc/loadavg").unwrap_or_default().split_whitespace()
+        .take(3).collect::<Vec<_>>().join(",") }
 fn to_v6(ip: std::net::IpAddr) -> std::net::Ipv6Addr {
     match ip { std::net::IpAddr::V4(v4) => v4.to_ipv6_mapped(), std::net::IpAddr::V6(v6) => v6 } }
 fn main() {
@@ -161,8 +165,7 @@ fn main() {
     recs: HashMap<u32, (bool, u64)>, ok_bytes: u64, corrupt: u64, malformed: u64, expected: Option<u32>,
     first_ns: Option<u64>, last_ns: u64,
     reported_complete: bool, }
-fn serve(a: &Args) {
-    let port: u16 = a.num("port", 0);
+fn serve(a: &Args) { let port: u16 = a.num("port", 0);
     if port == 0 { die("serve needs --port"); }
     let bind: Option<std::net::IpAddr> = a.str("bind").map(|s| s.parse().unwrap_or_else(|_| die("bad --bind")));
     let advertise: std::net::IpAddr = match a.str("advertise") {
@@ -177,7 +180,8 @@ fn serve(a: &Args) {
         None => *blake3::hash(b"stp_bench default server key").as_bytes(), };
     let kp = new_keypair_from_connect_magic1_with_seed(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b, seed).unwrap();
     let addr = STPAddress::from(to_v6(advertise), port, &kp);
-    let max_message_size = a.num("max-message-size", MAX_JUMBOGRAM_LEN).min(MAX_JUMBOGRAM_LEN); let queues = a.num("queues", 1);
+    let max_message_size = a.num("max-message-size", MAX_JUMBOGRAM_LEN).min(MAX_JUMBOGRAM_LEN);
+    let queues = a.num("queues", 1);
     let handle = new_network_thread_with_options(vec![kp], port, max_pps(a), send_buffer_params(a), max_message_size, NetworkThreadOptions { receive_memory: Some(bench_receive_budget(max_message_size, queues)), bind_ip: bind, send_queue_count: queues, ..Default::default() });
     println!("stp_bench serve: bound {}:{port}", bind.map(|b| b.to_string()).unwrap_or("[::]".into()));
     println!("STP address: {:?}", addr); let epoch = Instant::now(); let mut wanted = Vec::new();
@@ -190,19 +194,18 @@ fn serve(a: &Args) {
         wanted = pull.current_connections; outbox = pull.send_unreliable_rejected;
         let now_ns = epoch.elapsed().as_nanos() as u64; let thread_stats = pull.thread_stats;
         let conn_stats = pull.connection_stats;
-        for (key, data) in pull.received_unreliable_messages {
-            let p = peers.entry(key).or_default();
+        for (key, data) in pull.received_unreliable_messages { let p = peers.entry(key).or_default();
             match parse(&data) {
                 Parsed::Malformed => p.malformed += 1,
-                Parsed::Corrupt(id) => { p.corrupt += 1; if id < CTRL_BASE { p.recs.entry(id).or_insert((false, now_ns)); } }
+                Parsed::Corrupt(id) => { p.corrupt += 1;
+                    if id < CTRL_BASE { p.recs.entry(id).or_insert((false, now_ns)); } }
                 Parsed::Ok(PING, pl) if pl.len() == 8 => {
                     let mut r = pl.to_vec(); r.extend_from_slice(&now_ns.to_le_bytes());
                     outbox.push((key, 0, Dscp::BestEffort, ctrl(PONG, &r))); }
                 Parsed::Ok(STATUS_REQ, pl) if pl.len() == 4 => {
                     p.expected = Some(u32_at(pl, 0)); let mut r = Vec::with_capacity(4 + 13 * p.recs.len());
                     r.extend_from_slice(&(p.recs.len() as u32).to_le_bytes());
-                    for (id, (ok, t)) in &p.recs {
-                        r.extend_from_slice(&id.to_le_bytes()); r.push(*ok as u8);
+                    for (id, (ok, t)) in &p.recs { r.extend_from_slice(&id.to_le_bytes()); r.push(*ok as u8);
                         r.extend_from_slice(&t.to_le_bytes()); }
                     let (cpu_user_us, cpu_sys_us) = cpu_us();
                     let st = conn_stats.iter().find(|(k, _)| *k == key).map(|x| x.1).unwrap_or_default();
@@ -210,12 +213,11 @@ fn serve(a: &Args) {
                     r.extend_from_slice(&(words.len() as u32).to_le_bytes());
                     for w in words { r.extend_from_slice(&w.to_le_bytes()); }
                     outbox.push((key, 0, Dscp::BestEffort, ctrl(STATUS, &r)));
-                    if !p.reported_complete && p.recs.len() as u32 >= u32_at(pl, 0) {
-                        p.reported_complete = true;
+                    if !p.reported_complete && p.recs.len() as u32 >= u32_at(pl, 0) { p.reported_complete = true;
                         print_peer(&key, p); } }
                 Parsed::Ok(id, _) if id >= CTRL_BASE => p.malformed += 1,
-                Parsed::Ok(id, _) => {
-                    p.first_ns.get_or_insert(now_ns); p.last_ns = now_ns; let e = p.recs.entry(id).or_insert((false, now_ns));
+                Parsed::Ok(id, _) => { p.first_ns.get_or_insert(now_ns); p.last_ns = now_ns;
+                    let e = p.recs.entry(id).or_insert((false, now_ns));
                     if !e.0 { *e = (true, now_ns); p.ok_bytes += data.len() as u64; }
                     progress_dirty = true; } } }
         if progress_dirty && last_progress.elapsed() > Duration::from_secs(5) {
@@ -223,14 +225,12 @@ fn serve(a: &Args) {
             last_progress = Instant::now();
             progress_dirty = false; }
         std::thread::sleep(Duration::from_micros(300)); } }
-fn print_peer(key: &ConnectionKey, p: &PeerLog) {
-    let ok = p.recs.values().filter(|r| r.0).count();
+fn print_peer(key: &ConnectionKey, p: &PeerLog) { let ok = p.recs.values().filter(|r| r.0).count();
     let span = (p.last_ns.saturating_sub(p.first_ns.unwrap_or(p.last_ns))) as f64 / 1e9;
     println!("=== peer [{}]:{} complete: {} expected, {} verified ({:.1} MB), {} corrupt, {} malformed, first->last receive {:.3} s ({:.1} MB/s)",
         key.ip, key.port, p.expected.unwrap_or(0), ok, p.ok_bytes as f64 / 1e6, p.corrupt, p.malformed, span,
         if span > 0.0 { p.ok_bytes as f64 / 1e6 / span } else { 0.0 }); }
-fn bucket_of(size: usize) -> usize {
-    const B: [usize; 5] = [1 << 10, 64 << 10, 1 << 20, 10 << 20, 50 << 20];
+fn bucket_of(size: usize) -> usize { const B: [usize; 5] = [1 << 10, 64 << 10, 1 << 20, 10 << 20, 50 << 20];
     B.iter().position(|&b| size <= b).unwrap_or(B.len()) }
 const BUCKET_NAMES: [&str; 6] = ["<=1KiB", "<=64KiB", "<=1MiB", "<=10MiB", "<=50MiB", ">50MiB"];
 fn pct(sorted: &[f64], p: f64) -> Option<f64> {
@@ -241,7 +241,9 @@ fn jnum(v: Option<f64>) -> String { v.map(|x| format!("{x:.3}")).unwrap_or("null
 fn giant_size(s: &str) -> Option<usize> {
     let (number, scale) = match s.strip_suffix('G').or_else(|| s.strip_suffix("GiB")) {
         Some(n) => (n, 1usize << 30),
-        None => match s.strip_suffix('M').or_else(|| s.strip_suffix("MiB")) { Some(n) => (n, 1usize << 20), None => (s, 1), }, };
+        None => match s.strip_suffix('M').or_else(|| s.strip_suffix("MiB")) {
+            Some(n) => (n, 1usize << 20),
+            None => (s, 1), }, };
     let bytes = number.parse::<usize>().ok()?.checked_mul(scale)?;
     (HEADER..=MAX_JUMBOGRAM_LEN).contains(&bytes).then_some(bytes) }
 type Outbox = Vec<(ConnectionKey, usize, Dscp, Vec<u8>)>; type Wanted = Vec<(STPAddress, [u8; 64])>;
@@ -252,14 +254,14 @@ fn poll(handle: &NetworkThreadHandle, outbox: &mut Outbox, wanted: &mut Wanted) 
     p }
 fn mean_transmitted_redundancy(sum_repair_ratios: f64, sent_messages: u64) -> f64 {
     if sent_messages == 0 { 0.0 } else { 100.0 * sum_repair_ratios / sent_messages as f64 } }
-fn send_duty_off(elapsed_ns: u64, on_ns: u64, off_ns: u64) -> bool { off_ns != 0 && elapsed_ns % (on_ns + off_ns) >= on_ns }
+fn send_duty_off(elapsed_ns: u64, on_ns: u64, off_ns: u64) -> bool {
+    off_ns != 0 && elapsed_ns % (on_ns + off_ns) >= on_ns }
 fn category_bonus_json(percent: u32, messages: u64, planned_repairs: u64) -> String {
     format!(",\"category_bonus_percent\":{percent},\"category_bonus_messages\":{messages},\"category_bonus_repairs\":{planned_repairs},\"category_bonus_repairs_kind\":\"planned_layout_additions_not_emitted\"")
 }
 struct FecTrace(Option<std::io::BufWriter<std::fs::File>>);
 impl FecTrace {
-    fn open(a: &Args) -> Self {
-        use std::io::Write;
+    fn open(a: &Args) -> Self { use std::io::Write;
         Self(a.str("loss-trace").map(|p| {
             let mut w = std::io::BufWriter::new(std::fs::File::create(std::path::Path::new(p).with_extension("fec.csv")).unwrap());
             writeln!(w, "time_ns,package_id,root_id,offset,tag,message_len,block_bytes,k,n_planned,n_sent,lost,rescue_rounds,rescue_symbols,during_message_topup,tail_repairs,peak_retained_source_bytes").unwrap();
@@ -273,8 +275,7 @@ impl FecTrace {
                     m.lost_during_send, m.rescue_rounds, m.rescue_symbols, m.during_message_topup, m.tail_repairs, m.peak_retained_source_bytes).unwrap();
             } } }
     fn flush(&mut self) { use std::io::Write; if let Some(w) = &mut self.0 { w.flush().unwrap(); } } }
-fn send(a: &Args) {
-    let mut fec_trace = FecTrace::open(a);
+fn send(a: &Args) { let mut fec_trace = FecTrace::open(a);
     let to = STPAddress::parse(a.str("to").unwrap_or_else(|| die("send needs --to STPADDR"))).unwrap_or_else(|| die("bad --to address"));
     let seed: u64 = a.num("seed", 1);
     let giant = a.str("giant").map(|s| giant_size(s).unwrap_or_else(|| die("--giant needs a byte count, 256M or 1G (binary units, whole framed message)")));
@@ -282,7 +283,8 @@ fn send(a: &Args) {
     let mut min: usize = giant.unwrap_or_else(|| a.num("min", 100));
     let max: usize = giant.unwrap_or_else(|| a.num("max", 50_000_000));
     let timeout = Duration::from_secs(a.num("duration", a.num("timeout", 600)));
-    let idle = Duration::from_secs(a.num("idle", 10)); let on_ns = a.num::<u64>("send-on-ms", 2000).saturating_mul(1_000_000);
+    let idle = Duration::from_secs(a.num("idle", 10));
+    let on_ns = a.num::<u64>("send-on-ms", 2000).saturating_mul(1_000_000);
     let off_ns = a.num::<u64>("send-off-ms", 0).saturating_mul(1_000_000);
     if on_ns == 0 || on_ns.checked_add(off_ns).is_none() { die("invalid send duty cycle"); }
     let out = a.str("out").unwrap_or("stp_bench_report.json").to_string(); let fec_mode = "adaptive:span";
@@ -307,9 +309,9 @@ fn send(a: &Args) {
     let group_names: Vec<String> = match &classes { Some(c) => c.iter().map(|x| x.0.to_string()).collect(), None => BUCKET_NAMES.iter().map(|s| s.to_string()).collect() };
     let group_of = |size: usize| -> usize { match &classes { Some(c) => c.iter().position(|x| x.0 == size).unwrap(), None => bucket_of(size) } };
     let ngroups = group_names.len(); let mut order: Vec<u32> = (0..count).collect(); order.shuffle(&mut rng);
-    let total_bytes: u64 = sizes.iter().map(|&s| s as u64).sum(); let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
-    {
-        let sizes = sizes.clone(); let order = order.clone();
+    let total_bytes: u64 = sizes.iter().map(|&s| s as u64).sum();
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
+    { let sizes = sizes.clone(); let order = order.clone();
         std::thread::spawn(move || {
             for id in order {
                 let mut r = rand_chacha::ChaCha20Rng::seed_from_u64(seed ^ (id as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
@@ -336,7 +338,8 @@ fn send(a: &Args) {
     println!("connected to {:?}", to); let mut pings: Vec<(u64, i128)> = Vec::new(); let ping_phase = Instant::now();
     let mut sent_pings = 0;
     while pings.len() < 10 && ping_phase.elapsed() < Duration::from_secs(40) {
-        sent_pings += 1; let before = pings.len(); outbox.push((key, 0, Dscp::BestEffort, ctrl(PING, &ns().to_le_bytes())));
+        sent_pings += 1; let before = pings.len();
+        outbox.push((key, 0, Dscp::BestEffort, ctrl(PING, &ns().to_le_bytes())));
         let until = Instant::now() + Duration::from_secs(3);
         while Instant::now() < until && pings.len() == before {
             let p = poll(&handle, &mut outbox, &mut wanted); outbox.extend(p.send_unreliable_rejected);
@@ -352,8 +355,7 @@ fn send(a: &Args) {
     if !warmup_s.is_finite() || !(0.0..=60.0).contains(&warmup_s) { die("--giant-warmup must be in 0..=60 seconds"); }
     let warm_start = Instant::now(); let mut tu_changed = warm_start; let mut observed_tu = 0;
     let stable_for = Duration::from_nanos((3 * rtt_median_ns).max(500_000_000));
-    while warm_start.elapsed() < Duration::from_secs_f64(warmup_s) {
-        let p = poll(&handle, &mut outbox, &mut wanted);
+    while warm_start.elapsed() < Duration::from_secs_f64(warmup_s) { let p = poll(&handle, &mut outbox, &mut wanted);
         if let Some((_, st)) = p.connection_stats.iter().find(|(k, _)| *k == key) {
             if st.udp_payload_tu != observed_tu { observed_tu = st.udp_payload_tu; tu_changed = Instant::now(); } }
         if warm_start.elapsed() >= Duration::from_secs(1) && tu_changed.elapsed() >= stable_for { break; }
@@ -373,8 +375,7 @@ fn send(a: &Args) {
     loop {
         while pending.len() < 2 && produced < count {
             match rx.try_recv() { Ok(m) => { pending.push_back(m); produced += 1; } Err(_) => break } }
-        if pending.is_empty() && produced < count {
-            let t = ns(); pending.push_back(rx.recv().unwrap()); produced += 1;
+        if pending.is_empty() && produced < count { let t = ns(); pending.push_back(rx.recv().unwrap()); produced += 1;
             if start_ns.is_some() { generator_wait_ns += ns() - t; } }
         let in_off_period = start_ns.is_some_and(|s| send_duty_off(ns() - s, on_ns, off_ns));
         let mut budget = if in_off_period { vec![0; nqueues] } else { free.clone() };
@@ -385,7 +386,8 @@ fn send(a: &Args) {
             if blocked[q] || (budget[q] == u64::MAX && sent_empty[q]) || (budget[q] != u64::MAX && len > budget[q]) {
                 blocked[q] = true; index += 1; continue; }
             if budget[q] == u64::MAX { sent_empty[q] = true; } else { budget[q] -= len; }
-            let m = pending.remove(index).unwrap(); let t = ns(); start_ns.get_or_insert(t); first_submit_ns[id].get_or_insert(t);
+            let m = pending.remove(index).unwrap(); let t = ns(); start_ns.get_or_insert(t);
+            first_submit_ns[id].get_or_insert(t);
             send_now.push((key, q, traffic[q], m)); }
         let mut sent_status = false;
         if (all_queued || a.str("duration").is_some()) && last_status_req.is_none_or(|t| t.elapsed() > Duration::from_secs(1)) {
@@ -400,12 +402,10 @@ fn send(a: &Args) {
         for &(k, q, bytes) in &p.unreliable_send_free_bytes { if k == key { free[q] = bytes; } }
         if let Some((_, st)) = p.connection_stats.iter().find(|(k, _)| *k == key) { stats = *st; }
         sender_thread = p.thread_stats; fec_trace.record(ns(), &p.fec_messages);
-        for (k, m) in &p.fec_messages {
-            let id = m.tag as u32;
+        for (k, m) in &p.fec_messages { let id = m.tag as u32;
             if *k == key && id < count && m.message_len == sizes[id as usize] { fec_info.insert(id, (m.k, m.n_sent, m.n_planned, m.loss_estimate)); }
         }
-        if let Some(s0) = start_ns {
-            let t = (ns() - s0) as f64 / 1e9;
+        if let Some(s0) = start_ns { let t = (ns() - s0) as f64 / 1e9;
             if series.last().is_none_or(|x| t - x.0 >= 1.0) { series.push((t, stats.fec_loss_estimate, stats.fec_last_loss_sample, stats.packets_sent, stats.packets_lost, stats.bytes_sent, stats.rtt_us, stats.cc_rate_upps as f64 / 1e6, stats.cc_app_limited_entries)); }
         }
         if produced == count && pending.is_empty() { all_queued = true; }
@@ -447,11 +447,9 @@ fn send(a: &Args) {
             b_repairs[b] += repairs as u64; b_red[b] += repairs as f64 / k as f64;
             b_red_plan[b] += np.saturating_sub(k) as f64 / k as f64; }
         match recs.get(&id) {
-            Some(&(true, t)) => {
-                delivered += 1; delivered_bytes += size as u64; b_deliv[b] += 1; let r = to_sender(t);
+            Some(&(true, t)) => { delivered += 1; delivered_bytes += size as u64; b_deliv[b] += 1; let r = to_sender(t);
                 last_recv = last_recv.max(r);
-                if let Some(s) = first_submit_ns[id as usize] {
-                    let lat_ms = (r - s as f64) / 1e6;
+                if let Some(s) = first_submit_ns[id as usize] { let lat_ms = (r - s as f64) / 1e6;
                     b_lat[b].push(lat_ms); all_lat.push(lat_ms); } }
             Some(&(false, _)) => corrupt += 1,
             None => lost += 1, } }
@@ -497,7 +495,8 @@ fn send(a: &Args) {
     for b in 0..ngroups {
         if b_count[b] == 0 { continue; }
         let red = mean_transmitted_redundancy(b_red[b], b_sent[b]);
-        let red_plan = mean_transmitted_redundancy(b_red_plan[b], b_sent[b]); b_lat[b].sort_by(|x, y| x.partial_cmp(y).unwrap());
+        let red_plan = mean_transmitted_redundancy(b_red_plan[b], b_sent[b]);
+        b_lat[b].sort_by(|x, y| x.partial_cmp(y).unwrap());
         let rate = if b_count[b] > 0 { Some(b_deliv[b] as f64 / b_count[b] as f64) } else { None };
         let (p50, p99) = (pct(&b_lat[b], 50.0), pct(&b_lat[b], 99.0));
         println!("{:<9} {:>6} {:>9} {:>8} {:>12} {:>12} {:>7} {:>9.2} {:>9.2}", group_names[b], b_count[b], b_deliv[b],
@@ -571,11 +570,9 @@ fn traffic_classes(a: &Args, queues: usize) -> Vec<Dscp> {
         _ => die("--traffic-classes needs be,af11,af21,ef (one or one per queue)"), }).collect();
     if v.len() == 1 { vec![v[0]; queues] } else if v.len() == queues { v } else { die("wrong number of traffic classes") } }
 fn queue_report(n: usize, sizes: &[usize], queue_ids: &[usize], submitted: &[Option<u64>], recs: &HashMap<u32, (bool, u64)>, offset: i128, wall: f64, cutoff: Option<f64>) -> Vec<String> {
-    (0..n).map(|q| {
-        let mut lat = Vec::new(); let mut bytes = 0u64; let mut count = 0;
+    (0..n).map(|q| { let mut lat = Vec::new(); let mut bytes = 0u64; let mut count = 0;
         for (id, &size) in sizes.iter().enumerate().filter(|(id, _)| queue_ids[*id] == q) {
-            if let Some(&(true, t)) = recs.get(&(id as u32)) {
-                let recv = (t as i128 - offset) as f64;
+            if let Some(&(true, t)) = recs.get(&(id as u32)) { let recv = (t as i128 - offset) as f64;
                 if cutoff.is_some_and(|c| recv > c) { continue; }
                 count += 1; bytes += size as u64;
                 if let Some(s) = submitted[id] { lat.push((recv - s as f64) / 1e6); } } }
@@ -583,8 +580,7 @@ fn queue_report(n: usize, sizes: &[usize], queue_ids: &[usize], submitted: &[Opt
         println!("queue {q}: {count} delivered, {gp:.3} Mbit/s, last-byte latency p50 {} ms p99 {} ms", jnum(pct(&lat, 50.0)), jnum(pct(&lat, 99.0)));
         format!("{{\"queue\":{q},\"delivered\":{count},\"delivered_bytes\":{bytes},\"goodput_Mbitps\":{gp:.6},\"latency_ms_p50\":{},\"latency_ms_p99\":{}}}", jnum(pct(&lat, 50.0)), jnum(pct(&lat, 99.0)))
     }).collect() }
-fn send_magazines(a: &Args) {
-    let mut fec_trace = FecTrace::open(a); let mode = a.str("workload").unwrap();
+fn send_magazines(a: &Args) { let mut fec_trace = FecTrace::open(a); let mode = a.str("workload").unwrap();
     if !matches!(mode, "bulk" | "bulk-small" | "dueling") { die("--workload must be bulk, bulk-small or dueling"); }
     let n = a.num::<usize>("queues", if mode == "dueling" { 2 } else { 1 });
     if !(1..=64).contains(&n) || mode == "dueling" && n < 2 { die("invalid queue count"); }
@@ -625,8 +621,7 @@ fn send_magazines(a: &Args) {
     let mut free = vec![u64::MAX; n]; let mut last_status = Instant::now()-Duration::from_secs(1);
     let mut drained = false; let mut last_growth = Instant::now(); let mut last_delivery = start as f64;
     let drain_limit = a.num::<u64>("timeout", 180);
-    loop {
-        let elapsed = (ns()-start) as f64/1e9;
+    loop { let elapsed = (ns()-start) as f64/1e9;
         if elapsed < duration {
             if mode == "bulk-small" {
                 while next_small <= elapsed && next_small < duration {
@@ -639,8 +634,7 @@ fn send_magazines(a: &Args) {
                     let id = sizes.len() as u32; let mut m = template.clone();
                     m[..4].copy_from_slice(&id.to_le_bytes()); sizes.push(bulk_size); ids.push(q); submitted.push(None);
                     pending[q].push_back((id, m)); } } }
-        for q in 0..n {
-            let mut budget = free[q]; let mut sent_empty = false;
+        for q in 0..n { let mut budget = free[q]; let mut sent_empty = false;
             while let Some((id, m)) = pending[q].front() {
                 if budget == u64::MAX { if sent_empty { break; } sent_empty = true; }
                 else if m.len() as u64 > budget { break; } else { budget -= m.len() as u64; }
@@ -651,19 +645,16 @@ fn send_magazines(a: &Args) {
             outbox.push((key, control_queue, traffic[control_queue], ctrl(STATUS_REQ, &(sizes.len() as u32).to_le_bytes())));
             last_status = Instant::now(); }
         let p = poll(&handle, &mut outbox, &mut wanted);
-        for (_, q, _c, m) in p.send_unreliable_rejected.into_iter().rev() {
-            let id = u32_at(&m, 0);
+        for (_, q, _c, m) in p.send_unreliable_rejected.into_iter().rev() { let id = u32_at(&m, 0);
             if id < CTRL_BASE { pending[q].push_front((id, m)); } }
         fec_trace.record(ns(), &p.fec_messages);
         for &(k, q, b) in &p.unreliable_send_free_bytes { if k == key { free[q] = b; } }
         if let Some((_, st)) = p.connection_stats.iter().find(|(k, _)| *k == key) { stats = *st; }
         for (_, d) in p.received_unreliable_messages {
-            if let Parsed::Ok(STATUS, pl) = parse(&d) && pl.len() >= 4 {
-                let count = u32_at(pl, 0) as usize;
+            if let Parsed::Ok(STATUS, pl) = parse(&d) && pl.len() >= 4 { let count = u32_at(pl, 0) as usize;
                 if pl.len() < 4+13*count+4 { continue; }
                 let at = 4+13*count; let words = u32_at(pl, at) as usize;
-                if pl.len() == at+4+8*words {
-                    let v: Vec<u64> = (0..words).map(|i| u64_at(pl, at+4+8*i)).collect();
+                if pl.len() == at+4+8*words { let v: Vec<u64> = (0..words).map(|i| u64_at(pl, at+4+8*i)).collect();
                     if let Some(r) = RxReport::from_words(&v) { receiver = r; } }
                 for i in 0..count {
                     let at = 4+13*i; let id = u32_at(pl, at); let ok = pl[at+4] != 0; let t = u64_at(pl, at+5);

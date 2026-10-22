@@ -9,20 +9,19 @@ pub(crate) const FEC: crate::fec_adapt::AdaptiveFecConfig = crate::fec_adapt::Ad
     min_packets: 500, slot_ns: 60_000_000_000, slots: 10,
     window_ns: 600_000_000_000, };
 pub(crate) const ACK: crate::ack::AckPolicy = crate::ack::AckPolicy { every_packets: 8, max_delay_us: 10_000, };
-pub(crate) const FROZEN_POLICY: &[(&str, &str)] = &[
-    ("STP_CC_DELAY_BETA", "0.5"), ("STP_CC_DELAY_EVENT", "1"), ("STP_CC_DELAY_GIVEUP", "0"),
-    ("STP_CC_DELAY_HOLD_MAX_RTTS", "256"), ("STP_CC_DELAY_HOLD_RTTS", "16"), ("STP_CC_DELAY_INTERVAL_RTTS", "1"),
-    ("STP_CC_DELAY_K", "0.5"), ("STP_CC_DELAY_MAX_MS", "50"), ("STP_CC_DELAY_MIN_MS", "10"),
-    ("STP_P4_BASE_PARITY_MODEL", "0"), ("STP_P4_BUDGET_BASE", "1"), ("STP_P4_COST_SMOOTH", "1"),
-    ("STP_P4_EMPIRICAL_TAIL_CALIBRATION", "1"), ("STP_P4_EVENT_REPAIR", "0"), ("STP_P4_INTERLEAVE_WIDTH", "1"),
-    ("STP_P4_MEDIUM_BONUS_PERCENT", "0"), ("STP_P4_REPAIR_CAP_PERCENT", "0"), ("STP_P4_SLIPSTREAM", "0"),
-    ("STP_P4_TARGET_VALIDATION", "2"), ("STP_RACE_POLICY", "P4"), ("STP_TV_ALIVE", "1"), ("STP_TV_DUP", "1"),
-    ("STP_TV_E", "1"), ("STP_TV_H", "33.333333333333336"), ("STP_TV_P", "0.001"), ("STP_TV_RAND", "1"),
-    ("STP_TV_RAND_HALF_PKTS", "4000"), ("STP_TV_RAND_MAX", "0.05"), ("STP_TV_RAND_MULT", "2"),
-    ("STP_TV_RISK_EPS", "0.002"), ("STP_TV_RISK_HI", "1.02"), ("STP_TV_RISK_HI2", "0.7"),
-    ("STP_TV_RISK_HOLD_MAX_RTTS", "10"), ("STP_TV_RISK_HOLD_RTTS", "1"), ("STP_TV_RISK_LO", "0.98"),
-    ("STP_TV_RISK_LO2", "0.5"), ("STP_TV_RISK_PHI", "0.1"), ("STP_TV_RISK_SRC", "4"), ("STP_TV_RISK_STEP", "2"),
-    ("STP_TV_RISK_TAIL", "3.0"),
+pub(crate) const FROZEN_POLICY: &[(&str, &str)] = &[("STP_CC_DELAY_BETA", "0.5"),
+    ("STP_CC_DELAY_EVENT", "1"), ("STP_CC_DELAY_GIVEUP", "0"), ("STP_CC_DELAY_HOLD_MAX_RTTS", "256"),
+    ("STP_CC_DELAY_HOLD_RTTS", "16"), ("STP_CC_DELAY_INTERVAL_RTTS", "1"), ("STP_CC_DELAY_K", "0.5"),
+    ("STP_CC_DELAY_MAX_MS", "50"), ("STP_CC_DELAY_MIN_MS", "10"), ("STP_P4_BASE_PARITY_MODEL", "0"),
+    ("STP_P4_BUDGET_BASE", "1"), ("STP_P4_COST_SMOOTH", "1"), ("STP_P4_EMPIRICAL_TAIL_CALIBRATION", "1"),
+    ("STP_P4_EVENT_REPAIR", "0"), ("STP_P4_INTERLEAVE_WIDTH", "1"), ("STP_P4_MEDIUM_BONUS_PERCENT", "0"),
+    ("STP_P4_REPAIR_CAP_PERCENT", "0"), ("STP_P4_SLIPSTREAM", "0"), ("STP_P4_TARGET_VALIDATION", "2"),
+    ("STP_RACE_POLICY", "P4"), ("STP_TV_ALIVE", "1"), ("STP_TV_DUP", "1"), ("STP_TV_E", "1"),
+    ("STP_TV_H", "33.333333333333336"), ("STP_TV_P", "0.001"), ("STP_TV_RAND", "1"), ("STP_TV_RAND_HALF_PKTS", "4000"),
+    ("STP_TV_RAND_MAX", "0.05"), ("STP_TV_RAND_MULT", "2"), ("STP_TV_RISK_EPS", "0.002"), ("STP_TV_RISK_HI", "1.02"),
+    ("STP_TV_RISK_HI2", "0.7"), ("STP_TV_RISK_HOLD_MAX_RTTS", "10"), ("STP_TV_RISK_HOLD_RTTS", "1"),
+    ("STP_TV_RISK_LO", "0.98"), ("STP_TV_RISK_LO2", "0.5"), ("STP_TV_RISK_PHI", "0.1"), ("STP_TV_RISK_SRC", "4"),
+    ("STP_TV_RISK_STEP", "2"), ("STP_TV_RISK_TAIL", "3.0"),
     ("STP_COHORT_PROFILE", "b20r20"), ];
 pub(crate) fn policy_var(name: &str) -> Result<String, std::env::VarError> {
     #[cfg(feature = "research_target_validation")] {

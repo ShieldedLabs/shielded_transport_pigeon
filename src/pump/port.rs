@@ -9,14 +9,11 @@ impl Default for Ready {
     fn default() -> Self { Self { generation: AtomicU32::new(1), waiters: AtomicU32::new(0), enabled: AtomicBool::new(false), send_space: AtomicBool::new(false) } }
 }
 impl Ready {
-    pub(crate) fn notify(&self) {
-        self.generation.fetch_add(1, Ordering::SeqCst);
+    pub(crate) fn notify(&self) { self.generation.fetch_add(1, Ordering::SeqCst);
         if self.waiters.load(Ordering::SeqCst) != 0 {
             #[cfg(target_os = "linux")] crate::platform::sys::futex_wake_all(&self.generation); } }
-    pub fn wait(&self, observed: &mut u64) {
-        let wanted = *observed as u32; self.waiters.fetch_add(1, Ordering::SeqCst);
-        loop {
-            let current = self.generation.load(Ordering::SeqCst);
+    pub fn wait(&self, observed: &mut u64) { let wanted = *observed as u32; self.waiters.fetch_add(1, Ordering::SeqCst);
+        loop { let current = self.generation.load(Ordering::SeqCst);
             if current != wanted { *observed = current as u64; break; }
             #[cfg(target_os = "linux")] crate::platform::sys::futex_wait(&self.generation, wanted);
             #[cfg(not(target_os = "linux"))] std::thread::sleep(std::time::Duration::from_millis(1)); }
@@ -26,8 +23,8 @@ pub(crate) struct NativePort {
     pub counters: Counters, pub send_full: AtomicBool, pub control_full: AtomicBool,
     pub stats_requested: AtomicBool, stats_active: AtomicBool, pub stats_result: AtomicPtr<NetworkThreadPull>, }
 impl NativePort {
-    pub(crate) fn input_drained(&self, ready: &Ready, control: bool) {
-        std::sync::atomic::fence(Ordering::SeqCst); let full = if control { &self.control_full } else { &self.send_full };
+    pub(crate) fn input_drained(&self, ready: &Ready, control: bool) { std::sync::atomic::fence(Ordering::SeqCst);
+        let full = if control { &self.control_full } else { &self.send_full };
         if full.load(Ordering::SeqCst) { ready.notify(); } }
     pub(crate) fn emit(&self, ready: &Ready, event: Event) -> Result<(), Event> {
         unsafe { self.events.push(event) }?; ready.notify();
@@ -35,7 +32,8 @@ impl NativePort {
 struct ReferencePort { requests: Ring<NetworkThreadPush>, responses: Ring<NetworkThreadPull> }
 pub(crate) struct Port {
     reference: OnceLock<ReferencePort>, outstanding: AtomicBool, app: Mutex<()>, pub(crate) exchange: Mutex<()>,
-    pub(crate) stop: AtomicBool, pub(crate) exited: AtomicBool, pub(crate) wake: Arc<NetworkWake>, pub(crate) ready: Arc<Ready>,
+    pub(crate) stop: AtomicBool, pub(crate) exited: AtomicBool,
+    pub(crate) wake: Arc<NetworkWake>, pub(crate) ready: Arc<Ready>,
     pub(crate) native: OnceLock<NativePort>, max_payload: usize, send_queues: usize, }
 impl Port {
     pub(crate) fn new(max_payload: usize, send_queues: usize) -> Arc<Self> {
@@ -56,8 +54,7 @@ impl Port {
         if let Some(n) = self.native.get() { n.send.has_value() || n.control.has_value() || n.stats_requested.load(Ordering::Acquire) } else { self.reference.get().is_some_and(|r| r.requests.has_value()) }
     }
     pub(crate) fn publish(&self, response: NetworkThreadPull) {
-        if let Some(n) = self.native.get() {
-            let response = Box::into_raw(Box::new(response));
+        if let Some(n) = self.native.get() { let response = Box::into_raw(Box::new(response));
             assert!(n.stats_result.compare_exchange(std::ptr::null_mut(), response, Ordering::Release, Ordering::Relaxed).is_ok());
             n.stats_active.store(false, Ordering::Release);
         } else { assert!(unsafe { self.reference.get().unwrap().responses.push(response) }.is_ok()); }
@@ -71,8 +68,8 @@ impl Endpoint {
         let reference = self.inner.reference.get_or_init(|| ReferencePort { requests: Ring::new(1), responses: Ring::new(1) });
         assert!(unsafe { reference.requests.push(request) }.is_ok());
         self.inner.wake.notify(); Ok(()) }
-    pub(crate) fn try_take(&self) -> Option<NetworkThreadPull> {
-        let _app = self.inner.app.lock().unwrap(); let response = unsafe { self.inner.reference.get()?.responses.pop() }?;
+    pub(crate) fn try_take(&self) -> Option<NetworkThreadPull> { let _app = self.inner.app.lock().unwrap();
+        let response = unsafe { self.inner.reference.get()?.responses.pop() }?;
         self.inner.outstanding.store(false, Ordering::Release); Some(response) }
     pub fn into_rings(self, config: RingConfig) -> LockfreeEndpoint {
         assert!(!self.inner.outstanding.load(Ordering::Acquire));
@@ -85,6 +82,5 @@ impl Endpoint {
 }
 impl Drop for Endpoint { fn drop(&mut self) { self.close(); } }
 impl Drop for NativePort {
-    fn drop(&mut self) {
-        let result = *self.stats_result.get_mut();
+    fn drop(&mut self) { let result = *self.stats_result.get_mut();
         if !result.is_null() { unsafe { drop(Box::from_raw(result)); } } } }

@@ -22,11 +22,11 @@ impl LossTrace {
     pub fn outcome(&mut self, event: char, connection: u16, seq: u64, time: u64) {
         writeln!(self.0, "{event},{connection},{seq},{time},0,{},-1,-1,0,,,,,,,", (event == 'L') as u8).expect("write loss trace"); }
     pub fn sent(&mut self, connection: u16, seq: u64, time: u64, payload: &[u8]) {
-        if let Some(context) = self.1.get(&connection).copied() { self.cc_row('C', connection, seq, time, 0, "", context); }
+        if let Some(context) = self.1.get(&connection).copied() {
+            self.cc_row('C', connection, seq, time, 0, "", context); }
         writeln!(self.0, "S,{connection},{seq},{time},{},0,-1,-1,0,,,,,,,", payload.len()).expect("write loss trace");
         let mut cursor = 0;
-        while let Some((frame, consumed)) = crate::stp::read_frame(&payload[cursor..]) {
-            use crate::stp::WireFrame;
+        while let Some((frame, consumed)) = crate::stp::read_frame(&payload[cursor..]) { use crate::stp::WireFrame;
             match frame {
                 WireFrame::Whole(data) => writeln!(self.0, "F,{connection},{seq},{time},{},0,-1,{cursor},0,,,,,,,", data.len()).expect("write loss trace"),
                 WireFrame::Plain { id, offset, data, .. } => writeln!(self.0, "F,{connection},{seq},{time},{},0,{id},{offset},0,,,,,,,", data.len()).expect("write loss trace"),

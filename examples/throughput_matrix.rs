@@ -2,8 +2,7 @@
 use std::collections::VecDeque; use std::io::Write; use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering}; use std::sync::{Arc, Barrier, OnceLock};
 use std::time::{Duration, Instant};
-mod api {
-    use shielded_transport_pigeon::{pump::port::lockfree::*, stp::*}; use std::time::{Duration, Instant};
+mod api { use shielded_transport_pigeon::{pump::port::lockfree::*, stp::*}; use std::time::{Duration, Instant};
     pub use shielded_transport_pigeon::stp::Pump; pub type Ep = LockfreeEndpoint; pub type Peer = ConnectionKey;
     pub const RING_CAPACITY: usize = 8192; pub const SEND_BUFFER: (u32, u32, u32) = (1_000_000, 32 << 20, 32 << 20);
     pub const MAX_MESSAGE: usize = 32 << 20;
@@ -13,14 +12,14 @@ mod api {
         pub pump_cpu_us: u64, }
     pub enum AppEvent { Message(Vec<u8>), Rejected(Vec<u8>), Stats(Stats), }
     pub fn setup() -> (Pump, Ep, STPAddress) {
-        let probe = std::net::UdpSocket::bind("[::1]:0").unwrap(); let port = probe.local_addr().unwrap().port(); drop(probe);
+        let probe = std::net::UdpSocket::bind("[::1]:0").unwrap(); let port = probe.local_addr().unwrap().port();
+        drop(probe);
         let key = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b).unwrap();
         let address = STPAddress::from(std::net::Ipv6Addr::LOCALHOST, port, &key);
         let (pump, endpoint) = new_pump_with_options(vec![key], port, None, SEND_BUFFER, MAX_MESSAGE,
             NetworkThreadOptions { rings: RingConfig { send: RING_CAPACITY, control: RING_CAPACITY, receive: RING_CAPACITY }, ..Default::default() });
         (pump, endpoint, address) }
-    pub fn connect(a: &mut Ep, b: &mut Ep, address: STPAddress) -> Peer {
-        let target = address.connection_key();
+    pub fn connect(a: &mut Ep, b: &mut Ep, address: STPAddress) -> Peer { let target = address.connection_key();
         while !a.try_connect(address.clone()) { std::thread::yield_now(); }
         let deadline = Instant::now() + Duration::from_secs(5); let (mut outgoing, mut incoming) = (false, false);
         while !outgoing || !incoming {
@@ -34,11 +33,9 @@ mod api {
     pub fn request_stats(ep: &mut Ep) -> bool { ep.request_protocol_stats(); true }
     #[inline] pub fn poll(ep: &mut Ep, f: &mut impl FnMut(AppEvent)) -> usize {
         let mut n = 0;
-        while let Some(event) = ep.try_recv() {
-            n += 1;
+        while let Some(event) = ep.try_recv() { n += 1;
             if let Event::Message { data, .. } = event { f(AppEvent::Message(data)); } }
-        if let Some(u) = ep.try_protocol_stats() {
-            n += 1;
+        if let Some(u) = ep.try_protocol_stats() { n += 1;
             if let Some((_, s)) = u.connection_stats.first() {
                 f(AppEvent::Stats(Stats {
                     cc_rate_pps: s.cc_rate_upps as f64 / 1e6,
@@ -59,14 +56,13 @@ use api::{AppEvent, Ep, Peer, Stats};
         pub fn gettid() -> c_int; } }
 struct QuietStdout(i32);
 impl QuietStdout {
-    fn new() -> Self {
-        std::io::stdout().flush().unwrap(); let null = std::fs::OpenOptions::new().write(true).open("/dev/null").unwrap();
+    fn new() -> Self { std::io::stdout().flush().unwrap();
+        let null = std::fs::OpenOptions::new().write(true).open("/dev/null").unwrap();
         let saved = unsafe { libc::dup(libc::STDOUT_FILENO) }; assert!(saved >= 0);
         assert!(unsafe { libc::dup2(null.as_raw_fd(), libc::STDOUT_FILENO) } >= 0);
         Self(saved) } }
 impl Drop for QuietStdout {
-    fn drop(&mut self) {
-        std::io::stdout().flush().unwrap();
+    fn drop(&mut self) { std::io::stdout().flush().unwrap();
         unsafe { libc::dup2(self.0, libc::STDOUT_FILENO); libc::close(self.0); } } }
 fn epoch() -> Instant { static E: OnceLock<Instant> = OnceLock::new(); *E.get_or_init(Instant::now) }
 fn now_ns() -> u64 { epoch().elapsed().as_nanos() as u64 }
@@ -74,8 +70,7 @@ fn gettid() -> i32 { unsafe { libc::gettid() } }
 fn thread_cpu_ns(tid: i32) -> u64 {
     std::fs::read_to_string(format!("/proc/self/task/{tid}/schedstat"))
         .ok().and_then(|s| s.split_whitespace().next()?.parse().ok()).unwrap_or(0) }
-fn process_cpu_ns() -> u64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+fn process_cpu_ns() -> u64 { let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     assert_eq!(unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts) }, 0);
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64 }
 const SENTINEL: u64 = u64::MAX; struct Pattern(Vec<u8>);
@@ -91,18 +86,19 @@ impl PumpThread {
     fn start(mut pump: api::Pump, name: &str) -> Self {
         let cancel = Arc::new(AtomicBool::new(false)); let stop = cancel.clone(); let tid = Arc::new(AtomicI32::new(0));
         let t2 = tid.clone();
-        let join = std::thread::Builder::new().name(name.into()).spawn(move || {
-            t2.store(gettid(), Ordering::Release);
+        let join = std::thread::Builder::new().name(name.into()).spawn(move || { t2.store(gettid(), Ordering::Release);
             while !stop.load(Ordering::Acquire) { pump.run_for(Duration::from_millis(100)); } }).unwrap();
         while tid.load(Ordering::Acquire) == 0 { std::thread::yield_now(); }
         Self { cancel, join: Some(join), tid: tid.load(Ordering::Acquire) } } }
 impl Drop for PumpThread {
-    fn drop(&mut self) { self.cancel.store(true, Ordering::Release); if let Some(j) = self.join.take() { j.join().unwrap(); } } }
+    fn drop(&mut self) { self.cancel.store(true, Ordering::Release);
+        if let Some(j) = self.join.take() { j.join().unwrap(); } } }
 #[derive(Clone, Copy, PartialEq)] enum Kind { Msg, Bulk, Latency }
 #[derive(Clone)] struct Cell { name: String, kind: Kind, size: usize, window: usize, mode: &'static str, label: String,
     min_secs: f64, max_secs: f64, min_bytes: u64, fixed_count: Option<u64>, gap: Duration }
 #[derive(Default)] struct Shared {
-    received: AtomicU64, received_bytes: AtomicU64, sender_waiting: AtomicBool, receiver_done: AtomicBool, t0_ns: AtomicU64,
+    received: AtomicU64, received_bytes: AtomicU64, sender_waiting: AtomicBool, receiver_done: AtomicBool,
+    t0_ns: AtomicU64,
     last_recv_ns: AtomicU64, }
 struct SendOut { issued: u64, rejected: u64, stats: Vec<(u64, Stats)>, mid: Option<usize>, stop_idx: Option<usize> }
 struct RecvOut { received: u64, bytes: u64, bad: u64, dup: u64, latencies_us: Vec<f64>, stats: Vec<Stats> }
@@ -114,8 +110,7 @@ fn sender(mut ep: Ep, peer: Peer, cell: Cell, sh: Arc<Shared>, pat: Arc<Pattern>
     let mut stop_requested_stats = false; let mut stats_requests = 0usize;
     if api::request_stats(&mut ep) { stats_requests += 1; }
     let mut last_progress = (0u64, Instant::now());
-    loop {
-        let mut rejected_now = false;
+    loop { let mut rejected_now = false;
         api::poll(&mut ep, &mut |ev| match ev {
             AppEvent::Rejected(p) => { pending.push_back(p); out.rejected += 1; rejected_now = true; }
             AppEvent::Stats(s) => out.stats.push((now_ns(), s)),
@@ -139,8 +134,7 @@ fn sender(mut ep: Ep, peer: Peer, cell: Cell, sh: Arc<Shared>, pat: Arc<Pattern>
             break; }
         if rejected_now { std::thread::park_timeout(Duration::from_millis(1)); }
         let mut sent_any = false;
-        for _ in 0..64 {
-            let received = sh.received.load(Ordering::Acquire);
+        for _ in 0..64 { let received = sh.received.load(Ordering::Acquire);
             if slot.is_empty() {
                 if let Some(p) = pending.pop_front() { slot = p; }
                 else if !stopping && out.issued - received < cell.window as u64
@@ -155,11 +149,9 @@ fn sender(mut ep: Ep, peer: Peer, cell: Cell, sh: Arc<Shared>, pat: Arc<Pattern>
         sh.sender_waiting.store(true, Ordering::SeqCst);
         if sh.received.load(Ordering::SeqCst) == received { std::thread::park_timeout(Duration::from_millis(5)); }
         sh.sender_waiting.store(false, Ordering::SeqCst); }
-    while !sh.receiver_done.load(Ordering::Acquire) {
-        let mut s = pat.make(SENTINEL, 16, 0);
+    while !sh.receiver_done.load(Ordering::Acquire) { let mut s = pat.make(SENTINEL, 16, 0);
         while !api::try_send(&mut ep, peer, &mut s) { api::poll(&mut ep, &mut |_| {}); std::thread::yield_now(); }
-        for _ in 0..50 {
-            api::poll(&mut ep, &mut |ev| if let AppEvent::Stats(s) = ev { out.stats.push((now_ns(), s)) });
+        for _ in 0..50 { api::poll(&mut ep, &mut |ev| if let AppEvent::Stats(s) = ev { out.stats.push((now_ns(), s)) });
             if sh.receiver_done.load(Ordering::Acquire) { break; }
             std::thread::sleep(Duration::from_millis(1)); } }
     let want = stats_requests; let until = Instant::now() + Duration::from_secs(3);
@@ -170,11 +162,9 @@ fn sender(mut ep: Ep, peer: Peer, cell: Cell, sh: Arc<Shared>, pat: Arc<Pattern>
 fn receiver(mut ep: Ep, cell: Cell, sh: Arc<Shared>, pat: Arc<Pattern>, start: Arc<Barrier>, send_thread: std::thread::Thread) -> (Ep, RecvOut) {
     let mut out = RecvOut { received: 0, bytes: 0, bad: 0, dup: 0, latencies_us: Vec::new(), stats: Vec::new() };
     let mut seen: Vec<u64> = Vec::new(); start.wait(); api::request_stats(&mut ep); let mut done = false;
-    while !done {
-        let before = out.received;
+    while !done { let before = out.received;
         let n = api::poll(&mut ep, &mut |ev| match ev {
-            AppEvent::Message(m) => {
-                let t = if cell.kind == Kind::Latency { now_ns() } else { 0 };
+            AppEvent::Message(m) => { let t = if cell.kind == Kind::Latency { now_ns() } else { 0 };
                 if m.len() < 16 { out.bad += 1; return; }
                 let id = u64::from_le_bytes(m[..8].try_into().unwrap());
                 if id == SENTINEL { sh.last_recv_ns.store(now_ns(), Ordering::Relaxed); done = true; return; }
@@ -183,8 +173,7 @@ fn receiver(mut ep: Ep, cell: Cell, sh: Arc<Shared>, pat: Arc<Pattern>, start: A
                 if seen.len() <= w { seen.resize(w + 1024, 0); }
                 if seen[w] & b != 0 { out.dup += 1; return; }
                 seen[w] |= b;
-                if cell.kind == Kind::Latency {
-                    let sent = u64::from_le_bytes(m[8..16].try_into().unwrap());
+                if cell.kind == Kind::Latency { let sent = u64::from_le_bytes(m[8..16].try_into().unwrap());
                     out.latencies_us.push(t.saturating_sub(sent) as f64 / 1e3); }
                 out.received += 1;
                 out.bytes += m.len() as u64; }
@@ -247,13 +236,11 @@ fn run_cell(cell: &Cell, a: Ep, b: Ep, peer: Peer, pumps: (i32, i32), pat: &Arc<
     if let Some(s) = so.stop_idx.and_then(|i| st.get(i - 1)) { csv.row("cc_target_stop", p, m, s.1.cc_rate_pps, "pkt/s"); }
     if let (Some(f), Some(l)) = (st.first(), st.last()) {
         csv.row("sender_kernel_rx_drops", p, m, (l.1.kernel_rx_drops - f.1.kernel_rx_drops) as f64, "count"); }
-    if ro.stats.len() >= 2 {
-        let (f, l) = (ro.stats[0], *ro.stats.last().unwrap());
+    if ro.stats.len() >= 2 { let (f, l) = (ro.stats[0], *ro.stats.last().unwrap());
         csv.row("recv_kernel_rx_drops", p, m, (l.kernel_rx_drops - f.kernel_rx_drops) as f64, "count");
         csv.row("recv_queue_dropped", p, m, (l.recv_queue_dropped - f.recv_queue_dropped) as f64, "count"); }
     (a, b, ro.latencies_us) }
-pub fn main() {
-    let args: Vec<String> = std::env::args().collect();
+pub fn main() { let args: Vec<String> = std::env::args().collect();
     let arg = |k: &str| args.iter().position(|a| a == k).map(|i| args[i + 1].clone()); let only = arg("--only");
     let min_secs: f64 = arg("--min-secs").map_or(2.0, |s| s.parse().unwrap());
     let max_secs: f64 = arg("--max-secs").map_or(25.0, |s| s.parse().unwrap()); epoch(); let mut cells = Vec::new();
@@ -286,7 +273,8 @@ pub fn main() {
             min_secs: 0.0, max_secs: 1e9, min_bytes: 0, fixed_count: Some(100), gap: Duration::from_millis(100) };
         let (na, nb, mut l) = run_cell(&lat, a, b, peer, (wa.tid, wb.tid), &pat, &mut csv); a = na; b = nb;
         l.sort_by(f64::total_cmp); assert_eq!(l.len(), 100, "latency samples lost");
-        csv.row("latency_p50", "100B", "post_idle", l[49], "us"); csv.row("latency_p99", "100B", "post_idle", l[98], "us");
+        csv.row("latency_p50", "100B", "post_idle", l[49], "us");
+        csv.row("latency_p99", "100B", "post_idle", l[98], "us");
         csv.row("latency_max", "100B", "post_idle", l[99], "us"); }
     let status = std::fs::read_to_string("/proc/self/status").unwrap();
     let hwm: f64 = status.lines().find(|l| l.starts_with("VmHWM:")).unwrap().split_whitespace().nth(1).unwrap().parse().unwrap();

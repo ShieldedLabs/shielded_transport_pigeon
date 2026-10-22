@@ -4,8 +4,8 @@ pub(crate) fn encode(input: &[u8]) -> String {
     for chunk in input.chunks(3) {
         let a = chunk[0]; out.push(ALPHABET[(a >> 2) as usize] as char); let b = chunk.get(1).copied().unwrap_or(0);
         out.push(ALPHABET[(((a & 3) << 4) | (b >> 4)) as usize] as char);
-        if chunk.len() > 1 {
-            let c = chunk.get(2).copied().unwrap_or(0); out.push(ALPHABET[(((b & 15) << 2) | (c >> 6)) as usize] as char);
+        if chunk.len() > 1 { let c = chunk.get(2).copied().unwrap_or(0);
+            out.push(ALPHABET[(((b & 15) << 2) | (c >> 6)) as usize] as char);
             if chunk.len() > 2 { out.push(ALPHABET[(c & 63) as usize] as char); } } }
     out }
 fn digit(byte: u8) -> Option<u8> {
@@ -16,12 +16,10 @@ fn digit(byte: u8) -> Option<u8> {
         b'-' => 62,
         b'_' => 63,
         _ => return None, }) }
-pub(crate) fn decode(input: &str) -> Option<Vec<u8>> {
-    let bytes = input.as_bytes();
+pub(crate) fn decode(input: &str) -> Option<Vec<u8>> { let bytes = input.as_bytes();
     if bytes.len() % 4 == 1 { return None; }
     let mut out = Vec::with_capacity(bytes.len() / 4 * 3 + 2);
-    for chunk in bytes.chunks(4) {
-        let a = digit(chunk[0])?; let b = digit(chunk[1])?; out.push((a << 2) | (b >> 4));
+    for chunk in bytes.chunks(4) { let a = digit(chunk[0])?; let b = digit(chunk[1])?; out.push((a << 2) | (b >> 4));
         if chunk.len() == 2 { if b & 15 != 0 { return None; } continue; }
         let c = digit(chunk[2])?; out.push((b << 4) | (c >> 2));
         if chunk.len() == 3 { if c & 3 != 0 { return None; } continue; }

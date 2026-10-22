@@ -1,11 +1,11 @@
 #[derive(Clone)] pub struct ChaCha20Rng { key: [u8; 32], counter: u64, buffer: [u8; 64], word_index: usize, }
 impl ChaCha20Rng {
     pub fn from_seed(seed: [u8; 32]) -> Self { Self { key: seed, counter: 0, buffer: [0; 64], word_index: 16, } }
-    pub fn seed_from_u64(mut state: u64) -> Self {
-        let mut seed = [0; 32];
+    pub fn seed_from_u64(mut state: u64) -> Self { let mut seed = [0; 32];
         for chunk in seed.chunks_exact_mut(4) {
             state = state.wrapping_mul(6364136223846793005).wrapping_add(11634580027462260723);
-            let xorshifted = (((state >> 18) ^ state) >> 27) as u32; let value = xorshifted.rotate_right((state >> 59) as u32);
+            let xorshifted = (((state >> 18) ^ state) >> 27) as u32;
+            let value = xorshifted.rotate_right((state >> 59) as u32);
             chunk.copy_from_slice(&value.to_le_bytes()); }
         Self::from_seed(seed) }
     #[inline] fn refill(&mut self) {

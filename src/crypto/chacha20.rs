@@ -4,10 +4,10 @@ pub(crate) fn block(key: &[u8; 32], counter: u64, stream: u64) -> [u8; 64] {
         *word = u32::from_le_bytes(bytes.try_into().unwrap()); }
     state[12] = counter as u32; state[13] = (counter >> 32) as u32; state[14] = stream as u32;
     state[15] = (stream >> 32) as u32; let mut res = state;
-    for _ in 0..10 {
-        quarter_round(0, 4, 8, 12, &mut res); quarter_round(1, 5, 9, 13, &mut res);
+    for _ in 0..10 { quarter_round(0, 4, 8, 12, &mut res); quarter_round(1, 5, 9, 13, &mut res);
         quarter_round(2, 6, 10, 14, &mut res); quarter_round(3, 7, 11, 15, &mut res);
-        quarter_round(0, 5, 10, 15, &mut res); quarter_round(1, 6, 11, 12, &mut res); quarter_round(2, 7, 8, 13, &mut res);
+        quarter_round(0, 5, 10, 15, &mut res); quarter_round(1, 6, 11, 12, &mut res);
+        quarter_round(2, 7, 8, 13, &mut res);
         quarter_round(3, 4, 9, 14, &mut res); }
     let mut out = [0u8; 64];
     for (i, (s1, s0)) in res.iter().zip(state.iter()).enumerate() {

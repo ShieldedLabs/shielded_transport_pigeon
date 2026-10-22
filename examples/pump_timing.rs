@@ -14,8 +14,7 @@ fn main() {
                 let start = Instant::now(); let mut decoder = MessageDecoder::new(len, block_bytes).unwrap();
                 create_max = create_max.max(start.elapsed()); let mut block = vec![0; block_bytes];
                 let k = len.div_ceil(block_bytes) as u32; let mut total = Duration::ZERO; let mut complete = false;
-                for id in 0..k * 2 {
-                    let start = Instant::now(); let n = encoder.block_into(id, &mut block).unwrap();
+                for id in 0..k * 2 { let start = Instant::now(); let n = encoder.block_into(id, &mut block).unwrap();
                     if id >= k { repair_max = repair_max.max(start.elapsed()); }
                     if id < k && id % 20 == 0 { continue; }
                     let start = Instant::now(); let status = decoder.add(id, &block[..n]).unwrap();

@@ -3,12 +3,12 @@
 #[cfg(feature = "research_budget_diagnostic")] use crate::budget_diagnostic as diag;
 use std::collections::{HashMap, VecDeque}; use crate::{blake3, helpers::noise as snow};
 // magic1 dispatches an entire handshake/address-material interpretation, not just a hash/cipher suite. The current
-// implementations below remain hardcoded two-flight Noise IK with raw 32-byte X25519 address keys (or test plaintext). A future
-// selector may use address material such as a key hash and a different number/size of flights; it must specify resolution,
-// transcript authentication, bounded chunking/reassembly, and immutable flight retransmission. Completion must supply
-// authenticated peer identity, transcript binding and directional packet protection satisfying the full-nonce/rekey contract
-// below. This is a design boundary, not an implemented handshake trait, PQ scheme or discovery. Bit zero of each six-byte
-// selector must be one for ClientHello dispatch.
+// implementations below remain hardcoded two-flight Noise IK with raw 32-byte X25519 address keys (or test plaintext).
+// A future selector may use address material such as a key hash and a different number/size of flights; it must specify
+// resolution, transcript authentication, bounded chunking/reassembly, and immutable flight retransmission. Completion
+// must supply authenticated peer identity, transcript binding and directional packet protection satisfying the
+// full-nonce/rekey contract below. This is a design boundary, not an implemented handshake trait, PQ scheme or
+// discovery. Bit zero of each six-byte selector must be one for ClientHello dispatch.
 pub const CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b: u64 = 0xa891_6e3c_54d7;
 pub const CONNECT_MAGIC1_PLAIN_TEXT: u64 = 0x6d43_b2f8_091b;
 pub fn crypto_string_from_connect_magic1(magic: u64) -> Option<&'static str> {
@@ -27,12 +27,10 @@ pub fn negotiate_magic2(client_block: &[u8]) -> Option<u64> {
     let count = client_block[0] as usize;
     if count == 0 || count > 32 { return None; }
     for i in count..32 { let offset = 1 + i * 8; if load_u64(&client_block[offset..offset + 8]) != 0 { return None; } }
-    for i in 0..count {
-        let offset = 1 + i * 8; let magic2 = load_u64(&client_block[offset..offset + 8]);
+    for i in 0..count { let offset = 1 + i * 8; let magic2 = load_u64(&client_block[offset..offset + 8]);
         if SERVER_SUPPORTED_MAGIC2.contains(&magic2) { return Some(magic2); } }
     None }
-pub fn validate_magic2(magic2: u64) -> bool {
-    let block = build_magic2_client_block(); let count = block[0] as usize;
+pub fn validate_magic2(magic2: u64) -> bool { let block = build_magic2_client_block(); let count = block[0] as usize;
     for i in 0..count { let offset = 1 + i * 8; if load_u64(&block[offset..offset + 8]) == magic2 { return true; } }
     false }
 pub const fn total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(magic: u64) -> Option<usize> {
@@ -49,30 +47,28 @@ const STP_WHOLE_HEADER_SIZE: usize = 3;
     Fec { kind: u64, id: u64, block_id: u32, message_len: usize, block_bytes: usize,
         segment: Option<FecSegment>, data: &'a [u8] },
     Unknown, }
-// Frozen duplication policy: first-kind prefix flags. Canonical packet identity is the original data nonce; a copy MUST use the
-// immediately following data nonce. Both retain full independent authenticated nonces/ACKs/CE/loss accounting.
+// Frozen duplication policy: first-kind prefix flags. Canonical packet identity is the original data nonce; a copy MUST
+// use the immediately following data nonce. Both retain full independent authenticated nonces/ACKs/CE/loss accounting.
 const TARGET_DUP_ORIGINAL:u8=0x10; const TARGET_DUP_COPY:u8=0x20;
-fn target_dup_kind(kind:u8)->Option<(u8,bool)> {
-    let base=kind & 0x0f;
+fn target_dup_kind(kind:u8)->Option<(u8,bool)> { let base=kind & 0x0f;
     ((1..=6).contains(&base) && matches!(kind & 0xf0,TARGET_DUP_ORIGINAL|TARGET_DUP_COPY))
         .then_some((base,kind & 0xf0==TARGET_DUP_COPY)) }
-fn target_dup_counts(payload:&[u8])->(u64,bool) {
-    let mut p=payload;let mut messages=0;let mut fec=false;
+fn target_dup_counts(payload:&[u8])->(u64,bool) { let mut p=payload;let mut messages=0;let mut fec=false;
     while let Some((frame,n))=read_frame(p) {
         match frame {WireFrame::Whole(_)=>messages+=1,WireFrame::Fec{..}=>fec=true,_=>{}}
         p=&p[n..]; }
     (messages,fec) }
 fn target_is_copy(_payload:&[u8])->bool {
     {return _payload.first().and_then(|&k|target_dup_kind(k)).is_some_and(|(_,copy)|copy);} }
-/// Lazy 64 KiB replay history, 262144 canonical data positions, same bound as physical replay. Below its watermark identities are
-/// permanently stale (not forgotten/reopened), so even arbitrarily skewed copies cannot redeliver.
+/// Lazy 64 KiB replay history, 262144 canonical data positions, same bound as physical replay. Below its watermark
+/// identities are permanently stale (not forgotten/reopened), so even arbitrarily skewed copies cannot redeliver.
 fn target_dup_receive(history:&mut Option<Box<crate::sequence::ReceiveSequences>>,nonce:u64,payload:&[u8])->bool {
     let Some((_,copy))=payload.first().and_then(|&k|target_dup_kind(k)) else {return true};
     let Some(canonical)=nonce.checked_sub(u64::from(copy)) else {return false};
     history.get_or_insert_with(||Box::new(Default::default())).commit(canonical) }
-/// Atomically admit all packed wholes before committing their canonical nonce. A memory-erased original cannot poison the copy's
-/// later admission. Only whole delivery is suppressed: FEC/plain frames retain their existing identity dedup and may still use
-/// the second packet to recover a resource-erased first arrival.
+/// Atomically admit all packed wholes before committing their canonical nonce. A memory-erased original cannot poison
+/// the copy's later admission. Only whole delivery is suppressed: FEC/plain frames retain their existing identity dedup
+/// and may still use the second packet to recover a resource-erased first arrival.
 fn target_dup_prepare(history:&mut Option<Box<crate::sequence::ReceiveSequences>>,nonce:u64,payload:&[u8],
     budget:&std::sync::Arc<crate::receive_memory::ReceiveMemoryBudget>)->(bool,VecDeque<crate::receive_memory::Reservation>,bool) {
     let mut reservations=VecDeque::new();
@@ -125,7 +121,8 @@ pub fn new_keypair_from_connect_magic1_with_seed(magic1: u64, seed: [u8; 32]) ->
         ret.magic1 = CONNECT_MAGIC1_PLAIN_TEXT;
         return Some(ret); }
     if let Some(crypto_string) = crypto_string_from_connect_magic1(magic1) {
-        let mut rng = crate::crypto::rng::ChaCha20Rng::from_seed(seed); let mut private = [0; 32]; rng.fill_bytes(&mut private);
+        let mut rng = crate::crypto::rng::ChaCha20Rng::from_seed(seed); let mut private = [0; 32];
+        rng.fill_bytes(&mut private);
         let public = curve25519_dalek::montgomery::MontgomeryPoint::mul_base_clamped(private).to_bytes();
         Some(IdentityKeyPair { magic1, private: private.to_vec(), public: public.to_vec() }) } else { None } }
 pub fn b64(s: &[u8]) -> String { crate::encoding::encode(s) }
@@ -173,9 +170,11 @@ pub fn fmt_prefixed_byte_str_rev(f: &mut std::fmt::Formatter<'_>, pre: &str, byt
     fmt_byte_str_rev(f, bytes) }
 impl std::fmt::Debug for IdentityKeyPair {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "IdentityKeyPair {{ magic1: {}, private: REDACTED, public: \"", self.magic1)?; fmt_byte_str(f, &self.public)?;
+        write!(f, "IdentityKeyPair {{ magic1: {}, private: REDACTED, public: \"", self.magic1)?;
+        fmt_byte_str(f, &self.public)?;
         write!(f, "\" }}") } }
-#[derive( Clone, PartialEq, Eq, Hash)] pub struct IdentityKeyPair { pub magic1: u64, pub private: Vec<u8>, pub public:  Vec<u8>, }
+#[derive( Clone, PartialEq, Eq, Hash)]
+pub struct IdentityKeyPair { pub magic1: u64, pub private: Vec<u8>, pub public:  Vec<u8>, }
 impl std::fmt::Display for IdentityKeyPair {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
         write!(f, "magic1: {} sk: REDACTED pk: {}", b64(&self.magic1.to_le_bytes()[..6]), b64(&self.public)) } }
@@ -223,16 +222,14 @@ impl ReceiveIndex {
             WireFrame::Plain { id, .. } => stale(*id),
             WireFrame::Fec { id, segment, .. } => stale(*id) || segment.is_some_and(|s| stale(s.root)),
             _ => false, } }
-    fn claim(&mut self, id: u64, role: ReceiveRole) -> bool {
-        let Some(index) = self.get(id) else { return false; };
+    fn claim(&mut self, id: u64, role: ReceiveRole) -> bool { let Some(index) = self.get(id) else { return false; };
         match self.roles[index] { Some(old) => old == role, None => { self.roles[index] = Some(role); true } } }
     fn admit_at(&mut self, id: u64, plain: &mut [ReassemblySlot], fec: &mut [FecRecvSlot], now_ns: u64, grace_ns: u64) -> Option<usize> {
         if id == u64::MAX { return None; }
         if let Some(index) = self.get(id) { return Some(index); }
         if id < self.floor { return None; }
         let index = if self.slots.len() < plain.len() { self.slots.len() }
-            else {
-                let candidates = || self.slots.range(..id);
+            else { let candidates = || self.slots.range(..id);
                 let unused = |i: usize| plain[i].reservation.is_none() && plain[i].buf.is_empty()
                     && plain[i].received.is_empty() && plain[i].segment_parts.is_none() && !fec[i].in_use();
                 let last_active = |i: usize| plain[i].last_segment_ns.max(fec[i].last_active_ns());
@@ -257,7 +254,8 @@ impl RetentionQuota {
         let mut used = self.used.lock().unwrap();
         if bytes > self.byte_limit.saturating_sub(used.0) || used.1 >= self.slot_limit { return None; }
         used.0 += bytes; used.1 += 1; use std::sync::atomic::Ordering::Relaxed;
-        let current = self.telemetry.current.fetch_add(bytes, Relaxed) + bytes; self.telemetry.peak.fetch_max(current, Relaxed);
+        let current = self.telemetry.current.fetch_add(bytes, Relaxed) + bytes;
+        self.telemetry.peak.fetch_max(current, Relaxed);
         Some(std::sync::Arc::new(RetentionLease { quota: self.clone(), bytes })) } }
 #[derive(Debug)] struct RetentionLease { quota: std::sync::Arc<RetentionQuota>, bytes: usize }
 impl Drop for RetentionLease {
@@ -287,7 +285,8 @@ impl MessageSendContext {
         source_owner_bytes(self.partial_send_slot.as_ref(), self.segmented_send.as_ref(),
             self.fec_send_slot.as_ref(), self.fec_suspended.as_ref(), &self.fec_retained) }
     fn owns_package(&self, package: u64) -> bool {
-        self.send_package_id == package || self.fec_rescue_package == Some(package) || self.fec_retained.contains_key(&package) }
+        self.send_package_id == package || self.fec_rescue_package == Some(package) ||
+            self.fec_retained.contains_key(&package) }
     fn swap(&mut self, q: &mut UnreliableSendBuffer) {
         macro_rules! swap { ($($f:ident),*) => { $(std::mem::swap(&mut self.$f, &mut q.$f);)* }; }
         swap!(current_dscp, partial_send_slot, send_package_id, package_lease,
@@ -319,18 +318,16 @@ fn owner_remaining_packets(active: Option<&FecSendSlot>, suspended: Option<&FecS
     let mut packets = active.into_iter().chain(suspended).chain(retained.values().map(|r| &r.slot)).map(|f| {
             let n = if initial && f.repair_accounting.category_bonus > 0 { f.repair_accounting.unbonused_n } else { f.n };
             n.saturating_sub(f.next_id) }).sum::<u32>();
-    if let Some(g) = giant {
-        let plan = g.plan_ks.lock().unwrap(); let (k, n) = p4_new_train(g.message.len(), g.offset, payload, Some(plan.cap));
+    if let Some(g) = giant { let plan = g.plan_ks.lock().unwrap();
+        let (k, n) = p4_new_train(g.message.len(), g.offset, payload, Some(plan.cap));
         packets = packets.saturating_add(n);
-        if !initial && bonus_eligible {
-            let prefix_k: u64 = plan.started_k();
+        if !initial && bonus_eligible { let prefix_k: u64 = plan.started_k();
             packets = packets.saturating_add(source_bonus(prefix_k + k as u64, percent).saturating_sub(source_bonus(prefix_k, percent))); } }
     packets }
 fn source_owner_bytes(plain: Option<&(Vec<u8>, u32)>, giant: Option<&SegmentedSend>,
     active: Option<&FecSendSlot>, suspended: Option<&FecSendSlot>, retained: &HashMap<u64, RetainedFecSlot>) -> usize {
     let mut seen = Vec::new(); let mut bytes = plain.map_or(0, |(m, _)| m.capacity());
-    let mut charge = |m: &std::sync::Arc<Vec<u8>>| {
-        let ptr = std::sync::Arc::as_ptr(m);
+    let mut charge = |m: &std::sync::Arc<Vec<u8>>| { let ptr = std::sync::Arc::as_ptr(m);
         if !seen.contains(&ptr) { seen.push(ptr); bytes += m.capacity(); } };
     if let Some(g) = giant { charge(&g.message); }
     for f in active.into_iter().chain(suspended).chain(retained.values().map(|r| &r.slot)) { charge(&f.message); }
@@ -340,24 +337,21 @@ fn source_owner_bytes(plain: Option<&(Vec<u8>, u32)>, giant: Option<&SegmentedSe
     staged_seq: u64, framed: Option<u64>,
     committed: Option<u64>, }
 impl QueuedLedger {
-    fn admit(&mut self, charge: crate::pump::port::lockfree::Charge) {
-        let (cell, bytes) = charge.transfer(); debug_assert!(self.cell.as_ref().is_none_or(|c| std::sync::Arc::ptr_eq(c, &cell)));
+    fn admit(&mut self, charge: crate::pump::port::lockfree::Charge) { let (cell, bytes) = charge.transfer();
+        debug_assert!(self.cell.as_ref().is_none_or(|c| std::sync::Arc::ptr_eq(c, &cell)));
         self.cell.get_or_insert(cell); self.owned += bytes;
         self.unretired += bytes; }
-    fn retire(&mut self, len: usize) {
-        let bytes = (len as u64).min(self.unretired);
+    fn retire(&mut self, len: usize) { let bytes = (len as u64).min(self.unretired);
         if bytes == 0 { return; }
         self.unretired -= bytes;
         match self.framed {
-            Some(seq) if self.committed.is_none_or(|c| c < seq) => {
-                self.staged += bytes;
+            Some(seq) if self.committed.is_none_or(|c| c < seq) => { self.staged += bytes;
                 self.staged_seq = self.staged_seq.max(seq); }
             _ => self.release(bytes), } }
-    fn commit(&mut self, seq: u64) {
-        self.committed = Some(seq);
-        if self.staged != 0 && seq >= self.staged_seq { let bytes = std::mem::take(&mut self.staged); self.release(bytes); } }
-    fn release(&mut self, bytes: u64) {
-        self.owned -= bytes;
+    fn commit(&mut self, seq: u64) { self.committed = Some(seq);
+        if self.staged != 0 && seq >= self.staged_seq { let bytes = std::mem::take(&mut self.staged);
+            self.release(bytes); } }
+    fn release(&mut self, bytes: u64) { self.owned -= bytes;
         if let Some(cell) = &self.cell { cell.fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed); } } }
 impl Drop for QueuedLedger { fn drop(&mut self) { if self.owned != 0 { self.release(self.owned); } } }
 #[derive(Debug)] pub struct UnreliableSendBuffer {
@@ -404,7 +398,8 @@ pub struct FecSendSlot {
     first_source_commit: Option<(u64, u64)>, event_ids: Vec<(u32, u32)>, event_planned: u32, event_ids_overflow: u32,
     event_sink: Option<std::sync::Arc<EventSink>>, base_b: Vec<u32>, base_r: u32, base_cap_bound: bool,
     budget: Option<std::sync::Arc<std::sync::Mutex<BudgetSegment>>>, data_anchor: Option<(u64, u64)>,
-    budget_demand: u64, budget_shortfall: u64, budget_known_shortfall: u64, budget_limited: bool, budget_invalid_anchor: bool,
+    budget_demand: u64, budget_shortfall: u64, budget_known_shortfall: u64, budget_limited: bool,
+    budget_invalid_anchor: bool,
     #[cfg(feature="research_budget_diagnostic")] diagnostic_last_demand: Option<u32>, }
 #[derive(Debug, Default)]
 struct EventSink { planned: std::sync::atomic::AtomicU64, ids_overflow: std::sync::atomic::AtomicU64, overflow: std::sync::atomic::AtomicU64 }
@@ -412,11 +407,11 @@ struct EventSink { planned: std::sync::atomic::AtomicU64, ids_overflow: std::syn
     pub accepted_early: u64, pub accepted_timeout: u64, pub accepted_ce: u64, pub accepted_dropped: u64,
     pub skip_closed: u64, pub skip_latched: u64, pub skip_unexposed: u64, pub roots_granted: u64,
     pub slots_granted: u64, pub slots_unqualified: u64, pub grant_symbols: u64, pub planned: u64, pub emitted: u64,
-    pub repairs_emitted: u64, pub missing_anchor: u64, pub marks_abandoned: u64, pub ids_overflow: u64, pub ready_added: u64,
+    pub repairs_emitted: u64, pub missing_anchor: u64, pub marks_abandoned: u64, pub ids_overflow: u64,
+    pub ready_added: u64,
     pub counter_overflow: u64, }
 impl EventRepairInfo {
-    pub fn merge(&mut self, o: EventRepairInfo) {
-        let mut of = self.counter_overflow.max(o.counter_overflow);
+    pub fn merge(&mut self, o: EventRepairInfo) { let mut of = self.counter_overflow.max(o.counter_overflow);
         let mut add = |a: &mut u64, b: u64| { *a = a.checked_add(b).unwrap_or_else(|| { of = 1; u64::MAX }); };
         add(&mut self.accepted_early, o.accepted_early); add(&mut self.accepted_timeout, o.accepted_timeout);
         add(&mut self.accepted_ce, o.accepted_ce); add(&mut self.accepted_dropped, o.accepted_dropped);
@@ -437,14 +432,14 @@ impl EventRepairInfo {
     pub invalid_anchor_fallbacks: u64,
     pub counter_overflow: u64, }
 impl BudgetBaseInfo {
-    pub fn merge(&mut self, other: Self) {
-        let mut overflow = self.counter_overflow.max(other.counter_overflow);
+    pub fn merge(&mut self, other: Self) { let mut overflow = self.counter_overflow.max(other.counter_overflow);
         macro_rules! add { ($($f:ident),*) => { $(self.$f = self.$f.checked_add(other.$f).unwrap_or_else(|| { overflow = 1; u64::MAX });)* }; }
         add!(roots, source_symbols, repair_limit, demand_repairs, planned_repairs, sources_emitted, repairs_emitted, cap_limited_roots, cap_limited_slots, cap_shortfall, known_loss_shortfall, invalid_anchor_fallbacks);
         self.counter_overflow = overflow; } }
 #[derive(Debug)] struct BudgetRoot {
     sink: std::sync::Arc<std::sync::Mutex<BudgetBaseInfo>>, limited: bool, cap_percent: u32, target_draw:u64,
-    target_tail_applied:bool, target_risk:crate::target_validation::RiskAdmission, target_ordinal:u64, target_app_tag:[u8;8],
+    target_tail_applied:bool, target_risk:crate::target_validation::RiskAdmission, target_ordinal:u64,
+    target_app_tag:[u8;8],
     #[cfg(feature="research_target_validation")] target_owners:Vec<crate::target_validation::Owner>,
     target_state:crate::target_validation::RiskState,
     target_source_symbols:u64, }
@@ -474,8 +469,8 @@ impl FecSendSlot {
             if self.next_id < self.n || self.rescue_rounds >= 3 { return; } }
         let layout = crate::fec::MessageLayout::new(self.message.len(), self.block_bytes).unwrap();
         let groups = layout.groups as u32; let repairs = self.next_id.saturating_sub(self.k); let mut deficit = 0;
-        for group in 0..layout.groups {
-            let k = layout.group(group).1 as u32; let sent = k + repairs / groups + u32::from((group as u32) < repairs % groups);
+        for group in 0..layout.groups { let k = layout.group(group).1 as u32;
+            let sent = k + repairs / groups + u32::from((group as u32) < repairs % groups);
             deficit = deficit.max((k + 2).saturating_sub(sent.saturating_sub(self.group_lost[group]))); }
         let n = self.n.max(self.next_id.saturating_add(deficit * groups));
         self.n = if self.repair_policy == crate::fec_adapt::RepairPolicy::Reliability { n }
@@ -485,14 +480,12 @@ impl FecSendSlot {
         let from = acc.event_ids.last().map_or(from, |&(_, b)| from.max(b));
         if from >= to { return; }
         acc.event_planned = acc.event_planned.saturating_add(to - from);
-        if let Some(sink) = &acc.event_sink {
-            let add = (to - from) as u64;
+        if let Some(sink) = &acc.event_sink { let add = (to - from) as u64;
             if sink.planned.fetch_update(Relaxed, Relaxed, |v| v.checked_add(add)).is_err() { sink.overflow.store(1, Relaxed); } }
         let len = acc.event_ids.len();
         match acc.event_ids.last_mut() {
             Some(last) if last.1 == from => last.1 = to,
-            _ if len >= EVENT_IDS_CAP => {
-                acc.event_ids_overflow = acc.event_ids_overflow.saturating_add(1);
+            _ if len >= EVENT_IDS_CAP => { acc.event_ids_overflow = acc.event_ids_overflow.saturating_add(1);
                 if let Some(sink) = &acc.event_sink { sink.ids_overflow.fetch_add(1, Relaxed); } }
             _ => acc.event_ids.push((from, to)), } }
     fn event_ordinal(&self, ordinal: u32) -> bool {
@@ -520,8 +513,7 @@ impl FecSendSlot {
         let repairs = self.next_id.saturating_sub(self.k);
         let pending = self.next_id.saturating_sub(self.finalized_symbols) as u64;
         let mut r = self.repair_accounting.base_r; let mut cap_bound = false;
-        for g in 0..layout.groups {
-            let kg = layout.group(g).1 as u32; let d = self.group_lost[g];
+        for g in 0..layout.groups { let kg = layout.group(g).1 as u32; let d = self.group_lost[g];
             let rg = if self.next_id < self.k {
                 let want = d.saturating_add(self.repair_accounting.base_b[g]); cap_bound |= want > kg;
                 want.min(kg) } else {
@@ -541,8 +533,7 @@ impl FecSendSlot {
         let acc = &mut self.repair_accounting; let mut segment = acc.budget.as_ref().unwrap().lock().unwrap();
         let old = self.n.saturating_sub(self.k);
         let mut added = demand.saturating_sub(old).min(segment.limit.saturating_sub(segment.reserved));
-        if segment.root.lock().unwrap().cap_percent==0 {
-            let representable=u32::MAX-self.k-old;
+        if segment.root.lock().unwrap().cap_percent==0 { let representable=u32::MAX-self.k-old;
             if added>representable {
                 segment.root.lock().unwrap().sink.lock().unwrap().merge(BudgetBaseInfo {counter_overflow:1,..Default::default()});
                 added=0; } }
@@ -561,7 +552,8 @@ impl FecSendSlot {
         delta.demand_repairs = (demand as u64).saturating_sub(acc.budget_demand);
         delta.cap_shortfall = shortfall.saturating_sub(acc.budget_shortfall);
         delta.known_loss_shortfall = known_shortfall.saturating_sub(acc.budget_known_shortfall);
-        acc.budget_demand = acc.budget_demand.max(demand as u64); acc.budget_shortfall = acc.budget_shortfall.max(shortfall);
+        acc.budget_demand = acc.budget_demand.max(demand as u64);
+        acc.budget_shortfall = acc.budget_shortfall.max(shortfall);
         acc.budget_known_shortfall = acc.budget_known_shortfall.max(known_shortfall);
         if shortfall != 0 {
             if !acc.budget_limited { delta.cap_limited_slots = 1; acc.budget_limited = true; }
@@ -572,25 +564,23 @@ impl FecSendSlot {
         if selector==0 {return;}
         if self.segment.is_some_and(|s|s.offset as usize+self.message.len()!=s.total as usize) {return;}
         let Some(budget)=self.repair_accounting.budget.clone() else {return};
-        let (k,draw,root_base,target_state)={
-            let b=budget.lock().unwrap();let mut root=b.root.lock().unwrap();
+        let (k,draw,root_base,target_state)={ let b=budget.lock().unwrap();let mut root=b.root.lock().unwrap();
             if root.target_tail_applied {return;} root.target_tail_applied=true; let k=root.target_source_symbols;
             (u32::try_from(k).expect("tail root K overflow"),root.target_draw,root.target_risk.p_base,root.target_state.clone()) };
         let remaining=self.n.saturating_sub(self.next_id);
         let tail=crate::target_validation::tail_plan(&target_state,k,remaining,selector,draw,root_base).expect("STP_TV_RISK_TAIL reserve search failed");
-        let old=self.n; let demand=self.n.saturating_sub(self.k).checked_add(tail.added).expect("tail repair demand overflow");
+        let old=self.n;
+        let demand=self.n.saturating_sub(self.k).checked_add(tail.added).expect("tail repair demand overflow");
         if tail.added!=0 {self.budget_plan(demand);}
         let mut b=budget.lock().unwrap();b.target_tail_added=self.n-old;
         #[cfg(feature="research_target_validation")]
         if let Some(owner)=&b.target_owner {let mut row=owner.lock().unwrap();row.tail_risk=tail.risk;row.tail_k=tail.k;row.tail_added=b.target_tail_added;}
     }
     fn refresh_budget_plan(&mut self, a: &crate::fec_adapt::FecAdaptiveState) {
-        {
-            let segment=self.repair_accounting.budget.as_ref().unwrap().lock().unwrap();
+        { let segment=self.repair_accounting.budget.as_ref().unwrap().lock().unwrap();
             #[cfg(feature="research_target_validation")]
             if let Some(owner)=&segment.target_owner {owner.lock().unwrap().known_losses=segment.target_prior_losses.saturating_add(self.group_lost.iter().copied().sum::<u32>());}
-            if a.target_selector()!=0 {
-                let tail=segment.target_tail_added;
+            if a.target_selector()!=0 { let tail=segment.target_tail_added;
                 let r=segment.target_prior_losses.checked_add(tail).and_then(|start|self.group_lost.iter().zip(&self.repair_accounting.base_b).try_fold(start,|sum,(&d,&b)|sum.checked_add(d)?.checked_add(b)));
                 drop(segment);
                 match r {Some(r) if r<=u32::MAX-self.k=>self.budget_plan(r),_=>self.repair_accounting.budget.as_ref().unwrap().lock().unwrap().root.lock().unwrap().sink.lock().unwrap().merge(BudgetBaseInfo{counter_overflow:1,..Default::default()})}
@@ -656,8 +646,7 @@ impl FecSendSlot {
         self.refresh_plan_inner(a);
         #[cfg(feature = "research_budget_diagnostic")]
         if self.n != before { if let Some(l) = self.diagnostic { diag::layout_event(l, self.n, self.next_id, monotonic_clock_ns(), 1); } } }
-    fn refresh_plan_inner(&mut self, a: &crate::fec_adapt::FecAdaptiveState) {
-        use crate::fec_adapt::RepairPolicy;
+    fn refresh_plan_inner(&mut self, a: &crate::fec_adapt::FecAdaptiveState) { use crate::fec_adapt::RepairPolicy;
         if a.policy == RepairPolicy::MeanOpen || a.policy == RepairPolicy::MeanTopup { return; }
         if matches!(a.policy, RepairPolicy::Streaming | RepairPolicy::MessageBound) {
             if self.repair_accounting.budget.is_some() { self.refresh_budget_plan(a); return; }
@@ -671,12 +660,13 @@ impl FecSendSlot {
             let base0 = if self.repair_accounting.event_bonus.is_empty() { base } else {
                 let r0 = (0..layout.groups).map(|g| self.group_lost[g].saturating_add(margin).min(layout.group(g).1 as u32)).max().unwrap();
                 layout.round_plan(self.k.saturating_add(r0 * layout.groups as u32)) };
-            let unbonused_before = self.repair_accounting.unbonused_n; let bonus = self.repair_accounting.category_bonus;
-            self.repair_accounting.unbonused_n = self.repair_accounting.unbonused_n.max(self.n.saturating_sub(bonus)).max(base);
+            let unbonused_before = self.repair_accounting.unbonused_n;
+            let bonus = self.repair_accounting.category_bonus;
+            self.repair_accounting.unbonused_n = self.repair_accounting.unbonused_n
+                .max(self.n.saturating_sub(bonus)).max(base);
             let target = self.repair_accounting.unbonused_n.saturating_add(bonus);
             self.n = self.n.max(if bonus == 0 { target } else { target.min(self.k.saturating_mul(2)) });
-            if !self.repair_accounting.event_bonus.is_empty() {
-                let without = old_n.max(unbonused_before).max(base0);
+            if !self.repair_accounting.event_bonus.is_empty() { let without = old_n.max(unbonused_before).max(base0);
                 if self.n > without { self.event_attribute(without, self.n); } }
             let known = self.group_lost.iter().copied().max().unwrap_or(0);
             let known_n = self.k.saturating_add((known + 2).saturating_mul(layout.groups as u32));
@@ -686,8 +676,7 @@ impl FecSendSlot {
         let groups = layout.groups as u64; let sources = self.next_id.min(self.k) as u64;
         let repairs = self.next_id.saturating_sub(self.k) as u64; let mut per_group_repairs = 0;
         let (whole_k, target_groups, burst_tail) = self.plan_context();
-        for group in 0..layout.groups {
-            let k = layout.group(group).1 as u64;
+        for group in 0..layout.groups { let k = layout.group(group).1 as u64;
             let source_sent = (sources / groups + u64::from((group as u64) < sources % groups)).min(k);
             let repair_sent = repairs / groups + u64::from((group as u64) < repairs % groups);
             let total_repairs = repair_sent + a.extra_repair_blocks_needed_for_group_at_tail(k, whole_k, target_groups, source_sent + repair_sent, repair_sent, self.group_lost[group] as u64, burst_tail);
@@ -704,20 +693,19 @@ type PlanKs = std::sync::Arc<std::sync::Mutex<UnitPlan>>;
 impl UnitPlan {
     fn new(cap: usize) -> PlanKs { std::sync::Arc::new(std::sync::Mutex::new(Self { cap, ..Default::default() })) }
     fn record(&mut self, offset: u32, len: u32, k: u64) {
-        if offset as usize == self.end() {
-            let i = self.units.len() + 1; let low = i & i.wrapping_neg();
+        if offset as usize == self.end() { let i = self.units.len() + 1; let low = i & i.wrapping_neg();
             let node = k.wrapping_add(self.fenwick_prefix(i - 1)).wrapping_sub(self.fenwick_prefix(i - low));
             self.units.push((offset, len, k)); self.fenwick.push(node);
             self.total_k = self.total_k.checked_add(k).expect("adaptive root K overflow");
             return; }
         let i = self.units.partition_point(|u| u.0 < offset);
         let u = self.units.get_mut(i).filter(|u| u.0 == offset).expect("adaptive units start contiguously");
-        assert_eq!(u.1, len, "adaptive unit range is immutable"); let (old, delta) = (u.2, k.wrapping_sub(u.2)); u.2 = k;
+        assert_eq!(u.1, len, "adaptive unit range is immutable"); let (old, delta) = (u.2, k.wrapping_sub(u.2));
+        u.2 = k;
         self.total_k = self.total_k.checked_sub(old).and_then(|t| t.checked_add(k)).expect("adaptive root K overflow");
         let mut j = i + 1;
         while j <= self.fenwick.len() { self.fenwick[j - 1] = self.fenwick[j - 1].wrapping_add(delta); j += j & j.wrapping_neg(); } }
-    fn fenwick_prefix(&self, mut n: usize) -> u64 {
-        let mut sum = 0u64;
+    fn fenwick_prefix(&self, mut n: usize) -> u64 { let mut sum = 0u64;
         while n > 0 { sum = sum.wrapping_add(self.fenwick[n - 1]); n &= n - 1; }
         sum }
     fn end(&self) -> usize { self.units.last().map_or(0, |u| u.0 as usize + u.1 as usize) }
@@ -743,7 +731,8 @@ fn adaptive_exposure_cap(snap: ExposureSnapshot, width: usize, upper: impl Fn(u3
     while lo < hi { let mid = lo + (hi - lo).div_ceil(2); if fits(mid) { lo = mid } else { hi = mid - 1 } }
     lo * w }
 fn adaptive_unit_len(rem: usize, cap: usize) -> usize { rem.div_ceil(balanced_parts(rem, cap).0.max(1)) }
-fn segment_width(len: usize, block_bytes: usize) -> usize { block_bytes.min(len.saturating_sub(1).max(FEC_MIN_BLOCK_BYTES)) }
+fn segment_width(len: usize, block_bytes: usize) -> usize {
+    block_bytes.min(len.saturating_sub(1).max(FEC_MIN_BLOCK_BYTES)) }
 fn segment_unit_k(len: usize, block_bytes: usize) -> usize { len.div_ceil(segment_width(len, block_bytes).max(1)) }
 fn segment_unit_count(total: usize, plan_ks: Option<&PlanKs>) -> usize {
     let Some(plan) = plan_ks else { return total.div_ceil(FEC_SEGMENT_BYTES); }; let plan = plan.lock().unwrap();
@@ -769,15 +758,14 @@ pub(crate) const ADAPTIVE_MIN_UNIT_LEN: usize = FEC_MIN_BLOCK_BYTES + 1;
     plan_ks: PlanKs, message: std::sync::Arc<Vec<u8>>, offset: usize, root: u64,
     root_lease: Option<std::sync::Arc<PackageLease>>, }
 impl FecSegment {
-    fn valid(self, len: usize) -> bool {
-        let total = self.total as usize; let offset = self.offset as usize;
+    fn valid(self, len: usize) -> bool { let total = self.total as usize; let offset = self.offset as usize;
         let Some(end) = offset.checked_add(len) else { return false; };
         total <= MAX_JUMBOGRAM_LEN && len >= 1 && len < total && len <= FEC_SEGMENT_BYTES &&
             end <= total && len >= ADAPTIVE_MIN_UNIT_LEN } }
 pub const STP_EXT_KIND_GROUPED_FEC: u64 = 2; pub const FEC_INLINE_MAX_BLOCKS: usize = 256;
 const MAX_RECV_PACKETS_PER_TICK: usize = 64; const MAX_SEND_PACKETS_PER_TICK: u64 = 64;
-// One million pps, matching the existing startup ceiling. Bound long-lived cubic probing too; this is an arithmetic safety limit,
-// not a congestion signal.
+// One million pps, matching the existing startup ceiling. Bound long-lived cubic probing too; this is an arithmetic
+// safety limit, not a congestion signal.
 const MAX_CC_RATE_UPPS: u64 = 1_000_000_000_000; const MAX_SEND_CATCHUP_NS: u64 = 2_000_000;
 #[derive(Debug)] struct SendPacingGrant { packets: u64, carry_ns: u64 }
 fn rate_mul_div(rate: u64, multiplier: u64, divisor: u64) -> u64 {
@@ -810,7 +798,8 @@ fn parked_send_deadline(state: &ConnectionStateConnected, now: u64, cc: &Congest
 fn send_pacing_grant(elapsed_ns: u64, interval_ns: u64, credit_ns: u64) -> SendPacingGrant {
     let interval_ns = interval_ns.max(1); let budget = elapsed_ns.saturating_add(credit_ns);
     let due = budget / interval_ns; let packets = due.min(MAX_SEND_PACKETS_PER_TICK);
-    let carry_ns = if due > packets { (budget - packets * interval_ns).min(MAX_SEND_CATCHUP_NS) } else { budget % interval_ns };
+    let carry_ns = if due > packets {
+        (budget - packets * interval_ns).min(MAX_SEND_CATCHUP_NS) } else { budget % interval_ns };
     SendPacingGrant { packets, carry_ns } }
 pub enum UnreliableFragment<'a> {
     Plain { is_fin: bool, package_id: u64, data: &'a [u8], offset: u32 },
@@ -853,7 +842,8 @@ impl UnreliableSendBuffer {
             self.fec_send_slot.as_ref().is_none_or(|f| f.segment.is_none() && f.message.len() <= FEC_SEGMENT_BYTES &&
                 crate::fec::MessageLayout::new(f.message.len(), f.block_bytes).is_some_and(|l| l.groups == 1)) }
     fn slipstream_has_owner(&self) -> bool {
-        self.partial_send_slot.is_some() || self.fec_send_slot.is_some() || self.segmented_send.is_some() || self.p4_open }
+        self.partial_send_slot.is_some() || self.fec_send_slot.is_some() ||
+            self.segmented_send.is_some() || self.p4_open }
     fn slipstream_classify(&mut self, payload_len: usize) {
         if !self.slipstream_head || self.slipstream_eligible.is_some() { return; }
         let packets = owner_remaining_packets(self.fec_send_slot.as_ref(), self.fec_suspended.as_ref(),
@@ -872,8 +862,7 @@ impl UnreliableSendBuffer {
             "eligible" => i.heads_eligible += 1, "short" => i.ineligible_short += 1,
             "long" => i.ineligible_long += 1, _ => i.ineligible_other += 1, }
         self.slipstream_trace_event("evaluate", reason, "", 0, 0, payload_len); }
-    fn slipstream_select(&mut self, payload_len: usize, space: usize) {
-        self.slipstream_payload_len = payload_len;
+    fn slipstream_select(&mut self, payload_len: usize, space: usize) { self.slipstream_payload_len = payload_len;
         if space != payload_len || self.slipstream_packet == Some(self.next_packet_seq) { return; }
         if self.slipstream_has_owner() {
             self.slipstream_classify(payload_len); let mut c = MessageSendContext::empty(); c.swap(self);
@@ -881,8 +870,9 @@ impl UnreliableSendBuffer {
         if !self.interleave_parked.iter().any(|c| c.slipstream_head) {
             if let Some(c) = self.interleave_parked.front_mut() {
                 c.slipstream_head = true; c.slipstream_eligible = None; self.slipstream_turn_head = true;
-                self.slipstream_info.head_promotions += 1;
-            } else { self.slipstream_head = true; self.slipstream_eligible = None; self.slipstream_turn_head = true; return; } }
+                self.slipstream_info.head_promotions += 1; } else {
+                self.slipstream_head = true; self.slipstream_eligible = None; self.slipstream_turn_head = true;
+                return; } }
         let head_index = self.interleave_parked.iter().position(|c| c.slipstream_head).unwrap();
         if self.interleave_parked[head_index].slipstream_eligible.is_none() {
             let mut c = self.interleave_parked.remove(head_index).unwrap(); c.swap(self);
@@ -896,8 +886,7 @@ impl UnreliableSendBuffer {
                 if self.interleave_source_bytes().saturating_add(reserve) <= self.current_byte_capacity() as usize {
                     let (dscp, m) = self.message_queue.pop_front().unwrap(); self.current_dscp = dscp;
                     self.slipstream_head = false; self.slipstream_eligible = None; self.start_message(m, payload_len);
-                    if self.slipstream_has_owner() {
-                        let mut c = MessageSendContext::empty(); c.swap(self);
+                    if self.slipstream_has_owner() { let mut c = MessageSendContext::empty(); c.swap(self);
                         self.interleave_parked.push_back(c); } } } }
         debug_assert!(self.interleave_parked.len() <= 2);
         let unstarted = |c: &MessageSendContext| !c.slipstream_started ||
@@ -926,8 +915,7 @@ impl UnreliableSendBuffer {
         c.swap(self); }
     fn slipstream_emitted(&mut self, payload_len: usize) {
         if !self.slipstream { return; }
-        if !self.slipstream_started {
-            self.slipstream_started = true;
+        if !self.slipstream_started { self.slipstream_started = true;
             if !self.slipstream_head {
                 let kind = if self.logical_len > FEC_SEGMENT_BYTES || self.segmented_send.is_some() ||
                     self.fec_send_slot.as_ref().is_some_and(|f| f.segment.is_some()) { "segmented_giant" }
@@ -942,8 +930,7 @@ impl UnreliableSendBuffer {
         if concurrent > 2 { self.slipstream_info.recursive_windows += 1; }
         if self.slipstream_packet == Some(self.next_packet_seq) { return; }
         self.slipstream_packet = Some(self.next_packet_seq);
-        if self.slipstream_head {
-            self.slipstream_head_packets += 1;
+        if self.slipstream_head { self.slipstream_head_packets += 1;
             if self.slipstream_eligible == Some(true) && (!self.interleave_parked.is_empty() || !self.message_queue.is_empty()) {
                 self.slipstream_info.head_packets_alternated += 1; }
         } else { self.slipstream_follow_packets += 1; self.slipstream_info.follower_packets += 1; }
@@ -966,7 +953,8 @@ impl UnreliableSendBuffer {
             self.fec_now_ns, self.slipstream_queue, self.fec_rtt_ns).expect("write slipstream trace"); }
     fn interleave_select(&mut self, payload_len: usize, space: usize) {
         if self.slipstream { self.slipstream_select(payload_len, space); return; }
-        if self.interleave_width == 1 || space != payload_len || self.interleave_last_packet == Some(self.next_packet_seq) ||
+        if self.interleave_width == 1 || space != payload_len ||
+            self.interleave_last_packet == Some(self.next_packet_seq) ||
             !self.fec_adaptive.as_ref().is_some_and(|a| a.policy == crate::fec_adapt::RepairPolicy::MessageBound) ||
             !self.interleave_parkable() { return; }
         self.interleave_last_packet = Some(self.next_packet_seq);
@@ -976,8 +964,7 @@ impl UnreliableSendBuffer {
                 .and_then(|b| crate::fec::MessageLayout::new(m.len(), b)).is_some_and(|l| l.groups == 1));
         let selected = self.partial_send_slot.is_some() || self.fec_send_slot.is_some();
         if self.interleave_parked.is_empty() && (!selected || !eligible_head) { return; }
-        if selected {
-            let mut current = MessageSendContext::empty(); current.swap(self);
+        if selected { let mut current = MessageSendContext::empty(); current.swap(self);
             self.interleave_parked.push_back(current); }
         if eligible_head && self.interleave_parked.len() < self.interleave_width {
             let bytes = self.message_queue.front().unwrap().1.capacity();
@@ -990,8 +977,7 @@ impl UnreliableSendBuffer {
             c.partial_send_slot.as_ref().is_some_and(|(_, offset)| *offset == 0);
         let first_start = self.interleave_parked.iter().filter(|c| unstarted(c)).map(|c| c.send_package_id).min();
         let count = self.interleave_parked.len(); let mut selected = false;
-        for _ in 0..count {
-            let mut context = self.interleave_parked.pop_front().unwrap();
+        for _ in 0..count { let mut context = self.interleave_parked.pop_front().unwrap();
             let in_order = !unstarted(&context) || Some(context.send_package_id) == first_start;
             let ready = in_order && context.fec_send_slot.as_mut().is_none_or(|f|
                 (f.block_bytes + STP_FEC_FRAGMENT_HEADER_SIZE <= payload_len || Self::encoder_initialized(f)) && Self::encoder_ready(f));
@@ -1012,8 +998,7 @@ impl UnreliableSendBuffer {
                     #[cfg(feature = "research_cohort_observer")] crate::cohort_observe::fec_encoder_failed();
                     FecEncoderState::Failed } }; }
         true }
-    fn can_emit(&mut self) -> bool {
-        self.reclaim_finished_partial();
+    fn can_emit(&mut self) -> bool { self.reclaim_finished_partial();
         if self.interleave_parked.iter_mut().any(|c| c.fec_send_slot.as_mut().is_none_or(Self::encoder_ready)) { return true; }
         if self.interleave_width > 1 && !self.message_queue.is_empty() && self.interleave_parkable() { return true; }
         if self.partial_send_slot.is_some() { return true; }
@@ -1022,8 +1007,7 @@ impl UnreliableSendBuffer {
                 if let Some(r) = self.fec_retained.get_mut(&package) { return Self::encoder_ready(&mut r.slot); } } }
         if let Some(f) = &mut self.fec_send_slot { return Self::encoder_ready(f); }
         self.has_unsent_data() }
-    pub fn fec_prepare_packet(&mut self, seq: u64) {
-        self.next_packet_seq = seq;
+    pub fn fec_prepare_packet(&mut self, seq: u64) { self.next_packet_seq = seq;
         if let Some(tags) = &mut self.fec_packet_tags { tags.take((seq % PACKETS_WAITING_ACK_CAPACITY) as usize); }
         self.fec_extra_packet_tags.remove(&(seq % PACKETS_WAITING_ACK_CAPACITY)); }
     fn tag_symbol(&mut self, package: u64, ordinal: u32) {
@@ -1042,13 +1026,13 @@ impl UnreliableSendBuffer {
         self.fec_finalize_tags(seq, lost, extra.as_deref().unwrap_or(&[]));
         if tag != 0 { self.fec_finalize_tags(seq, lost, &[tag]); } }
     fn fec_finalize_tags(&mut self, seq: u64, lost: bool, tags: &[u128]) {
-        for &tag in tags {
-            let count = ((tag >> 32) & 0xffff_ffff) as u32;
+        for &tag in tags { let count = ((tag >> 32) & 0xffff_ffff) as u32;
             if count == 0 { continue; }
             let package = (tag >> 64) as u64;
             if let Some(index) = self.interleave_parked.iter().position(|c| c.owns_package(package)) {
                 let mut context = self.interleave_parked.remove(index).unwrap(); context.swap(self);
-                self.fec_finalize_tags(seq, lost, &[tag]); context.swap(self); self.interleave_parked.insert(index, context);
+                self.fec_finalize_tags(seq, lost, &[tag]); context.swap(self);
+                self.interleave_parked.insert(index, context);
                 continue; }
             let active = self.fec_send_slot.is_some() && package == self.fec_rescue_package.unwrap_or(self.send_package_id);
             let suspended = self.fec_suspended.is_some() && package == self.send_package_id;
@@ -1062,18 +1046,14 @@ impl UnreliableSendBuffer {
             let first = tag as u32;
             if seq < f.first_seq || first.saturating_add(count) > f.next_id { continue; }
             f.finalized_symbols = f.finalized_symbols.saturating_add(count);
-            if lost {
-                f.lost = f.lost.saturating_add(count);
-                {
-                    let layout = crate::fec::MessageLayout::new(f.message.len(), f.block_bytes).unwrap();
-                    for ordinal in first..first + count {
-                        let group = layout.local_id(layout.wire_id(ordinal)).0;
+            if lost { f.lost = f.lost.saturating_add(count);
+                { let layout = crate::fec::MessageLayout::new(f.message.len(), f.block_bytes).unwrap();
+                    for ordinal in first..first + count { let group = layout.local_id(layout.wire_id(ordinal)).0;
                         f.group_lost[group] = f.group_lost[group].saturating_add(1); } }
                 if suspended || active && self.fec_rescue_package.is_none() || f.repair_policy == crate::fec_adapt::RepairPolicy::MessageBound {
                     if let Some(a) = &self.fec_adaptive { f.refresh_plan(a); } } }
             if !suspended && (!active || self.fec_rescue_package.is_some()) { f.rescue_plan(); }
-            if retained {
-                let ready = f.next_id < f.n; let done = !ready && f.finalized_symbols >= f.next_id;
+            if retained { let ready = f.next_id < f.n; let done = !ready && f.finalized_symbols >= f.next_id;
                 if ready && !was_ready { self.rescue_ready.push_back(package); self.rescue_ready_count += 1; }
                 if !ready && was_ready { self.rescue_ready_count -= 1; }
                 if done { self.remove_retained(package); } } } }
@@ -1086,7 +1066,8 @@ impl UnreliableSendBuffer {
         self.remove_retained(package) }
     fn ready_rescue_package(&mut self) -> Option<u64> {
         while let Some(&package) = self.rescue_ready.front() {
-            if self.fec_retained.get(&package).is_some_and(|r| r.expires_ns <= self.fec_now_ns) { self.remove_retained(package); }
+            if self.fec_retained.get(&package).is_some_and(|r| r.expires_ns <= self.fec_now_ns) {
+                self.remove_retained(package); }
             if self.fec_retained.get(&package).is_some_and(|r| r.slot.next_id > 0 && r.slot.next_id < r.slot.n) { return Some(package); }
             self.rescue_ready.pop_front(); }
         None }
@@ -1140,14 +1121,14 @@ impl UnreliableSendBuffer {
                 self.queue_bytes_filled += m.len(); self.message_queue.push_back((dscp, m));
             } else { rejected.push((dscp, m)); rejected.extend(iter); break; } }
         rejected }
-    pub fn free_bytes(&mut self) -> u64 {
-        self.reclaim_finished_partial();
+    pub fn free_bytes(&mut self) -> u64 { self.reclaim_finished_partial();
         if self.queue_bytes_filled == 0 { return u64::MAX; }
         (self.current_byte_capacity() as u64).saturating_sub(self.queue_bytes_filled as u64) }
     pub fn has_unsent_data(&self) -> bool {
         if !self.interleave_parked.is_empty() { return true; }
         if !self.message_queue.is_empty() || self.segmented_send.is_some() { return true; }
-        if let Some((msg, start_byte)) = &self.partial_send_slot { if (*start_byte as usize) < msg.len() { return true; } }
+        if let Some((msg, start_byte)) = &self.partial_send_slot {
+            if (*start_byte as usize) < msg.len() { return true; } }
         if let Some(f) = &self.fec_send_slot { if f.next_id < f.n { return true; } }
         self.fec_suspended.as_ref().is_some_and(|f| f.next_id < f.n) || self.rescue_ready_count != 0 }
     fn fec_expire_active_rescue(&mut self) {
@@ -1161,9 +1142,9 @@ impl UnreliableSendBuffer {
         if !self.fec_send_slot.as_ref().is_some_and(|f| f.next_id >= f.k ||
             f.repair_accounting.budget.is_some() && f.next_id + 1 == f.k && f.n == f.k) { return; }
         self.p4_tail_refreshed = true; let Some(a) = &self.fec_adaptive else { return; };
-        for (&package, r) in &mut self.fec_retained {
-            let ready = r.slot.next_id < r.slot.n; r.slot.refresh_plan(a);
-            if !ready && r.slot.next_id < r.slot.n { self.rescue_ready.push_back(package); self.rescue_ready_count += 1; } } }
+        for (&package, r) in &mut self.fec_retained { let ready = r.slot.next_id < r.slot.n; r.slot.refresh_plan(a);
+            if !ready && r.slot.next_id < r.slot.n { self.rescue_ready.push_back(package);
+                self.rescue_ready_count += 1; } } }
     fn p4_finish_if_idle(&mut self) {
         if self.p4_open && self.fec_send_slot.is_none() && self.fec_suspended.is_none() &&
             self.segmented_send.is_none() && self.rescue_ready_count == 0 {
@@ -1208,8 +1189,7 @@ impl UnreliableSendBuffer {
                 self.rescue_ready.push_back(package); self.rescue_ready_count += 1;
                 info.ready_added += 1; } }
         self.fec_adaptive = Some(a); }
-    fn event_info(&self) -> EventRepairInfo {
-        use std::sync::atomic::Ordering::Relaxed;
+    fn event_info(&self) -> EventRepairInfo { use std::sync::atomic::Ordering::Relaxed;
         EventRepairInfo { planned: self.event_sink.planned.load(Relaxed), ids_overflow: self.event_sink.ids_overflow.load(Relaxed),
             counter_overflow: self.event_repair.counter_overflow.max(self.event_sink.overflow.load(Relaxed)), ..self.event_repair } }
     fn fec_commit_marks(&mut self, seq: u64, sent: u64) {
@@ -1235,8 +1215,7 @@ impl UnreliableSendBuffer {
                 else if self.fec_suspended.is_some() && m.package == self.send_package_id { self.fec_suspended.as_mut() }
                 else { self.fec_retained.get_mut(&m.package).map(|r| &mut r.slot) };
             if let Some(f) = f { f.repair_accounting.first_source_commit.get_or_insert((seq, sent)); } } }
-    fn reclaim_finished_partial(&mut self) {
-        self.fec_expire_active_rescue();
+    fn reclaim_finished_partial(&mut self) { self.fec_expire_active_rescue();
         if let Some((msg, start_byte)) = &self.partial_send_slot {
             if *start_byte as usize >= msg.len() {
                 let msg_len = msg.len(); self.queue_bytes_filled -= msg_len; self.queued_ledger.retire(msg_len);
@@ -1244,11 +1223,11 @@ impl UnreliableSendBuffer {
                 self.partial_send_slot = None; self.package_lease = None;
                 self.send_package_id = self.send_package_id.checked_add(1).expect("message identity exhausted"); } }
         if let Some(f) = &self.fec_send_slot {
-            if f.next_id >= f.n {
-                let message_len = f.message.len(); let rescue = self.fec_rescue_package.take();
-                let package = rescue.unwrap_or(self.send_package_id); let mut finished = self.fec_send_slot.take().unwrap();
-                if rescue.is_none() {
-                    self.queue_bytes_filled -= message_len; self.queued_ledger.retire(message_len); self.package_lease = None;
+            if f.next_id >= f.n { let message_len = f.message.len(); let rescue = self.fec_rescue_package.take();
+                let package = rescue.unwrap_or(self.send_package_id);
+                let mut finished = self.fec_send_slot.take().unwrap();
+                if rescue.is_none() { self.queue_bytes_filled -= message_len; self.queued_ledger.retire(message_len);
+                    self.package_lease = None;
                     self.send_package_id = self.send_package_id.checked_add(1).expect("message identity exhausted"); }
                 finished.rescue_plan();
                 if message_len > FEC_RETAIN_SOURCE_BYTES { drop(finished); }
@@ -1260,7 +1239,8 @@ impl UnreliableSendBuffer {
         let block_bytes = payload_len.checked_sub(STP_FEC_FRAGMENT_HEADER_SIZE)?.min(0x3fff);
         crate::fec::MessageLayout::new(message_len, block_bytes)?;
         Some(block_bytes) }
-    fn exposure_sized(&self) -> bool { self.tu_unresolved && self.fec_adaptive.as_ref().is_some_and(|a| a.budget_base_active()) }
+    fn exposure_sized(&self) -> bool {
+        self.tu_unresolved && self.fec_adaptive.as_ref().is_some_and(|a| a.budget_base_active()) }
     fn adaptive_unit_cap_floor(&self, payload_len: usize) -> usize {
         if !self.tu_unresolved { return FEC_SEGMENT_BYTES; }
         if !self.exposure_sized() { return ADAPTIVE_PREFIX_CAP; }
@@ -1279,8 +1259,7 @@ impl UnreliableSendBuffer {
         self.fec_adaptive.is_some() && len >= 2 * ADAPTIVE_MIN_UNIT_LEN && len > self.adaptive_unit_cap_floor(payload_len) }
     fn segmented_class(&self, len: usize, payload_len: usize) -> bool {
         len > FEC_SEGMENT_BYTES || self.may_segment(len, payload_len) }
-    fn ensure_budget_root(&mut self, root_message: &[u8]) {
-        let Some(a) = self.fec_adaptive.as_ref() else { return; };
+    fn ensure_budget_root(&mut self, root_message: &[u8]) { let Some(a) = self.fec_adaptive.as_ref() else { return; };
         if !a.budget_base_active() || self.budget_root.is_some() { return; }
         let cap_percent = a.repair_cap_percent();
         self.target_root_sequence=self.target_root_sequence.checked_add(1).expect("target root ordinal exhausted");
@@ -1297,7 +1276,8 @@ impl UnreliableSendBuffer {
         restart_budget: Option<std::sync::Arc<std::sync::Mutex<BudgetSegment>>>) {
         let layout = crate::fec::MessageLayout::new(message.len(), block_bytes).unwrap(); let k = layout.k as u32;
         let a = self.fec_adaptive.as_ref().expect("adaptive FEC initialized before coding");
-        if a.policy == crate::fec_adapt::RepairPolicy::MessageBound { self.p4_open = true; self.p4_tail_refreshed = false; }
+        if a.policy == crate::fec_adapt::RepairPolicy::MessageBound { self.p4_open = true;
+            self.p4_tail_refreshed = false; }
         let total = segment.map_or(message.len(), |s| s.total as usize);
         if let (Some(segment), Some(ks)) = (segment, &plan_ks) {
             ks.lock().unwrap().record(segment.offset, message.len() as u32, k as u64); }
@@ -1350,7 +1330,8 @@ impl UnreliableSendBuffer {
                 let root = self.budget_root.get_or_insert_with(|| {
                     self.budget_sink.lock().unwrap().merge(BudgetBaseInfo { roots: 1, ..Default::default() });
                     std::sync::Arc::new(std::sync::Mutex::new(BudgetRoot { sink: self.budget_sink.clone(), limited: false, cap_percent: a.repair_cap_percent(),
-                        target_tail_applied:false, target_risk:crate::target_validation::risk_admission(&self.target_state),
+                        target_tail_applied:false,
+                        target_risk:crate::target_validation::risk_admission(&self.target_state),
                         target_draw:0,target_ordinal:0,
                         target_app_tag:[0;8],#[cfg(feature="research_target_validation")] target_owners:Vec::new(),target_state:self.target_state.clone(),target_source_symbols:0 }))
                 }).clone();
@@ -1384,8 +1365,7 @@ impl UnreliableSendBuffer {
         self.fec_packet_tags.get_or_insert_with(PacketTags::default);
         self.fec_send_slot = Some(FecSendSlot { #[cfg(feature = "research_budget_diagnostic")] diagnostic: None, segment, root_lease, plan_ks, retention_lease: None, retain_limit: self.retention_quota.byte_limit, package_lease: self.package_lease.clone(), dscp: self.current_dscp, finalized_symbols: 0, send_started_ns: self.fec_now_ns, original_send_duration_ns: None, repair_policy: a.policy, rescue_rounds: 0, retained_until_ns: None, original_symbols: None, repair_accounting: RepairAccounting { unbonused_n: n_base, category_bonus, base_b, base_r, base_cap_bound, budget, data_anchor: anchor, ..Default::default() }, group_lost: vec![0; layout.groups], message, block_bytes, k, n, next_id: 0, encoder, block_buf: vec![0u8; block_bytes], first_seq: self.next_packet_seq, lost: 0, n_planned: n, loss_estimate });
         if let Some(f) = &mut self.fec_send_slot {
-            if f.repair_accounting.budget.is_some() {
-                f.n = k; f.budget_plan(n.saturating_sub(k)); let count = f.n - k;
+            if f.repair_accounting.budget.is_some() { f.n = k; f.budget_plan(n.saturating_sub(k)); let count = f.n - k;
                 if a.target_selector()==0 {for (g, b) in f.repair_accounting.base_b.iter_mut().enumerate() {
                     *b = count / layout.groups as u32 + u32::from((g as u32) < count % layout.groups as u32); }}
                 #[cfg(feature="research_target_validation")]
@@ -1401,22 +1381,20 @@ impl UnreliableSendBuffer {
                     planned:f.n, phase:app.map(|m|m[1]),app_id:app.map(|m|u32::from_le_bytes(m[2..6].try_into().unwrap())),
                     ns:self.fec_now_ns, ..Default::default() }));
                 self.diagnostic_last=f.diagnostic;
-                if let Some(segment)=&f.repair_accounting.budget {
-                    let mut segment=segment.lock().unwrap();
+                if let Some(segment)=&f.repair_accounting.budget { let mut segment=segment.lock().unwrap();
                     if segment.diagnostic_owner_generation==0 {segment.diagnostic_owner_generation=f.diagnostic.unwrap().generation;} } } } }
-    fn start_message(&mut self, msg: Vec<u8>, payload_len: usize) -> bool {
-        self.package_lease = None;
+    fn start_message(&mut self, msg: Vec<u8>, payload_len: usize) -> bool { self.package_lease = None;
         if let Some(ids) = self.package_allocator.clone() {
-            let Some(lease) = ids.allocate() else { self.message_queue.push_front((self.current_dscp, msg)); return false; };
+            let Some(lease) = ids.allocate() else { self.message_queue.push_front((self.current_dscp, msg));
+                return false; };
             self.send_package_id = lease.id;
             self.package_lease = Some(lease); }
-        if self.slipstream {
-            let mut tag = [0; 8]; let len = msg.len().min(8); tag[..len].copy_from_slice(&msg[..len]);
-            self.logical_root = self.send_package_id; self.logical_tag = u64::from_le_bytes(tag); self.logical_len = msg.len();
+        if self.slipstream { let mut tag = [0; 8]; let len = msg.len().min(8); tag[..len].copy_from_slice(&msg[..len]);
+            self.logical_root = self.send_package_id; self.logical_tag = u64::from_le_bytes(tag);
+            self.logical_len = msg.len();
             self.slipstream_started = false; }
         self.category_eligible = None; self.budget_root = None;
-        let cap = if self.may_segment(msg.len(), payload_len) {
-            self.ensure_budget_root(&msg);
+        let cap = if self.may_segment(msg.len(), payload_len) { self.ensure_budget_root(&msg);
             self.adaptive_unit_cap(payload_len, msg.len()) } else { usize::MAX };
         if msg.len() > cap {
             self.segmented_send = Some(SegmentedSend { plan_ks: UnitPlan::new(cap), message: std::sync::Arc::new(msg), offset: 0,
@@ -1444,8 +1422,7 @@ impl UnreliableSendBuffer {
         let block_bytes = segment_width(message.len(), block_bytes);
         self.start_fec_group(message, block_bytes, Some(segment), root_lease, Some(plan_ks), None);
         true }
-    fn resume_suspended(&mut self) {
-        self.fec_send_slot = self.fec_suspended.take();
+    fn resume_suspended(&mut self) { self.fec_send_slot = self.fec_suspended.take();
         if let Some(f) = &mut self.fec_send_slot { f.retention_lease = None; } }
     fn fill_tier(&mut self, payload_len: usize, space: usize, class: Option<Dscp>) -> Option<u8> {
         self.reclaim_finished_partial();
@@ -1456,7 +1433,8 @@ impl UnreliableSendBuffer {
         if self.partial_send_slot.is_none() && (self.fec_send_slot.is_some() ||
             self.segmented_send.is_some() || self.ready_rescue_package().is_some()) { return None; }
         let (dscp, len, offset) = if let Some((m, offset)) = &self.partial_send_slot {
-            (self.current_dscp, m.len(), *offset as usize) } else { let (c,m) = self.message_queue.front()?; (*c, m.len(), 0) };
+            (self.current_dscp, m.len(), *offset as usize)
+        } else { let (c,m) = self.message_queue.front()?; (*c, m.len(), 0) };
         if class.is_some_and(|c| c != dscp) || len > payload_len.saturating_sub(STP_WHOLE_HEADER_SIZE) { return None; }
         if offset == 0 && len + STP_WHOLE_HEADER_SIZE <= space { return Some(1); }
         if offset==0 && self.target_dup_no_chop {return None;}
@@ -1487,8 +1465,7 @@ impl UnreliableSendBuffer {
                 self.fec_send_slot = Some(slot); } }
         if self.partial_send_slot.is_none() && self.fec_send_slot.is_none() {
             if self.segmented_send.is_some() { if !self.start_segment(payload_len) { return None; } } else {
-                if !self.interleave_parked.is_empty() {
-                    let (_, head) = self.message_queue.front()?;
+                if !self.interleave_parked.is_empty() { let (_, head) = self.message_queue.front()?;
                     let extra = head.capacity().saturating_add(if self.slipstream && self.segmented_class(head.len(), payload_len) { head.len() } else { 0 });
                     if self.slipstream && self.slipstream_head ||
                         (head.len() > payload_len.saturating_sub(STP_WHOLE_HEADER_SIZE) && (!self.slipstream || space < payload_len)) ||
@@ -1499,8 +1476,7 @@ impl UnreliableSendBuffer {
                 if self.slipstream && self.slipstream_head { self.slipstream_eligible = None; }
                 if !self.start_message(front_msg, payload_len) { return None; }
                 if self.slipstream { self.slipstream_classify(payload_len); } } }
-        if self.fec_send_slot.is_some() {
-            self.p4_refresh_tail();
+        if self.fec_send_slot.is_some() { self.p4_refresh_tail();
             if self.fec_rescue_package.is_none() { if let (Some(a), Some(f)) = (&self.fec_adaptive, &mut self.fec_send_slot) {
                 if f.next_id >= f.k && (f.next_id == f.k || f.next_id + 1 >= f.n) { f.refresh_plan(a); } } }
             let need = { let f = self.fec_send_slot.as_ref().unwrap(); (if f.segment.is_some() { STP_SEGMENT_FEC_HEADER_SIZE } else { STP_FEC_FRAGMENT_HEADER_SIZE }) + crate::fec::block_len(f.message.len(), f.block_bytes, crate::fec::MessageLayout::new(f.message.len(), f.block_bytes).unwrap().wire_id(f.next_id)) };
@@ -1530,16 +1506,14 @@ impl UnreliableSendBuffer {
                     self.start_fec_group(f.message, payload_len - STP_FEC_FRAGMENT_HEADER_SIZE, None, None, None, f.repair_accounting.budget);
                     return self.next_fragment(payload_len, space); }
                 let f = self.fec_send_slot.take().unwrap(); drop(f.encoder);
-                if self.fec_rescue_package.take().is_some() {
-                    self.resume_suspended();
+                if self.fec_rescue_package.take().is_some() { self.resume_suspended();
                     return self.next_fragment(payload_len, space); }
                 self.send_package_id = self.send_package_id.checked_add(1).expect("message identity exhausted");
                 let msg = std::sync::Arc::try_unwrap(f.message).unwrap_or_else(|a| (*a).clone());
                 if !self.start_message(msg, payload_len) { return None; }
                 return self.next_fragment(payload_len, space); }
             let package_id = self.fec_rescue_package.unwrap_or(self.send_package_id); let mut repair_len = None;
-            {
-                let f = self.fec_send_slot.as_mut().unwrap();
+            { let f = self.fec_send_slot.as_mut().unwrap();
                 if f.next_id >= f.k {
                     if !Self::encoder_initialized(f) { return None; }
                     repair_len = match &mut f.encoder {
@@ -1552,8 +1526,7 @@ impl UnreliableSendBuffer {
             let f = self.fec_send_slot.as_ref().unwrap();
             if f.next_id >= f.n { return self.next_fragment(payload_len, space); }
             self.tag_symbol(package_id, self.fec_send_slot.as_ref().unwrap().next_id);
-            {
-                let f = self.fec_send_slot.as_ref().unwrap();
+            { let f = self.fec_send_slot.as_ref().unwrap();
                 let first_source = f.next_id < f.k && f.repair_accounting.first_source_commit.is_none();
                 let event = u32::from(f.event_ordinal(f.next_id)); let repair = u32::from(f.next_id >= f.k);
                 let source = u32::from(f.next_id < f.k); let budget = f.repair_accounting.budget.clone();
@@ -1585,7 +1558,8 @@ impl UnreliableSendBuffer {
             if f.repair_accounting.budget.is_some() && self.p4_open && f.next_id >= f.n &&
                 self.segmented_send.is_none() && self.fec_suspended.is_none() && self.rescue_ready_count == 0 {
                 self.p4_closing = true; }
-            if f.next_id == 1 || f.next_id == f.k { if let Some(rec) = &mut self.fec_record { rec.push(f.progress_info()); } }
+            if f.next_id == 1 || f.next_id == f.k {
+                if let Some(rec) = &mut self.fec_record { rec.push(f.progress_info()); } }
             let start = id as usize * f.block_bytes; let end = (start + f.block_bytes).min(f.message.len());
             self.packet_dscp = Some(dscp);
             return Some(UnreliableFragment::Fec { segment: f.segment, package_id, message_len: f.message.len() as u32, block_bytes: f.block_bytes as u16, block_id: id, data: &f.message[start..end] });
@@ -1596,7 +1570,8 @@ impl UnreliableSendBuffer {
         let frag_size = space.checked_sub(if whole { STP_WHOLE_HEADER_SIZE } else { STP_FRAGMENT_HEADER_SIZE })?;
         let (msg, start_byte) = self.partial_send_slot.as_mut().unwrap(); let start = *start_byte as usize;
         if frag_size == 0 && !msg.is_empty() { return None; }
-        let ret_size = (msg.len() - start).min(frag_size); *start_byte += ret_size as u32; self.packet_dscp = Some(dscp);
+        let ret_size = (msg.len() - start).min(frag_size); *start_byte += ret_size as u32;
+        self.packet_dscp = Some(dscp);
         Some(UnreliableFragment::Plain { is_fin: *start_byte as usize == msg.len(), package_id: self.send_package_id, data: &msg[start..start + ret_size], offset: start as u32 })
     } }
 #[derive(Debug)] pub struct SendQueues {
@@ -1642,20 +1617,17 @@ impl SendQueues {
     fn set_exposure(&mut self, exposure: ExposureSnapshot) { for q in &mut self.queues { q.exposure = exposure; } }
     fn set_time(&mut self, now: u64, rtt: u64) {
         for q in &mut self.queues { q.fec_now_ns = now; q.fec_rtt_ns = rtt; q.fec_prune_retained(); q.fec_expire_active_rescue(); } }
-    fn set_rate(&mut self, bytes_per_second: u64) {
-        self.total_bytes_per_second = bytes_per_second;
+    fn set_rate(&mut self, bytes_per_second: u64) { self.total_bytes_per_second = bytes_per_second;
         let active = self.queues.iter().filter(|q| q.has_unsent_data()).count().max(1) as u64;
         for q in &mut self.queues { q.current_bytes_per_second = bytes_per_second / active; } }
     fn refresh_queue_rates(&mut self) {
         if self.total_bytes_per_second == 0 || !self.queues.iter().any(|q| q.slipstream || q.category_bonus_percent != 0) { return; }
         let active = self.queues.iter_mut().map(|q| u64::from(q.can_emit())).sum::<u64>().max(1);
         for q in &mut self.queues { q.current_bytes_per_second = self.total_bytes_per_second / active; } }
-    fn set_overhead(&mut self) {
-        let ppm = self.fec_adaptive.as_ref().unwrap().representative_ppm();
+    fn set_overhead(&mut self) { let ppm = self.fec_adaptive.as_ref().unwrap().representative_ppm();
         for q in &mut self.queues { q.fec_capacity_overhead_ppm = ppm; } }
     fn fec_event_repair(&mut self, e: &AcceptedCcEvent) {
-        for q in &mut self.queues {
-            q.fec_adaptive = self.fec_adaptive.take(); q.p4_event_repair(e);
+        for q in &mut self.queues { q.fec_adaptive = self.fec_adaptive.take(); q.p4_event_repair(e);
             self.fec_adaptive = q.fec_adaptive.take(); } }
     fn fec_on_data_committed(&mut self, seq: u64, sent: u64) {
         for q in &mut self.queues { q.fec_commit_marks(seq, sent); }
@@ -1674,7 +1646,8 @@ impl SendQueues {
             let base=if self.target_dup_pairs.contains_key(&seq) {Some(seq)}else{seq.checked_sub(1).filter(|b|self.target_dup_pairs.contains_key(b))};
             if let Some(base)=base {
                 let pair=self.target_dup_pairs.get_mut(&base).unwrap(); pair[(seq-base) as usize]=Some(lost);
-                if let [Some(a),Some(b)]=*pair { self.target_dup_pairs.remove(&base); self.fec_finalize_original(base,a && b); }
+                if let [Some(a),Some(b)]=*pair { self.target_dup_pairs.remove(&base);
+                    self.fec_finalize_original(base,a && b); }
                 return; } }
         self.fec_finalize_original(seq,lost); }
     fn fec_finalize_original(&mut self, seq:u64,lost:bool) {
@@ -1682,7 +1655,8 @@ impl SendQueues {
         let Some(tags) = &mut self.fec_packet_tags else { return; }; let index = seq % PACKETS_WAITING_ACK_CAPACITY;
         let tag = tags.take(index as usize); let extra = self.fec_extra_packet_tags.remove(&index);
         let Some(owners) = &mut self.packet_owner else { return; };
-        let owner = std::mem::replace(&mut owners[index as usize], u8::MAX); let by_owner = self.fec_owner_tags.remove(&index);
+        let owner = std::mem::replace(&mut owners[index as usize], u8::MAX);
+        let by_owner = self.fec_owner_tags.remove(&index);
         for (owner, tag) in by_owner.into_iter().flatten().chain(extra.into_iter().flatten().map(|tag| (owner, tag)))
             .chain(std::iter::once((owner, tag))).filter(|(_, tag)| *tag != 0) {
             let Some(q) = self.queues.get_mut(owner as usize) else { continue; };
@@ -1694,8 +1668,7 @@ impl SendQueues {
         let old = owners[index];
         if old == owner as u8 { return; }
         owners[index] = owner as u8;
-        if let Some(tags) = &mut self.fec_packet_tags {
-            let tag = tags.take(index);
+        if let Some(tags) = &mut self.fec_packet_tags { let tag = tags.take(index);
             if tag != 0 { self.fec_owner_tags.entry(index as u64).or_default().push((old, tag)); } }
         if let Some(tags) = self.fec_extra_packet_tags.remove(&(index as u64)) {
             self.fec_owner_tags.entry(index as u64).or_default().extend(tags.into_iter().map(|tag| (old, tag))); } }
@@ -1714,8 +1687,7 @@ impl SendQueues {
             if self.target_copy_pending() {return self.take_target_copy(payload);}
             for q in &mut self.queues {q.target_dup_no_chop=_duplicate;} }
         let count = self.queues.len(); self.refresh_queue_rates();
-        for i in 0..count {
-            let active = self.queues[i].can_emit();
+        for i in 0..count { let active = self.queues[i].can_emit();
             if !self.queue_active[i] { self.scheduled_bytes[i] = self.scheduled_bytes[i].max(self.service_clock); }
             self.queue_active[i] = active; }
         if let Some(clock) = (0..count).filter(|&i| self.queue_active[i]).map(|i| self.scheduled_bytes[i]).min() {
@@ -1726,8 +1698,7 @@ impl SendQueues {
         let mut blocked = 0u64; let mut cursor = 0; let mut class = None;
         while cursor + STP_WHOLE_HEADER_SIZE <= payload.len() {
             self.refresh_queue_rates(); let mut candidate = None; let mut best = (true, u8::MAX, u64::MAX);
-            for step in 0..count {
-                let i = (self.next_queue + step) % count;
+            for step in 0..count { let i = (self.next_queue + step) % count;
                 if !self.queue_active[i] || blocked & (1u64 << i) != 0 { continue; }
                 if let Some(tier) = self.queues[i].fill_tier(payload.len(), payload.len()-cursor, class) {
                     let debt = class.is_some() && self.scheduled_bytes[i] > self.service_clock + payload.len() as u64;
@@ -1737,12 +1708,16 @@ impl SendQueues {
             while cursor + STP_WHOLE_HEADER_SIZE <= payload.len() {
                 let q = &mut self.queues[i]; q.next_packet_seq = self.next_packet_seq; q.packet_dscp = class;
                 q.fec_adaptive = self.fec_adaptive.take(); q.fec_packet_tags = self.fec_packet_tags.take();
-                q.fec_extra_packet_tags = std::mem::take(&mut self.fec_extra_packet_tags); q.fec_record = self.fec_record.take();
+                q.fec_extra_packet_tags = std::mem::take(&mut self.fec_extra_packet_tags);
+                q.fec_record = self.fec_record.take();
                 let used = q.next_fragment(payload.len(), payload.len() - cursor)
                     .map(|frag| write_fragment(&mut payload[cursor..], frag)).unwrap_or(0);
                 self.fec_adaptive = q.fec_adaptive.take(); self.fec_packet_tags = q.fec_packet_tags.take();
-                self.fec_extra_packet_tags = std::mem::take(&mut q.fec_extra_packet_tags); self.fec_record = q.fec_record.take();
-                if used == 0 { blocked |= 1u64 << i; if cursor == 0 || !q.can_emit() { self.queue_active[i] = false; } break; }
+                self.fec_extra_packet_tags = std::mem::take(&mut q.fec_extra_packet_tags);
+                self.fec_record = q.fec_record.take();
+                if used == 0 { blocked |= 1u64 << i;
+                    if cursor == 0 || !q.can_emit() { self.queue_active[i] = false; }
+                    break; }
                 q.slipstream_emitted(payload.len()); q.queued_ledger.framed = Some(self.next_packet_seq);
                 class = q.packet_dscp; self.last_dscp = class.unwrap(); self.last_queue = i;
                 self.next_queue = (i + 1) % count; self.scheduled_bytes[i] += used as u64; cursor += used;
@@ -1754,12 +1729,12 @@ impl SendQueues {
         payload[cursor..].fill(0xff);
         if _duplicate {self.plan_target_copy(payload);}
         payload.len() }
-    fn plan_target_copy(&mut self,payload:&mut[u8]) {
-        let (messages,fec)=target_dup_counts(payload);
+    fn plan_target_copy(&mut self,payload:&mut[u8]) { let (messages,fec)=target_dup_counts(payload);
         if messages==0 {return;}
         if self.next_packet_seq>=crate::sequence::ACK_SPACE-2 {self.target_dup_fallbacks+=1;return;}
         assert!((1..=6).contains(&payload[0]) && payload[0]&0x30==0,"research flags overlap a frame kind");
-        payload[0]|=TARGET_DUP_ORIGINAL; self.target_duplicate=Some((self.next_packet_seq,self.last_dscp,payload.to_vec()));
+        payload[0]|=TARGET_DUP_ORIGINAL;
+        self.target_duplicate=Some((self.next_packet_seq,self.last_dscp,payload.to_vec()));
         if fec {self.target_dup_pairs.insert(self.next_packet_seq,[None,None]);} } }
 pub const MAX_RECV_QUEUE_BYTES: usize = 64 * 1024 * 1024;
 #[derive(Debug, Default)] pub struct ReceiveQueue {
@@ -1778,17 +1753,17 @@ impl ReceiveQueue {
         self.reservations.push_back(reservation); self.messages.push_back((key, buf));
         while self.bytes > cap_bytes && self.messages.len() > 1 {
             let Some((_, m)) = self.messages.pop_front() else { break; }; self.reservations.pop_front();
-            let n = Self::entry_bytes(&m); self.bytes -= n; self.dropped_messages += 1; self.dropped_messages_total += 1;
+            let n = Self::entry_bytes(&m); self.bytes -= n; self.dropped_messages += 1;
+            self.dropped_messages_total += 1;
             self.dropped_bytes += n as u64; }
         self.peak_bytes = self.peak_bytes.max(self.bytes);
         self.peak_messages = self.peak_messages.max(self.messages.len()); }
-    pub fn take(&mut self) -> VecDeque<(ConnectionKey, Vec<u8>)> {
-        self.bytes = 0; self.reservations.clear();
+    pub fn take(&mut self) -> VecDeque<(ConnectionKey, Vec<u8>)> { self.bytes = 0; self.reservations.clear();
         std::mem::take(&mut self.messages) } }
 fn write_fragment(payload: &mut [u8], frag: UnreliableFragment<'_>) -> usize {
     let (kind, size, data) = match frag {
-        UnreliableFragment::Plain { is_fin, package_id, data, offset } => {
-            let whole = is_fin && offset == 0; let size = if whole { STP_WHOLE_HEADER_SIZE } else { STP_FRAGMENT_HEADER_SIZE };
+        UnreliableFragment::Plain { is_fin, package_id, data, offset } => { let whole = is_fin && offset == 0;
+            let size = if whole { STP_WHOLE_HEADER_SIZE } else { STP_FRAGMENT_HEADER_SIZE };
             if !whole { store_u64(&mut payload[3..11], package_id); store_u32(&mut payload[11..15], offset); }
             (if whole { 1 } else if is_fin { 3 } else { 2 }, size, data) }
         UnreliableFragment::Fec { segment, package_id, message_len, block_bytes, block_id, data } => {
@@ -1800,7 +1775,8 @@ fn write_fragment(payload: &mut [u8], frag: UnreliableFragment<'_>) -> usize {
                 (6, STP_SEGMENT_FEC_HEADER_SIZE)
             } else { (if message_len as usize > crate::fec::MAX_BLOCKS * block_bytes as usize { 5 } else { 4 }, STP_FEC_FRAGMENT_HEADER_SIZE) };
             (kind, size, data) } };
-    payload[0] = kind; store_u16(&mut payload[1..3], u16::try_from(size - 3 + data.len()).expect("ordinary UDP frame length"));
+    payload[0] = kind;
+    store_u16(&mut payload[1..3], u16::try_from(size - 3 + data.len()).expect("ordinary UDP frame length"));
     payload[size..size + data.len()].copy_from_slice(data);
     size + data.len() }
 fn fill_packet_payload_with_unreliable_fragments(payload: &mut [u8], buf: &mut UnreliableSendBuffer) -> usize {
@@ -1861,7 +1837,8 @@ impl ConnectionCipherTriplet {
         self.outgoing_started_ns = None; self.outgoing_confirmed = false; self.outgoing_first_data_nonce = None;
         true }
     fn confirm_outgoing(&mut self, highest_receipt: u64) {
-        if self.outgoing_first_data_nonce.is_some_and(|first| highest_receipt >= first) { self.outgoing_confirmed = true; } }
+        if self.outgoing_first_data_nonce.is_some_and(|first| highest_receipt >= first) {
+            self.outgoing_confirmed = true; } }
     fn prepare_outgoing(&mut self, now: u64, nonce: u64) -> Option<u32> {
         let aged = self.outgoing_started_ns.is_some_and(|t| now.saturating_sub(t) >= REKEY_AGE_NS);
         if aged && self.outgoing_confirmed && !self.advance_outgoing() { return None; }
@@ -1882,9 +1859,9 @@ impl ConnectionCipherTriplet {
             let n = self.current.read_message_with_additional_data(nonce, header, ciphertext, out)?;
             self.record_incoming(space, counter, false);
             return Ok(n); }
-        // Previous and next have the same parity. Try only retained previous, then prederived next, with monotone per-space epoch
-        // boundaries. Stateless AEAD never changes keys/nonce state on either failed trial; next authenticates the original
-        // ciphertext, not the scratch output.
+        // Previous and next have the same parity. Try only retained previous, then prederived next, with monotone
+        // per-space epoch boundaries. Stateless AEAD never changes keys/nonce state on either failed trial; next
+        // authenticates the original ciphertext, not the scratch output.
         if phase <= 1 && now <= self.previous_until_ns &&
             self.incoming_previous_floor[space].is_none_or(|floor| counter > floor) &&
             self.incoming_current_min[space].is_none_or(|min| counter < min) {
@@ -1899,15 +1876,15 @@ impl ConnectionCipherTriplet {
         self.previous_until_ns = now.saturating_add(PREVIOUS_KEY_NS); self.record_incoming(space, counter, false);
         Ok(n) } }
 impl Drop for ConnectionCipherTriplet {
-    fn drop(&mut self) {
-        self.erase_old(); self.current.rekey_manually(Some(&[0; 32]), Some(&[0; 32]));
+    fn drop(&mut self) { self.erase_old(); self.current.rekey_manually(Some(&[0; 32]), Some(&[0; 32]));
         self.new.rekey_manually(Some(&[0; 32]), Some(&[0; 32])); } }
-/// Encrypt once, then retain the exact result across local WouldBlock retries. None closes the connection before actual nonce or
-/// epoch exhaustion.
+/// Encrypt once, then retain the exact result across local WouldBlock retries. None closes the connection before actual
+/// nonce or epoch exhaustion.
 fn seal_connected_packet(cipher: &mut Option<ConnectionCipherTriplet>, prefix: u16,
     nonce: u64, payload: &[u8], out: &mut [u8], now: u64) -> Option<usize> {
     if nonce == u64::MAX || nonce == crate::sequence::ACK_SPACE - 1 { return None; }
-    let epoch = if let Some(c) = cipher { c.prepare_outgoing(now, nonce)? } else { 0 }; store_u16(&mut out[..2], prefix);
+    let epoch = if let Some(c) = cipher { c.prepare_outgoing(now, nonce)? } else { 0 };
+    store_u16(&mut out[..2], prefix);
     store_u32(&mut out[2..6], (nonce as u32 & crate::sequence::COUNTER_MASK) | ((epoch & 1) << 31));
     let (header, body) = out.split_at_mut(CONNECTED_HEADER_SIZE);
     let n = if let Some(c) = cipher {
@@ -1916,7 +1893,9 @@ fn seal_connected_packet(cipher: &mut Option<ConnectionCipherTriplet>, prefix: u
     Some(CONNECTED_HEADER_SIZE + n) }
 #[derive(Debug)] pub enum ConnectionState {
     SendingClientHelloPlaintext { last_sent_time_ns: u64, hello_packet_payload: Vec<u8>, },
-    SendingClientHello { magic1: u64, last_sent_time_ns: u64, hello_packet_payload: Vec<u8>, handshake: snow::HandshakeState, },
+    SendingClientHello {
+        magic1: u64, last_sent_time_ns: u64, hello_packet_payload: Vec<u8>,
+        handshake: snow::HandshakeState, },
     SendingServerHelloPlaintext { magic2: u64, last_sent_time_ns: u64, hello_packet_payload: Vec<u8>, },
     SendingServerHello {
         cipher: ConnectionCipherTriplet, magic1: u64, magic2: u64, last_sent_time_ns: u64,
@@ -1925,8 +1904,8 @@ fn seal_connected_packet(cipher: &mut Option<ConnectionCipherTriplet>, prefix: u
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingSendKind { Ack, Data, Keepalive, MtuProbe, Outage, Reachability, ReachabilityCurrent }
 impl PendingSendKind { fn is_generic(self) -> bool { matches!(self, Self::Reachability | Self::ReachabilityCurrent) } }
-/// At most one refused datagram per connection. Nothing else may use its nonce until these exact ciphertext bytes are accepted.
-/// Allocation is failure-only.
+/// At most one refused datagram per connection. Nothing else may use its nonce until these exact ciphertext bytes are
+/// accepted. Allocation is failure-only.
 #[derive(Debug)] struct PendingSend { kind: PendingSendKind, bytes: Vec<u8>, plaintext: Vec<u8>, dscp: Dscp, }
 #[derive(Debug)] pub struct ConnectionStateConnected {
     target_state:crate::target_validation::RiskState, pending_send: Option<PendingSend>, locally_blocked: bool,
@@ -2001,8 +1980,8 @@ impl SlipstreamInfo {
             head_promotions, recursive_windows);
         self.max_concurrent_started_messages = self.max_concurrent_started_messages.max(other.max_concurrent_started_messages);
         if other.heads_evaluated > 0 {
-            if self.heads_evaluated == other.heads_evaluated {
-                self.rtt_ns_min = other.rtt_ns_min; self.fair_share_pps_min = other.fair_share_pps_min; } else {
+            if self.heads_evaluated == other.heads_evaluated { self.rtt_ns_min = other.rtt_ns_min;
+                self.fair_share_pps_min = other.fair_share_pps_min; } else {
                 self.rtt_ns_min = self.rtt_ns_min.min(other.rtt_ns_min);
                 self.fair_share_pps_min = self.fair_share_pps_min.min(other.fair_share_pps_min); }
             self.rtt_ns_max = self.rtt_ns_max.max(other.rtt_ns_max);
@@ -2042,8 +2021,7 @@ impl Default for RxSeqTracker {
     fn default() -> Self { RxSeqTracker { base: 0, highest_plus1: 0, bits: [0; (RX_REORDER_WINDOW / 64) as usize], run: 0 } } }
 impl RxSeqTracker {
     fn close_run(&mut self, stats: &mut ConnectionStats) {
-        if self.run > 0 {
-            let class = RX_BURST_CLASS_MAX.iter().position(|&m| self.run <= m).unwrap_or(6);
+        if self.run > 0 { let class = RX_BURST_CLASS_MAX.iter().position(|&m| self.run <= m).unwrap_or(6);
             stats.rx_burst_hist[class] += 1; stats.rx_bursts += 1;
             self.run = 0; } }
     fn finalize_to(&mut self, new_base: u64, stats: &mut ConnectionStats) {
@@ -2072,8 +2050,7 @@ impl RxSeqTracker {
     pub recv_queue_dropped_messages: u64, }
 #[derive(Debug, Clone)] pub struct TestDropSchedule { steps: Vec<(u64, u64)>, period_ns: Option<u64> }
 impl TestDropSchedule {
-    pub fn parse(spec: &str) -> Option<TestDropSchedule> {
-        let mut steps = Vec::new(); let mut period_ns = None;
+    pub fn parse(spec: &str) -> Option<TestDropSchedule> { let mut steps = Vec::new(); let mut period_ns = None;
         for part in spec.split(',').map(str::trim).filter(|p| !p.is_empty()) {
             let secs = |t: &str| t.trim().trim_end_matches('s').parse::<f64>().ok().map(|x| (x * 1e9) as u64);
             if let Some(p) = part.strip_prefix('@') { period_ns = Some(secs(p)?.max(1)); continue; }
@@ -2082,11 +2059,9 @@ impl TestDropSchedule {
         if steps.is_empty() { return None; }
         steps.sort();
         Some(TestDropSchedule { steps, period_ns }) }
-    fn from_env() -> Option<TestDropSchedule> {
-        let v = std::env::var("STP_TEST_DROP_SCHEDULE").ok()?;
+    fn from_env() -> Option<TestDropSchedule> { let v = std::env::var("STP_TEST_DROP_SCHEDULE").ok()?;
         Some(Self::parse(&v).unwrap_or_else(|| panic!("bad STP_TEST_DROP_SCHEDULE {v:?}"))) }
-    pub fn ppm_at(&self, t_ns: u64) -> u64 {
-        let t = match self.period_ns { Some(p) => t_ns % p, None => t_ns };
+    pub fn ppm_at(&self, t_ns: u64) -> u64 { let t = match self.period_ns { Some(p) => t_ns % p, None => t_ns };
         self.steps.iter().take_while(|s| s.0 <= t).last().map_or(0, |s| s.1) } }
 pub fn send_history_time_ns(t: u64) -> u64 { (t / 0x400000) * 0x400000 }
 pub fn get_send_time_for_sequence_number(sequence_number: u64, send_time_band: &[u64; 1024], send_time_band_head_index: u64) -> u64 {
@@ -2110,8 +2085,7 @@ impl ConnectionStateConnected {
         self.send_sequence_number >= crate::sequence::ACK_SPACE - 1 || self.send_ack_sequence_number == u64::MAX ||
             buf.queues.first().and_then(|q| q.package_allocator.as_ref())
                 .is_some_and(|ids| ids.load(std::sync::atomic::Ordering::Relaxed) == u64::MAX) }
-    fn reserve_ack_nonce(&mut self) -> Option<u64> {
-        let nonce = self.send_ack_sequence_number;
+    fn reserve_ack_nonce(&mut self) -> Option<u64> { let nonce = self.send_ack_sequence_number;
         if nonce == u64::MAX { return None; }
         self.send_ack_sequence_number = nonce.checked_add(1)?;
         Some(nonce) }
@@ -2132,8 +2106,7 @@ impl ConnectionStateConnected {
         if now < due { return false; }
         self.recovery.upward_issued(size); self.tu_probe_size = size; self.tu_probe_obsolete = false;
         true }
-    fn finish_upward_probe(&mut self, success: bool, sent: u64, now: u64) {
-        self.tu_probe_sequence_number = u64::MAX;
+    fn finish_upward_probe(&mut self, success: bool, sent: u64, now: u64) { self.tu_probe_sequence_number = u64::MAX;
         if self.tu_probe_obsolete || self.tu_probe_size <= self.current_tu {
             self.recovery.upward_finished(self.tu_probe_size, false);
             return; }
@@ -2169,20 +2142,20 @@ impl ConnectionStateConnected {
             *word &= !mask;
             Some(if index == self.tu_probe_sequence_number {
                 PositiveReceipt::PendingProbe } else { PositiveReceipt::PendingData })
-        } else if index < self.packets_waiting_ack_tail && self.packets_waiting_ack_tail - index <= PACKETS_WAITING_ACK_CAPACITY {
+        } else if index < self.packets_waiting_ack_tail
+            && self.packets_waiting_ack_tail - index <= PACKETS_WAITING_ACK_CAPACITY {
             let word = &mut self.declared_lost_field[(bit / 64) as usize];
             if *word & mask == 0 { return None; }
             *word &= !mask;
-            Some(if index < self.outage.ignore_loss_before_seq { PositiveReceipt::PreOutage } else { PositiveReceipt::LateData })
-        } else { None } }
+            Some(if index < self.outage.ignore_loss_before_seq {
+                PositiveReceipt::PreOutage } else { PositiveReceipt::LateData }) } else { None } }
     fn send_time(&self, sequence: u64) -> u64 {
         get_send_time_for_sequence_number(sequence, &self.send_time_band, self.send_time_band_head_index) }
-    fn observe_feedback_payload(&mut self, payload: &[u8]) { self.active_ack_feedback |= payload.first() != Some(&0xff); }
-    fn update_feedback_deadline(&mut self, now: u64) {
-        self.ack_timer = self.ack_receiver.feedback_deadline(now);
+    fn observe_feedback_payload(&mut self, payload: &[u8]) {
+        self.active_ack_feedback |= payload.first() != Some(&0xff); }
+    fn update_feedback_deadline(&mut self, now: u64) { self.ack_timer = self.ack_receiver.feedback_deadline(now);
         if self.ack_timer == u64::MAX { self.active_ack_feedback = false; } }
-    fn account_send(&mut self, actual_ns: u64) {
-        self.outage.pending_since_ns.get_or_insert(actual_ns);
+    fn account_send(&mut self, actual_ns: u64) { self.outage.pending_since_ns.get_or_insert(actual_ns);
         if self.send_sequence_number >= crate::sequence::ACK_SPACE - 1 { return; }
         increment_sequence_number_and_account(actual_ns, &mut self.send_sequence_number,
             &mut self.send_time_band, &mut self.send_time_band_head_index, &mut self.packets_waiting_ack_field);
@@ -2196,8 +2169,7 @@ impl Default for PacketTags {
     fn default() -> Self { Self { pages: (0..PACKETS_WAITING_ACK_CAPACITY as usize / 256).map(|_| None).collect() } } }
 impl PacketTags {
     fn get(&self, index: usize) -> u128 { self.pages[index / 256].as_ref().map_or(0, |p| p.tags[index % 256]) }
-    fn set(&mut self, index: usize, tag: u128) {
-        let page = &mut self.pages[index / 256];
+    fn set(&mut self, index: usize, tag: u128) { let page = &mut self.pages[index / 256];
         if tag == 0 && page.is_none() { return; }
         let p = page.get_or_insert_with(|| Box::new(TagPage { tags: [0; 256], live: 0 }));
         let old = std::mem::replace(&mut p.tags[index % 256], tag);
@@ -2205,18 +2177,15 @@ impl PacketTags {
         if p.live == 0 { *page = None; } }
     fn take(&mut self, index: usize) -> u128 { let tag = self.get(index); if tag != 0 { self.set(index, 0); } tag } }
 pub fn increment_sequence_number_and_account(send_time_ns: u64, send_sequence_number: &mut u64, send_time_band: &mut [u64; 1024], send_time_band_head_index: &mut u64, packets_waiting_ack_field: &mut [u64; PACKETS_WAITING_ACK_WORDS]) {
-    {
-        let bit_index = *send_sequence_number % PACKETS_WAITING_ACK_CAPACITY;
+    { let bit_index = *send_sequence_number % PACKETS_WAITING_ACK_CAPACITY;
         packets_waiting_ack_field[(bit_index / 64) as usize] |= 1u64 << (bit_index % 64); }
     let new_head_index = send_time_ns / 0x400000;
-    if new_head_index >= *send_time_band_head_index + 1023 {
-        let current = *send_sequence_number;
+    if new_head_index >= *send_time_band_head_index + 1023 { let current = *send_sequence_number;
         for i in 0..1024 { send_time_band[i] = current; }
         send_time_band[(new_head_index % 1024) as usize] = current + 1; *send_time_band_head_index = new_head_index;
         *send_sequence_number = current + 1;
         return; }
-    if new_head_index > *send_time_band_head_index {
-        let current = *send_sequence_number;
+    if new_head_index > *send_time_band_head_index { let current = *send_sequence_number;
         for i in *send_time_band_head_index+1..new_head_index { send_time_band[(i % 1024) as usize] = current; }
         send_time_band[(new_head_index % 1024) as usize] = current + 1; *send_time_band_head_index = new_head_index;
         *send_sequence_number = current + 1;
@@ -2238,20 +2207,22 @@ pub fn connection_state_string(state: &ConnectionState) -> &'static str {
         ConnectionState::SendingServerHelloPlaintext { .. } => "SendingServerHelloPlaintext",
         ConnectionState::SendingServerHello          { .. } => "SendingServerHello",
         ConnectionState::Connected(_)                        => "Connected", } }
-pub fn connect_to_endpoint(
-    connections_map: &mut HashMap::<ConnectionKey, ConnectionTrackingData>, my_connect_keypair: &IdentityKeyPair,
-    endpoint: &STPAddress, send_buffer_params: (u32, u32, u32), send_queue_count: usize,
-    budget: &std::sync::Arc<crate::receive_memory::ReceiveMemoryBudget>, connection_receive_limit: usize, max_message_size: usize,
+pub fn connect_to_endpoint(connections_map: &mut HashMap::<ConnectionKey, ConnectionTrackingData>,
+    my_connect_keypair: &IdentityKeyPair, endpoint: &STPAddress, send_buffer_params: (u32, u32, u32),
+    send_queue_count: usize, budget: &std::sync::Arc<crate::receive_memory::ReceiveMemoryBudget>,
+    connection_receive_limit: usize, max_message_size: usize,
 ) {
     let Some(receive_reservation) = budget.reserve(RECEIVE_CONNECTION_BYTES) else { return; };
     assert!(my_connect_keypair.magic1 == endpoint.magic1); let magic2_block = build_magic2_client_block();
     let connection_state = if my_connect_keypair.magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
         let mut hello_packet_payload = vec![0u8; 6 + 32 + MAGIC2_BLOCK_SIZE];
-        store_u48(&mut hello_packet_payload[0..6], my_connect_keypair.magic1); assert_eq!(my_connect_keypair.public.len(), 32);
+        store_u48(&mut hello_packet_payload[0..6], my_connect_keypair.magic1);
+        assert_eq!(my_connect_keypair.public.len(), 32);
         hello_packet_payload[6..6+32].copy_from_slice(&my_connect_keypair.public[..]);
         hello_packet_payload[6+32..6+32+MAGIC2_BLOCK_SIZE].copy_from_slice(&magic2_block);
         ConnectionState::SendingClientHelloPlaintext { last_sent_time_ns: 0, hello_packet_payload } } else {
-        let mut hello_packet_payload = vec![0u8; 1024]; store_u48(&mut hello_packet_payload[0..6], my_connect_keypair.magic1);
+        let mut hello_packet_payload = vec![0u8; 1024];
+        store_u48(&mut hello_packet_payload[0..6], my_connect_keypair.magic1);
         let mut handshake = noise_initiator(crypto_string_from_connect_magic1(my_connect_keypair.magic1).unwrap(),
             &hello_packet_payload[0..6], &my_connect_keypair.private, &endpoint.key).unwrap();
         let handshake_size = handshake.write_message(&magic2_block, &mut hello_packet_payload[6..]).unwrap();
@@ -2272,7 +2243,8 @@ const        VERBOSE                :bool=0!=                (1);
 macro_rules! pod { ($($item:item)*) => { $(#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)] $item)* }; }
 fn segment_reassembly_peak(total: usize) -> usize {
     total + total.div_ceil(2) + total.min(FEC_SEGMENT_BYTES) + 256 + total.div_ceil(FEC_SEGMENT_BYTES) * 64 }
-const SEGMENT_ROOT_METADATA: usize = 256; const FEC_INGRESS_SLOT_BYTES: usize = std::mem::size_of::<(u32, Vec<u8>)>() + 128;
+const SEGMENT_ROOT_METADATA: usize = 256;
+const FEC_INGRESS_SLOT_BYTES: usize = std::mem::size_of::<(u32, Vec<u8>)>() + 128;
 fn fec_ingress_bytes(layout: crate::fec::MessageLayout) -> usize {
     (layout.k * (layout.block_bytes + FEC_INGRESS_SLOT_BYTES)).min(MAX_FEC_INGRESS_BYTES) }
 const FEC_WORKERS_PER_QUEUE: usize = 8;
@@ -2287,8 +2259,7 @@ pub fn receive_connection_memory_limit(max_message_size: usize, queues: usize) -
     if !(1..=64).contains(&queues) { return None; }
     let max_message_size = max_message_size.min(MAX_JUMBOGRAM_LEN); let unit = max_message_size.min(FEC_SEGMENT_BYTES);
     let workers = receive_worker_capacity_dimension(max_message_size, queues);
-    let decoder = if unit > FEC_MIN_BLOCK_BYTES {
-        let layout = wire_fec_layout(unit, FEC_MIN_BLOCK_BYTES)?;
+    let decoder = if unit > FEC_MIN_BLOCK_BYTES { let layout = wire_fec_layout(unit, FEC_MIN_BLOCK_BYTES)?;
         let ingress = (unit + u16::MAX as usize + layout.k * FEC_INGRESS_SLOT_BYTES).min(MAX_FEC_INGRESS_BYTES);
         crate::fec::receive_memory_charge(layout, workers != 0, ingress)? } else { 0 };
     let codecs = if workers != 0 { workers } else { queues };
@@ -2306,11 +2277,14 @@ impl SegmentParts {
         debug_assert!(!self.contains(offset) && self.desc.len() < self.desc.capacity()); self.bytes += part.len();
         self.part_capacity += part.capacity(); let i = self.position(offset);
         self.desc.insert(i, (offset, part)); }
-    fn next_len(&self, prefix: usize) -> Option<usize> { self.desc.last().filter(|p| p.0 as usize == prefix).map(|p| p.1.len()) }
+    fn next_len(&self, prefix: usize) -> Option<usize> {
+        self.desc.last().filter(|p| p.0 as usize == prefix).map(|p| p.1.len()) }
     fn pop_next(&mut self) -> Vec<u8> {
-        let (_, part) = self.desc.pop().expect("joinable part"); self.bytes -= part.len(); self.part_capacity -= part.capacity();
+        let (_, part) = self.desc.pop().expect("joinable part"); self.bytes -= part.len();
+        self.part_capacity -= part.capacity();
         part } }
-impl std::ops::Deref for SegmentParts { type Target = [(u32, Vec<u8>)]; fn deref(&self) -> &Self::Target { &self.desc } }
+impl std::ops::Deref for SegmentParts { type Target = [(u32, Vec<u8>)];
+    fn deref(&self) -> &Self::Target { &self.desc } }
 #[derive(Debug, Default)] pub struct ReassemblySlot {
     reservation: Option<crate::receive_memory::Reservation>, pub buf: Vec<u8>, pub total_len: Option<u32>,
     pub received: Vec<(u32, u32)>, pub package_id: u64, completed: bool, segment_parts: Option<SegmentParts>,
@@ -2325,8 +2299,7 @@ impl ReassemblySlot {
     pub fn bytes_received(&self) -> u64 {
         self.segment_parts.as_ref().map_or_else(|| self.received.iter().map(|&(s, e)| (e - s) as u64).sum(),
             |parts| self.buf.len() as u64 + parts.bytes as u64) }
-    pub fn new_ring(size: usize) -> Vec<ReassemblySlot> {
-        let mut vec = Vec::with_capacity(size);
+    pub fn new_ring(size: usize) -> Vec<ReassemblySlot> { let mut vec = Vec::with_capacity(size);
         for _ in 0..size { vec.push(Self::new()); }
         vec }
     fn admit(&mut self, offset: usize, len: usize, budget: &std::sync::Arc<crate::receive_memory::ReceiveMemoryBudget>) -> bool {
@@ -2348,7 +2321,9 @@ impl ReassemblySlot {
         if !segment.valid(layout.len) || segment.total as usize > budget.limit() ||
             !valid_fec_symbol(layout, block_id, data_len) { return false; }
         let in_use = self.completed || self.total_len.is_some() || !self.received.is_empty();
-        if in_use && self.package_id != segment.root { if segment.root < self.package_id { return false; } *self = Self::new(); }
+        if in_use && self.package_id != segment.root {
+            if segment.root < self.package_id { return false; }
+            *self = Self::new(); }
         self.package_id = segment.root;
         if self.completed { return true; }
         if self.total_len.is_some_and(|n| n != segment.total) ||
@@ -2363,8 +2338,7 @@ impl ReassemblySlot {
     fn bind_segment_extent(&mut self, segment: FecSegment, len: usize, now_ns: u64) -> bool {
         let (offset, end) = (segment.offset as usize, segment.offset as usize + len); let ext = &self.segment_extents;
         let i = ext.partition_point(|e| (e.0 as usize) < offset);
-        if ext.get(i).is_some_and(|e| e.0 as usize == offset && e.1 as usize == len) {
-            self.last_segment_ns = now_ns;
+        if ext.get(i).is_some_and(|e| e.0 as usize == offset && e.1 as usize == len) { self.last_segment_ns = now_ns;
             return true; }
         if ext.get(i).is_some_and(|e| (e.0 as usize) < end) ||
             i > 0 && ext[i - 1].0 as usize + ext[i - 1].1 as usize > offset { return false; }
@@ -2396,7 +2370,8 @@ impl ReassemblySlot {
                 && parts.len() < parts.capacity() && !parts.contains(segment.offset));
         if !bound { drop(message); drop(donor); return None; }
         donor.shrink(message.capacity());
-        if let Err(donor) = self.reservation.as_mut().unwrap().absorb(donor) { drop(message); drop(donor); return None; }
+        if let Err(donor) = self.reservation.as_mut().unwrap().absorb(donor) { drop(message); drop(donor);
+            return None; }
         self.segment_parts.as_mut().unwrap().insert(segment.offset, message);
         self.flush_contiguous_segment() }
     fn flush_contiguous_segment(&mut self) -> Option<(Vec<u8>, crate::receive_memory::Reservation)> {
@@ -2409,8 +2384,7 @@ impl ReassemblySlot {
         while let Some(next_len) = parts.next_len(self.buf.len()) {
             if self.buf.is_empty() { let part = parts.pop_next(); bytes -= part.capacity(); self.buf = part; } else {
                 let end = self.buf.len() + next_len;
-                if end > self.buf.capacity() {
-                    let geometric = (self.buf.capacity() * 2).max(end).min(total);
+                if end > self.buf.capacity() { let geometric = (self.buf.capacity() * 2).max(end).min(total);
                     let capacity = if reservation.grow(metadata + geometric + bytes) { geometric }
                         else if reservation.grow(metadata + end + bytes) { end }
                         else { return None; };
@@ -2445,9 +2419,9 @@ impl ReassemblySlot {
         let last = self.received.partition_point(|&(s, _)| s <= end);
         for &(rs, re) in &self.received[first..last] {
             let ov_start = start.max(rs) as usize; let ov_end = end.min(re) as usize;
-            if ov_start < ov_end {
-                let data_off = ov_start - offset;
-                if self.buf[ov_start..ov_end] != data[data_off..data_off + (ov_end - ov_start)] { return (false, false); } } }
+            if ov_start < ov_end { let data_off = ov_start - offset;
+                if self.buf[ov_start..ov_end] != data[data_off..data_off + (ov_end - ov_start)] {
+                    return (false, false); } } }
         self.buf[offset..offset + data.len()].copy_from_slice(data);
         let merged_start = if first < last { self.received[first].0.min(start) } else { start };
         let merged_end = if first < last { self.received[last - 1].1.max(end) } else { end };
@@ -2497,8 +2471,7 @@ fn sweep_segment_roots_bounded(slots: &mut [ReassemblySlot], cursor: &mut usize,
         let joinable = !slot.completed && slot.segment_parts.as_ref().is_some_and(|parts|
             parts.next_len(slot.buf.len()).is_some());
         if joinable {
-            if let Some((message, reservation)) = slot.flush_contiguous_segment() {
-                delivered += 1;
+            if let Some((message, reservation)) = slot.flush_contiguous_segment() { delivered += 1;
                 deliver(message, reservation); } }
         retire_inactive_segment_roots(std::slice::from_mut(slot), now_ns, grace_ns);
         *cursor += 1; }
@@ -2541,8 +2514,7 @@ struct FecDecodeJob {
     _guard: FecWorkerGuard, }
 struct FecWorkerGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>, std::sync::Arc<crate::receive_memory::ReceiveMemoryBudget>, Option<std::sync::Arc<NetworkWake>>);
 impl Drop for FecWorkerGuard {
-    fn drop(&mut self) {
-        self.1.release_worker(); self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    fn drop(&mut self) { self.1.release_worker(); self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         if let Some(wake) = &self.2 { wake.notify(); } } }
 fn fec_receive_block_waking(slot: &mut FecRecvSlot, connection_key: ConnectionKey, package_id: u64,
     message_len: usize, block_bytes: usize, block_id: u32, data: &[u8],
@@ -2551,29 +2523,28 @@ fn fec_receive_block_waking(slot: &mut FecRecvSlot, connection_key: ConnectionKe
 ) -> Option<(Vec<u8>, crate::receive_memory::Reservation)> {
     use crate::fec::*;
     if matches!(slot.state, FecRecvState::Done) { #[cfg(feature = "research_budget_diagnostic")] diag::rx_status(3); return None; }
-    slot.blocks_received = slot.blocks_received.saturating_add(1); let layout = MessageLayout::new(message_len, block_bytes)?;
+    slot.blocks_received = slot.blocks_received.saturating_add(1);
+    let layout = MessageLayout::new(message_len, block_bytes)?;
     if !valid_fec_symbol(layout, block_id, data.len()) { return None; }
     if slot.params().is_some_and(|p| p != (message_len, block_bytes)) { #[cfg(feature = "research_budget_diagnostic")] diag::rx_status(4); return None; }
-    if !slot.in_use() {
-        let worker = layout.k > FEC_INLINE_MAX_BLOCKS; let ingress_bytes = fec_ingress_bytes(layout);
+    if !slot.in_use() { let worker = layout.k > FEC_INLINE_MAX_BLOCKS; let ingress_bytes = fec_ingress_bytes(layout);
         let source_only = !worker && (block_id as usize) < layout.k;
         let charge = if source_only { SourceOnly::charge(layout)? }
             else { receive_memory_charge(layout, worker, ingress_bytes)? };
         let reservation = if !worker || workers.load(std::sync::atomic::Ordering::Acquire) < MAX_FEC_DECODE_WORKERS {
             budget.reserve(charge) } else { slot.worker_limit_refused = true; None };
-        let Some(reservation) = reservation else {
-            slot.admission_refused = true;
+        let Some(reservation) = reservation else { slot.admission_refused = true;
             #[cfg(feature = "research_budget_diagnostic")] diag::rx_status(5); slot.ingress_dropped += 1;
             return None; };
         if worker {
-            if !budget.acquire_worker() {
-                slot.worker_limit_refused = true;
+            if !budget.acquire_worker() { slot.worker_limit_refused = true;
                 slot.admission_refused = true; #[cfg(feature = "research_budget_diagnostic")] diag::rx_status(5); slot.ingress_dropped += 1; return None;
             }
             let (tx, rx) = std::sync::mpsc::sync_channel::<(u32, Vec<u8>)>(ingress_slots(ingress_bytes, block_bytes));
             workers.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             let guard = FecWorkerGuard(workers.clone(), budget.clone(), None); let generation = std::sync::Arc::new(());
-            let Some(decoder) = MessageDecoder::with_layout(layout) else { drop(guard); slot.ingress_dropped += 1; return None; };
+            let Some(decoder) = MessageDecoder::with_layout(layout) else {
+                drop(guard); slot.ingress_dropped += 1; return None; };
             let job = Box::new(FecDecodeJob { rx, decoder, reservation: Some(reservation), _guard: guard });
             slot.state = FecRecvState::Worker { tx, job: Some(job), message_len, block_bytes, generation };
         } else if source_only {
@@ -2594,12 +2565,10 @@ fn fec_receive_block_waking(slot: &mut FecRecvSlot, connection_key: ConnectionKe
             return None; }
         if source.native_failed { #[cfg(feature = "research_budget_diagnostic")] diag::rx_status(15); slot.ingress_dropped += 1; return None; }
         let charge = receive_memory_charge(layout, false, 0)?;
-        let Some(native_reservation) = budget.reserve(charge) else {
-            slot.admission_refused = true;
+        let Some(native_reservation) = budget.reserve(charge) else { slot.admission_refused = true;
             #[cfg(feature = "research_budget_diagnostic")] diag::rx_status(5); slot.ingress_dropped += 1;
             return None; };
-        let upgraded = source.decoder().and_then(|mut dec| {
-            let status = dec.add(block_id, data)?;
+        let upgraded = source.decoder().and_then(|mut dec| { let status = dec.add(block_id, data)?;
             let message = if status == DecodeStatus::Done { #[cfg(feature = "research_budget_diagnostic")] diag::rx_status(10);
                 Some(dec.recover().ok_or(DecodeError::Failed(-1))?) } else { None };
             Ok((dec, message)) });
@@ -2609,8 +2578,7 @@ fn fec_receive_block_waking(slot: &mut FecRecvSlot, connection_key: ConnectionKe
                 slot.state = if message.is_some() { FecRecvState::Done } else { FecRecvState::Inline(Box::new(dec)) };
                 slot.reservation = Some(native_reservation); slot.last_block_ns = monotonic_clock_ns();
                 return message.map(|m| (m, slot.reservation.take().unwrap())); }
-            Err(_) => {
-                source.native_failed = true;
+            Err(_) => { source.native_failed = true;
                 #[cfg(feature = "research_budget_diagnostic")] diag::rx_status(8); slot.ingress_dropped += 1;
                 return None; } } }
     match &mut slot.state {
@@ -2645,9 +2613,9 @@ fn fec_receive_block_waking(slot: &mut FecRecvSlot, connection_key: ConnectionKe
                         _ => {} } } }
             None }
         _ => None, } }
-// Largest unreliable message a receiver reassembles; a peer sending a bigger one is disconnected. u32 lengths and offsets fit 1
-// GiB; FEC kind 2 partitions it into bounded Wirehair codecs. Both ends need this limit (and kind 2 support for messages above
-// 64000 packets).
+// Largest unreliable message a receiver reassembles; a peer sending a bigger one is disconnected. u32 lengths and
+// offsets fit 1 GiB; FEC kind 2 partitions it into bounded Wirehair codecs. Both ends need this limit (and kind 2
+// support for messages above 64000 packets).
 pub const MAX_JUMBOGRAM_LEN: usize = 1 << 30; pub const ACK_BUFFER_TIME_NS: u64 = 50_000_000;
 #[derive(Default)] pub struct NetworkThreadPush {
     #[cfg(feature = "research_budget_diagnostic")] pub diagnostic_take: bool,
@@ -2656,7 +2624,8 @@ pub const MAX_JUMBOGRAM_LEN: usize = 1 << 30; pub const ACK_BUFFER_TIME_NS: u64 
 #[derive(Default)] pub struct NetworkThreadPull {
     pub exchange_processing_ns: u64,
     #[cfg(feature = "research_budget_diagnostic")] pub diagnostic: Option<diag::Capture>,
-    pub current_connections: Vec<(STPAddress, [u8; 64])>, pub received_unreliable_messages: VecDeque<(ConnectionKey, Vec<u8>)>,
+    pub current_connections: Vec<(STPAddress, [u8; 64])>,
+    pub received_unreliable_messages: VecDeque<(ConnectionKey, Vec<u8>)>,
     pub send_unreliable_rejected: Vec<(ConnectionKey, usize, Dscp, Vec<u8>)>,
     pub send_unreliable_oversized: Vec<(ConnectionKey, usize, Dscp, Vec<u8>)>,
     pub send_unreliable_invalid_queue: Vec<(ConnectionKey, usize, Dscp, Vec<u8>)>,
@@ -2688,14 +2657,12 @@ impl RingState {
         if let Some(address) = self.connects.remove(&peer) {
             self.pending.push_back(RingEvent::ConnectFailed { address, reason: if reason == DisconnectReason::Local { ConnectFailure::Cancelled } else { ConnectFailure::TimedOut } });
         } }
-    fn message(&self, port: &Port, peer: ConnectionKey, data: Vec<u8>) {
-        let n = port.native.get().unwrap();
+    fn message(&self, port: &Port, peer: ConnectionKey, data: Vec<u8>) { let n = port.native.get().unwrap();
         if !self.peers.contains_key(&peer) { return; }
         if n.emit(&port.ready, RingEvent::Message { peer, data }).is_err() {
             n.counters.receive_dropped_full.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         } else { n.counters.received.fetch_add(1, std::sync::atomic::Ordering::Relaxed); } }
-    fn flush(&mut self, port: &Port) {
-        let n = port.native.get().unwrap();
+    fn flush(&mut self, port: &Port) { let n = port.native.get().unwrap();
         for _ in 0..32 {
             if !n.events.has_space() { break; }
             let Some(event) = self.pending.pop_front() else { break; };
@@ -2733,9 +2700,9 @@ pub(crate) fn new_reference_pump(my_keypairs: Vec<IdentityKeyPair>, my_port: u16
 impl Default for NetworkThreadOptions {
     fn default() -> Self { Self { rings: RingConfig::default(), send_queue_count: 1, receive_memory: None, bind_ip: None, record_fec_messages: false, record_loss_episodes: false, loss_trace: None, #[cfg(feature = "research_budget_diagnostic")] budget_diagnostic: false } }
 }
-/// `max_message_size` is required local application configuration in both directions, clamped to 1 GiB. Oversized submissions
-/// return in `send_unreliable_oversized`. Both applications must configure compatible limits; no negotiation is added. Panics
-/// synchronously if its receive cap plus bookkeeping cannot fit the budget.
+/// `max_message_size` is required local application configuration in both directions, clamped to 1 GiB. Oversized
+/// submissions return in `send_unreliable_oversized`. Both applications must configure compatible limits; no
+/// negotiation is added. Panics synchronously if its receive cap plus bookkeeping cannot fit the budget.
 pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_pps: Option<u64>, send_buffer_params: (u32, u32, u32), max_message_size: usize, options: NetworkThreadOptions) -> (Pump, Endpoint) {
     let bind_ip = options.bind_ip; let send_queue_count = options.send_queue_count;
     assert!((1..=64).contains(&send_queue_count), "send_queue_count must be 1..=64");
@@ -2754,8 +2721,7 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
     let mut loss_trace = options.loss_trace.as_deref().map(|p| crate::loss_trace::LossTrace::open(p).expect("open loss trace"));
     let thread_inner = inner.clone();
     #[cfg(feature="research_budget_diagnostic")] let diagnostic_enabled = options.budget_diagnostic;
-    {
-        let exit = NetworkExit(thread_inner.clone());
+    { let exit = NetworkExit(thread_inner.clone());
         #[cfg(feature = "research_budget_diagnostic")] diag::enable(diagnostic_enabled);
         struct SocketOwner(SockHandle);
         impl Drop for SocketOwner { fn drop(&mut self) { unsafe { self.0.close(); } } }
@@ -2775,7 +2741,8 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
         let mut test_drop_burst_left = 0u64; let test_drop_t0 = monotonic_clock_ns();
         let mut receive_queue_report_time_ns = 0u64; let mut thread_stats = NetworkThreadStats::default();
         let mut last_loop_start_ns = 0u64; let mut kernel_drops_read_ns = 0u64; let mut cpu_read_ns = 0u64;
-        let mut network_cpu = (0u64, 0u64); let mut connections_map = HashMap::<ConnectionKey, ConnectionTrackingData>::new();
+        let mut network_cpu = (0u64, 0u64);
+        let mut connections_map = HashMap::<ConnectionKey, ConnectionTrackingData>::new();
         let mut ready_peers = HashMap::new(); let mut ring_state = RingState::default();
         let mut receive_notified = false; let mut ready_used = 0usize; let mut receive_round = 0usize;
         let mut receiving = true; let mut send_keys = VecDeque::<ConnectionKey>::new();
@@ -2796,11 +2763,9 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                 } else { active_wait = None; } }
             if budget.expired() { return wake_hint; }
             if thread_inner.stop.load(std::sync::atomic::Ordering::Acquire) { return None; }
-            {
-                let t = monotonic_clock_ns();
+            { let t = monotonic_clock_ns();
                 if budget.sampled(t) { return wake_hint; }
-                if last_loop_start_ns != 0 {
-                    let gap = t.saturating_sub(last_loop_start_ns);
+                if last_loop_start_ns != 0 { let gap = t.saturating_sub(last_loop_start_ns);
                     thread_stats.max_loop_gap_ns = thread_stats.max_loop_gap_ns.max(gap);
                     if gap > 1_000_000 { thread_stats.loop_gaps_over_1ms += 1; }
                     if gap > 10_000_000 { thread_stats.loop_gaps_over_10ms += 1; }
@@ -2809,17 +2774,14 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                 thread_stats.loop_iterations += 1; }
             let test_drop_ppm = match &test_drop_schedule { Some(sch) => sch.ppm_at(monotonic_clock_ns().saturating_sub(test_drop_t0)), None => test_drop_ppm };
             if !budget.command_owed() && thread_inner.has_request() && std::time::Instant::now() >= caller_deadline { return wake_hint; }
-            if let Some(n) = thread_inner.native.get() {
-                ring_state.flush(&thread_inner);
+            if let Some(n) = thread_inner.native.get() { ring_state.flush(&thread_inner);
                 for _ in 0..if active_wait.is_some() { 1 } else { 32 } {
                     if !budget.command_owed() && std::time::Instant::now() >= caller_deadline { break; }
                     let mut ring_admitted = false;
                     if ring_state.pending.is_empty() {
-                        if let Some(control) = unsafe { n.control.pop() } {
-                            n.input_drained(&thread_inner.ready, true);
+                        if let Some(control) = unsafe { n.control.pop() } { n.input_drained(&thread_inner.ready, true);
                             match control {
-                                Control::Connect(address) => {
-                                    let peer = address.connection_key();
+                                Control::Connect(address) => { let peer = address.connection_key();
                                     if connections_map.contains_key(&peer) {
                                         ring_state.pending.push_back(RingEvent::ConnectFailed { address, reason: ConnectFailure::AlreadyConnected });
                                     } else if let Some(keypair) = my_keypairs.iter().find(|kp| kp.magic1 == address.magic1 && kp.public != address.key) {
@@ -2828,20 +2790,18 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                         else { ring_state.pending.push_back(RingEvent::ConnectFailed { address, reason: ConnectFailure::InvalidAddress }); }
                                     } else { ring_state.pending.push_back(RingEvent::ConnectFailed { address, reason: ConnectFailure::InvalidAddress }); }
                                 }
-                                Control::Disconnect(peer) => {
-                                    connections_map.remove(&peer);
+                                Control::Disconnect(peer) => { connections_map.remove(&peer);
                                     ring_state.disconnected(peer, DisconnectReason::Local); } }
                             ring_admitted = true; } }
                     if !ring_admitted {
-                        if let Some(message) = unsafe { n.send.peek() } {
-                            let mut drop_kind = 0; let mut fits = true;
+                        if let Some(message) = unsafe { n.send.peek() } { let mut drop_kind = 0; let mut fits = true;
                             if message.payload.len() > max_message_size { drop_kind = 2; }
                             else if let Some(conn) = connections_map.get_mut(&message.peer).filter(|c| c.is_connected()) {
                                 if message.queue >= conn.unreliable_send_buffer.queues.len() { drop_kind = 3; }
                                 else { fits = message.payload.len() as u64 <= conn.unreliable_send_buffer.queues[message.queue].free_bytes(); }
                             } else { drop_kind = 1; }
-                            if fits {
-                                let message = unsafe { n.send.pop() }.unwrap(); n.input_drained(&thread_inner.ready, false);
+                            if fits { let message = unsafe { n.send.pop() }.unwrap();
+                                n.input_drained(&thread_inner.ready, false);
                                 let counter = match drop_kind {
                                     1 => &n.counters.send_dropped_unknown,
                                     2 => &n.counters.send_dropped_oversized,
@@ -2856,8 +2816,7 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                             } else { n.counters.send_head_blocked.fetch_add(1, std::sync::atomic::Ordering::Relaxed); } } }
                     if ring_admitted { budget.admitted(); } else { break; } }
                 if let Some(until) = active_wait { return Some(until); } }
-            if let Some((mut req, disconnect)) = thread_inner.take_request() {
-                budget.admitted();
+            if let Some((mut req, disconnect)) = thread_inner.take_request() { budget.admitted();
                 if let Some(peer) = disconnect { connections_map.remove(&peer); }
                 let exchange_started = std::time::Instant::now(); let current_time_now_ns = monotonic_clock_ns();
                 if thread_inner.is_reference() { connections_map.retain(|key, value| {
@@ -2891,7 +2850,8 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                             resp.send_unreliable_invalid_queue.extend(batch.into_iter().map(|(dscp, m)| (key, queue, dscp, m)));
                             continue; }
                         if !tracking_data.is_connected() { batch } else {
-                            tracking_data.unreliable_send_buffer.submit_classified_messages(queue, batch) } } else { batch };
+                            tracking_data.unreliable_send_buffer.submit_classified_messages(queue, batch) }
+                    } else { batch };
                     resp.send_unreliable_rejected.extend(rejected.into_iter().map(|(dscp, m)| (key, queue, dscp, m))); }
                 #[cfg(feature = "research_budget_diagnostic")]
                 if req.diagnostic_take { resp.diagnostic = diag::take(current_time_now_ns); }
@@ -2902,17 +2862,16 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                     let test_drop_configured = test_drop_ppm != 0 || test_drop_schedule.is_some();
                     resp.cohort_observation = connections_map.iter().map(|(key, value)| (*key, cohort_observation_of(value, test_drop_configured))).collect();
                 }
-                if current_time_now_ns.saturating_sub(cpu_read_ns) >= 100_000_000 {
-                    cpu_read_ns = current_time_now_ns;
+                if current_time_now_ns.saturating_sub(cpu_read_ns) >= 100_000_000 { cpu_read_ns = current_time_now_ns;
                     #[cfg(target_os = "linux")]
                     if let Some(cpu) = crate::platform::sys::thread_cpu_time_us() { network_cpu = cpu; } }
                 resp.connection_stats = connections_map.iter().filter_map(|(key, value)| match &value.connection_state {
-                    ConnectionState::Connected(c) => {
-                        let mut st = c.stats;
+                    ConnectionState::Connected(c) => { let mut st = c.stats;
                         { (st.rand_bg_packets,st.rand_bg_lost,st.rand_p_ppm,st.rand_p_base_ppm)=crate::target_validation::rand_counters(&c.target_state); }
-                        for q in &value.unreliable_send_buffer.queues {
-                            st.slipstream.merge(q.slipstream_info); st.category_bonus_messages += q.category_bonus_messages;
-                            st.category_bonus_repairs += q.category_bonus_repairs; st.event_repair.merge(q.event_info());
+                        for q in &value.unreliable_send_buffer.queues { st.slipstream.merge(q.slipstream_info);
+                            st.category_bonus_messages += q.category_bonus_messages;
+                            st.category_bonus_repairs += q.category_bonus_repairs;
+                            st.event_repair.merge(q.event_info());
                             st.budget_base.merge(*q.budget_sink.lock().unwrap()); }
                         st.event_repair.accepted_dropped += c.accepted_cc_dropped;
                         st.event_repair.missing_anchor += c.accepted_cc_missing_anchor;
@@ -2920,15 +2879,15 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                         st.seq_numbers_used = c.send_sequence_number; st.udp_payload_tu = c.current_tu;
                         st.network_cpu_user_us = network_cpu.0; st.network_cpu_sys_us = network_cpu.1;
                         c.rx_tracker.provisional_bursts(&mut st);
-                        if let Some(a) = &value.unreliable_send_buffer.fec_adaptive {
-                            st.fec_loss_estimate = a.p;
+                        if let Some(a) = &value.unreliable_send_buffer.fec_adaptive { st.fec_loss_estimate = a.p;
                             st.fec_last_loss_sample = a.tracker.last_sample(); }
                         Some((*key, st)) }
                     _ => None, }).collect();
                 if current_time_now_ns.saturating_sub(kernel_drops_read_ns) >= 100_000_000 {
                     kernel_drops_read_ns = current_time_now_ns;
                     thread_stats.kernel_rx_drops = udp_socket_kernel_rx_drops(socket); }
-                thread_stats.recv_queue_dropped_messages = receive_queue.dropped_messages_total; resp.thread_stats = thread_stats;
+                thread_stats.recv_queue_dropped_messages = receive_queue.dropped_messages_total;
+                resp.thread_stats = thread_stats;
                 if record_fec_messages {
                     for (key, value) in connections_map.iter_mut() {
                         let peak = value.unreliable_send_buffer.queues[0].retention_quota.telemetry.peak.load(std::sync::atomic::Ordering::Relaxed);
@@ -2936,7 +2895,8 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                             resp.fec_messages.extend(rec.drain(..).map(|mut m| { m.peak_retained_source_bytes = peak as u64; (*key, m) })); } } } }
                 if thread_inner.wants_snapshot() {
                 resp.current_connections = connections_map.iter().filter_map(|(key, value)| {
-                    if value.is_connected() { Some((value.address().clone(), value.handshake_hash)) } else { None } }).collect();
+                    if value.is_connected() { Some((value.address().clone(), value.handshake_hash)) } else { None }
+                }).collect();
                 resp.received_unreliable_messages = receive_queue.take(); receive_notified = false;
                 ready_used = connections_map.values().flat_map(|c| &c.unreliable_send_buffer.queues).map(|q| q.queue_bytes_filled as usize).sum(); }
                 if !thread_inner.is_reference() && !resp.send_unreliable_rejected.is_empty() {
@@ -2950,8 +2910,7 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                     let packet = if let Some(packet) = pending_receive.take() { packet } else {
                         match udp_recv_with_congestion_and_dscp(socket, &mut packet_memory_encrypted[..]) {
                             Ok(packet) => {
-                                if budget.sampled(packet.6) {
-                                    pending_receive = Some(packet);
+                                if budget.sampled(packet.6) { pending_receive = Some(packet);
                                     return Some(std::time::Instant::now()); }
                                 packet },
                             Err(_) => break, } };
@@ -2966,8 +2925,7 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                 continue; } }
                         let magic1 = first_six_bytes;
                         if magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
-                            for key_i in 0..my_keypairs.len() {
-                                let my_kp = &my_keypairs[key_i];
+                            for key_i in 0..my_keypairs.len() { let my_kp = &my_keypairs[key_i];
                                 if my_kp.magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
                                     if buf_len == 6 + 32 + MAGIC2_BLOCK_SIZE {
                                         let client_key = &packet_memory_encrypted[6..6+32];
@@ -3008,8 +2966,7 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                 unreliable_reassembly: ReassemblySlot::new_ring(1024),
                                                     unreliable_fec: FecRecvSlot::new_ring(1024), }, ); } } } } }
                         else if let Some(crypto_string) = crypto_string_from_connect_magic1(magic1) {
-                            for key_i in 0..my_keypairs.len() {
-                                let my_kp = &my_keypairs[key_i];
+                            for key_i in 0..my_keypairs.len() { let my_kp = &my_keypairs[key_i];
                                 if my_kp.magic1 == magic1 {
                                     let mut new_handshake = noise_responder(crypto_string,
                                         &packet_memory_encrypted[0..6], &my_kp.private).unwrap();
@@ -3151,7 +3108,8 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                 let mut ack_latency_ns = 0u64; let mut data_ack_progress = false;
                                 let mut newly_acked_data = 0u64; let mut delivery_latency_ns = 0u64;
                                 let mut shadow_acked_data = 0u64; let mut shadow_latency_ns = 0u64;
-                                let mut oldest_newly_acked_send_time: u64 = u64::MAX; let mut oldest_newly_acked_seq: u64 = 0;
+                                let mut oldest_newly_acked_send_time: u64 = u64::MAX;
+                                let mut oldest_newly_acked_seq: u64 = 0;
                                 let relevant_ack = bitmap_ack.as_ref().map(|a| a.relevant(&state.packets_waiting_ack_field, &state.declared_lost_field[..]));
                                 let indices = relevant_ack.iter().flat_map(crate::ack::BitmapAck::acknowledged);
                                 let mut small_recovery_proof = false;
@@ -3177,7 +3135,8 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                         state.stats.spurious_losses += 1;
                                         if receipt == PositiveReceipt::PreOutage { state.outage.ignored_spurious += 1; } }
                                     if sent_ns != 0 && sent_ns != u64::MAX {
-                                        let raw = timestamp_ns.saturating_sub(sent_ns); ack_latency_ns = ack_latency_ns.max(raw);
+                                        let raw = timestamp_ns.saturating_sub(sent_ns);
+                                        ack_latency_ns = ack_latency_ns.max(raw);
                                         if receipt.is_data() {
                                             if let Some(latency) = state.delivery_growth.shadow_receipt_latency(timestamp_ns, sent_ns) {
                                                 shadow_acked_data += 1;
@@ -3188,8 +3147,7 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                         if bitmap_ack.as_ref().is_none_or(|a| index == a.sample_seq) {
                                             let delay = bitmap_ack.as_ref().map_or(0, |a| a.delay_us as u64 * 1000);
                                             if delay < raw {
-                                                {
-                                                    let sample=(raw-delay).max(100_000);
+                                                { let sample=(raw-delay).max(100_000);
                                                     observe_delay_event(state,timestamp_ns,sample,index,sent_ns,delay_event_config(),&cc,max_pps);
                                                     state.target_min_rtt_ns=state.target_min_rtt_ns.min(sample);
                                                     crate::target_validation::risk_rtt(&state.target_state,sample,state.target_min_rtt_ns); }
@@ -3202,8 +3160,7 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                 if ack_latency_ns != 0 { state.loss_timer.observe(ack_latency_ns); }
                                 state.delivery_growth.acknowledged_samples(timestamp_ns, (newly_acked_data, delivery_latency_ns),
                                     (shadow_acked_data, shadow_latency_ns), state.RTT_mean as u64 * 100_000, cc.rate_floor_upps);
-                                if data_ack_progress {
-                                    let before = state.congestion_event_time_ns;
+                                if data_ack_progress { let before = state.congestion_event_time_ns;
                                     let context = loss_trace.as_ref().map(|_| cc_trace_context(state, timestamp_ns, &cc, max_pps));
                                     let cut = observe_ack_hole(state, timestamp_ns, &cc, max_pps);
                                     drain_accepted_cc_events(state, &mut existing_connection.unreliable_send_buffer);
@@ -3219,33 +3176,29 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                     if anchor != 0 && anchor != u64::MAX {
                                         state.ecn_congestion_received = true; state.ecn_oldest_send_time = anchor;
                                         state.ecn_oldest_seq = anchor_seq; } }
-                                if RTT_count > 0 {
-                                    state.stats.rtt_samples += RTT_count; let slot = (state.RTT_sample_cursor % 16) as usize;
+                                if RTT_count > 0 { state.stats.rtt_samples += RTT_count;
+                                    let slot = (state.RTT_sample_cursor % 16) as usize;
                                     state.RTT_sample_sums[slot] = RTT_acc as u32;
                                     state.RTT_sample_counts[slot] = RTT_count as u16;
                                     state.ack_arrival_times[slot] = timestamp_ns; state.RTT_sample_cursor += 1;
                                     let n = (state.RTT_sample_cursor as usize).min(16);
-                                    if n >= 2 {
-                                        let clamp_ns = state.RTT_mean as u64 * 200_000; let mut gap_sum = 0u64;
+                                    if n >= 2 { let clamp_ns = state.RTT_mean as u64 * 200_000; let mut gap_sum = 0u64;
                                         let mut gap_count = 0u64;
                                         for i in 1..n {
                                             let cur = state.ack_arrival_times[((state.RTT_sample_cursor - 1 - (i as u64 - 1)) % 16) as usize];
                                             let prev = state.ack_arrival_times[((state.RTT_sample_cursor - 1 - i as u64) % 16) as usize];
-                                            if prev != 0 && cur > prev {
-                                                gap_sum += (cur - prev).min(clamp_ns);
+                                            if prev != 0 && cur > prev { gap_sum += (cur - prev).min(clamp_ns);
                                                 gap_count += 1; } }
-                                        if gap_count > 0 {
-                                            let mean_ns = gap_sum / gap_count; let mut max_ns = mean_ns;
+                                        if gap_count > 0 { let mean_ns = gap_sum / gap_count; let mut max_ns = mean_ns;
                                             for i in 1..n {
                                                 let cur = state.ack_arrival_times[((state.RTT_sample_cursor - 1 - (i as u64 - 1)) % 16) as usize];
                                                 let prev = state.ack_arrival_times[((state.RTT_sample_cursor - 1 - i as u64) % 16) as usize];
-                                                if prev != 0 && cur > prev {
-                                                    let gap = cur - prev;
+                                                if prev != 0 && cur > prev { let gap = cur - prev;
                                                     if gap <= mean_ns * 2 { max_ns = max_ns.max(gap); } } }
                                             state.ack_pace_estimate = (max_ns / 100_000) as u16; } } }
                                 break 'conn; }
-                            // This is not an ack packet. AEAD, nonce-space/type, replay and minimum-size admission have all
-                            // succeeded.
+                            // This is not an ack packet. AEAD, nonce-space/type, replay and minimum-size admission have
+                            // all succeeded.
                             state.last_peer_packet_received_time = timestamp_ns;
                             // Authentication/replay admission precedes allocation, but positive receipt follows it. A
                             // memory-erased packet must look lost to the sender.
@@ -3299,8 +3252,7 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                         if !existing_connection.unreliable_reassembly[root_idx].admit_segment(segment, layout, block_id, data.len(), timestamp_ns, &existing_connection.receive_budget) {
                                             memory_erased = true; continue; }
                                         if existing_connection.unreliable_reassembly[root_idx].segment_covered(segment, message_len) { continue; } }
-                                    {
-                                        let slot = &mut existing_connection.unreliable_fec[slot_idx];
+                                    { let slot = &mut existing_connection.unreliable_fec[slot_idx];
                                         if slot.in_use() && slot.package_id != package_id {
                                             if package_id < slot.package_id { state.stats.rx_stale_fragments += 1; continue; }
                                             if !matches!(slot.state, FecRecvState::Done) {
@@ -3344,8 +3296,7 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                     continue; }
                                 let WireFrame::Plain { fin: is_fin, id: package_id, offset, data: frag_data } = frame else { continue; };
                                 let frag_offset = offset as u64; let frag_len = frag_data.len() as u64;
-                                if frag_offset + frag_len > u32::MAX as u64 {
-                                    connections_map.remove(&connection_key);
+                                if frag_offset + frag_len > u32::MAX as u64 { connections_map.remove(&connection_key);
                                         ring_state.disconnected(connection_key, DisconnectReason::TimedOut);
                                     break 'conn; }
                                 if frag_offset + frag_len > max_message_size as u64 {
@@ -3356,15 +3307,15 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                 let Some(slot_idx) = existing_connection.receive_index.admit_at(package_id,
                                     &mut existing_connection.unreliable_reassembly, &mut existing_connection.unreliable_fec, timestamp_ns, fec_inactive_grace_ns(state.RTT_mean, true)) else { memory_erased = true; continue; };
                                 if !existing_connection.receive_index.claim(package_id, ReceiveRole::Plain) { continue; }
-                                {
-                                    let slot = &mut existing_connection.unreliable_reassembly[slot_idx];
+                                { let slot = &mut existing_connection.unreliable_reassembly[slot_idx];
                                     let slot_in_use = slot.completed || slot.total_len.is_some() || !slot.received.is_empty();
                                     if slot_in_use && slot.package_id != package_id {
                                         if package_id < slot.package_id { state.stats.rx_stale_fragments += 1; continue; }
                                         if !slot.completed { state.stats.rx_partial_evicted += 1; }
                                         state.stats.rx_partial_evicted_bytes += slot.bytes_received();
                                         *slot = ReassemblySlot::new(); }
-                                    slot.package_id = package_id; let fec = &mut existing_connection.unreliable_fec[slot_idx];
+                                    slot.package_id = package_id;
+                                    let fec = &mut existing_connection.unreliable_fec[slot_idx];
                                     if fec.in_use() && fec.package_id != package_id && package_id > fec.package_id {
                                         if !matches!(fec.state, FecRecvState::Done) {
                                             state.stats.rx_partial_evicted += 1;
@@ -3372,26 +3323,25 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                         *fec = FecRecvSlot::default(); } }
                                 if !existing_connection.unreliable_reassembly[slot_idx].admit(frag_offset as usize, frag_data.len(), &existing_connection.receive_budget) { state.stats.rx_plain_admission_refusals += 1; memory_erased = true; continue; }
                                 let (mut success, mut complete) = existing_connection.unreliable_reassembly[slot_idx].insert(frag_offset as usize, frag_data, is_fin);
-                                if !success {
-                                    state.stats.rx_insert_failures += 1;
+                                if !success { state.stats.rx_insert_failures += 1;
                                     existing_connection.unreliable_reassembly[slot_idx] = ReassemblySlot::new();
                                     existing_connection.unreliable_reassembly[slot_idx].package_id = package_id;
                                     if !existing_connection.unreliable_reassembly[slot_idx].admit(frag_offset as usize, frag_data.len(), &existing_connection.receive_budget) { state.stats.rx_plain_admission_refusals += 1; memory_erased = true; continue; }
                                     (success, complete) = existing_connection.unreliable_reassembly[slot_idx].insert(frag_offset as usize, frag_data, is_fin);
                                     assert!(success); }
                                 existing_connection.unreliable_reassembly[slot_idx].last_segment_ns = timestamp_ns;
-                                if complete {
-                                    state.stats.rx_messages_completed += 1;
+                                if complete { state.stats.rx_messages_completed += 1;
                                     let reservation = existing_connection.unreliable_reassembly[slot_idx].reservation.take();
                                     let completed = existing_connection.unreliable_reassembly[slot_idx].take_complete();
                                     if thread_inner.is_reference() { receive_queue.push_reserved(connection_key, completed, MAX_RECV_QUEUE_BYTES, reservation); } else { ring_state.message(&thread_inner, connection_key, completed); }
                                 } }
-                            if !memory_erased {
-                                state.observe_feedback_payload(payload); let app_full = application_receive_full(&thread_inner);
+                            if !memory_erased { state.observe_feedback_payload(payload);
+                                let app_full = application_receive_full(&thread_inner);
                                 let unique = state.ack_receiver.receive_with_rtt(nonce, timestamp_ns, ecn_marked || app_full,
                                     &mut state.ack_timer, state.stats.rtt_us, buf_len);
                                 if unique && app_full && !ecn_marked { state.stats.rx_app_overload_ce_marks += 1; } } } } } }
-                if receiving { receiving = false; receive_round = 0; send_keys.extend(connections_map.keys().copied()); }
+                if receiving { receiving = false; receive_round = 0;
+                    send_keys.extend(connections_map.keys().copied()); }
                 if budget.expired() { return Some(std::time::Instant::now()); }
                 while !budget.checkpoint() {
                     let Ok(completion) = fec_done_rx.try_recv() else { break; }; budget.progressed();
@@ -3401,7 +3351,8 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                         let slot = &mut conn.unreliable_fec[idx];
                         if !completion.owns(slot, &conn.receive_budget) { continue; }
                         let FecCompletion { message, reservation: mut _reservation, .. } = completion;
-                        let tail = monotonic_clock_ns().saturating_sub(slot.last_block_ns); slot.state = FecRecvState::Done;
+                        let tail = monotonic_clock_ns().saturating_sub(slot.last_block_ns);
+                        slot.state = FecRecvState::Done;
                         let completed = if let Some(segment) = slot.segment {
                             let Some(root_idx) = conn.receive_index.get(segment.root) else { drop(message); continue; };
                             _reservation.shrink(message.capacity());
@@ -3430,7 +3381,8 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                 c.stats.fec_decode_timeouts += retire_inactive_fec_workers(&mut conn.unreliable_fec, current_time_now_ns, grace, false);
                             }
                             let (delivered, done) = sweep_segment_roots_bounded(&mut conn.unreliable_reassembly,
-                                &mut fec_sweep_root_index, current_time_now_ns, grace, sweep_entry_root_checkpoint(&mut budget),
+                                &mut fec_sweep_root_index, current_time_now_ns, grace,
+                                sweep_entry_root_checkpoint(&mut budget),
                                 |message, reservation| if thread_inner.is_reference() { receive_queue.push_reserved(key, message, MAX_RECV_QUEUE_BYTES, Some(reservation)); } else { ring_state.message(&thread_inner, key, message); });
                             c.stats.rx_messages_completed += delivered;
                             if !done { return Some(std::time::Instant::now()); } } }
@@ -3505,8 +3457,7 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                             } else { state.pending_send = Some(pending); }
                             return true; }
                         if current_time_now_ns > state.ack_timer {
-                            {
-                                let Some(virtual_nonce) = state.reserve_ack_nonce() else { return false; };
+                            { let Some(virtual_nonce) = state.reserve_ack_nonce() else { return false; };
                                 let a = state.ack_receiver.ack(current_time_now_ns);
                                 state.stats.ack_delay_us_max = state.stats.ack_delay_us_max.max(a.delay_us);
                                 let encoded = a.encode();
@@ -3542,8 +3493,7 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                             enter_outage(state, &mut connection_tracking_data.unreliable_send_buffer,
                                 current_time_now_ns, connection_tracking_data.two_byte_send_prefix, loss_trace.as_mut()); }
                         if state.outage.since_ns.is_some() {
-                            if state.outage.probe_due(current_time_now_ns) {
-                                let seq = state.send_sequence_number;
+                            if state.outage.probe_due(current_time_now_ns) { let seq = state.send_sequence_number;
                                 let probe_payload_len = state.current_tu as usize - total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(state.magic1).unwrap();
                                 packet_memory_send[..probe_payload_len].fill(0xff);
                                 if connection_tracking_data.unreliable_send_buffer.target_copy_pending() {
@@ -3568,10 +3518,8 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                         if state.RTT_sample_cursor != state.RTT_mean_cursor {
                             state.RTT_mean_cursor = state.RTT_sample_cursor; let previous_rtt_mean = state.RTT_mean;
                             let n = (state.RTT_sample_cursor as usize).min(16);
-                            if n > 0 {
-                                let mut total_sum = 0u64; let mut total_count = 0u64;
-                                for i in 0..n {
-                                    total_sum += state.RTT_sample_sums[i] as u64;
+                            if n > 0 { let mut total_sum = 0u64; let mut total_count = 0u64;
+                                for i in 0..n { total_sum += state.RTT_sample_sums[i] as u64;
                                     total_count += state.RTT_sample_counts[i] as u64; }
                                 state.RTT_mean = quantized_rtt_mean(total_sum, total_count);
                                 state.stats.rtt_us = state.RTT_mean as u64 * 100; }
@@ -3609,8 +3557,7 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                 let original_send_time = send_time;
                                 if send_time != 0 && (state.RTT_mean == 0 || send_age_ns(current_time_now_ns, send_time) < time_to_considered_dropped) {
                                     break; }
-                                if send_time == 0 {
-                                    let history_ns = 4_295_000_000;
+                                if send_time == 0 { let history_ns = 4_295_000_000;
                                     send_time = current_time_now_ns.saturating_sub(history_ns); }
                                 if state.packets_waiting_ack_tail == state.tu_probe_sequence_number {
                                     state.finish_upward_probe(false, state.last_sent_tu_probe_time_ns, current_time_now_ns);
@@ -3618,8 +3565,7 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                 else {
                                     let trigger = count_congestion_signal(state, state.packets_waiting_ack_tail,
                                         send_time, current_time_now_ns, &cc);
-                                    if trigger {
-                                        let before = state.congestion_event_time_ns;
+                                    if trigger { let before = state.congestion_event_time_ns;
                                         let context = loss_trace.as_ref().map(|_| cc_trace_context(state, current_time_now_ns, &cc, max_pps));
                                         if apply_loss_congestion(state, send_time, current_time_now_ns, &cc, max_pps) {
                                             let seq = state.packets_waiting_ack_tail;
@@ -3638,8 +3584,7 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                     #[cfg(feature = "research_budget_diagnostic")]
                                     diag::feedback(state.packets_waiting_ack_tail,current_time_now_ns,3);
                                     state.declared_lost_field[(bit_index / 64) as usize] |= 1u64 << (bit_index % 64); } }
-                            if record_loss_episodes {
-                                let sent_ns = state.send_time(state.packets_waiting_ack_tail);
+                            if record_loss_episodes { let sent_ns = state.send_time(state.packets_waiting_ack_tail);
                                 let lost = state.declared_lost_field[(bit_index / 64) as usize] & (1u64 << (bit_index % 64)) != 0;
                                 if sent_ns != 0 && sent_ns != u64::MAX {
                                     state.loss_episodes.on_packet(sent_ns, lost, state.RTT_mean as u64 * 100_000, &mut state.stats); } }
@@ -3675,7 +3620,8 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                 &mut state.send_pacer_acc_ns, current_time_now_ns, time_between_sends_ns); }
                         let elapsed_ns = current_time_now_ns + 1 - state.last_sent_could_have_sent_data_packet.max(state.last_pacing_ack_received_time.saturating_sub(ACK_BUFFER_TIME_NS));
                         let grant = send_pacing_grant(elapsed_ns, time_between_sends_ns, state.send_pacer_acc_ns);
-                        let mut packet_send_allowance_now = grant.packets; let pacing_first_sequence = state.send_sequence_number;
+                        let mut packet_send_allowance_now = grant.packets;
+                        let pacing_first_sequence = state.send_sequence_number;
                         state.stats.pacing_commanded_packets += packet_send_allowance_now;
                         let could_have_sent = packet_send_allowance_now != 0;
                         state.current_tu = state.current_tu.min(ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE as u64);
@@ -3701,8 +3647,7 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                 &[], Dscp::Af21, connection_tracking_data.two_byte_send_prefix, loss_trace.as_mut()) { return true; }
                             packet_send_allowance_now = packet_send_allowance_now.saturating_sub(1); }
                         connection_tracking_data.unreliable_send_buffer.set_rate(rate_mul_div(allowed_bandwidth_upps, payload_size as u64, 1_000_000));
-                        {
-                            let buf = &mut connection_tracking_data.unreliable_send_buffer;
+                        { let buf = &mut connection_tracking_data.unreliable_send_buffer;
                             let a = buf.fec_adaptive.get_or_insert_with(|| crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, current_time_now_ns));
                             a.on_tick(current_time_now_ns);
                             if a.base_parity_active() || a.budget_base_active() {
@@ -3747,8 +3692,7 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                             state.stats.pacing_burst_hist[class] += 1; }
                         let has_data = connection_tracking_data.unreliable_send_buffer.has_unsent_data();
                         update_app_limit(state, current_time_now_ns, has_data);
-                        if could_have_sent {
-                            state.last_sent_could_have_sent_data_packet = current_time_now_ns;
+                        if could_have_sent { state.last_sent_could_have_sent_data_packet = current_time_now_ns;
                             if packet_send_allowance_now == 0 { state.send_pacer_acc_ns = grant.carry_ns; }
                             else { state.send_pacer_acc_ns = 0; } }
                         if state.last_status_print_time + 1_000_000_000 < current_time_now_ns {
@@ -3766,19 +3710,16 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                     let mut connected = 0; let mut changed = false; let mut used = 0usize;
                     for (key, conn) in &connections_map {
                         used = used.saturating_add(conn.unreliable_send_buffer.queues.iter().map(|q| q.queue_bytes_filled as usize).sum::<usize>());
-                        if conn.is_connected() {
-                            connected += 1;
+                        if conn.is_connected() { connected += 1;
                             changed |= ready_peers.get(key) != Some(&conn.handshake_hash); } }
                     changed |= connected != ready_peers.len();
-                    if changed {
-                        ready_peers.clear();
+                    if changed { ready_peers.clear();
                         ready_peers.extend(connections_map.iter().filter(|(_, c)| c.is_connected()).map(|(k, c)| (*k, c.handshake_hash))); }
                     let receive_ready = !receive_notified && !receive_queue.messages.is_empty();
                     receive_notified |= receive_ready;
                     let space_ready = thread_inner.send_space_ready(used, ready_used); ready_used = used;
                     if changed || receive_ready || space_ready { thread_inner.transport_ready(); } }
-                if should_sleep {
-                    let now = monotonic_clock_ns(); let mut deadline = now.saturating_add(100_000_000);
+                if should_sleep { let now = monotonic_clock_ns(); let mut deadline = now.saturating_add(100_000_000);
                     let mut include = |due| { deadline = deadline.min(next_service_deadline(now, due)); };
                     include(fec_sweep_ns.saturating_add(100_000_000)); let mut active_retry = false;
                     for conn in connections_map.values() {
@@ -3805,7 +3746,8 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                                 if c.pending_send.is_none() && !conn.unreliable_send_buffer.target_copy_pending()
                                     && c.send_sequence_number - c.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY - 1
                                     && c.current_tu != ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE as u64
-                                    && c.tu_probe_sequence_number == u64::MAX { include(c.upward_probe_deadline(now)); } }
+                                    && c.tu_probe_sequence_number == u64::MAX {
+                                    include(c.upward_probe_deadline(now)); } }
                             ConnectionState::SendingClientHelloPlaintext { last_sent_time_ns, .. }
                             | ConnectionState::SendingClientHello { last_sent_time_ns, .. } => {
                                 include(last_sent_time_ns.saturating_add(2_500_000_001));
@@ -3824,7 +3766,8 @@ pub(crate) fn new_reference_pump_with_options(my_keypairs: Vec<IdentityKeyPair>,
                         if waited_across_idle_quantum(now, deadline, resumed) { idle_resume_ns = resumed; } } } } } };
         let pump = Pump { run: Box::new(run), wakeup: Some(std::time::Instant::now()) };
         (pump, Endpoint { inner }) } }
-fn cubic_rate(t_ns: u64, r_max: u64, k_ns: u64) -> (u64, char) { cubic_rate_with_options(t_ns, r_max, k_ns, &crate::ship::CC) }
+fn cubic_rate(t_ns: u64, r_max: u64, k_ns: u64) -> (u64, char) {
+    cubic_rate_with_options(t_ns, r_max, k_ns, &crate::ship::CC) }
 pub(crate) fn cubic_rate_with_options(t_ns: u64, r_max: u64, k_ns: u64, cc: &CongestionPolicy) -> (u64, char) {
     cubic_rate_additive(t_ns, t_ns, r_max, k_ns, cc) }
 fn cubic_rate_additive(t_ns: u64, add_ns: u64, r_max: u64, k_ns: u64, cc: &CongestionPolicy) -> (u64, char) {
@@ -3833,23 +3776,19 @@ fn cubic_rate_additive(t_ns: u64, add_ns: u64, r_max: u64, k_ns: u64, cc: &Conge
     let drop = r * (1.0 - cc.beta); let rtt_seconds = k / (cc.recovery_rtts as f64 * 1e9);
     let floor = cc.min_growth_uppsps; let ceiling = cc.max_growth_uppsps; let min_growth = floor / 1e9 * a;
     let linear_cap_slope = ceiling / 1e9;
-    let finish = |rate: u64, mode| {
-        let absolute = r * cc.beta + (floor + ceiling) / 1e9 * t - floor / 1e9 * (t - a);
+    let finish = |rate: u64, mode| { let absolute = r * cc.beta + (floor + ceiling) / 1e9 * t - floor / 1e9 * (t - a);
         let relative = r * cc.beta * (cc.relative_growth_per_rtt * t / (rtt_seconds * 1e9)).exp() + min_growth;
         (rate.min(relative.min(absolute) as u64).min(MAX_CC_RATE_UPPS), mode) };
     let r_rp = r * cc.rate_rp; let r_drop = r_rp - r * cc.beta;
-    if t <= k {
-        let p = 1.0 - t / k; let rate = r_rp - r_drop * p * p + min_growth;
+    if t <= k { let p = 1.0 - t / k; let rate = r_rp - r_drop * p * p + min_growth;
         return finish((rate.max(r * cc.beta)) as u64, 'R'); }
     let dt = t - k; let t_pg = (cc.time_pg - 1.0) * k; let t_gs = (cc.time_gs - 1.0) * k; let r_pg = r * cc.rate_pg;
     let r_gs = r * cc.rate_gs; let p_slope = (r_pg - r_rp) / t_pg;
-    if dt <= t_pg {
-        let rate = r_rp + p_slope * dt + min_growth; let capped = r_rp + linear_cap_slope * dt + min_growth;
+    if dt <= t_pg { let rate = r_rp + p_slope * dt + min_growth; let capped = r_rp + linear_cap_slope * dt + min_growth;
         let rate = rate.min(capped); let rate = if rate.is_finite() { rate } else { r };
         return finish(rate as u64, 'P'); }
     let g_dt = t_gs - t_pg; let a = (r_gs - r_pg - p_slope * g_dt) / (g_dt * g_dt);
-    if dt <= t_gs {
-        let u = dt - t_pg; let rate = r_pg + p_slope * u + a * u * u + min_growth;
+    if dt <= t_gs { let u = dt - t_pg; let rate = r_pg + p_slope * u + a * u * u + min_growth;
         let capped = r + linear_cap_slope * dt + min_growth; let rate = rate.min(capped);
         let rate = if rate.is_finite() { rate } else { r };
         return finish(rate as u64, 'G'); }
@@ -3874,7 +3813,8 @@ pub(crate) fn service_connections(endpoint: &Endpoint, mut req: NetworkThreadPus
         std::thread::sleep(std::time::Duration::from_micros(25)); } }
 pub fn get_handshake_hash(handshake: &snow::HandshakeState) -> [u8; 64] {
     let handshake_hash_slice = handshake.get_handshake_hash(); assert!(handshake_hash_slice.len() <= 64);
-    let mut handshake_hash = [0u8; 64]; handshake_hash[..handshake_hash_slice.len()].copy_from_slice(handshake_hash_slice);
+    let mut handshake_hash = [0u8; 64];
+    handshake_hash[..handshake_hash_slice.len()].copy_from_slice(handshake_hash_slice);
     handshake_hash }
 use crate::helpers::*; pub use crate::native_sockets::Dscp; use crate::native_sockets::*;
 const OUTAGE_ACK_SILENCE_NS: u64 = 2_000_000_000; const OUTAGE_TIMEOUT_NS: u64 = 120_000_000_000;
@@ -3887,8 +3827,7 @@ const OUTAGE_PROBE_RECORDS: usize = 32;
     pre_startup_done: bool, }
 fn recent_outage_probe_acked(state: &ConnectionStateConnected, ack: &crate::ack::BitmapAck, now: u64) -> bool {
     let Some(since) = state.outage.since_ns else { return false; };
-    state.outage.probes.iter().any(|&(seq, sent)| {
-        let bit = seq % PACKETS_WAITING_ACK_CAPACITY;
+    state.outage.probes.iter().any(|&(seq, sent)| { let bit = seq % PACKETS_WAITING_ACK_CAPACITY;
         sent != 0 && sent >= since && sent <= now && (ack.sample_seq == seq || ack.contains(seq)) &&
             seq >= state.packets_waiting_ack_tail && seq < state.send_sequence_number &&
             state.packets_waiting_ack_field[(bit / 64) as usize] & (1 << (bit % 64)) != 0 &&
@@ -3898,12 +3837,10 @@ impl OutageState {
         self.since_ns = Some(now); self.probes.fill((0, 0)); self.probe_cursor = 0; self.next_probe_ns = now;
         self.probe_interval_ns = OUTAGE_FIRST_PROBE_NS;
         self.resume_rate_upps = rate.min(crate::ship::CC.initial_rate_upps); }
-    fn record_probe(&mut self, sequence: u64, sent: u64) {
-        self.probes[self.probe_cursor] = (sequence, sent);
+    fn record_probe(&mut self, sequence: u64, sent: u64) { self.probes[self.probe_cursor] = (sequence, sent);
         self.probe_cursor = (self.probe_cursor + 1) % OUTAGE_PROBE_RECORDS; }
     fn probe_due(&self, now: u64) -> bool { self.since_ns.is_some() && now >= self.next_probe_ns }
-    fn probe_sent(&mut self, now: u64) {
-        self.next_probe_ns = now.saturating_add(self.probe_interval_ns);
+    fn probe_sent(&mut self, now: u64) { self.next_probe_ns = now.saturating_add(self.probe_interval_ns);
         self.probe_interval_ns = self.probe_interval_ns.saturating_mul(2).min(OUTAGE_MAX_PROBE_NS); }
     fn expired(now: u64, last_ack: u64) -> bool { now.saturating_sub(last_ack) >= OUTAGE_TIMEOUT_NS } }
 fn enter_outage(state: &mut ConnectionStateConnected, buf: &mut SendQueues,
@@ -3919,13 +3856,15 @@ fn enter_outage(state: &mut ConnectionStateConnected, buf: &mut SendQueues,
         if pending {
             if lost {
                 state.packets_in_flight = state.packets_in_flight.checked_sub(1).expect("outage flight underflow");
-                state.stats.packets_lost += 1; state.outage.ignored_losses += 1; state.packet_lost_since_last_print += 1;
+                state.stats.packets_lost += 1; state.outage.ignored_losses += 1;
+                state.packet_lost_since_last_print += 1;
                 state.declared_lost_field[(bit / 64) as usize] |= 1 << (bit % 64);
                 if let Some(t) = trace.as_deref_mut() { t.outcome('L', prefix, seq, now); }
                 #[cfg(feature = "research_budget_diagnostic")] diag::feedback(seq,now,4);
             } else { state.stats.tu_probes_lost += 1; } }
         state.packets_waiting_ack_field[(bit / 64) as usize] &= !(1 << (bit % 64));
-        drain_accepted_cc_events(state, buf); rand_finalize_packet(state,seq,lost); buf.fec_on_packet_finalized(seq, lost);
+        drain_accepted_cc_events(state, buf); rand_finalize_packet(state,seq,lost);
+        buf.fec_on_packet_finalized(seq, lost);
         state.packets_waiting_ack_tail += 1; }
     state.tu_probe_sequence_number = u64::MAX; state.recovery.startup_cancel(); state.ecn_congestion_received = false;
     state.loss_count_in_window = 0; state.stats.cc_rate_upps = 0;
@@ -3934,14 +3873,12 @@ fn resume_outage(state: &mut ConnectionStateConnected, buf: &mut SendQueues,
     slots: &mut [FecRecvSlot], now: u64, max_pps: Option<u64>) {
     let Some(since) = state.outage.since_ns.take() else { return; }; let paused = now.saturating_sub(since);
     for q in &mut buf.queues {
-        for retained in q.fec_retained.values_mut() {
-            retained.expires_ns = retained.expires_ns.saturating_add(paused);
+        for retained in q.fec_retained.values_mut() { retained.expires_ns = retained.expires_ns.saturating_add(paused);
             if let Some(deadline) = &mut retained.slot.retained_until_ns { *deadline = deadline.saturating_add(paused); } }
         for slot in [&mut q.fec_send_slot, &mut q.fec_suspended].into_iter().flatten() {
             slot.send_started_ns = slot.send_started_ns.saturating_add(paused);
             if let Some(deadline) = &mut slot.retained_until_ns { *deadline = deadline.saturating_add(paused); } } }
-    if buf.fec_adaptive.is_some() {
-        let policy = buf.fec_adaptive.as_ref().unwrap().policy;
+    if buf.fec_adaptive.is_some() { let policy = buf.fec_adaptive.as_ref().unwrap().policy;
         let mut fresh = crate::fec_adapt::FecAdaptiveState::new(crate::ship::FEC, now); fresh.policy = policy;
         buf.fec_adaptive = Some(fresh); }
     for slot in slots {
@@ -3956,8 +3893,8 @@ fn resume_outage(state: &mut ConnectionStateConnected, buf: &mut SendQueues,
     state.delivery_growth = DeliveryGrowth::new(now, state.congestion_event_rate_upps); state.cc_startup_done = short;
     { state.delay_curve_beta=None; }
     fresh_hold_clear(state);
-    if !short {
-    state.RTT_sample_sums.fill(0); state.RTT_sample_counts.fill(0); state.RTT_sample_cursor = 0; state.RTT_mean_cursor = 0;
+    if !short { state.RTT_sample_sums.fill(0); state.RTT_sample_counts.fill(0); state.RTT_sample_cursor = 0;
+    state.RTT_mean_cursor = 0;
     state.RTT_mean = u16::MAX; }
     state.ack_arrival_times.fill(0); state.ack_pace_estimate = 0; state.send_pacer_acc_ns = 0;
     state.last_sent_could_have_sent_data_packet = now; state.last_sent_data_packet = now;
@@ -3969,16 +3906,15 @@ fn take_ecn_signal(state: &mut ConnectionStateConnected, guard_rtts: f64) -> boo
     let eligible = pending && state.ecn_oldest_send_time > state.congestion_event_time_ns.saturating_add((state.RTT_mean as f64 * 100_000.0 * guard_rtts) as u64);
     if eligible { state.loss_count_in_window = 0; }
     eligible }
-fn retry_handshake(created: u64, last_sent: &mut u64, now: u64, lifetime: u64, send: impl FnOnce() -> Option<u64>) -> bool {
+fn retry_handshake(created: u64, last_sent: &mut u64, now: u64, lifetime: u64,
+    send: impl FnOnce() -> Option<u64>) -> bool {
     if now.saturating_sub(created) > lifetime { return false; }
     if last_sent.saturating_add(2_500_000_000) < now && send().is_some() {
         *last_sent = if *last_sent == 0 { now - 2_500_000_000 + 10_000_000 } else { now }; }
     true }
 fn prepare_connected_send_tick(state: &mut ConnectionStateConnected, buf: &mut SendQueues, now: u64) {
-    if !buf.target_state.same_connection(&state.target_state) {
-        buf.target_state = state.target_state.clone();
-        for q in &mut buf.queues {
-            q.target_state = state.target_state.clone();
+    if !buf.target_state.same_connection(&state.target_state) { buf.target_state = state.target_state.clone();
+        for q in &mut buf.queues { q.target_state = state.target_state.clone();
             if let Some(root)=&q.budget_root {root.lock().unwrap().target_state=state.target_state.clone();}
             for context in &mut q.interleave_parked {
                 if let Some(root)=&context.budget_root {root.lock().unwrap().target_state=state.target_state.clone();} } } }
@@ -3989,8 +3925,8 @@ fn prepare_connected_send_tick(state: &mut ConnectionStateConnected, buf: &mut S
     buf.set_tu_unresolved(!state.tu_assessment_settled);
     let exposure = buf.exposure_snapshot(state.stats.cc_rate_upps, state.RTT_mean); buf.set_exposure(exposure);
     if state.locally_blocked { freeze_local_send(state, now); } }
-fn freeze_local_send(state: &mut ConnectionStateConnected, now: u64) {
-    update_app_limit(state, now, false); state.congestion_event_time_ns = now.saturating_sub(state.app_limit_time_offset);
+fn freeze_local_send(state: &mut ConnectionStateConnected, now: u64) { update_app_limit(state, now, false);
+    state.congestion_event_time_ns = now.saturating_sub(state.app_limit_time_offset);
     state.last_sent_could_have_sent_data_packet = now;
     state.send_pacer_acc_ns = 0; }
 #[cfg(feature = "research_cohort_observer")]
@@ -4048,10 +3984,8 @@ fn commit_connected_send(state: &mut ConnectionStateConnected, buf: &mut SendQue
         let bits=state.rand_background_bits.get_or_insert_with(||vec![0;PACKETS_WAITING_ACK_WORDS].into_boxed_slice());
         let bit=seq%PACKETS_WAITING_ACK_CAPACITY; bits[(bit/64) as usize]&=!(1u64<<(bit%64));
         if background {bits[(bit/64) as usize]|=1u64<<(bit%64);} }
-    {
-        state.stats.dup_fallbacks=buf.target_dup_fallbacks;
-        if target_is_copy(plaintext) {
-            state.stats.dup_datagrams+=1;state.stats.dup_bytes+=len as u64;
+    { state.stats.dup_fallbacks=buf.target_dup_fallbacks;
+        if target_is_copy(plaintext) { state.stats.dup_datagrams+=1;state.stats.dup_bytes+=len as u64;
             state.stats.dup_messages+=target_dup_counts(plaintext).0;
             if kind != PendingSendKind::Data { buf.queued_commit(seq); } } }
     if kind != PendingSendKind::Data { buf.fec_prepare_packet(seq); }
@@ -4078,13 +4012,13 @@ fn commit_connected_send(state: &mut ConnectionStateConnected, buf: &mut SendQue
         if let Some(tu) = state.deferred_tu.take() { state.apply_effective_tu(tu, sent); } }
     state.max_in_flight_since_last_print = state.max_in_flight_since_last_print.max(state.packets_in_flight); }
 fn update_app_limit(state: &mut ConnectionStateConnected, now_ns: u64, has_data: bool) {
-    if !has_data && !state.is_app_limited {
-        state.stats.cc_app_limited_entries += 1;
+    if !has_data && !state.is_app_limited { state.stats.cc_app_limited_entries += 1;
         state.app_limit_time_offset = now_ns.saturating_sub(state.congestion_event_time_ns);
-        state.delivery_growth.app_limited_since_ns = now_ns; state.is_app_limited = true;
-    } else if has_data && state.is_app_limited {
+        state.delivery_growth.app_limited_since_ns = now_ns;
+        state.is_app_limited = true; } else if has_data && state.is_app_limited {
         let quiet_start = state.delivery_growth.app_limited_since_ns;
-        state.delivery_growth.resume_after_quiet(now_ns, now_ns.saturating_sub(quiet_start), state.RTT_mean as u64 * 100_000);
+        state.delivery_growth.resume_after_quiet(now_ns, now_ns.saturating_sub(quiet_start),
+            state.RTT_mean as u64 * 100_000);
         state.congestion_event_time_ns = now_ns.saturating_sub(state.app_limit_time_offset);
         state.is_app_limited = false; } }
 fn connection_curve_policy(state:&ConnectionStateConnected, cc:&CongestionPolicy) -> CongestionPolicy {
@@ -4094,8 +4028,7 @@ fn connection_curve_policy(state:&ConnectionStateConnected, cc:&CongestionPolicy
 fn connection_rate(t_ns: u64, anchor_upps: u64, k_ns: u64, cc: &CongestionPolicy, startup_done: bool) -> (u64, char) {
     connection_rate_add(t_ns, t_ns, anchor_upps, k_ns, cc, startup_done) }
 fn connection_rate_add(t_ns: u64, add_ns: u64, anchor_upps: u64, k_ns: u64, cc: &CongestionPolicy, startup_done: bool) -> (u64, char) {
-    if !startup_done {
-        let rtt_ns = k_ns / cc.recovery_rtts;
+    if !startup_done { let rtt_ns = k_ns / cc.recovery_rtts;
         let exponent = if rtt_ns == u16::MAX as u64 * 100_000 { 0.0 } else { cc.startup_multiplier.ln() * t_ns as f64 / rtt_ns.max(100_000) as f64 };
         ((anchor_upps as f64 * exponent.min(30.0).exp()).min(MAX_CC_RATE_UPPS as f64) as u64, 'I')
     } else { cubic_rate_additive(t_ns, add_ns, anchor_upps, k_ns, cc) } }
@@ -4104,7 +4037,10 @@ struct FreshHold { phase:u8, barrier_ns:u64, release_coord_ns:i128, release_wall
 impl FreshHold {
     const NONE: FreshHold = FreshHold { phase:0, barrier_ns:0, release_coord_ns:0, release_wall_ns:0, min_sample_ns:u64::MAX };
     fn add(&self, t:u64) -> u64 {
-        match self.phase { 1 => 0, 2 => (t as i128 - self.release_coord_ns).clamp(0, u64::MAX as i128) as u64, _ => t, } }
+        match self.phase {
+            1 => 0,
+            2 => (t as i128 - self.release_coord_ns).clamp(0, u64::MAX as i128) as u64,
+            _ => t, } }
     fn for_send(&self, sent_ns:u64) -> FreshHold {
         if self.phase==2 && sent_ns<=self.release_wall_ns { FreshHold { phase:1, ..*self } } else { *self } } }
 fn fresh_hold_reanchored(h:FreshHold, current_t:u64, hi:u64) -> FreshHold {
@@ -4115,10 +4051,10 @@ fn state_rate(state:&ConnectionStateConnected, t_ns:u64, k_ns:u64, cc:&Congestio
 fn state_rate_sent(state:&ConnectionStateConnected, sent_ns:u64, t_ns:u64, k_ns:u64, cc:&CongestionPolicy, startup_done:bool) -> (u64, char) {
     connection_rate_add(t_ns, state.fresh_hold.for_send(sent_ns).add(t_ns), state.congestion_event_rate_upps, k_ns, cc, startup_done) }
 fn fresh_hold_clear(state:&mut ConnectionStateConnected) { state.fresh_hold=FreshHold::NONE; }
-// Age on the new-K curve that first reaches the old-K rate at `current_t`, searched from the original lower bound. The original
-// upper bound is only a first guess: it doubles (saturating) until reached. Invariant: hi reaches the rate, and lo is the
-// original bound or lo - 1 does not. None means no u64 age reaches it, which with a growing startup multiplier only occurs on the
-// flat no-sample sentinel curve.
+// Age on the new-K curve that first reaches the old-K rate at `current_t`, searched from the original lower bound. The
+// original upper bound is only a first guess: it doubles (saturating) until reached. Invariant: hi reaches the rate,
+// and lo is the original bound or lo - 1 does not. None means no u64 age reaches it, which with a growing startup
+// multiplier only occurs on the flat no-sample sentinel curve.
 fn rtt_reanchor_age(current_t: u64, anchor_upps: u64, old_k: u64, new_k: u64, cc: &CongestionPolicy, startup_done: bool) -> Option<u64> {
     rtt_reanchor_age_hold(current_t, anchor_upps, old_k, new_k, cc, startup_done, FreshHold::NONE) }
 fn rtt_reanchor_age_hold(current_t: u64, anchor_upps: u64, old_k: u64, new_k: u64, cc: &CongestionPolicy, startup_done: bool, hold: FreshHold) -> Option<u64> {
@@ -4137,7 +4073,8 @@ fn cc_trace_context(state: &ConnectionStateConnected, now: u64, cc: &CongestionP
         else { now.saturating_sub(state.congestion_event_time_ns) };
     let (rate, mode) = state_rate(state, age, k, cc, state.cc_startup_done);
     let capped = |r: u64| state.delivery_growth.bound(local_rate_limit(r.max(cc.rate_floor_upps), max_pps));
-    let rate = capped(rate); let next = capped(state_rate(state, age.saturating_add(1_000_000), k, cc, state.cc_startup_done).0);
+    let rate = capped(rate);
+    let next = capped(state_rate(state, age.saturating_add(1_000_000), k, cc, state.cc_startup_done).0);
     crate::loss_trace::CcContext { pps: rate as f64 / 1_000_000.0,
         slope_ppsps: if state.is_app_limited { 0.0 } else { next.saturating_sub(rate) as f64 / 1000.0 },
         rtt_ns, feedback_ns: rtt_ns.saturating_add((rtt_ns / 16).max(1_000_000))
@@ -4161,26 +4098,26 @@ fn observe_ack_hole(state: &mut ConnectionStateConnected, now: u64, cc: &Congest
     if state.outage.since_ns.is_some() || state.RTT_mean == u16::MAX { return None; }
     let Some(third) = state.ack_hole.newest[ACK_HOLE_NEWER_PACKETS - 1] else { return None; };
     let grace = (state.RTT_mean as u64 * 100_000 / 16).max(1_000_000);
-    let guard = state.congestion_event_time_ns.saturating_add((state.RTT_mean as f64 * 100_000.0 * cc.event_guard_rtts) as u64);
+    let guard = state.congestion_event_time_ns.saturating_add(
+        (state.RTT_mean as f64 * 100_000.0 * cc.event_guard_rtts) as u64);
     let mut seq = state.ack_hole.cursor.max(state.packets_waiting_ack_tail).max(state.outage.ignore_loss_before_seq);
     let covered = state.ack_hole.pending.back().map_or(seq, |&(end, _)| end.max(seq));
     if third > covered {
-        if state.ack_hole.pending.len() < ACK_HOLE_PENDING_RANGES {
-            state.ack_hole.pending.push_back((third, now));
+        if state.ack_hole.pending.len() < ACK_HOLE_PENDING_RANGES { state.ack_hole.pending.push_back((third, now));
         } else { *state.ack_hole.pending.back_mut().unwrap() = (third, now); } }
     let mut cut = None;
     while let Some(&(end, since)) = state.ack_hole.pending.front() {
         if end > seq && now.saturating_sub(since) < grace { break; }
         state.ack_hole.pending.pop_front();
-        while seq < end {
-            let bit = seq % PACKETS_WAITING_ACK_CAPACITY;
+        while seq < end { let bit = seq % PACKETS_WAITING_ACK_CAPACITY;
             let word = state.packets_waiting_ack_field[(bit / 64) as usize] >> (bit % 64);
             if word == 0 { seq = (seq + 64 - bit % 64).min(end); continue; }
             seq += word.trailing_zeros() as u64;
             if seq >= end { seq = end; break; }
             let sent = state.send_time(seq);
             if seq != state.tu_probe_sequence_number && sent != 0 && sent != u64::MAX && sent > guard {
-                let trigger = count_congestion_signal(state, seq, sent, now, cc); state.ack_hole.confirmed_before = seq + 1;
+                let trigger = count_congestion_signal(state, seq, sent, now, cc);
+                state.ack_hole.confirmed_before = seq + 1;
                 if trigger {
                     if apply_loss_congestion(state, sent, now, cc, max_pps) {
                         push_accepted_cc_event(state, AcceptedCcEvent { kind: CC_EVENT_EARLY, evidence_seq: seq, evidence_sent_ns: sent, feedback_ns: now });
@@ -4192,8 +4129,7 @@ fn observe_ack_hole(state: &mut ConnectionStateConnected, now: u64, cc: &Congest
     cut }
 #[derive(Debug, Default)] struct LossTimer { srtt_ns: u64, rttvar_ns: u64, }
 impl LossTimer {
-    fn observe(&mut self, latency_ns: u64) {
-        let sample = latency_ns.max(100_000);
+    fn observe(&mut self, latency_ns: u64) { let sample = latency_ns.max(100_000);
         if self.srtt_ns == 0 { self.srtt_ns = sample; self.rttvar_ns = sample / 2; } else {
             self.rttvar_ns = (3 * self.rttvar_ns + self.srtt_ns.abs_diff(sample)) / 4;
             self.srtt_ns = (7 * self.srtt_ns + sample) / 8; } }
@@ -4209,13 +4145,13 @@ fn congestion_discovery_rate(state: &ConnectionStateConnected, discovered: u64, 
 #[derive(Clone, Copy, Debug)] struct DelayEventConfig {
     k:f64, min_ms:f64, max_ms:f64, interval_rtts:f64, giveup:u64, hold:Option<DelayHoldConfig>,
     beta:Option<f64>, #[cfg(feature="research_target_validation")] effect:Option<DelayEffectConfig>, }
-#[cfg(feature="research_target_validation")] #[derive(Clone, Copy, Debug)] struct DelayEffectConfig { frac:f64, rtts:f64 }
+#[cfg(feature="research_target_validation")] #[derive(Clone, Copy, Debug)]
+struct DelayEffectConfig { frac:f64, rtts:f64 }
 #[cfg(feature="research_target_validation")] #[derive(Debug)]
 struct DelayEffectPending { excess_ns:u64, guard_until_ns:u64, deadline_ns:u64 }
 #[derive(Clone, Copy, Debug)] struct DelayHoldConfig { rtts:f64, max_rtts:f64 }
 impl DelayHoldConfig {
-    fn duration_ns(self, consecutive:u64, srtt_ns:u64) -> u64 {
-        let mut rtts=self.rtts;
+    fn duration_ns(self, consecutive:u64, srtt_ns:u64) -> u64 { let mut rtts=self.rtts;
         for _ in 0..consecutive.saturating_sub(1).min(2098) {
             if rtts>=self.max_rtts { break; }
             rtts=(rtts*2.).min(self.max_rtts); }
@@ -4290,14 +4226,11 @@ fn delay_effect_update(state:&mut ConnectionStateConnected, now:u64, sample:Opti
     if let Some(p)=&g.pending_effect {
         let effective=now>p.guard_until_ns && now<=p.deadline_ns && sample.is_some_and(|m|
             m.saturating_sub(state.target_min_rtt_ns) as f64<=(1.-effect.frac)*p.excess_ns as f64);
-        if effective || now>p.deadline_ns {
-            g.pending_effect=None;
+        if effective || now>p.deadline_ns { g.pending_effect=None;
             if effective { state.stats.delay_effective+=1; g.ineffective=0; } else {
                 state.stats.delay_ineffective+=1; g.ineffective=g.ineffective.saturating_add(1);
-                if g.ineffective>=c.giveup && !g.suspended {
-                    g.suspended=true;
-                    if let Some(h)=c.hold {
-                        g.consecutive_suspensions=g.consecutive_suspensions.saturating_add(1);
+                if g.ineffective>=c.giveup && !g.suspended { g.suspended=true;
+                    if let Some(h)=c.hold { g.consecutive_suspensions=g.consecutive_suspensions.saturating_add(1);
                         g.hold_until_ns=Some(now.saturating_add(h.duration_ns(g.consecutive_suspensions,srtt)));
                         g.clean_until_ns=None; }
                     state.stats.delay_suspensions+=1; } } } }
@@ -4311,17 +4244,14 @@ fn delay_effect_update(state:&mut ConnectionStateConnected, now:u64, sample:Opti
 fn close_delay_event(state:&mut ConnectionStateConnected, now:u64, c:DelayEventConfig,
     cc:&CongestionPolicy, max_pps:Option<u64>) -> bool {
     let srtt=state.RTT_mean as u64*100_000;
-    if c.hold.is_some() {
-        let g=&mut state.delay_giveup;
-        if !g.suspended && g.clean_until_ns.is_some_and(|deadline|now>=deadline) {
-            g.consecutive_suspensions=0;
+    if c.hold.is_some() { let g=&mut state.delay_giveup;
+        if !g.suspended && g.clean_until_ns.is_some_and(|deadline|now>=deadline) { g.consecutive_suspensions=0;
             g.clean_until_ns=None; } }
     let closed_sample=if c.giveup>0 && state.delay_event_window.deadline_ns.is_some_and(|d|now>=d) {
         state.delay_event_window.min_sample_ns } else { None };
     let fh_closing=state.fresh_hold.phase==1 && state.delay_event_window.deadline_ns.is_some_and(|d|now>=d);
     let event=state.delay_event_window.close(now,state.target_min_rtt_ns,srtt,c);
-    if fh_closing {
-        let fresh=state.fresh_hold.min_sample_ns!=u64::MAX; state.fresh_hold.min_sample_ns=u64::MAX;
+    if fh_closing { let fresh=state.fresh_hold.min_sample_ns!=u64::MAX; state.fresh_hold.min_sample_ns=u64::MAX;
         if fresh {
             let age=if state.is_app_limited { state.app_limit_time_offset } else { now.saturating_sub(state.congestion_event_time_ns) };
             state.fresh_hold=FreshHold { phase:2, release_coord_ns:age as i128, release_wall_ns:now, ..FreshHold::NONE };
@@ -4331,22 +4261,20 @@ fn close_delay_event(state:&mut ConnectionStateConnected, now:u64, c:DelayEventC
     if c.effect.is_some() && delay_effect_update(state,now,closed_sample,event.is_some(),c,srtt) { return false; }
     #[cfg(feature="research_target_validation")] let effect_enabled=c.effect.is_some();
     #[cfg(not(feature="research_target_validation"))] let effect_enabled=false;
-    if !effect_enabled && closed_sample.is_some() {
-        let g=&mut state.delay_giveup;
+    if !effect_enabled && closed_sample.is_some() { let g=&mut state.delay_giveup;
         if event.is_none() {
             if let Some(h)=c.hold {
                 if g.suspended && g.hold_until_ns.is_some_and(|deadline|now<deadline) {
                     state.stats.delay_hold_blocked_rearms+=1;
                     return false; }
-                if g.suspended { state.stats.delay_rearms+=1; g.clean_until_ns=Some(now.saturating_add(h.clean_ns(srtt))); }
+                if g.suspended { state.stats.delay_rearms+=1;
+                    g.clean_until_ns=Some(now.saturating_add(h.clean_ns(srtt))); }
                 g.suspended=false; g.pending_event_ns=None; g.ineffective=0; g.hold_until_ns=None;
             } else { if g.suspended { state.stats.delay_rearms+=1; } *g=DelayGiveupState::default(); } } else {
             if g.pending_event_ns.is_some_and(|at|now>at.saturating_add((srtt as f64*cc.event_guard_rtts) as u64)) {
                 g.pending_event_ns=None; g.ineffective=g.ineffective.saturating_add(1);
-                if g.ineffective>=c.giveup && !g.suspended {
-                    g.suspended=true;
-                    if let Some(h)=c.hold {
-                        g.consecutive_suspensions=g.consecutive_suspensions.saturating_add(1);
+                if g.ineffective>=c.giveup && !g.suspended { g.suspended=true;
+                    if let Some(h)=c.hold { g.consecutive_suspensions=g.consecutive_suspensions.saturating_add(1);
                         g.hold_until_ns=Some(now.saturating_add(h.duration_ns(g.consecutive_suspensions,srtt)));
                         g.clean_until_ns=None; }
                     state.stats.delay_suspensions+=1; } }
@@ -4356,8 +4284,7 @@ fn close_delay_event(state:&mut ConnectionStateConnected, now:u64, c:DelayEventC
     state.ecn_congestion_received=true; state.ecn_oldest_seq=seq; state.ecn_oldest_send_time=sent;
     let accepted=apply_ecn_congestion(state,now,cc,max_pps);
     (state.ecn_congestion_received,state.ecn_oldest_seq,state.ecn_oldest_send_time)=saved;
-    if accepted {
-        state.stats.delay_events_accepted+=1;
+    if accepted { state.stats.delay_events_accepted+=1;
         state.fresh_hold=FreshHold { phase:1, barrier_ns:now.saturating_add((state.RTT_mean as f64*100_000.0*cc.event_guard_rtts) as u64), ..FreshHold::NONE };
         if let Some(beta)=c.beta { state.delay_curve_beta=Some(beta); state.stats.delay_cuts_beta_override+=1; }
         #[cfg(feature="research_target_validation")] if let Some(effect)=c.effect {
@@ -4366,7 +4293,8 @@ fn close_delay_event(state:&mut ConnectionStateConnected, now:u64, c:DelayEventC
                 excess_ns:closed_sample.unwrap().saturating_sub(state.target_min_rtt_ns),
                 guard_until_ns,deadline_ns:guard_until_ns.saturating_add((effect.rtts*srtt as f64).ceil() as u64), });
         } else if c.giveup>0 { state.delay_giveup.pending_event_ns=Some(now); }
-        #[cfg(not(feature="research_target_validation"))] if c.giveup>0 { state.delay_giveup.pending_event_ns=Some(now); }
+        #[cfg(not(feature="research_target_validation"))]
+        if c.giveup>0 { state.delay_giveup.pending_event_ns=Some(now); }
         push_accepted_cc_event(state,AcceptedCcEvent { kind:CC_EVENT_CE,evidence_seq:seq,evidence_sent_ns:sent,feedback_ns:now }); }
     accepted }
 fn observe_delay_event(state:&mut ConnectionStateConnected, now:u64, sample:u64, seq:u64, sent:u64,
@@ -4481,8 +4409,7 @@ fn apply_loss_congestion(state: &mut ConnectionStateConnected, send_time: u64, c
 fn count_congestion_signal(state: &mut ConnectionStateConnected, seq: u64, sent: u64, now: u64, cc: &CongestionPolicy) -> bool {
     if seq < state.ack_hole.confirmed_before { return false; }
     let rtt_ns = state.RTT_mean as u64 * 100_000;
-    if now.saturating_sub(state.loss_window_start_ns) > rtt_ns {
-        state.loss_window_start_ns = now;
+    if now.saturating_sub(state.loss_window_start_ns) > rtt_ns { state.loss_window_start_ns = now;
         state.loss_count_in_window = 0; }
     let eligible = seq >= state.outage.ignore_loss_before_seq
         && sent > state.congestion_event_time_ns.saturating_add((rtt_ns as f64 * cc.event_guard_rtts) as u64);
@@ -4502,10 +4429,8 @@ impl LossEpisodes {
         for b in &mut self.buckets {
             if sent_ns < b.start_ns { continue; }
             if sent_ns - b.start_ns >= rtt_ns {
-                if b.packets >= 8 {
-                    let ppm = (b.lost * 1_000_000 / b.packets) as u32;
-                    if ppm > stats.max_rtt_loss_ppm {
-                        stats.max_rtt_loss_ppm = ppm;
+                if b.packets >= 8 { let ppm = (b.lost * 1_000_000 / b.packets) as u32;
+                    if ppm > stats.max_rtt_loss_ppm { stats.max_rtt_loss_ppm = ppm;
                         stats.max_rtt_loss_window_packets = b.packets; } }
                 b.start_ns += ((sent_ns - b.start_ns) / rtt_ns) * rtt_ns; b.packets = 0;
                 b.lost = 0; }

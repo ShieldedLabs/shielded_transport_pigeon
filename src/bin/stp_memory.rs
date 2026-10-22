@@ -1,6 +1,6 @@
 //! Authenticated adversarial receive-memory probes. Each invocation is a fresh process. `stp_memory
-//! sparse|inline|workers|pending|complete COUNT SIZE [CONNECTIONS]` SIZE is bytes (plain end offset / FEC message length). Never
-//! sends outside loopback.
+//! sparse|inline|workers|pending|complete COUNT SIZE [CONNECTIONS]` SIZE is bytes (plain end offset / FEC message
+//! length). Never sends outside loopback.
 extern crate shielded_transport_pigeon as stp_core;
 #[path = "../../tests/support/pump_thread.rs"] mod pump_thread;
 use pump_thread::*; use shielded_transport_pigeon::stp::*; use std::{net::UdpSocket, time::Duration};
@@ -11,7 +11,8 @@ impl Peer {
         let key = new_keypair_from_connect_magic1(magic).unwrap(); let prologue = &magic.to_le_bytes()[..6];
         let mut hs = shielded_transport_pigeon::helpers::noise_initiator(&params, prologue, &key.private, &server.public).unwrap();
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap(); socket.connect(("127.0.0.1", port)).unwrap();
-        socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap(); let mut b = [0u8; 2048]; b[..6].copy_from_slice(prologue);
+        socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let mut b = [0u8; 2048]; b[..6].copy_from_slice(prologue);
         let n = hs.write_message(&build_magic2_client_block(), &mut b[6..]).unwrap(); socket.send(&b[..6+n]).unwrap();
         let n = socket.recv(&mut b).ok()?; hs.read_message(&b[6..n], &mut [0;1024]).unwrap();
         Some(Self { socket, cipher: ConnectionCipherTriplet::new_from_old_init_only(hs.into_stateless_transport_mode().unwrap()),
@@ -23,17 +24,16 @@ impl Peer {
         payload[1..3].copy_from_slice(&((o - 3 + bytes.len()) as u16).to_le_bytes());
         payload[3..11].copy_from_slice(&((header >> 2) & 0xffff).to_le_bytes());
         payload[11..15].copy_from_slice(&((header >> 32) as u32).to_le_bytes());
-        if let Some(w) = word {
-            payload[15..19].copy_from_slice(&(w as u32).to_le_bytes());
+        if let Some(w) = word { payload[15..19].copy_from_slice(&(w as u32).to_le_bytes());
             payload[19..21].copy_from_slice(&((w >> 32) as u16).to_le_bytes()); }
-        payload[o..o+bytes.len()].copy_from_slice(bytes); assert!(self.seq < shielded_transport_pigeon::sequence::ACK_SPACE - 1);
+        payload[o..o+bytes.len()].copy_from_slice(bytes);
+        assert!(self.seq < shielded_transport_pigeon::sequence::ACK_SPACE - 1);
         let mut b = vec![0; payload.len()+CONNECTED_HEADER_SIZE+16]; b[..2].copy_from_slice(&self.prefix.to_le_bytes());
         let low = self.seq as u32 & shielded_transport_pigeon::sequence::COUNTER_MASK;
         b[2..6].copy_from_slice(&low.to_le_bytes()); let (ad, body) = b.split_at_mut(CONNECTED_HEADER_SIZE);
         let n = self.cipher.current.write_message_with_additional_data(self.seq, ad, &payload, body).unwrap();
         self.socket.send(&b[..n+CONNECTED_HEADER_SIZE]).unwrap(); self.seq += 1; }
-    fn acked(&self) -> usize {
-        self.socket.set_read_timeout(Some(Duration::from_millis(30))).unwrap();
+    fn acked(&self) -> usize { self.socket.set_read_timeout(Some(Duration::from_millis(30))).unwrap();
         let mut b = [0;2048]; let mut out = [0;2048]; let mut count = 0;
         let mut sequences = shielded_transport_pigeon::sequence::ReceiveSequences::default();
         while let Ok(n) = self.socket.recv(&mut b) {
@@ -51,8 +51,7 @@ impl Peer {
 fn rss() -> String {
     std::fs::read_to_string("/proc/self/status").unwrap().lines()
         .filter(|l| l.starts_with("VmRSS:") || l.starts_with("VmHWM:")).collect::<Vec<_>>().join("; ") }
-fn main() {
-    let a: Vec<_> = std::env::args().collect();
+fn main() { let a: Vec<_> = std::env::args().collect();
     let mode = a.get(1).expect("mode"); let count: usize = a.get(2).expect("count").parse().unwrap();
     let size: usize = a.get(3).expect("size").parse().unwrap();
     let connections: usize = a.get(4).map_or(1, |v| v.parse().unwrap());
@@ -76,8 +75,7 @@ fn main() {
                 "pending" => {},
                 "sparse" => peer.send((i as u64)<<2 | 1<<18 | ((size-1) as u64)<<32, None, &[1]),
                 "complete" => {
-                    for offset in (0..size).step_by(1000) {
-                        let len = (size-offset).min(1000);
+                    for offset in (0..size).step_by(1000) { let len = (size-offset).min(1000);
                         peer.send((i as u64)<<2 | ((len as u64)<<18) | ((offset as u64)<<32)
                             | if offset+len == size {2} else {0}, None, &vec![1;len]);
                         std::thread::sleep(Duration::from_micros(100)); } },
@@ -87,8 +85,7 @@ fn main() {
                     let layout = shielded_transport_pigeon::fec::MessageLayout::new(size, block).unwrap();
                     let kind = if layout.groups > 1 {STP_EXT_KIND_GROUPED_FEC} else {STP_EXT_KIND_FEC};
                     let rounds = if mode == "tiny" {layout.groups} else {1};
-                    for group in 0..rounds {
-                        let id = layout.group(group).0;
+                    for group in 0..rounds { let id = layout.group(group).0;
                         peer.send(1 | ((i as u64)<<2) | ((block as u64)<<18) | ((id as u64)<<32),
                             Some(size as u64 | (block as u64)<<32 | kind<<48), &vec![1;block]);
                         std::thread::sleep(Duration::from_millis(2)); } },
@@ -96,8 +93,7 @@ fn main() {
             std::thread::sleep(Duration::from_millis(5)); } }
     std::thread::sleep(Duration::from_millis(300)); let acked: usize = peers.iter().map(Peer::acked).sum();
     println!("result mode={mode} count={count} size={size} connections={connections} acked={acked} {}", rss()); }
-fn pressure(server_key: IdentityKeyPair, seconds: usize, size: usize) {
-    use std::time::Instant;
+fn pressure(server_key: IdentityKeyPair, seconds: usize, size: usize) { use std::time::Instant;
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap(); let port = socket.local_addr().unwrap().port(); drop(socket);
     let address = STPAddress::from("127.0.0.1".parse::<std::net::Ipv4Addr>().unwrap().to_ipv6_mapped(), port, &server_key);
     let cap = receive_connection_memory_limit(size, 1).expect("message-size receive cap");

@@ -41,8 +41,7 @@ pub const EWOULDBLOCK: c_int = EAGAIN; pub const EMSGSIZE: c_int = 40; pub const
 pub const EAFNOSUPPORT: c_int = 47; pub const EADDRNOTAVAIL: c_int = 49; pub const ENETDOWN: c_int = 50;
 pub const ENETUNREACH: c_int = 51; pub const ENOBUFS: c_int = 55; pub const ECONNREFUSED: c_int = 61;
 pub const EHOSTDOWN: c_int = 64; pub const EHOSTUNREACH: c_int = 65; pub const GETENTROPY_MAX: usize = 256;
-unsafe extern "C" {
-    pub fn socket(domain: c_int, ty: c_int, protocol: c_int) -> c_int;
+unsafe extern "C" { pub fn socket(domain: c_int, ty: c_int, protocol: c_int) -> c_int;
     pub fn setsockopt(fd: c_int, level: c_int, name: c_int, value: *const c_void, len: socklen_t) -> c_int;
     pub fn getsockopt(fd: c_int, level: c_int, name: c_int, value: *mut c_void, len: *mut socklen_t) -> c_int;
     pub fn bind(fd: c_int, addr: *const sockaddr, len: socklen_t) -> c_int;
@@ -81,8 +80,7 @@ pub fn fill_random(buf: &mut [u8]) -> std::io::Result<()> {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() != Some(EINTR) { return Err(err); } } }
     Ok(()) }
-const _: () = {
-    use core::mem::{align_of, offset_of, size_of};
+const _: () = { use core::mem::{align_of, offset_of, size_of};
     assert!(size_of::<sockaddr>() == 16 && size_of::<sockaddr_in>() == 16 && size_of::<sockaddr_in6>() == 28 && size_of::<sockaddr_storage>() == 128);
     assert!(offset_of!(sockaddr_in6, sin6_family) == 1 && offset_of!(sockaddr_in6, sin6_port) == 2 && offset_of!(sockaddr_in6, sin6_addr) == 8 && offset_of!(sockaddr_in6, sin6_scope_id) == 24);
     assert!(offset_of!(sockaddr_in, sin_addr) == 4 && offset_of!(sockaddr_storage, ss_family) == 1 && align_of::<sockaddr_storage>() == 8);

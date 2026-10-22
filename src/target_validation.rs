@@ -1,6 +1,8 @@
-use std::sync::{Arc, Mutex, OnceLock}; use std::collections::BTreeMap; pub const PLAN_VERSION: &str = "frozen-target-v1";
+use std::sync::{Arc, Mutex, OnceLock}; use std::collections::BTreeMap;
+pub const PLAN_VERSION: &str = "frozen-target-v1";
 pub const FORECAST_SHA256: &str = "5e5081cd1ebdc9ddb78391fdb8f7eaaabdb74586bda86bbc6d590a238e153ef5";
-pub const MIX_SEED: u64 = 0x5354505f544d0001; pub const EVIDENCE_CAPACITY: usize = 4096; pub const MAX_PLAN_K: u32 = 32000;
+pub const MIX_SEED: u64 = 0x5354505f544d0001; pub const EVIDENCE_CAPACITY: usize = 4096;
+pub const MAX_PLAN_K: u32 = 32000;
 const fn adaptive_root_source_upper(total:usize)->u64 {
     if total==0 {return 0;}
     let units=total/crate::stp::ADAPTIVE_MIN_UNIT_LEN; let units=if units==0 {1}else{units};
@@ -15,12 +17,12 @@ pub(crate) fn initialize(selector:u32, profile:Option<&str>, cost:u32, cap:u32, 
         Some("g4") => ("g4",0.04354000000000002,333.33333333333337,MIX_SEED),
         Some("b20r20") => ("b20r20",0.005739999999999967,33.333333333333336,MIX_SEED),
         _ => return Err("target validation requires STP_COHORT_PROFILE=g4 or b20r20".into()) };
-    let _=risk_config(); let _=tail_config(); let _=dup_config(); let _=rand_config(); crate::stp::initialize_delay_event();
+    let _=risk_config(); let _=tail_config(); let _=dup_config(); let _=rand_config();
+    crate::stp::initialize_delay_event();
     let _=CONFIG.set(c); Ok(()) }
 static OVERRIDE: OnceLock<Option<(f64,f64,f64)>> = OnceLock::new();
 fn tv_override() -> Option<(f64,f64,f64)> {
-    *OVERRIDE.get_or_init(|| {
-        let g=|n:&str| crate::ship::policy_var(n).ok().map(|v| v.parse::<f64>().expect(n));
+    *OVERRIDE.get_or_init(|| { let g=|n:&str| crate::ship::policy_var(n).ok().map(|v| v.parse::<f64>().expect(n));
         match (g("STP_TV_P"),g("STP_TV_H"),g("STP_TV_E")) {
             (Some(p),Some(h),Some(e)) => { assert!(p>0.&&p<0.5&&h>0.&&e>0.); Some((p,h,e)) }
             (None,None,None) => None,
@@ -33,8 +35,7 @@ fn tv_override() -> Option<(f64,f64,f64)> {
 impl std::fmt::Debug for RiskState {
     fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.write_str("RiskState { .. }")} }
 impl RiskState { pub(crate) fn same_connection(&self,other:&Self)->bool {Arc::ptr_eq(&self.0,&other.0)} }
-fn risk_now_ns() -> u64 {
-    static START:OnceLock<std::time::Instant>=OnceLock::new();
+fn risk_now_ns() -> u64 { static START:OnceLock<std::time::Instant>=OnceLock::new();
     START.get_or_init(std::time::Instant::now).elapsed().as_nanos().min((u64::MAX-1) as u128) as u64+1 }
 fn refresh_latch(s:&mut RiskSnapshot) { update_latch(s,risk_config(),risk_now_ns()); }
 pub(crate) fn risk_rate(state: &RiskState,rate:u64, anchor:u64, mode:char, smoothed_rtt_ns:u64) {
@@ -44,15 +45,13 @@ pub(crate) fn risk_rtt(state: &RiskState,sample_ns:u64, min_rtt_ns:u64) {
     let mut s=state.0.lock().unwrap(); s.latest_rtt_ns=sample_ns; s.min_rtt_ns=min_rtt_ns; refresh_latch(&mut s); }
 pub(crate) fn risk_congestion(state: &RiskState,anchor:u64, rtt_ns:u64, guard_rtts:f64, recovery_rtts:u64, queue_signal:bool) {
     let mut s=state.0.lock().unwrap(); refresh_latch(&mut s); s.anchor=anchor; s.event_ns=Some(risk_now_ns());
-    if rand_config().is_some() {
-        let now=s.event_ns.unwrap();
+    if rand_config().is_some() { let now=s.event_ns.unwrap();
         rand_queue_guard(&mut s,queue_signal,now,rtt_ns,guard_rtts,recovery_rtts); }
     let qd=s.latest_rtt_ns.saturating_sub(s.min_rtt_ns);
     if qd!=0 { s.qd_ref_ns=qd; }
     refresh_latch(&mut s); }
 #[derive(Clone, Copy, Debug)] struct RandConfig { mult:f64, alpha:f64, max:f64 }
-fn rand_config()->Option<RandConfig> {
-    static RAND:OnceLock<Option<RandConfig>>=OnceLock::new();
+fn rand_config()->Option<RandConfig> { static RAND:OnceLock<Option<RandConfig>>=OnceLock::new();
     *RAND.get_or_init(|| {
         if !env_switch("STP_TV_RAND") {return None;}
         let base=tv_override().expect("STP_TV_RAND requires STP_TV_P/STP_TV_H/STP_TV_E").0;
@@ -66,8 +65,7 @@ fn rand_config()->Option<RandConfig> {
         Some(RandConfig{mult,alpha:-(-std::f64::consts::LN_2/half).exp_m1(),max}) }) }
 #[derive(Clone, Copy, Debug, Default, PartialEq)] struct RandState { p:f64, bg_packets:u64, bg_lost:u64, p_base:f64 }
 impl RandState {
-    fn observe(&mut self,cfg:Option<RandConfig>,background:bool,lost:bool) {
-        let Some(c)=cfg else {return};
+    fn observe(&mut self,cfg:Option<RandConfig>,background:bool,lost:bool) { let Some(c)=cfg else {return};
         if !background {return;}
         self.bg_packets=self.bg_packets.saturating_add(1); self.bg_lost=self.bg_lost.saturating_add(u64::from(lost));
         self.p+=c.alpha*((if lost {1.}else{0.})-self.p); }
@@ -76,8 +74,7 @@ fn rand_queue_guard(s:&mut RiskSnapshot,queue_signal:bool,now:u64,rtt_ns:u64,gua
     if !queue_signal {return;}
     let duration=if rtt_ns==0 {u64::MAX}else{(rtt_ns as f64*guard_rtts.max(recovery_rtts as f64)) as u64};
     s.rand_guard_until_ns=s.rand_guard_until_ns.max(now.saturating_add(duration)); }
-fn background_risk(s:RiskSnapshot,c:RiskConfig)->f64 {
-    let ramp=|x:f64,lo:f64,hi:f64|((x-lo)/(hi-lo)).clamp(0.,1.);
+fn background_risk(s:RiskSnapshot,c:RiskConfig)->f64 { let ramp=|x:f64,lo:f64,hi:f64|((x-lo)/(hi-lo)).clamp(0.,1.);
     let cc=(s.anchor!=0).then(||ramp(s.rate as f64/s.anchor as f64,c.lo,c.hi));
     let queue=(s.qd_ref_ns!=0).then(||ramp(s.latest_rtt_ns.saturating_sub(s.min_rtt_ns) as f64/s.qd_ref_ns as f64,c.lo2,c.hi2));
     match c.src {
@@ -142,23 +139,20 @@ fn risk_config() -> Option<RiskConfig> {
 #[derive(Clone, Copy, Debug, Default)] pub(crate) struct RiskAdmission {
     pub risk:f64, pub p_eff:f64, pub rate_over_anchor:f64, pub queue_delay_us:f64, pub qd_ref_us:f64, pub mode:char,
     pub p_base:f64, }
-fn raw_risk(s:RiskSnapshot,c:RiskConfig)->f64 {
-    let ratio=if s.anchor==0 {0.}else{s.rate as f64/s.anchor as f64};
+fn raw_risk(s:RiskSnapshot,c:RiskConfig)->f64 { let ratio=if s.anchor==0 {0.}else{s.rate as f64/s.anchor as f64};
     let ramp=|x:f64,lo:f64,hi:f64| ((x-lo)/(hi-lo)).clamp(0.,1.); let cc=if s.anchor==0 {1.}else{ramp(ratio,c.lo,c.hi)};
     let qd=s.latest_rtt_ns.saturating_sub(s.min_rtt_ns);
     let queue=if s.qd_ref_ns==0 {cc}else{ramp(qd as f64/s.qd_ref_ns as f64,c.lo2,c.hi2)};
     match c.src {1=>cc,2=>queue,3=>cc.max(queue),4=>cc.min(queue),_=>unreachable!()} }
 fn update_latch(s:&mut RiskSnapshot,cfg:Option<RiskConfig>,now:u64) {
     let Some(c)=cfg else {return}; let Some((h,m))=c.hold else {return};
-    if let Some(start)=s.latch_ns {
-        let event=s.event_ns.filter(|&t|t>start);
+    if let Some(start)=s.latch_ns { let event=s.event_ns.filter(|&t|t>start);
         let expired=s.smoothed_rtt_ns!=0 && match event {
             Some(t)=>now.saturating_sub(t) as f64 >= h*s.smoothed_rtt_ns as f64,
             None=>now.saturating_sub(start) as f64 >= m*s.smoothed_rtt_ns as f64, };
         if expired {s.latch_ns=None;} }
     if s.latch_ns.is_none() && raw_risk(*s,c)>=1. {s.latch_ns=Some(now);} }
-fn decision_risk(s:RiskSnapshot,c:RiskConfig,step:bool)->f64 {
-    let raw=raw_risk(s,c);
+fn decision_risk(s:RiskSnapshot,c:RiskConfig,step:bool)->f64 { let raw=raw_risk(s,c);
     if step {if raw>=1. || (c.hold.is_some() && s.latch_ns.is_some()) {1.}else{0.}}else{raw} }
 fn admission_from(s:RiskSnapshot, cfg:Option<RiskConfig>, base:f64) -> RiskAdmission {
     let ratio=if s.anchor==0 {0.}else{s.rate as f64/s.anchor as f64};
@@ -167,8 +161,7 @@ fn admission_from(s:RiskSnapshot, cfg:Option<RiskConfig>, base:f64) -> RiskAdmis
         queue_delay_us:qd as f64/1000.,qd_ref_us:s.qd_ref_ns as f64/1000.,mode:s.mode} }
 fn env_switch(n:&str)->bool {
     crate::ship::policy_var(n).ok().is_some_and(|v| {assert!(v=="0" || v=="1","{n} must be 0 or 1"); v=="1"}) }
-fn dup_config()->bool {
-    static DUP:OnceLock<bool>=OnceLock::new();
+fn dup_config()->bool { static DUP:OnceLock<bool>=OnceLock::new();
     *DUP.get_or_init(|| {let on=env_switch("STP_TV_DUP"); assert!(!on || risk_config().is_some(),"STP_TV_DUP requires risk");on}) }
 pub(crate) fn duplicate_at_risk(enabled:bool,risk:f64)->bool {enabled && risk>=1.}
 fn duplicate_from(s:RiskSnapshot,cfg:Option<RiskConfig>)->bool {
@@ -177,13 +170,12 @@ pub(crate) fn duplicate_now(state: &RiskState,)->bool {
     if !dup_config() {return false;}
     let cfg=risk_config(); let mut s=state.0.lock().unwrap(); refresh_latch(&mut s);
     duplicate_from(*s,cfg) }
-pub(crate) fn risk_admission(state: &RiskState,) -> RiskAdmission {
-    let cfg=risk_config(); let rand=rand_config(); let base=if cfg.is_some() || rand.is_some() {tv_override().unwrap().0}else{0.};
+pub(crate) fn risk_admission(state: &RiskState,) -> RiskAdmission { let cfg=risk_config(); let rand=rand_config();
+    let base=if cfg.is_some() || rand.is_some() {tv_override().unwrap().0}else{0.};
     let mut s=state.0.lock().unwrap(); refresh_latch(&mut s); let a=rand_admission_from(*s,cfg,base,rand);
     if rand.is_some() {s.rand.p_base=a.p_base;}
     a }
-fn tail_config() -> Option<f64> {
-    static TAIL:OnceLock<Option<f64>>=OnceLock::new();
+fn tail_config() -> Option<f64> { static TAIL:OnceLock<Option<f64>>=OnceLock::new();
     *TAIL.get_or_init(|| crate::ship::policy_var("STP_TV_RISK_TAIL").ok().map(|v| {
         assert!(risk_config().is_some(),"STP_TV_RISK_TAIL requires STP_TV_RISK_SRC != 0");
         let t=v.parse::<f64>().expect("STP_TV_RISK_TAIL must be finite and positive RTTs");
@@ -198,8 +190,8 @@ fn tail_from(k:u32,remaining:u32,selector:u32,profile:&str,mix_draw:u64,s:RiskSn
     let kt=((s.rate as f64/1_000_000.)*(rtt_ns as f64/1e9)*t).ceil().min(k as f64) as u32;
     let tail_draw=draw(mix_draw^0x5441494c5f525356);
     let reserve=if kt==0 {0}else if kt<=MAX_PLAN_K {
-        plan_for_risk(kt,selector,profile,tail_draw,a,Some(c))?.proactive
-    }else { plan_with_policy_max(kt,selector,profile,tail_draw,Some((a.p_eff,c.eps)),tv_override(),MAX_TAIL_PLAN_K)?.proactive };
+        plan_for_risk(kt,selector,profile,tail_draw,a,Some(c))?.proactive }else {
+        plan_with_policy_max(kt,selector,profile,tail_draw,Some((a.p_eff,c.eps)),tv_override(),MAX_TAIL_PLAN_K)?.proactive };
     Ok(TailPlan{risk:a.risk,k:kt,added:reserve.saturating_sub(remaining)}) }
 pub(crate) fn tail_plan(state: &RiskState,k:u32,remaining:u32,selector:u32,mix_draw:u64,root_base:f64) -> Result<TailPlan,String> {
     let tail=tail_config();
@@ -209,25 +201,21 @@ pub(crate) fn tail_plan(state: &RiskState,k:u32,remaining:u32,selector:u32,mix_d
 pub fn configuration() -> (&'static str,f64,f64,u64) { CONFIG.get().copied().unwrap_or(("uninitialized",0.,0.,MIX_SEED)) }
 #[derive(Clone,Copy,Debug,Default,PartialEq)]
 pub struct Plan { pub k:u32, pub proactive:u32, pub lower:u32, pub upper:u32, pub upper_probability:f64, pub mix_threshold:u64, pub mix_draw:u64 }
-pub fn draw(sequence:u64) -> u64 {
-    let mut z=MIX_SEED.wrapping_add(sequence.wrapping_mul(0x9e3779b97f4a7c15)); z=(z^(z>>30)).wrapping_mul(0xbf58476d1ce4e5b9);
+pub fn draw(sequence:u64) -> u64 { let mut z=MIX_SEED.wrapping_add(sequence.wrapping_mul(0x9e3779b97f4a7c15));
+    z=(z^(z>>30)).wrapping_mul(0xbf58476d1ce4e5b9);
     z=(z^(z>>27)).wrapping_mul(0x94d049bb133111eb); z^(z>>31) }
-fn delivery(k:u32,r:u32,p:f64) -> f64 {
-    let n=k+r; let mode=(((n+1) as f64*p).floor() as u32).min(n);
+fn delivery(k:u32,r:u32,p:f64) -> f64 { let n=k+r; let mode=(((n+1) as f64*p).floor() as u32).min(n);
     let mut total=1.; let mut good=if mode<=r {1.} else {0.}; let mut mass=1.;
     for i in (1..=mode).rev() { mass*=i as f64/(n-i+1) as f64*(1.-p)/p; total+=mass; if i-1<=r {good+=mass;} }
     mass=1.; for i in mode..n { mass*=(n-i) as f64/(i+1) as f64*p/(1.-p); total+=mass; if i+1<=r {good+=mass;} }
     (good/total).clamp(0.,1.) }
-fn tail_delivery(k:u32,r:u32,p:f64) -> (f64,u32) {
-    let n=k+r; let mode=(((n+1) as f64*p).floor() as u32).min(n);
+fn tail_delivery(k:u32,r:u32,p:f64) -> (f64,u32) { let n=k+r; let mode=(((n+1) as f64*p).floor() as u32).min(n);
     let mut total=1.; let mut good=if mode<=r {1.}else{0.}; let mut terms=1; let mut mass=1.; let mut i=mode;
-    while i>0 {
-        let q=i as f64/(n-i+1) as f64*(1.-p)/p;
+    while i>0 { let q=i as f64/(n-i+1) as f64*(1.-p)/p;
         if q<1. && mass*q/(1.-q)<=f64::EPSILON*0.25*total {break;}
         mass*=q; i-=1; terms+=1; total+=mass; if i<=r {good+=mass;} }
     mass=1.; i=mode;
-    while i<n {
-        let q=(n-i) as f64/(i+1) as f64*p/(1.-p);
+    while i<n { let q=(n-i) as f64/(i+1) as f64*p/(1.-p);
         if q<1. && mass*q/(1.-q)<=f64::EPSILON*0.25*total {break;}
         mass*=q; i+=1; terms+=1; total+=mass; if i<=r {good+=mass;} }
     ((good/total).clamp(0.,1.),terms) }
@@ -263,7 +251,8 @@ fn policy_parameters(profile:&str,policy:Option<(f64,f64,f64)>) -> Result<(f64,f
     match (policy,profile) {(Some(o),_)=>Ok(o),(None,"g4")=>Ok((0.04354000000000002,333.33333333333337,1.)),(None,"b20r20")=>Ok((0.005739999999999967,33.333333333333336,1.)),_=>Err("unknown frozen profile".into())}
 }
 fn unit_loss(profile:&str,loss:Option<(f64,Option<f64>)>,offset:u32,len:u32,total:u32,policy:Option<(f64,f64,f64)>) -> Result<(f64,Option<f64>),String> {
-    validate_unit_extent(offset,len,total)?; let (base,h,e)=policy_parameters(profile,policy)?; let p=loss.map_or(base,|v|v.0);
+    validate_unit_extent(offset,len,total)?; let (base,h,e)=policy_parameters(profile,policy)?;
+    let p=loss.map_or(base,|v|v.0);
     if !p.is_finite() || p<=0. || p>=1. || !h.is_finite() || h<=0. || !e.is_finite() || e<=0. {
         return Err("invalid unit admission loss/policy".into()); }
     let root_k=adaptive_root_source_upper(total as usize);
@@ -272,10 +261,10 @@ fn unit_loss(profile:&str,loss:Option<(f64,Option<f64>)>,offset:u32,len:u32,tota
     if !root_epsilon.is_finite() || root_epsilon<=0. || root_epsilon>1. || !epsilon.is_finite() || epsilon<=0. || epsilon>1. {
         return Err("invalid unit admission epsilon".into()); }
     Ok((p,Some(epsilon))) }
-#[cfg(feature="research_target_validation")] pub fn plan_from_evidence(r:&OwnerEvidence,profile:&str) -> Result<Plan,String> {
+#[cfg(feature="research_target_validation")]
+pub fn plan_from_evidence(r:&OwnerEvidence,profile:&str) -> Result<Plan,String> {
     let mut loss=risk_config().map(|c|(r.p_eff,c.eps)).or_else(||rand_config().map(|_|(r.p_eff,None)));
-    if r.unit_len!=0 || r.root_total!=0 {
-        validate_unit_extent(r.segment_offset,r.unit_len,r.root_total)?;
+    if r.unit_len!=0 || r.root_total!=0 { validate_unit_extent(r.segment_offset,r.unit_len,r.root_total)?;
         if r.unit_len!=r.root_total {
             loss=Some(unit_loss(profile,loss,r.segment_offset,r.unit_len,r.root_total,tv_override())?); } }
     plan_with_loss(r.k,r.selector,profile,r.mix_draw,loss) }
@@ -298,12 +287,14 @@ fn plan_with_policy_max(k:u32,selector:u32,profile:&str,mix_draw:u64,loss:Option
     }
     let cdf=|r| if k<=MAX_PLAN_K {delivery(k,r,p)}else{tail_delivery(k,r,p).0};
     let hi=reserve_upper(&cdf,target,max_k)?; let lo=hi.saturating_sub(1); let dlo=cdf(lo);let dhi=cdf(hi);
-    let w=if dhi>dlo {((1.-target-dlo)/(dhi-dlo)).clamp(0.,1.)}else{0.}; let threshold=(w*18446744073709551616.).floor() as u64;
+    let w=if dhi>dlo {((1.-target-dlo)/(dhi-dlo)).clamp(0.,1.)}else{0.};
+    let threshold=(w*18446744073709551616.).floor() as u64;
     let proactive=if selector==1 || w==1. || mix_draw<threshold {hi}else{lo};
     Ok(Plan{k,proactive,lower:lo,upper:hi,upper_probability:w,mix_threshold:threshold,mix_draw}) }
 #[cfg(feature="research_target_validation")] #[derive(Clone,Copy,Debug,Default,PartialEq)] pub struct OwnerEvidence {
     pub generation:u64, pub root_id:u64, pub package_id:u64, pub root_ordinal:u64, pub app_tag:[u8;8],
-    pub segment_offset:u32, pub selector:u32, pub k:u32, pub current_k:u32, pub groups:u32, pub unit_len:u32, pub root_total:u32,
+    pub segment_offset:u32, pub selector:u32, pub k:u32, pub current_k:u32, pub groups:u32,
+    pub unit_len:u32, pub root_total:u32,
     pub proactive:u32, pub lower:u32, pub upper:u32, pub w_bits:u64, pub mix_threshold:u64, pub mix_draw:u64,
     pub known_losses:u32, pub planned_repairs:u32, pub sources_emitted:u64, pub repairs_emitted:u64,
     pub started_ns:u64, pub sealed_ns:u64, pub sealed:bool, pub restarts:u32,
@@ -313,7 +304,8 @@ pub(crate) fn active()->bool {CONFIG.get().is_some()}
 #[cfg(feature="research_target_validation")] pub(crate) type Owner = Arc<Mutex<OwnerEvidence>>;
 #[cfg(feature="research_target_validation")] #[derive(Debug,Default)]
 pub struct Evidence {pub rows:Vec<OwnerEvidence>,pub dropped:u64}
-#[cfg(feature="research_target_validation")] #[derive(Default)] struct Audit {next:u64, rows:BTreeMap<u64,Owner>,dropped:u64}
+#[cfg(feature="research_target_validation")] #[derive(Default)]
+struct Audit {next:u64, rows:BTreeMap<u64,Owner>,dropped:u64}
 #[cfg(feature="research_target_validation")] static AUDIT:OnceLock<Mutex<Audit>>=OnceLock::new();
 #[cfg(feature="research_target_validation")] fn audit()->&'static Mutex<Audit> {AUDIT.get_or_init(Default::default)}
 #[cfg(feature="research_target_validation")] pub(crate) fn register(mut row:OwnerEvidence)->Owner {

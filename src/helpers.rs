@@ -27,7 +27,8 @@ impl<const N: usize> SliceRead for [u8; N] {
 #[inline] pub fn store_u64(buf: &mut [u8], value: u64) {
     debug_assert!(buf.len() == 8);
     buf[..8].copy_from_slice(&value.to_le_bytes()); }
-#[inline] pub fn load_u64(buf: &[u8]) -> u64 { debug_assert!(buf.len() == 8); u64::from_le_bytes(buf[..8].try_into().unwrap()) }
+#[inline]
+pub fn load_u64(buf: &[u8]) -> u64 { debug_assert!(buf.len() == 8); u64::from_le_bytes(buf[..8].try_into().unwrap()) }
 #[inline] pub fn store_u48(buf: &mut [u8], value: u64) {
     debug_assert!(buf.len() == 6);
     buf.copy_from_slice(&value.to_le_bytes()[..6]); }
@@ -53,8 +54,7 @@ impl<const N: usize> SliceRead for [u8; N] {
     debug_assert!(buf.len() == 2); let mut tmp = [0u8; 2]; tmp[..2].copy_from_slice(buf);
     u16::from_le_bytes(tmp) }
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)] pub struct BytesPerSecond(pub u64);
-impl BytesPerSecond {
-    const KIB: u64 = 1024; const MIB: u64 = 1024 * 1024; const GIB: u64 = 1024 * 1024 * 1024;
+impl BytesPerSecond { const KIB: u64 = 1024; const MIB: u64 = 1024 * 1024; const GIB: u64 = 1024 * 1024 * 1024;
     const TIB: u64 = 1024 * 1024 * 1024 * 1024;
     pub fn best_unit(bps: u64) -> (u64, &'static str) {
         if bps >= Self::TIB { (Self::TIB, "TiB/s") } else if bps >= Self::GIB {

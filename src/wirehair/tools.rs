@@ -1,18 +1,18 @@
 //! Wirehair tools for the in-crate Wirehair port.
 //!
-//! Pure-Rust port of `third_party/wirehair/WirehairTools.{h,cpp}` and `WirehairHeavy.h`, including the per-N seed fixup tables
-//! (`WirehairDenseFixups.inc`, `WirehairPeelFixups.inc`). Every constant, table and PRNG step is preserved exactly; the tables at
-//! the bottom of this file are generated mechanically from the vendored C++ sources.
+//! Pure-Rust port of `third_party/wirehair/WirehairTools.{h,cpp}` and `WirehairHeavy.h`, including the per-N seed fixup
+//! tables (`WirehairDenseFixups.inc`, `WirehairPeelFixups.inc`). Every constant, table and PRNG step is preserved
+//! exactly; the tables at the bottom of this file are generated mechanically from the vendored C++ sources.
 //!
-//! Not ported: `SIMDSafeAllocate`/`SIMDSafeFree` (use a zeroed `Vec<u8>`), the `WH_SEED_KNOBS` / `WH_PEELCAP` experiment (off in
-//! the vendored build), and the debug-only `CAT_DEBUG_ASSERT` checks. Preconditions that the C++ leaves to the caller (for
-//! example an index past a table) panic here instead of reading out of bounds.
+//! Not ported: `SIMDSafeAllocate`/`SIMDSafeFree` (use a zeroed `Vec<u8>`), the `WH_SEED_KNOBS` / `WH_PEELCAP`
+//! experiment (off in the vendored build), and the debug-only `CAT_DEBUG_ASSERT` checks. Preconditions that the C++
+//! leaves to the caller (for example an index past a table) panic here instead of reading out of bounds.
 //!
-//! Original code: Copyright (c) 2012-2018 Christopher A. Taylor. All rights reserved. Rust port derived from it under the same
-//! license:
+//! Original code: Copyright (c) 2012-2018 Christopher A. Taylor. All rights reserved. Rust port derived from it under
+//! the same license:
 //!
-//! Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following
-//! conditions are met:
+//! Redistribution and use in source and binary forms, with or without modification, are permitted provided that the
+//! following conditions are met:
 //!
 //! * Redistributions of source code must retain the above copyright notice,
 //!   this list of conditions and the following disclaimer.
@@ -23,13 +23,13 @@
 //!   used to endorse or promote products derived from this software without
 //!   specific prior written permission.
 //!
-//! THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING,
-//! BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT
-//! SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-//! CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-//! PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
-//! TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
-//! POSSIBILITY OF SUCH DAMAGE.
+//! THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES,
+//! INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+//! DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+//! SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+//! SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+//! WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+//! OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #![allow(dead_code)]
 pub const REF_LIST_MAX: usize = 32; pub const MAX_DENSE_ROWS: usize = 500; pub const MAX_EXTRA_ROWS: usize = 32;
 pub const WIREHAIR_MAX_N: u32 = 64000; pub const WIREHAIR_MIN_N: u32 = 2; pub const HEAVY_ROWS: usize = 6;
@@ -62,8 +62,7 @@ pub fn next_prime16(n: u16) -> u16 {
     match n { 0 | 1 => return 1, 2 => return 2, 3 => return 3, 4 | 5 => return 5, 6 | 7 => return 7, _ => {} }
     if n <= PRIMES_UNDER_256_FROM_11[PRIMES_UNDER_256_COUNT - 1] as u16 {
         let mut lo = 0usize; let mut hi = PRIMES_UNDER_256_COUNT;
-        while lo < hi {
-            let mid = (lo + hi) >> 1;
+        while lo < hi { let mid = (lo + hi) >> 1;
             if (PRIMES_UNDER_256_FROM_11[mid] as u16) < n { lo = mid + 1; } else { hi = mid; } }
         return PRIMES_UNDER_256_FROM_11[lo] as u16; }
     if n > 65521 { return 0; }
@@ -71,12 +70,12 @@ pub fn next_prime16(n: u16) -> u16 {
     let mut next: u16 = SIEVE_TABLE[offset as usize] as u16; offset += next as u32 + 1; n = n.wrapping_add(next);
     let mut p_max: u32 = floor_square_root16(n) as u32; let mut p_max2: u32 = p_max * p_max;
     'try_next: loop {
-        for &p in PRIMES_UNDER_256_FROM_11.iter() {
-            let p = p as u32;
+        for &p in PRIMES_UNDER_256_FROM_11.iter() { let p = p as u32;
             if p > p_max { return n; }
             if n as u32 % p == 0 {
                 if offset >= SIEVE_TABLE_SIZE { offset -= SIEVE_TABLE_SIZE; }
-                next = SIEVE_TABLE[offset as usize] as u16; offset += next as u32 + 1; n = n.wrapping_add(next).wrapping_add(1);
+                next = SIEVE_TABLE[offset as usize] as u16; offset += next as u32 + 1;
+                n = n.wrapping_add(next).wrapping_add(1);
                 if p_max2 < n as u32 { p_max += 1; p_max2 = p_max * p_max; }
                 continue 'try_next; } }
         return n; } }
@@ -85,23 +84,20 @@ pub fn next_prime16(n: u16) -> u16 {
     ((rv2 as u64) << 32) | rv1 as u64 }
 pub fn add_invertible_gf2_matrix(matrix: &mut [u64], offset: u32, pitch_words: u32, n: u32) {
     let pitch = pitch_words as usize;
-    if n >= MATRIX_SEED_COUNT {
-        let mut row = 0usize;
-        for ii in 0..n {
-            let column_i = offset + ii; matrix[row + (column_i >> 6) as usize] ^= 1u64 << (column_i & 63);
-            if ii + 1 < n { let column_j = column_i + 1; matrix[row + (column_j >> 6) as usize] ^= 1u64 << (column_j & 63); }
+    if n >= MATRIX_SEED_COUNT { let mut row = 0usize;
+        for ii in 0..n { let column_i = offset + ii; matrix[row + (column_i >> 6) as usize] ^= 1u64 << (column_i & 63);
+            if ii + 1 < n { let column_j = column_i + 1;
+                matrix[row + (column_j >> 6) as usize] ^= 1u64 << (column_j & 63); }
             row += pitch; }
         return; }
     let seed = INVERTIBLE_MATRIX_SEEDS[n as usize]; let mut prng = PcgRandom::seeded(seed as u64, 0);
     let shift = offset & 63; let mut row = (offset >> 6) as usize;
-    for _row_i in 0..n {
-        let mut dest = row; let mut target = n; let word0 = random64(&mut prng); let mut temp0 = word0;
+    for _row_i in 0..n { let mut dest = row; let mut target = n; let word0 = random64(&mut prng); let mut temp0 = word0;
         let mut written0 = 64 - shift;
         if target < 64 { temp0 &= (1u64 << target) - 1; if written0 > target { written0 = target; } }
         matrix[dest] ^= temp0 << shift; dest += 1; target -= written0; let mut prev = word0;
         if target != 0 {
-            loop {
-                let mut temp: u64 = 0;
+            loop { let mut temp: u64 = 0;
                 if shift != 0 { temp = prev >> (64 - shift); }
                 let mut word: u64 = 0;
                 if target > shift { word = random64(&mut prng); temp |= word << shift; }
@@ -117,50 +113,40 @@ pub fn add_invertible_gf2_matrix(matrix: &mut [u64], offset: u32, pitch_words: u
 pub fn shuffle_deck16(prng: &mut PcgRandom, deck: &mut [u16], count: u32) {
     if count == 0 { return; }
     let deck = &mut deck[..count as usize]; deck[0] = 0;
-    if count <= 256 {
-        let mut ii: u32 = 1;
-        loop {
-            let rv = prng.next();
+    if count <= 256 { let mut ii: u32 = 1;
+        loop { let rv = prng.next();
             match count - ii {
                 0 => return,
                 1 => { let jj = (rv >> 16) as u8 as u32 % ii; deck_step(deck, ii, jj); return; }
-                2 => {
+                2 => { let jj = (rv >> 8) as u8 as u32 % ii; deck_step(deck, ii, jj); ii += 1;
+                    let jj = (rv >> 16) as u8 as u32 % ii; deck_step(deck, ii, jj);
+                    return; }
+                3 => { let jj = rv as u8 as u32 % ii; deck_step(deck, ii, jj); ii += 1;
                     let jj = (rv >> 8) as u8 as u32 % ii; deck_step(deck, ii, jj); ii += 1;
                     let jj = (rv >> 16) as u8 as u32 % ii; deck_step(deck, ii, jj);
                     return; }
-                3 => {
-                    let jj = rv as u8 as u32 % ii; deck_step(deck, ii, jj); ii += 1;
-                    let jj = (rv >> 8) as u8 as u32 % ii; deck_step(deck, ii, jj); ii += 1;
-                    let jj = (rv >> 16) as u8 as u32 % ii; deck_step(deck, ii, jj);
-                    return; }
-                _ => {
-                    let jj = rv as u8 as u32 % ii; deck_step(deck, ii, jj); ii += 1;
+                _ => { let jj = rv as u8 as u32 % ii; deck_step(deck, ii, jj); ii += 1;
                     let jj = (rv >> 8) as u8 as u32 % ii; deck_step(deck, ii, jj); ii += 1;
                     let jj = (rv >> 16) as u8 as u32 % ii; deck_step(deck, ii, jj); ii += 1;
                     let jj = (rv >> 24) as u8 as u32 % ii; deck_step(deck, ii, jj);
                     ii += 1; } } } } else {
         let mut ii: u32 = 1;
-        loop {
-            let rv = prng.next();
+        loop { let rv = prng.next();
             match count - ii {
                 0 => return,
                 1 => { let jj = rv as u16 as u32 % ii; deck_step(deck, ii, jj); return; }
-                _ => {
-                    let jj = rv as u16 as u32 % ii; deck_step(deck, ii, jj); ii += 1;
+                _ => { let jj = rv as u16 as u32 % ii; deck_step(deck, ii, jj); ii += 1;
                     let jj = (rv >> 16) as u16 as u32 % ii; deck_step(deck, ii, jj);
                     ii += 1; } } } } }
 #[inline(always)] pub fn iterate_next_column(x: &mut u16, b: u16, p: u16, a: u16) {
     let mut next: u32 = *x as u32 + a as u32;
     if next >= p as u32 { next -= p as u32; }
     *x = next as u16;
-    if *x >= b {
-        let distance_to_p: u16 = p.wrapping_sub(*x);
-        if a >= distance_to_p {
-            *x = a - distance_to_p;
+    if *x >= b { let distance_to_p: u16 = p.wrapping_sub(*x);
+        if a >= distance_to_p { *x = a - distance_to_p;
         } else { *x = ((((a as u32) << 16).wrapping_sub(distance_to_p as u32)) % a as u32) as u16; } } }
 pub const P1: u32 = 33554431; const P2: u32 = PEEL_COUNT_DISTRIBUTION[1]; const P3: u32 = PEEL_COUNT_DISTRIBUTION[2];
-pub fn generate_peel_row_weight(rv: u32, block_count: u16) -> u16 {
-    let mut rv = rv;
+pub fn generate_peel_row_weight(rv: u32, block_count: u16) -> u16 { let mut rv = rv;
     if block_count as u32 <= MAX_N_FOR_WEIGHT1 { if rv < P1 { return 1; } rv -= P1; }
     if rv <= P2 { return 2; }
     if rv <= P3 { return 3; }
@@ -199,19 +185,18 @@ impl PeelRowIterator {
         true } }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RowMixIterator { pub columns: [u16; RowMixIterator::COLUMN_COUNT], }
-impl RowMixIterator {
-    pub const COLUMN_COUNT: usize = 3;
+impl RowMixIterator { pub const COLUMN_COUNT: usize = 3;
     #[inline(always)] pub fn new(params: &PeelRowParameters, column_count: u16, column_count_next_prime: u16) -> Self {
         let mut x = params.mix_first; let mut columns = [0u16; Self::COLUMN_COUNT]; columns[0] = x;
         for c in columns.iter_mut().skip(1) {
             iterate_next_column(&mut x, column_count, column_count_next_prime, params.mix_add);
             *c = x; }
         RowMixIterator { columns } } }
-const HEAVY_BYTE_LOOKUP: [[u8; 4]; 16] = [
-    [0, 0, 0, 0], [1, 0, 0, 0], [0, 1, 0, 0], [1, 1, 0, 0], [0, 0, 1, 0], [1, 0, 1, 0], [0, 1, 1, 0], [1, 1, 1, 0],
-    [0, 0, 0, 1], [1, 0, 0, 1], [0, 1, 0, 1], [1, 1, 0, 1],
+const HEAVY_BYTE_LOOKUP: [[u8; 4]; 16] = [[0, 0, 0, 0], [1, 0, 0, 0], [0, 1, 0, 0], [1, 1, 0, 0],
+    [0, 0, 1, 0], [1, 0, 1, 0], [0, 1, 1, 0], [1, 1, 1, 0], [0, 0, 0, 1], [1, 0, 0, 1], [0, 1, 0, 1], [1, 1, 0, 1],
     [0, 0, 1, 1], [1, 0, 1, 1], [0, 1, 1, 1], [1, 1, 1, 1], ];
-#[inline(always)] pub fn heavy_window_word(bits: u32) -> u32 { u32::from_ne_bytes(HEAVY_BYTE_LOOKUP[(bits & 15) as usize]) }
+#[inline(always)]
+pub fn heavy_window_word(bits: u32) -> u32 { u32::from_ne_bytes(HEAVY_BYTE_LOOKUP[(bits & 15) as usize]) }
 #[inline(always)] pub fn add_heavy_window(destination: &mut [u8], bits: u32, coefficient: u8) {
     let d = &mut destination[..4]; let mut w = [0u8; 4]; w.copy_from_slice(d);
     let word = u32::from_ne_bytes(w) ^ heavy_window_word(bits).wrapping_mul(coefficient as u32);
@@ -221,15 +206,14 @@ pub fn interpolate_dense_count(n0: u16, n1: u16, count0: u16, count1: u16, n: u3
     let numerator = offset * count_delta; let denominator = n1 as i64 - n0 as i64;
     let count = count0 as i64 + numerator / denominator;
     count as u16 }
-pub fn get_dense_count(n: u32) -> u16 {
-    let (low, high): ((u16, u16), (u16, u16));
+pub fn get_dense_count(n: u32) -> u16 { let (low, high): ((u16, u16), (u16, u16));
     if n < TINY_TABLE_COUNT + SMALL_TABLE_COUNT {
         if n < TINY_TABLE_COUNT { return TINY_DENSE_COUNTS[n as usize] as u16; } else if n <= 500 {
             low = (64, 26); high = (500, 35);
-        } else if n <= 1000 { low = (500, 35); high = (1000, 48); } else { low = (1000, 48); high = (2048, 62); } } else {
+        } else if n <= 1000 { low = (500, 35); high = (1000, 48); } else { low = (1000, 48); high = (2048, 62); }
+    } else {
         let mut lo = 0usize; let mut hi = DENSE_POINTS.len() - 1;
-        loop {
-            let mid = (hi + lo) / 2;
+        loop { let mid = (hi + lo) / 2;
             if mid == lo { break; }
             if n > DENSE_POINTS[mid].0 as u32 { lo = mid; } else { hi = mid; } }
         low = DENSE_POINTS[lo];
@@ -243,13 +227,14 @@ pub fn get_dense_count(n: u32) -> u16 {
     dense_count }
 pub fn get_dense_seed_pre_fixup(n: u32, dense_count: u32) -> u16 {
     if n < TINY_TABLE_COUNT { TINY_DENSE_SEEDS[n as usize] } else if n < TINY_TABLE_COUNT + SMALL_TABLE_COUNT {
-        SMALL_DENSE_SEEDS[(n - TINY_TABLE_COUNT) as usize] as u16 } else { DENSE_SEEDS[(dense_count / 4) as usize] as u16 } }
-fn find_fixup(table: &[(u16, u8)], n: u32) -> Option<u8> {
-    let (mut lo, mut hi) = (0usize, table.len());
+        SMALL_DENSE_SEEDS[(n - TINY_TABLE_COUNT) as usize] as u16
+    } else { DENSE_SEEDS[(dense_count / 4) as usize] as u16 } }
+fn find_fixup(table: &[(u16, u8)], n: u32) -> Option<u8> { let (mut lo, mut hi) = (0usize, table.len());
     while lo < hi { let mid = (lo + hi) >> 1; if (table[mid].0 as u32) < n { lo = mid + 1; } else { hi = mid; } }
     if lo < table.len() && table[lo].0 as u32 == n { Some(table[lo].1) } else { None } }
 pub fn get_dense_seed(n: u32, dense_count: u32) -> u16 {
-    if let Some(seed) = find_fixup(&DENSE_SEED_FIXUPS, n) { if dense_count == get_dense_count(n) as u32 { return seed as u16; } }
+    if let Some(seed) = find_fixup(&DENSE_SEED_FIXUPS, n) {
+        if dense_count == get_dense_count(n) as u32 { return seed as u16; } }
     get_dense_seed_pre_fixup(n, dense_count) }
 pub fn get_peel_seed_pre_fixup(n: u32) -> u16 {
     if n < TINY_TABLE_COUNT + SMALL_TABLE_COUNT {
@@ -258,44 +243,43 @@ pub fn get_peel_seed(n: u32) -> u16 {
     if let Some(seed) = find_fixup(&PEEL_SEED_FIXUPS, n) { return seed as u16; }
     get_peel_seed_pre_fixup(n) }
 #[allow(unused_imports)] pub use self::PcgRandom as PCGRandom;
-pub(crate) const SQUARE_ROOT_TABLE: [u8; 256] = [
-    0, 16, 16, 16, 32, 32, 32, 32, 32, 48, 48, 48, 48, 48, 48, 48, 64, 64, 64, 64, 64, 64, 64, 64, 64, 80, 80, 80, 80,
-    80, 80, 80, 80, 80, 80, 80, 96, 96, 96, 96, 96, 96, 96, 96, 96, 96, 96, 96, 96, 112, 112, 112, 112, 112, 112, 112,
-    112, 112, 112, 112, 112, 112, 112, 112, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142,
-    143, 143, 144, 145, 146, 147, 148, 149, 150, 150, 151, 152, 153, 154, 155, 155, 156, 157, 158, 159, 159, 160, 161,
-    162, 163, 163, 164, 165, 166, 167, 167, 168, 169, 170, 170, 171, 172, 173, 173, 174, 175, 175, 176, 177, 178, 178,
-    179, 180, 181, 181, 182, 183, 183, 184, 185, 185, 186, 187, 187, 188, 189, 189, 190, 191, 191, 192, 193, 193, 194,
-    195, 195, 196, 197, 197, 198, 199, 199, 200, 201, 201, 202, 203, 203, 204, 204, 205, 206, 206, 207, 207, 208, 209,
-    209, 210, 211, 211, 212, 212, 213, 214, 214, 215, 215, 216, 217, 217, 218, 218, 219, 219, 220, 221, 221, 222, 222,
-    223, 223, 224, 225, 225, 226, 226, 227, 227, 228, 229, 229, 230, 230, 231, 231, 232, 232, 233, 234, 234, 235, 235,
-    236, 236, 237, 237, 238, 238, 239, 239, 240, 241, 241, 242, 242, 243, 243, 244, 244, 245, 245, 246, 246, 247, 247,
+pub(crate) const SQUARE_ROOT_TABLE: [u8; 256] = [0, 16, 16, 16, 32, 32, 32, 32, 32, 48, 48, 48, 48, 48, 48, 48,
+    64, 64, 64, 64, 64, 64, 64, 64, 64, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 96, 96, 96, 96, 96, 96, 96, 96, 96,
+    96, 96, 96, 96, 112, 112, 112, 112, 112, 112, 112, 112, 112, 112, 112, 112, 112, 112, 112, 128, 129, 130, 131, 132,
+    133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 143, 144, 145, 146, 147, 148, 149, 150, 150, 151, 152, 153,
+    154, 155, 155, 156, 157, 158, 159, 159, 160, 161, 162, 163, 163, 164, 165, 166, 167, 167, 168, 169, 170, 170, 171,
+    172, 173, 173, 174, 175, 175, 176, 177, 178, 178, 179, 180, 181, 181, 182, 183, 183, 184, 185, 185, 186, 187, 187,
+    188, 189, 189, 190, 191, 191, 192, 193, 193, 194, 195, 195, 196, 197, 197, 198, 199, 199, 200, 201, 201, 202, 203,
+    203, 204, 204, 205, 206, 206, 207, 207, 208, 209, 209, 210, 211, 211, 212, 212, 213, 214, 214, 215, 215, 216, 217,
+    217, 218, 218, 219, 219, 220, 221, 221, 222, 222, 223, 223, 224, 225, 225, 226, 226, 227, 227, 228, 229, 229, 230,
+    230, 231, 231, 232, 232, 233, 234, 234, 235, 235, 236, 236, 237, 237, 238, 238, 239, 239, 240, 241, 241, 242, 242,
+    243, 243, 244, 244, 245, 245, 246, 246, 247, 247,
     248, 248, 249, 249, 250, 250, 251, 251, 252, 252, 253, 253, 254, 254, 255, 255, ];
-pub(crate) const SIEVE_TABLE: [u8; 210] = [
-    1, 0, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 1, 0, 3, 2, 1, 0, 1, 0, 3, 2, 1, 0, 5, 4, 3, 2, 1, 0, 1, 0, 5, 4, 3, 2, 1, 0, 3,
-    2, 1, 0, 1, 0, 3, 2, 1, 0, 5, 4, 3, 2, 1, 0, 5, 4, 3, 2, 1, 0, 1, 0, 5, 4, 3, 2, 1, 0, 3, 2, 1, 0, 1, 0, 5, 4, 3, 2,
-    1, 0, 3, 2, 1, 0, 5, 4, 3, 2, 1, 0, 7, 6, 5, 4, 3, 2, 1, 0, 3, 2, 1, 0, 1, 0, 3, 2, 1, 0, 1, 0, 3, 2, 1, 0, 7, 6, 5,
-    4, 3, 2, 1, 0, 5, 4, 3, 2, 1, 0, 3, 2, 1, 0, 5, 4, 3, 2, 1, 0, 1, 0, 3, 2, 1, 0, 5, 4, 3, 2, 1, 0, 1, 0, 5, 4, 3, 2,
-    1, 0, 5, 4, 3, 2, 1, 0, 3, 2, 1, 0, 1, 0, 3, 2, 1, 0, 5, 4, 3, 2, 1, 0, 1, 0, 5, 4, 3, 2, 1, 0, 3, 2, 1, 0, 1, 0, 3,
-    2, 1, 0, 1, 0, 9, 8, 7, 6, 5, 4, 3, 2,
+pub(crate) const SIEVE_TABLE: [u8; 210] = [1, 0, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 1, 0, 3, 2,
+    1, 0, 1, 0, 3, 2, 1, 0, 5, 4, 3, 2, 1, 0, 1, 0, 5, 4, 3, 2, 1, 0, 3, 2, 1, 0, 1, 0, 3, 2, 1, 0, 5, 4, 3, 2, 1, 0, 5,
+    4, 3, 2, 1, 0, 1, 0, 5, 4, 3, 2, 1, 0, 3, 2, 1, 0, 1, 0, 5, 4, 3, 2, 1, 0, 3, 2, 1, 0, 5, 4, 3, 2, 1, 0, 7, 6, 5, 4,
+    3, 2, 1, 0, 3, 2, 1, 0, 1, 0, 3, 2, 1, 0, 1, 0, 3, 2, 1, 0, 7, 6, 5, 4, 3, 2, 1, 0, 5, 4, 3, 2, 1, 0, 3, 2, 1, 0, 5,
+    4, 3, 2, 1, 0, 1, 0, 3, 2, 1, 0, 5, 4, 3, 2, 1, 0, 1, 0, 5, 4, 3, 2, 1, 0, 5, 4, 3, 2, 1, 0, 3, 2, 1, 0, 1, 0, 3, 2,
+    1, 0, 5, 4, 3, 2, 1, 0, 1, 0, 5, 4, 3, 2, 1, 0, 3, 2, 1, 0, 1, 0, 3, 2, 1, 0, 1, 0, 9, 8, 7, 6, 5, 4, 3, 2,
     1, 0, ];
-pub(crate) const PRIMES_UNDER_256_FROM_11: [u8; 50] = [
-    11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97, 101, 103, 107, 109, 113, 127,
-    131, 137, 139, 149, 151, 157, 163, 167, 173, 179, 181, 191, 193, 197, 199, 211, 223, 227, 229, 233, 239,
+pub(crate) const PRIMES_UNDER_256_FROM_11: [u8; 50] = [11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71,
+    73, 79, 83, 89, 97, 101, 103, 107, 109, 113, 127, 131, 137, 139, 149, 151, 157, 163, 167, 173, 179, 181, 191, 193,
+    197, 199, 211, 223, 227, 229, 233, 239,
     241, 251, ];
-pub(crate) const INVERTIBLE_MATRIX_SEEDS: [u8; 512] = [
-    0, 1, 4, 2, 0, 12, 0, 1, 1, 0, 2, 2, 1, 4, 1, 1, 1, 9, 9, 1, 0, 0, 0, 0, 2, 2, 2, 4, 3, 4, 1, 1, 0, 0, 0, 0, 7, 1,
-    6, 2, 5, 1, 0, 4, 0, 0, 10, 0, 11, 3, 3, 2, 10, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 6, 4, 0, 2, 3, 0, 0, 0, 1, 0, 0, 3, 3,
-    3, 1, 4, 0, 2, 2, 3, 1, 6, 0, 4, 1, 2, 3, 1, 1, 7, 0, 7, 0, 0, 3, 5, 2, 6, 1, 3, 3, 0, 7, 0, 0, 4, 7, 1, 7, 5, 4, 1,
-    4, 4, 4, 6, 3, 0, 0, 4, 5, 5, 1, 8, 1, 1, 0, 2, 4, 4, 2, 2, 2, 4, 5, 0, 0, 2, 0, 2, 4, 1, 3, 3, 3, 0, 4, 0, 0, 0, 0,
-    0, 0, 2, 1, 1, 17, 3, 3, 3, 2, 9, 14, 3, 2, 5, 1, 1, 6, 3, 1, 6, 0, 0, 5, 5, 3, 3, 0, 0, 0, 0, 7, 4, 7, 7, 10, 0, 1,
-    1, 9, 0, 0, 0, 1, 3, 0, 1, 2, 0, 2, 4, 1, 4, 0, 0, 2, 0, 4, 3, 3, 1, 0, 1, 10, 12, 5, 2, 2, 4, 1, 0, 1, 1, 1, 0, 6,
-    4, 0, 0, 0, 3, 1, 3, 5, 0, 10, 2, 0, 3, 3, 1, 1, 0, 1, 6, 19, 2, 2, 1, 3, 5, 3, 1, 1, 1, 4, 4, 0, 0, 3, 2, 8, 1, 14,
-    3, 0, 0, 1, 0, 1, 1, 4, 1, 1, 2, 0, 6, 8, 6, 5, 0, 0, 0, 6, 1, 1, 4, 1, 6, 3, 0, 0, 1, 6, 3, 2, 2, 1, 3, 1, 9, 6, 8,
-    3, 1, 0, 3, 0, 0, 1, 1, 5, 2, 2, 4, 0, 1, 2, 2, 6, 5, 7, 6, 0, 10, 3, 5, 0, 0, 0, 4, 0, 2, 10, 3, 1, 2, 2, 0, 2, 0,
-    9, 0, 0, 5, 3, 4, 4, 4, 2, 0, 7, 0, 0, 0, 0, 2, 5, 0, 0, 0, 4, 5, 0, 0, 2, 4, 7, 3, 2, 2, 0, 1, 8, 1, 0, 2, 2, 2, 6,
-    2, 0, 0, 0, 9, 0, 0, 0, 1, 0, 1, 1, 3, 0, 0, 3, 3, 3, 5, 0, 0, 1, 0, 1, 1, 1, 14, 12, 9, 2, 11, 3, 2, 3, 3, 3, 3, 7,
-    6, 6, 0, 0, 0, 11, 0, 0, 3, 2, 1, 1, 1, 2, 3, 2, 3, 3, 3, 3, 3, 0, 0, 0, 1, 8, 4, 3, 4, 4, 4, 1, 4, 6, 0, 6, 4, 3,
-    7, 6, 0, 1, 3, 3, 0, 2, 1, 1, 1, 1, 2, 0, 1, 0, 0, 8, 3, 2, 2, 2, 2, 2, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 9,
+pub(crate) const INVERTIBLE_MATRIX_SEEDS: [u8; 512] = [0, 1, 4, 2, 0, 12, 0, 1, 1, 0, 2, 2, 1, 4, 1, 1,
+    1, 9, 9, 1, 0, 0, 0, 0, 2, 2, 2, 4, 3, 4, 1, 1, 0, 0, 0, 0, 7, 1, 6, 2, 5, 1, 0, 4, 0, 0, 10, 0, 11, 3, 3, 2, 10, 0,
+    0, 0, 0, 0, 0, 1, 0, 0, 1, 6, 4, 0, 2, 3, 0, 0, 0, 1, 0, 0, 3, 3, 3, 1, 4, 0, 2, 2, 3, 1, 6, 0, 4, 1, 2, 3, 1, 1, 7,
+    0, 7, 0, 0, 3, 5, 2, 6, 1, 3, 3, 0, 7, 0, 0, 4, 7, 1, 7, 5, 4, 1, 4, 4, 4, 6, 3, 0, 0, 4, 5, 5, 1, 8, 1, 1, 0, 2, 4,
+    4, 2, 2, 2, 4, 5, 0, 0, 2, 0, 2, 4, 1, 3, 3, 3, 0, 4, 0, 0, 0, 0, 0, 0, 2, 1, 1, 17, 3, 3, 3, 2, 9, 14, 3, 2, 5, 1,
+    1, 6, 3, 1, 6, 0, 0, 5, 5, 3, 3, 0, 0, 0, 0, 7, 4, 7, 7, 10, 0, 1, 1, 9, 0, 0, 0, 1, 3, 0, 1, 2, 0, 2, 4, 1, 4, 0,
+    0, 2, 0, 4, 3, 3, 1, 0, 1, 10, 12, 5, 2, 2, 4, 1, 0, 1, 1, 1, 0, 6, 4, 0, 0, 0, 3, 1, 3, 5, 0, 10, 2, 0, 3, 3, 1, 1,
+    0, 1, 6, 19, 2, 2, 1, 3, 5, 3, 1, 1, 1, 4, 4, 0, 0, 3, 2, 8, 1, 14, 3, 0, 0, 1, 0, 1, 1, 4, 1, 1, 2, 0, 6, 8, 6, 5,
+    0, 0, 0, 6, 1, 1, 4, 1, 6, 3, 0, 0, 1, 6, 3, 2, 2, 1, 3, 1, 9, 6, 8, 3, 1, 0, 3, 0, 0, 1, 1, 5, 2, 2, 4, 0, 1, 2, 2,
+    6, 5, 7, 6, 0, 10, 3, 5, 0, 0, 0, 4, 0, 2, 10, 3, 1, 2, 2, 0, 2, 0, 9, 0, 0, 5, 3, 4, 4, 4, 2, 0, 7, 0, 0, 0, 0, 2,
+    5, 0, 0, 0, 4, 5, 0, 0, 2, 4, 7, 3, 2, 2, 0, 1, 8, 1, 0, 2, 2, 2, 6, 2, 0, 0, 0, 9, 0, 0, 0, 1, 0, 1, 1, 3, 0, 0, 3,
+    3, 3, 5, 0, 0, 1, 0, 1, 1, 1, 14, 12, 9, 2, 11, 3, 2, 3, 3, 3, 3, 7, 6, 6, 0, 0, 0, 11, 0, 0, 3, 2, 1, 1, 1, 2, 3,
+    2, 3, 3, 3, 3, 3, 0, 0, 0, 1, 8, 4, 3, 4, 4, 4, 1, 4, 6, 0, 6, 4, 3, 7, 6, 0, 1, 3, 3, 0, 2, 1, 1, 1, 1, 2, 0, 1, 0,
+    0, 8, 3, 2, 2, 2, 2, 2, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 9,
     0, 0, 2, 3, 2, 0, 0, 10, 11, 0, 0, 0, 2, 0, 6, 0, ];
 pub(crate) const PEEL_COUNT_DISTRIBUTION: [u32; 64] = [
     0x00000000, 0x7fffffff, 0xaaaaaaa9, 0xbfffffff, 0xcccccccb, 0xd5555554, 0xdb6db6da, 0xdfffffff, 0xe38e38e2,
@@ -306,19 +290,17 @@ pub(crate) const PEEL_COUNT_DISTRIBUTION: [u32; 64] = [
     0xfa6f4de8, 0xfa8d9df4, 0xfaaaaaa9, 0xfac687d5, 0xfae147ad, 0xfafafaf9, 0xfb13b13a, 0xfb2b78c0, 0xfb425ecf,
     0xfb586fb4, 0xfb6db6da,
     0xfb823edf, 0xfb9611a6, 0xfba93867, 0xfbbbbbba, 0xfbcda3ab, 0xfbdef7bc, 0xfbefbefa, 0xffffffff, ];
-pub(crate) const PEEL_WEIGHT_FIRST_BY_TOP_BYTE: [u8; 256] = [
+pub(crate) const PEEL_WEIGHT_FIRST_BY_TOP_BYTE: [u8; 256] = [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
     3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
     3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
     3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
     3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
-    3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4,
-    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 8, 8, 8, 8, 9, 9, 9, 10, 10,
-    11, 11, 12, 12, 13, 14, 15,
+    3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5,
+    5, 5, 5, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 8, 8, 8, 8, 9, 9, 9, 10, 10, 11, 11, 12, 12, 13, 14, 15,
     16, 17, 18, 19, 21, 23, 25, 28, 32, 36, 42, 51, 63, 63, 63, 63, ];
-pub(crate) const TINY_DENSE_COUNTS: [u8; 65] = [
-    0, 0, 2, 3, 3, 5, 6, 6, 6, 7, 9, 10, 10, 10, 12, 14, 13, 14, 12, 12, 15, 16, 21, 14, 14, 13, 18, 21, 22, 21, 13, 22,
-    13, 24, 14, 17, 16, 24, 30, 26, 24, 18, 15, 15, 24, 18, 21, 17, 14, 16, 21, 18, 17, 22, 25, 20, 17, 18, 21, 18, 23,
-    20, 19, 23,
+pub(crate) const TINY_DENSE_COUNTS: [u8; 65] = [0, 0, 2, 3, 3, 5, 6, 6, 6, 7, 9, 10, 10, 10, 12, 14,
+    13, 14, 12, 12, 15, 16, 21, 14, 14, 13, 18, 21, 22, 21, 13, 22, 13, 24, 14, 17, 16, 24, 30, 26, 24, 18, 15, 15, 24,
+    18, 21, 17, 14, 16, 21, 18, 17, 22, 25, 20, 17, 18, 21, 18, 23, 20, 19, 23,
     19, ];
 pub(crate) const TINY_DENSE_SEEDS: [u16; 65] = [
     0, 0, 12678, 31247, 24246, 6830, 10311, 18975, 46844, 888, 38598, 63780, 12170, 24444, 55961, 13141, 53472, 55486,
@@ -404,147 +386,146 @@ pub(crate) const SMALL_DENSE_SEEDS: [u8; 1983] = [
     52, 57, 177, 177, 23, 233, 60, 127, 113, 200, 13, 56, 40, 197, 71, 149, 242, 81, 87, 167, 254, 171, 115, 53, 10, 12,
     77, 8, 66, 207, 123, 141, 2, 46, 95, 83, 140, 20, 22, 179, 245, 165, 160, 238, 20, 22, 57, 112, 48, 95, 220,
     15, 187, 42, 7, 99, 58, 31, 45, 36, 43, 94, 76, 54, 217, 200, ];
-pub(crate) const SMALL_PEEL_SEEDS: [u8; 2048] = [
-    0, 0, 0, 11, 1, 0, 0, 0, 1, 0, 0, 0, 5, 1, 0, 0, 4, 11, 0, 0, 0, 3, 0, 1, 7, 2, 3, 12, 11, 9, 2, 3, 0, 3, 1, 9, 21,
-    46, 5, 8, 27, 4, 37, 37, 69, 5, 180, 8, 30, 201, 21, 23, 12, 59, 151, 77, 214, 216, 221, 46, 23, 89, 39, 11, 46,
-    228, 189, 11, 18, 24, 41, 229, 31, 123, 11, 39, 119, 19, 10, 102, 178, 23, 131, 210, 2, 116, 219, 34, 43, 105, 22,
-    128, 87, 187, 179, 89, 70, 54, 65, 173, 190, 85, 98, 98, 238, 16, 57, 80, 67, 115, 135, 178, 80, 195, 135, 183, 113,
-    116, 199, 137, 4, 152, 33, 146, 185, 46, 153, 141, 1, 0, 4, 3, 0, 7, 0, 3, 6, 13, 5, 2, 1, 0, 2, 3, 1, 3, 2, 1, 1,
-    4, 2, 2, 3, 0, 3, 7, 1, 0, 5, 0, 0, 4, 0, 4, 1, 5, 0, 2, 4, 130, 5, 6, 10, 6, 0, 4, 3, 0, 16, 2, 4, 0, 19, 0, 7, 0,
-    7, 5, 0, 4, 1, 4, 5, 1, 4, 2, 8, 7, 15, 7, 3, 1, 1, 2, 2, 0, 2, 2, 14, 3, 6, 6, 5, 3, 2, 12, 14, 12, 22, 16, 3, 2,
-    3, 6, 5, 10, 2, 1, 1, 0, 1, 6, 2, 0, 7, 9, 10, 5, 1, 10, 4, 2, 2, 2, 9, 3, 1, 1, 33, 5, 11, 4, 4, 7, 8, 0, 0, 3, 0,
-    10, 3, 1, 5, 7, 5, 37, 9, 0, 10, 12, 2, 13, 2, 3, 12, 5, 20, 0, 5, 0, 0, 20, 9, 2, 23, 12, 31, 2, 14, 3, 3, 2, 23,
-    4, 0, 14, 1, 3, 10, 4, 22, 5, 28, 0, 23, 19, 4, 13, 14, 4, 29, 12, 19, 21, 5, 1, 5, 1, 22, 2, 7, 3, 5, 30, 11, 18,
-    2, 15, 60, 9, 6, 0, 8, 7, 1, 9, 4, 13, 0, 37, 42, 23, 29, 8, 5, 5, 9, 17, 8, 5, 8, 51, 17, 2, 3, 21, 11, 27, 30, 51,
-    10, 7, 45, 7, 13, 12, 5, 30, 12, 24, 50, 47, 60, 98, 31, 47, 23, 4, 16, 45, 10, 2, 27, 45, 42, 11, 44, 81, 34, 26,
-    3, 7, 22, 2, 5, 19, 16, 8, 63, 9, 39, 71, 41, 6, 51, 2, 88, 4, 13, 6, 19, 7, 35, 23, 6, 42, 4, 2, 26, 35, 37, 49,
-    45, 19, 40, 63, 78, 37, 30, 1, 19, 2, 8, 1, 15, 31, 0, 6, 12, 0, 16, 4, 10, 86, 25, 9, 18, 21, 13, 0, 50, 62, 0, 43,
-    107, 8, 29, 19, 60, 35, 81, 11, 118, 10, 39, 53, 4, 11, 37, 78, 33, 32, 61, 7, 19, 21, 26, 7, 6, 11, 81, 44, 72, 37,
-    3, 17, 98, 28, 15, 11, 113, 42, 163, 98, 15, 122, 13, 119, 12, 50, 45, 4, 85, 37, 124, 40, 0, 45, 113, 39, 52, 112,
-    19, 88, 32, 48, 36, 90, 18, 39, 15, 20, 43, 71, 74, 183, 57, 79, 79, 0, 110, 8, 12, 100, 16, 47, 78, 93, 0, 41, 20,
-    1, 10, 36, 21, 162, 2, 39, 203, 16, 79, 25, 2, 1, 158, 122, 134, 15, 36, 73, 42, 157, 91, 0, 8, 34, 242, 18, 39, 98,
-    211, 49, 41, 69, 5, 56, 71, 25, 110, 87, 48, 51, 5, 69, 64, 135, 42, 122, 10, 65, 20, 126, 181, 108, 112, 124, 200,
-    10, 135, 14, 135, 0, 136, 11, 70, 29, 7, 199, 226, 225, 171, 130, 50, 44, 80, 31, 89, 41, 80, 18, 65, 43, 21, 53,
-    70, 37, 162, 165, 91, 91, 33, 87, 105, 87, 110, 215, 13, 32, 122, 19, 69, 18, 178, 8, 30, 28, 2, 206, 128, 61, 5,
-    38, 43, 9, 6, 122, 51, 17, 85, 180, 60, 16, 23, 63, 83, 112, 80, 115, 36, 63, 18, 146, 22, 59, 83, 24, 71, 34, 10,
-    237, 51, 126, 2, 168, 64, 18, 37, 28, 135, 146, 5, 80, 4, 17, 44, 105, 47, 68, 219, 26, 119, 13, 0, 138, 60, 26, 93,
-    24, 75, 20, 39, 21, 242, 42, 62, 17, 18, 0, 83, 1, 36, 76, 152, 107, 138, 2, 246, 15, 65, 26, 16, 49, 203, 59, 216,
-    127, 64, 255, 28, 198, 137, 22, 14, 42, 20, 198, 47, 67, 8, 48, 67, 40, 10, 244, 159, 217, 27, 208, 6, 54, 143, 3,
-    21, 80, 119, 82, 133, 117, 152, 107, 42, 38, 153, 213, 45, 29, 20, 10, 140, 107, 14, 11, 33, 26, 41, 32, 123, 139,
-    104, 42, 213, 2, 3, 12, 79, 44, 156, 40, 65, 237, 41, 5, 63, 52, 149, 251, 37, 10, 143, 1, 162, 90, 138, 43, 12, 97,
-    46, 4, 105, 43, 81, 39, 222, 107, 35, 28, 10, 62, 48, 21, 27, 186, 105, 0, 171, 248, 6, 20, 145, 10, 52, 3, 215,
-    151, 13, 24, 165, 131, 170, 42, 46, 139, 114, 43, 22, 28, 73, 48, 231, 70, 142, 77, 224, 133, 153, 46, 35, 251, 153,
-    108, 2, 197, 175, 37, 56, 45, 28, 6, 77, 1, 182, 112, 43, 4, 137, 169, 19, 203, 154, 129, 13, 6, 215, 16, 47, 89, 1,
-    3, 53, 63, 245, 175, 45, 164, 158, 85, 236, 16, 15, 13, 185, 171, 18, 95, 25, 19, 12, 106, 12, 254, 24, 68, 50, 107,
-    53, 155, 44, 5, 231, 15, 4, 103, 38, 24, 66, 38, 166, 38, 61, 20, 129, 212, 49, 2, 3, 101, 100, 148, 106, 87, 37, 3,
-    2, 210, 157, 2, 68, 109, 34, 96, 26, 176, 76, 173, 172, 46, 47, 102, 255, 233, 122, 224, 38, 27, 27, 54, 54, 47, 32,
-    7, 85, 148, 158, 136, 113, 145, 211, 241, 128, 17, 88, 34, 69, 224, 246, 52, 27, 43, 30, 90, 239, 52, 82, 248, 231,
-    26, 81, 146, 0, 2, 216, 209, 80, 39, 14, 46, 10, 93, 255, 170, 31, 203, 89, 242, 79, 81, 174, 225, 16, 6, 52, 244,
-    236, 149, 28, 74, 57, 63, 135, 25, 86, 17, 28, 124, 18, 168, 158, 140, 125, 168, 84, 221, 245, 49, 163, 150, 100,
-    89, 20, 18, 8, 11, 184, 31, 30, 77, 196, 39, 149, 200, 170, 52, 120, 29, 136, 7, 28, 45, 211, 190, 83, 34, 27, 1,
-    197, 163, 93, 36, 53, 177, 97, 233, 226, 80, 238, 41, 186, 226, 45, 43, 226, 107, 20, 93, 215, 59, 125, 175, 77, 86,
-    123, 23, 171, 14, 28, 36, 1, 99, 9, 54, 38, 213, 27, 38, 99, 61, 155, 186, 199, 203, 143, 112, 0, 68, 215, 177, 111,
-    178, 124, 21, 173, 205, 103, 47, 77, 27, 111, 68, 252, 251, 249, 175, 97, 144, 7, 5, 43, 170, 112, 30, 18, 186, 109,
-    150, 129, 253, 53, 28, 42, 41, 31, 51, 144, 0, 68, 6, 175, 71, 141, 3, 29, 114, 70, 225, 5, 34, 121, 23, 151, 240,
-    119, 38, 238, 8, 51, 179, 201, 7, 206, 244, 98, 15, 53, 195, 239, 27, 200, 72, 112, 198, 23, 64, 6, 66, 153, 201,
-    46, 26, 78, 5, 160, 59, 209, 18, 25, 168, 215, 128, 73, 77, 195, 26, 98, 28, 71, 73, 84, 228, 227, 67, 189, 125, 39,
-    60, 108, 140, 29, 86, 71, 185, 63, 65, 98, 72, 74, 18, 58, 76, 28, 44, 36, 192, 113, 249, 55, 214, 220, 19, 177, 29,
-    252, 94, 129, 218, 117, 223, 17, 14, 160, 232, 17, 25, 49, 14, 57, 93, 250, 194, 193, 37, 184, 18, 93, 28, 74, 20,
-    31, 1, 139, 117, 1, 25, 52, 231, 52, 21, 53, 61, 145, 26, 73, 5, 36, 92, 66, 180, 19, 214, 8, 200, 210, 204, 21,
-    177, 12, 241, 154, 58, 75, 192, 17, 72, 229, 106, 37, 179, 59, 18, 46, 166, 103, 189, 100, 88, 223, 5, 40, 118, 80,
-    44, 71, 60, 137, 56, 2, 235, 40, 191, 12, 139, 129, 191, 73, 110, 11, 71, 6, 11, 60, 232, 180, 117, 63, 1, 117, 89,
-    47, 87, 90, 136, 229, 137, 245, 3, 19, 249, 146, 27, 237, 225, 20, 81, 173, 119, 4, 38, 113, 82, 42, 240, 5, 10,
-    173, 213, 175, 17, 97, 63, 0, 13, 38, 20, 230, 225, 120, 152, 7, 64, 94, 11, 131, 92, 112, 90, 21, 2, 62, 75, 13,
-    104, 138, 26, 119, 161, 42, 183, 15, 36, 63, 121, 48, 2, 36, 71, 130, 134, 154, 127, 245, 213, 17, 155, 153, 134,
-    81, 29, 50, 48, 107, 77, 9, 182, 57, 16, 179, 115, 85, 49, 77, 60, 121, 149, 134, 68, 197, 100, 114, 1, 13, 88, 3,
-    7, 182, 38, 46, 180, 214, 45, 30, 221, 54, 129, 22, 52, 114, 17, 150, 110, 66, 134, 158, 242, 231, 38, 77, 216, 23,
-    104, 235, 132, 196, 65, 34, 43, 131, 60, 111, 13, 32, 135, 171, 60, 135, 13, 254, 228, 91, 237, 19, 72, 51, 249,
-    104, 72, 145, 193, 14, 45, 81, 80, 69, 45, 193, 30, 200, 55, 63, 121, 52, 41, 21, 41, 17, 190, 104, 67, 30, 1, 26,
-    88, 47, 43, 42, 26, 105, 185, 25, 88, 25, 13, 72, 40, 18, 40, 34, 78, 80, 94, 185, 40, 33, 77, 227, 179, 118, 113,
-    14, 129, 126, 134, 115, 151, 137, 214, 193, 77, 156, 249, 219, 3, 17, 109, 208, 119, 186, 65, 226, 4, 117, 102, 173,
-    113, 214, 4, 241, 156, 89, 228, 97, 210, 164, 62, 183, 232, 127, 61, 20, 153, 57, 96, 166, 189, 180, 251, 23, 147,
-    94, 125, 133, 20, 121, 150, 80, 254, 100, 225, 35, 160, 93, 214, 23, 25, 9, 8, 123, 238, 1, 129, 214, 5, 6, 194,
-    154, 24, 37, 54, 10, 252, 40, 85, 196, 165, 207, 6, 37, 15, 197, 88, 95, 41, 129, 113, 180, 81, 84, 52, 204, 83,
-    171, 200, 24, 238, 70, 28, 145, 158, 117, 135, 195, 252, 144, 183, 89, 181, 32, 12, 33, 153, 27, 19, 222, 74, 83,
-    139, 190, 84, 39, 48, 110, 124, 129, 3, 28, 56, 248, 237, 147, 15, 62, 40, 71, 78, 201, 192, 8, 65, 118, 220, 31,
-    225, 50, 181, 80, 216, 131, 192, 48, 154, 128, 155, 107, 203, 41, 67, 25, 185, 82, 232, 119, 13, 150, 139, 90, 248,
-    49, 28, 157, 244, 88, 90, 3, 151, 217, 74, 213, 17, 86, 38, 55, 222, 163, 160, 118, 126, 206, 64, 208, 142, 132, 96,
-    204, 216, 35, 211, 84, 33, 194, 100, 244, 206, 132, 74, 66, 160, 128, 177, 121, 0, 143, 8, 104, 83, 208, 184, 71,
-    33, 115, 50, 73, 2, 47, 171, 152, 95, 212, 5, 152, 122, 113, 156, 111, 216, 88, 68, 210, 24, 159, 170, 231, 69, 14,
-    170, 254, 209, 147, 99, 138, 137, 127, 61, 203, 73, 49, 200, 53, 75, 128, 9, 145, 32, 171, 147, 49, 203, 143, 66,
-    207, 56, 150, 15, 76, 91, 50, 89, 64, 209, 75, 224, 191, 206, 136, 129, 84, 194, 4, 11, 76, 131, 160, 254, 44, 208,
-    117, 235, 49, 64, 71, 102, 1, 61, 215, 77, 10, 228, 167, 82, 34, 32, 29, 75, 191, 218, 29, 165, 242, 30, 152, 190,
-    9, 195, 141, 134, 26, 18, 112, 93, 70, 232, 25, 67, 253, 36, 25, 240, 133, 93, 120, 104, 246, 211, 5, 86, 184, 71,
-    41, 33, 158, 183, 98, 134, 6, 68, 168, 217, 204, 205, 84, 169, 98, 93, 16, 62, 93, 80, 101, 248, 122, 156, 56, 18,
-    102, 171, 223, 72, 43, 4, 43, 59, 24, 200, 211, 120, 132, 54, 112, 107, 255, 111, 66, 72, 93, 135, 215, 123, 136,
-    57, 217, 66, 36, 169, 185, 46, 176, 68, 190, 92, 62, 252, 12, 11, 6, 30, 80, 157, 18, 243, 72, 4, 5, 57, 44, 66, 13,
-    23, 94, 237, 24, 197, 91, 127, 103, 157,
+pub(crate) const SMALL_PEEL_SEEDS: [u8; 2048] = [0, 0, 0, 11, 1, 0, 0, 0, 1, 0, 0, 0, 5, 1, 0, 0,
+    4, 11, 0, 0, 0, 3, 0, 1, 7, 2, 3, 12, 11, 9, 2, 3, 0, 3, 1, 9, 21, 46, 5, 8, 27, 4, 37, 37, 69, 5, 180, 8, 30, 201,
+    21, 23, 12, 59, 151, 77, 214, 216, 221, 46, 23, 89, 39, 11, 46, 228, 189, 11, 18, 24, 41, 229, 31, 123, 11, 39, 119,
+    19, 10, 102, 178, 23, 131, 210, 2, 116, 219, 34, 43, 105, 22, 128, 87, 187, 179, 89, 70, 54, 65, 173, 190, 85, 98,
+    98, 238, 16, 57, 80, 67, 115, 135, 178, 80, 195, 135, 183, 113, 116, 199, 137, 4, 152, 33, 146, 185, 46, 153, 141,
+    1, 0, 4, 3, 0, 7, 0, 3, 6, 13, 5, 2, 1, 0, 2, 3, 1, 3, 2, 1, 1, 4, 2, 2, 3, 0, 3, 7, 1, 0, 5, 0, 0, 4, 0, 4, 1, 5,
+    0, 2, 4, 130, 5, 6, 10, 6, 0, 4, 3, 0, 16, 2, 4, 0, 19, 0, 7, 0, 7, 5, 0, 4, 1, 4, 5, 1, 4, 2, 8, 7, 15, 7, 3, 1, 1,
+    2, 2, 0, 2, 2, 14, 3, 6, 6, 5, 3, 2, 12, 14, 12, 22, 16, 3, 2, 3, 6, 5, 10, 2, 1, 1, 0, 1, 6, 2, 0, 7, 9, 10, 5, 1,
+    10, 4, 2, 2, 2, 9, 3, 1, 1, 33, 5, 11, 4, 4, 7, 8, 0, 0, 3, 0, 10, 3, 1, 5, 7, 5, 37, 9, 0, 10, 12, 2, 13, 2, 3, 12,
+    5, 20, 0, 5, 0, 0, 20, 9, 2, 23, 12, 31, 2, 14, 3, 3, 2, 23, 4, 0, 14, 1, 3, 10, 4, 22, 5, 28, 0, 23, 19, 4, 13, 14,
+    4, 29, 12, 19, 21, 5, 1, 5, 1, 22, 2, 7, 3, 5, 30, 11, 18, 2, 15, 60, 9, 6, 0, 8, 7, 1, 9, 4, 13, 0, 37, 42, 23, 29,
+    8, 5, 5, 9, 17, 8, 5, 8, 51, 17, 2, 3, 21, 11, 27, 30, 51, 10, 7, 45, 7, 13, 12, 5, 30, 12, 24, 50, 47, 60, 98, 31,
+    47, 23, 4, 16, 45, 10, 2, 27, 45, 42, 11, 44, 81, 34, 26, 3, 7, 22, 2, 5, 19, 16, 8, 63, 9, 39, 71, 41, 6, 51, 2,
+    88, 4, 13, 6, 19, 7, 35, 23, 6, 42, 4, 2, 26, 35, 37, 49, 45, 19, 40, 63, 78, 37, 30, 1, 19, 2, 8, 1, 15, 31, 0, 6,
+    12, 0, 16, 4, 10, 86, 25, 9, 18, 21, 13, 0, 50, 62, 0, 43, 107, 8, 29, 19, 60, 35, 81, 11, 118, 10, 39, 53, 4, 11,
+    37, 78, 33, 32, 61, 7, 19, 21, 26, 7, 6, 11, 81, 44, 72, 37, 3, 17, 98, 28, 15, 11, 113, 42, 163, 98, 15, 122, 13,
+    119, 12, 50, 45, 4, 85, 37, 124, 40, 0, 45, 113, 39, 52, 112, 19, 88, 32, 48, 36, 90, 18, 39, 15, 20, 43, 71, 74,
+    183, 57, 79, 79, 0, 110, 8, 12, 100, 16, 47, 78, 93, 0, 41, 20, 1, 10, 36, 21, 162, 2, 39, 203, 16, 79, 25, 2, 1,
+    158, 122, 134, 15, 36, 73, 42, 157, 91, 0, 8, 34, 242, 18, 39, 98, 211, 49, 41, 69, 5, 56, 71, 25, 110, 87, 48, 51,
+    5, 69, 64, 135, 42, 122, 10, 65, 20, 126, 181, 108, 112, 124, 200, 10, 135, 14, 135, 0, 136, 11, 70, 29, 7, 199,
+    226, 225, 171, 130, 50, 44, 80, 31, 89, 41, 80, 18, 65, 43, 21, 53, 70, 37, 162, 165, 91, 91, 33, 87, 105, 87, 110,
+    215, 13, 32, 122, 19, 69, 18, 178, 8, 30, 28, 2, 206, 128, 61, 5, 38, 43, 9, 6, 122, 51, 17, 85, 180, 60, 16, 23,
+    63, 83, 112, 80, 115, 36, 63, 18, 146, 22, 59, 83, 24, 71, 34, 10, 237, 51, 126, 2, 168, 64, 18, 37, 28, 135, 146,
+    5, 80, 4, 17, 44, 105, 47, 68, 219, 26, 119, 13, 0, 138, 60, 26, 93, 24, 75, 20, 39, 21, 242, 42, 62, 17, 18, 0, 83,
+    1, 36, 76, 152, 107, 138, 2, 246, 15, 65, 26, 16, 49, 203, 59, 216, 127, 64, 255, 28, 198, 137, 22, 14, 42, 20, 198,
+    47, 67, 8, 48, 67, 40, 10, 244, 159, 217, 27, 208, 6, 54, 143, 3, 21, 80, 119, 82, 133, 117, 152, 107, 42, 38, 153,
+    213, 45, 29, 20, 10, 140, 107, 14, 11, 33, 26, 41, 32, 123, 139, 104, 42, 213, 2, 3, 12, 79, 44, 156, 40, 65, 237,
+    41, 5, 63, 52, 149, 251, 37, 10, 143, 1, 162, 90, 138, 43, 12, 97, 46, 4, 105, 43, 81, 39, 222, 107, 35, 28, 10, 62,
+    48, 21, 27, 186, 105, 0, 171, 248, 6, 20, 145, 10, 52, 3, 215, 151, 13, 24, 165, 131, 170, 42, 46, 139, 114, 43, 22,
+    28, 73, 48, 231, 70, 142, 77, 224, 133, 153, 46, 35, 251, 153, 108, 2, 197, 175, 37, 56, 45, 28, 6, 77, 1, 182, 112,
+    43, 4, 137, 169, 19, 203, 154, 129, 13, 6, 215, 16, 47, 89, 1, 3, 53, 63, 245, 175, 45, 164, 158, 85, 236, 16, 15,
+    13, 185, 171, 18, 95, 25, 19, 12, 106, 12, 254, 24, 68, 50, 107, 53, 155, 44, 5, 231, 15, 4, 103, 38, 24, 66, 38,
+    166, 38, 61, 20, 129, 212, 49, 2, 3, 101, 100, 148, 106, 87, 37, 3, 2, 210, 157, 2, 68, 109, 34, 96, 26, 176, 76,
+    173, 172, 46, 47, 102, 255, 233, 122, 224, 38, 27, 27, 54, 54, 47, 32, 7, 85, 148, 158, 136, 113, 145, 211, 241,
+    128, 17, 88, 34, 69, 224, 246, 52, 27, 43, 30, 90, 239, 52, 82, 248, 231, 26, 81, 146, 0, 2, 216, 209, 80, 39, 14,
+    46, 10, 93, 255, 170, 31, 203, 89, 242, 79, 81, 174, 225, 16, 6, 52, 244, 236, 149, 28, 74, 57, 63, 135, 25, 86, 17,
+    28, 124, 18, 168, 158, 140, 125, 168, 84, 221, 245, 49, 163, 150, 100, 89, 20, 18, 8, 11, 184, 31, 30, 77, 196, 39,
+    149, 200, 170, 52, 120, 29, 136, 7, 28, 45, 211, 190, 83, 34, 27, 1, 197, 163, 93, 36, 53, 177, 97, 233, 226, 80,
+    238, 41, 186, 226, 45, 43, 226, 107, 20, 93, 215, 59, 125, 175, 77, 86, 123, 23, 171, 14, 28, 36, 1, 99, 9, 54, 38,
+    213, 27, 38, 99, 61, 155, 186, 199, 203, 143, 112, 0, 68, 215, 177, 111, 178, 124, 21, 173, 205, 103, 47, 77, 27,
+    111, 68, 252, 251, 249, 175, 97, 144, 7, 5, 43, 170, 112, 30, 18, 186, 109, 150, 129, 253, 53, 28, 42, 41, 31, 51,
+    144, 0, 68, 6, 175, 71, 141, 3, 29, 114, 70, 225, 5, 34, 121, 23, 151, 240, 119, 38, 238, 8, 51, 179, 201, 7, 206,
+    244, 98, 15, 53, 195, 239, 27, 200, 72, 112, 198, 23, 64, 6, 66, 153, 201, 46, 26, 78, 5, 160, 59, 209, 18, 25, 168,
+    215, 128, 73, 77, 195, 26, 98, 28, 71, 73, 84, 228, 227, 67, 189, 125, 39, 60, 108, 140, 29, 86, 71, 185, 63, 65,
+    98, 72, 74, 18, 58, 76, 28, 44, 36, 192, 113, 249, 55, 214, 220, 19, 177, 29, 252, 94, 129, 218, 117, 223, 17, 14,
+    160, 232, 17, 25, 49, 14, 57, 93, 250, 194, 193, 37, 184, 18, 93, 28, 74, 20, 31, 1, 139, 117, 1, 25, 52, 231, 52,
+    21, 53, 61, 145, 26, 73, 5, 36, 92, 66, 180, 19, 214, 8, 200, 210, 204, 21, 177, 12, 241, 154, 58, 75, 192, 17, 72,
+    229, 106, 37, 179, 59, 18, 46, 166, 103, 189, 100, 88, 223, 5, 40, 118, 80, 44, 71, 60, 137, 56, 2, 235, 40, 191,
+    12, 139, 129, 191, 73, 110, 11, 71, 6, 11, 60, 232, 180, 117, 63, 1, 117, 89, 47, 87, 90, 136, 229, 137, 245, 3, 19,
+    249, 146, 27, 237, 225, 20, 81, 173, 119, 4, 38, 113, 82, 42, 240, 5, 10, 173, 213, 175, 17, 97, 63, 0, 13, 38, 20,
+    230, 225, 120, 152, 7, 64, 94, 11, 131, 92, 112, 90, 21, 2, 62, 75, 13, 104, 138, 26, 119, 161, 42, 183, 15, 36, 63,
+    121, 48, 2, 36, 71, 130, 134, 154, 127, 245, 213, 17, 155, 153, 134, 81, 29, 50, 48, 107, 77, 9, 182, 57, 16, 179,
+    115, 85, 49, 77, 60, 121, 149, 134, 68, 197, 100, 114, 1, 13, 88, 3, 7, 182, 38, 46, 180, 214, 45, 30, 221, 54, 129,
+    22, 52, 114, 17, 150, 110, 66, 134, 158, 242, 231, 38, 77, 216, 23, 104, 235, 132, 196, 65, 34, 43, 131, 60, 111,
+    13, 32, 135, 171, 60, 135, 13, 254, 228, 91, 237, 19, 72, 51, 249, 104, 72, 145, 193, 14, 45, 81, 80, 69, 45, 193,
+    30, 200, 55, 63, 121, 52, 41, 21, 41, 17, 190, 104, 67, 30, 1, 26, 88, 47, 43, 42, 26, 105, 185, 25, 88, 25, 13, 72,
+    40, 18, 40, 34, 78, 80, 94, 185, 40, 33, 77, 227, 179, 118, 113, 14, 129, 126, 134, 115, 151, 137, 214, 193, 77,
+    156, 249, 219, 3, 17, 109, 208, 119, 186, 65, 226, 4, 117, 102, 173, 113, 214, 4, 241, 156, 89, 228, 97, 210, 164,
+    62, 183, 232, 127, 61, 20, 153, 57, 96, 166, 189, 180, 251, 23, 147, 94, 125, 133, 20, 121, 150, 80, 254, 100, 225,
+    35, 160, 93, 214, 23, 25, 9, 8, 123, 238, 1, 129, 214, 5, 6, 194, 154, 24, 37, 54, 10, 252, 40, 85, 196, 165, 207,
+    6, 37, 15, 197, 88, 95, 41, 129, 113, 180, 81, 84, 52, 204, 83, 171, 200, 24, 238, 70, 28, 145, 158, 117, 135, 195,
+    252, 144, 183, 89, 181, 32, 12, 33, 153, 27, 19, 222, 74, 83, 139, 190, 84, 39, 48, 110, 124, 129, 3, 28, 56, 248,
+    237, 147, 15, 62, 40, 71, 78, 201, 192, 8, 65, 118, 220, 31, 225, 50, 181, 80, 216, 131, 192, 48, 154, 128, 155,
+    107, 203, 41, 67, 25, 185, 82, 232, 119, 13, 150, 139, 90, 248, 49, 28, 157, 244, 88, 90, 3, 151, 217, 74, 213, 17,
+    86, 38, 55, 222, 163, 160, 118, 126, 206, 64, 208, 142, 132, 96, 204, 216, 35, 211, 84, 33, 194, 100, 244, 206, 132,
+    74, 66, 160, 128, 177, 121, 0, 143, 8, 104, 83, 208, 184, 71, 33, 115, 50, 73, 2, 47, 171, 152, 95, 212, 5, 152,
+    122, 113, 156, 111, 216, 88, 68, 210, 24, 159, 170, 231, 69, 14, 170, 254, 209, 147, 99, 138, 137, 127, 61, 203, 73,
+    49, 200, 53, 75, 128, 9, 145, 32, 171, 147, 49, 203, 143, 66, 207, 56, 150, 15, 76, 91, 50, 89, 64, 209, 75, 224,
+    191, 206, 136, 129, 84, 194, 4, 11, 76, 131, 160, 254, 44, 208, 117, 235, 49, 64, 71, 102, 1, 61, 215, 77, 10, 228,
+    167, 82, 34, 32, 29, 75, 191, 218, 29, 165, 242, 30, 152, 190, 9, 195, 141, 134, 26, 18, 112, 93, 70, 232, 25, 67,
+    253, 36, 25, 240, 133, 93, 120, 104, 246, 211, 5, 86, 184, 71, 41, 33, 158, 183, 98, 134, 6, 68, 168, 217, 204, 205,
+    84, 169, 98, 93, 16, 62, 93, 80, 101, 248, 122, 156, 56, 18, 102, 171, 223, 72, 43, 4, 43, 59, 24, 200, 211, 120,
+    132, 54, 112, 107, 255, 111, 66, 72, 93, 135, 215, 123, 136, 57, 217, 66, 36, 169, 185, 46, 176, 68, 190, 92, 62,
+    252, 12, 11, 6, 30, 80, 157, 18, 243, 72, 4, 5, 57, 44, 66, 13, 23, 94, 237, 24, 197, 91, 127, 103, 157,
     249, 78, 72, 210, 139, 14, 77, 43, 21, 16, 12, 54, 166, 49, 32, 140, ];
-pub(crate) const DENSE_SEEDS: [u8; 100] = [
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 214, 53, 190, 233, 221, 24, 33, 241, 138, 159, 32, 131, 17, 199, 245, 235,
-    87, 241, 116, 148, 16, 105, 141, 119, 181, 133, 156, 85, 38, 152, 36, 219, 58, 160, 81, 50, 93, 27, 15, 60, 116,
-    117, 130, 106, 13, 138, 81, 7, 31, 34, 188, 157, 4, 145, 150, 19, 140, 115, 255, 165, 243, 186, 249, 178, 13, 174,
-    242, 41, 128, 127, 177, 119, 142, 96, 39, 28, 78, 226, 42, 38, 108, 82, 1,
+pub(crate) const DENSE_SEEDS: [u8; 100] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 214, 53, 190,
+    233, 221, 24, 33, 241, 138, 159, 32, 131, 17, 199, 245, 235, 87, 241, 116, 148, 16, 105, 141, 119, 181, 133, 156,
+    85, 38, 152, 36, 219, 58, 160, 81, 50, 93, 27, 15, 60, 116, 117, 130, 106, 13, 138, 81, 7, 31, 34, 188, 157, 4, 145,
+    150, 19, 140, 115, 255, 165, 243, 186, 249, 178, 13, 174, 242, 41, 128, 127, 177, 119, 142, 96, 39, 28, 78, 226, 42,
+    38, 108, 82, 1,
     84, 112, 152, 0, ];
-pub(crate) const PEEL_SEEDS: [u8; 2048] = [
-    0, 13, 4, 7, 6, 13, 1, 6, 13, 7, 15, 13, 11, 1, 6, 7, 13, 5, 12, 11, 7, 14, 2, 10, 13, 3, 3, 3, 1, 9, 13, 7, 2, 9,
-    10, 0, 2, 14, 14, 0, 13, 11, 5, 0, 15, 14, 7, 3, 15, 2, 1, 3, 7, 2, 15, 12, 9, 10, 14, 12, 5, 13, 1, 7, 2, 4, 3, 15,
-    17, 11, 9, 10, 11, 4, 7, 15, 0, 14, 1, 2, 10, 7, 11, 3, 14, 1, 3, 14, 0, 1, 7, 2, 3, 2, 17, 10, 3, 12, 0, 6, 4, 5,
-    9, 15, 11, 9, 18, 11, 8, 3, 6, 4, 5, 27, 9, 13, 5, 13, 5, 12, 4, 13, 2, 7, 16, 0, 4, 5, 7, 4, 11, 12, 0, 8, 11, 9,
-    13, 5, 3, 4, 4, 7, 4, 7, 1, 0, 6, 14, 0, 6, 5, 11, 9, 1, 14, 7, 1, 19, 1, 6, 12, 7, 0, 6, 17, 7, 15, 2, 11, 2, 1, 7,
-    13, 11, 14, 3, 4, 3, 2, 4, 22, 1, 17, 0, 13, 4, 8, 19, 9, 12, 1, 1, 20, 15, 9, 14, 8, 2, 9, 5, 15, 3, 7, 3, 1, 4, 8,
-    12, 4, 2, 15, 9, 15, 22, 7, 7, 7, 9, 9, 0, 5, 4, 1, 6, 12, 13, 9, 7, 12, 14, 3, 8, 0, 9, 16, 3, 7, 3, 0, 15, 7, 7,
-    6, 7, 3, 3, 12, 0, 12, 13, 5, 6, 0, 10, 14, 9, 7, 1, 15, 2, 2, 11, 12, 11, 3, 6, 18, 11, 7, 13, 12, 0, 7, 4, 11, 2,
-    9, 14, 15, 11, 10, 9, 1, 7, 0, 10, 7, 6, 5, 18, 0, 9, 4, 1, 6, 3, 0, 7, 21, 1, 2, 7, 3, 15, 5, 0, 3, 10, 9, 0, 18,
-    10, 1, 1, 17, 0, 4, 18, 2, 12, 4, 2, 2, 2, 9, 8, 9, 2, 9, 3, 5, 11, 9, 3, 9, 3, 15, 2, 1, 5, 9, 15, 9, 4, 10, 12, 2,
-    2, 6, 5, 11, 2, 9, 5, 6, 6, 14, 10, 10, 22, 9, 4, 6, 10, 0, 12, 6, 18, 11, 3, 4, 15, 3, 5, 10, 3, 7, 0, 24, 20, 10,
-    2, 7, 3, 5, 8, 6, 0, 10, 2, 16, 10, 5, 9, 9, 3, 0, 13, 2, 14, 2, 0, 4, 0, 3, 4, 4, 12, 12, 2, 3, 0, 1, 3, 7, 2, 2,
-    5, 14, 7, 5, 0, 8, 9, 13, 4, 13, 5, 4, 9, 19, 2, 13, 0, 11, 1, 3, 4, 0, 3, 3, 4, 3, 4, 15, 0, 6, 5, 9, 15, 0, 22, 3,
-    2, 7, 5, 10, 9, 2, 3, 17, 3, 9, 6, 2, 2, 4, 15, 11, 10, 2, 1, 6, 3, 8, 13, 9, 9, 0, 2, 7, 1, 6, 13, 7, 0, 9, 1, 16,
-    2, 13, 9, 0, 12, 4, 11, 2, 3, 0, 0, 2, 9, 11, 12, 11, 18, 1, 0, 4, 21, 3, 7, 2, 5, 7, 5, 4, 1, 12, 0, 14, 3, 17, 8,
-    11, 8, 9, 5, 8, 0, 3, 3, 7, 11, 8, 3, 15, 1, 15, 3, 7, 3, 17, 10, 7, 18, 11, 0, 2, 9, 10, 4, 16, 17, 0, 7, 7, 4, 8,
-    13, 7, 12, 7, 0, 1, 19, 15, 3, 4, 12, 18, 8, 2, 3, 0, 13, 22, 6, 14, 3, 1, 7, 8, 2, 6, 6, 10, 18, 12, 12, 7, 15, 1,
-    0, 9, 5, 11, 4, 2, 0, 1, 0, 6, 11, 2, 8, 13, 17, 4, 1, 8, 12, 12, 1, 3, 1, 5, 19, 5, 12, 1, 11, 11, 3, 8, 3, 12, 15,
-    6, 13, 5, 0, 5, 10, 1, 8, 5, 7, 11, 3, 22, 5, 9, 12, 1, 17, 0, 7, 12, 1, 8, 8, 3, 17, 3, 10, 5, 5, 3, 4, 3, 0, 9, 4,
-    1, 0, 9, 7, 4, 9, 1, 7, 1, 4, 3, 3, 7, 11, 4, 9, 9, 8, 8, 5, 1, 12, 10, 7, 7, 0, 0, 10, 4, 12, 4, 4, 2, 6, 13, 7, 7,
-    13, 8, 2, 0, 7, 3, 12, 7, 4, 7, 4, 8, 7, 8, 7, 3, 1, 12, 19, 17, 4, 1, 4, 12, 1, 0, 15, 0, 8, 0, 9, 1, 18, 0, 0, 7,
-    3, 2, 10, 12, 1, 11, 11, 18, 1, 17, 3, 13, 4, 6, 0, 9, 0, 1, 5, 2, 2, 10, 3, 10, 12, 1, 3, 5, 2, 2, 5, 1, 5, 3, 1,
-    25, 0, 18, 0, 4, 2, 9, 10, 10, 5, 7, 10, 8, 7, 9, 1, 4, 0, 0, 1, 14, 10, 7, 15, 4, 3, 7, 1, 12, 0, 6, 15, 1, 4, 12,
-    9, 3, 17, 1, 2, 16, 7, 0, 10, 1, 9, 10, 10, 11, 0, 7, 4, 17, 11, 4, 5, 16, 10, 0, 10, 1, 3, 9, 6, 1, 5, 15, 5, 9, 0,
-    3, 14, 6, 1, 9, 1, 6, 9, 5, 9, 0, 3, 9, 2, 9, 4, 7, 1, 1, 5, 0, 12, 6, 8, 11, 0, 1, 1, 5, 1, 7, 7, 11, 2, 11, 1, 7,
-    2, 4, 1, 7, 4, 15, 12, 1, 17, 16, 12, 3, 1, 10, 11, 12, 7, 11, 11, 4, 18, 6, 5, 3, 10, 7, 3, 4, 2, 6, 9, 15, 9, 17,
-    4, 8, 3, 4, 4, 4, 4, 0, 1, 12, 1, 13, 13, 4, 7, 7, 9, 9, 19, 1, 12, 16, 4, 14, 1, 5, 8, 9, 12, 2, 12, 15, 11, 10, 5,
-    1, 13, 6, 7, 8, 9, 1, 0, 9, 6, 14, 1, 15, 1, 5, 13, 7, 15, 9, 3, 1, 14, 2, 10, 9, 11, 7, 2, 18, 11, 0, 8, 16, 20, 7,
-    11, 14, 22, 13, 1, 11, 15, 7, 5, 7, 8, 6, 7, 6, 1, 11, 6, 12, 2, 6, 6, 1, 10, 2, 9, 15, 7, 8, 0, 12, 10, 17, 1, 0,
-    7, 12, 0, 2, 2, 18, 17, 0, 12, 0, 3, 1, 7, 12, 11, 6, 5, 0, 5, 4, 3, 3, 11, 22, 1, 3, 0, 7, 14, 11, 3, 0, 2, 6, 19,
-    6, 10, 11, 3, 8, 4, 7, 5, 1, 2, 4, 11, 10, 4, 9, 9, 3, 8, 1, 3, 15, 17, 1, 0, 5, 15, 0, 7, 2, 10, 1, 4, 3, 1, 8, 9,
-    12, 2, 6, 7, 9, 7, 1, 4, 0, 10, 11, 2, 12, 4, 11, 3, 1, 13, 3, 2, 11, 4, 1, 5, 6, 7, 7, 12, 7, 4, 5, 10, 9, 11, 0,
-    9, 0, 11, 2, 6, 4, 3, 0, 10, 1, 17, 9, 10, 15, 6, 5, 11, 4, 3, 11, 0, 13, 9, 4, 1, 14, 6, 14, 7, 4, 3, 1, 1, 0, 4,
-    5, 11, 2, 5, 2, 4, 13, 7, 19, 10, 3, 10, 14, 4, 5, 3, 3, 4, 17, 2, 5, 20, 1, 9, 1, 18, 7, 7, 3, 8, 9, 12, 5, 9, 4,
-    11, 1, 12, 17, 0, 12, 11, 21, 13, 9, 18, 4, 4, 7, 13, 1, 17, 0, 12, 3, 7, 0, 9, 16, 9, 13, 11, 3, 10, 5, 0, 13, 9,
-    0, 6, 6, 1, 12, 3, 1, 3, 9, 10, 2, 15, 8, 4, 11, 7, 0, 9, 15, 12, 0, 12, 4, 4, 7, 2, 0, 4, 3, 1, 0, 15, 9, 0, 0, 12,
-    3, 6, 0, 10, 17, 10, 5, 9, 14, 2, 2, 7, 8, 7, 10, 9, 7, 7, 4, 1, 12, 12, 5, 12, 9, 6, 7, 12, 3, 9, 14, 4, 2, 4, 6,
-    4, 8, 3, 1, 1, 5, 7, 0, 11, 7, 14, 7, 2, 24, 11, 4, 13, 9, 5, 0, 17, 5, 2, 14, 7, 1, 7, 8, 1, 9, 2, 1, 1, 7, 12, 10,
-    21, 1, 17, 4, 9, 7, 12, 0, 1, 9, 0, 2, 6, 1, 4, 3, 0, 11, 6, 9, 11, 12, 0, 2, 8, 0, 0, 8, 9, 1, 0, 19, 13, 3, 0, 3,
-    0, 7, 6, 12, 2, 6, 9, 12, 4, 1, 4, 12, 10, 15, 4, 3, 9, 15, 1, 14, 4, 12, 9, 3, 4, 15, 0, 15, 7, 1, 9, 0, 9, 3, 4,
-    7, 17, 1, 6, 8, 4, 17, 7, 0, 0, 11, 2, 12, 17, 3, 13, 7, 3, 16, 13, 0, 2, 8, 8, 8, 9, 7, 13, 14, 19, 4, 7, 12, 11,
-    11, 4, 6, 7, 11, 0, 0, 12, 2, 11, 14, 15, 3, 5, 9, 0, 13, 3, 0, 7, 3, 8, 7, 14, 14, 15, 3, 0, 13, 8, 11, 1, 7, 9, 3,
-    9, 11, 18, 7, 3, 12, 4, 9, 21, 0, 1, 8, 0, 6, 7, 12, 3, 1, 2, 12, 13, 3, 2, 9, 1, 9, 8, 10, 7, 11, 15, 17, 7, 0, 5,
-    11, 4, 13, 8, 12, 1, 3, 1, 0, 11, 5, 5, 5, 8, 7, 5, 3, 8, 9, 5, 9, 8, 1, 7, 15, 4, 2, 1, 14, 7, 10, 17, 16, 1, 18,
-    8, 8, 0, 2, 1, 15, 0, 1, 3, 4, 3, 7, 4, 14, 15, 10, 9, 1, 9, 18, 3, 0, 1, 5, 11, 11, 10, 7, 7, 9, 4, 9, 9, 1, 18,
-    10, 3, 20, 0, 0, 9, 0, 3, 7, 7, 4, 21, 9, 15, 7, 5, 10, 7, 0, 6, 17, 7, 5, 16, 7, 11, 10, 10, 0, 6, 7, 7, 4, 0, 12,
-    4, 1, 2, 9, 2, 8, 3, 7, 2, 3, 0, 15, 11, 7, 7, 4, 17, 9, 3, 1, 4, 4, 1, 9, 7, 5, 1, 7, 4, 6, 18, 4, 4, 0, 14, 3, 7,
-    11, 13, 13, 4, 11, 2, 5, 6, 9, 6, 11, 8, 6, 0, 11, 7, 5, 0, 3, 8, 1, 0, 8, 1, 4, 7, 11, 0, 8, 8, 15, 9, 1, 19, 4,
-    10, 3, 11, 3, 19, 1, 2, 1, 2, 1, 9, 7, 10, 1, 0, 3, 24, 4, 11, 15, 9, 11, 0, 3, 11, 9, 3, 13, 4, 12, 11, 1, 7, 15,
-    2, 1, 0, 3, 1, 6, 7, 11, 2, 4, 1, 9, 1, 5, 1, 7, 12, 7, 5, 9, 1, 7, 9, 6, 0, 6, 9, 0, 1, 14, 21, 15, 11, 5, 9, 5,
-    10, 7, 12, 16, 10, 10, 3, 16, 7, 8, 12, 1, 2, 0, 8, 1, 2, 1, 5, 0, 4, 4, 0, 4, 0, 14, 3, 2, 17, 6, 10, 17, 4, 19, 6,
-    0, 0, 9, 5, 3, 0, 4, 10, 1, 1, 5, 2, 9, 1, 7, 4, 0, 4, 2, 4, 2, 11, 2, 5, 4, 5, 6, 1, 7, 4, 0, 11, 11, 3, 13, 8, 12,
-    1, 0, 1, 14, 7, 9, 11, 1, 7, 4, 7, 7, 0, 13, 9, 19, 12, 8, 5, 8, 1, 5, 10, 1, 7, 2, 12, 6, 0, 15, 13, 2, 0, 8, 7,
-    13, 7, 0, 7, 1, 5, 1, 5, 4, 13, 3, 8, 0, 0, 0, 1, 6, 14, 4, 0, 1, 12, 4, 5, 9, 15, 15, 9, 5, 2, 19, 1, 0, 3, 4, 2,
-    0, 4, 4, 3, 20, 9, 3, 4, 12, 0, 6, 4, 4, 4, 3, 1, 12, 7, 0, 5, 3, 10, 6, 9, 8, 0, 3, 14, 9, 3, 0, 1, 11, 3, 12, 7,
-    0, 7, 7, 4, 8, 8, 10, 7, 14, 10, 0, 0, 15, 5, 2, 8, 9, 6, 4, 22, 16, 13, 11, 3, 6, 6, 14, 1, 3, 4, 7, 17, 14, 5, 9,
-    3, 9, 0, 1, 12, 6, 2, 7, 0, 0, 5, 1, 7, 7, 4, 4, 4, 21, 3, 3, 4, 12, 0, 9, 14, 4, 12, 0, 9, 4, 14, 14, 1, 7, 3, 14,
-    19, 7, 2, 11, 3, 1, 3, 14, 11, 4, 1, 9, 0, 1, 4, 1, 12, 5, 0, 2, 14, 13, 0, 1, 1, 4, 0,
+pub(crate) const PEEL_SEEDS: [u8; 2048] = [0, 13, 4, 7, 6, 13, 1, 6, 13, 7, 15, 13, 11, 1, 6, 7,
+    13, 5, 12, 11, 7, 14, 2, 10, 13, 3, 3, 3, 1, 9, 13, 7, 2, 9, 10, 0, 2, 14, 14, 0, 13, 11, 5, 0, 15, 14, 7, 3, 15, 2,
+    1, 3, 7, 2, 15, 12, 9, 10, 14, 12, 5, 13, 1, 7, 2, 4, 3, 15, 17, 11, 9, 10, 11, 4, 7, 15, 0, 14, 1, 2, 10, 7, 11, 3,
+    14, 1, 3, 14, 0, 1, 7, 2, 3, 2, 17, 10, 3, 12, 0, 6, 4, 5, 9, 15, 11, 9, 18, 11, 8, 3, 6, 4, 5, 27, 9, 13, 5, 13, 5,
+    12, 4, 13, 2, 7, 16, 0, 4, 5, 7, 4, 11, 12, 0, 8, 11, 9, 13, 5, 3, 4, 4, 7, 4, 7, 1, 0, 6, 14, 0, 6, 5, 11, 9, 1,
+    14, 7, 1, 19, 1, 6, 12, 7, 0, 6, 17, 7, 15, 2, 11, 2, 1, 7, 13, 11, 14, 3, 4, 3, 2, 4, 22, 1, 17, 0, 13, 4, 8, 19,
+    9, 12, 1, 1, 20, 15, 9, 14, 8, 2, 9, 5, 15, 3, 7, 3, 1, 4, 8, 12, 4, 2, 15, 9, 15, 22, 7, 7, 7, 9, 9, 0, 5, 4, 1, 6,
+    12, 13, 9, 7, 12, 14, 3, 8, 0, 9, 16, 3, 7, 3, 0, 15, 7, 7, 6, 7, 3, 3, 12, 0, 12, 13, 5, 6, 0, 10, 14, 9, 7, 1, 15,
+    2, 2, 11, 12, 11, 3, 6, 18, 11, 7, 13, 12, 0, 7, 4, 11, 2, 9, 14, 15, 11, 10, 9, 1, 7, 0, 10, 7, 6, 5, 18, 0, 9, 4,
+    1, 6, 3, 0, 7, 21, 1, 2, 7, 3, 15, 5, 0, 3, 10, 9, 0, 18, 10, 1, 1, 17, 0, 4, 18, 2, 12, 4, 2, 2, 2, 9, 8, 9, 2, 9,
+    3, 5, 11, 9, 3, 9, 3, 15, 2, 1, 5, 9, 15, 9, 4, 10, 12, 2, 2, 6, 5, 11, 2, 9, 5, 6, 6, 14, 10, 10, 22, 9, 4, 6, 10,
+    0, 12, 6, 18, 11, 3, 4, 15, 3, 5, 10, 3, 7, 0, 24, 20, 10, 2, 7, 3, 5, 8, 6, 0, 10, 2, 16, 10, 5, 9, 9, 3, 0, 13, 2,
+    14, 2, 0, 4, 0, 3, 4, 4, 12, 12, 2, 3, 0, 1, 3, 7, 2, 2, 5, 14, 7, 5, 0, 8, 9, 13, 4, 13, 5, 4, 9, 19, 2, 13, 0, 11,
+    1, 3, 4, 0, 3, 3, 4, 3, 4, 15, 0, 6, 5, 9, 15, 0, 22, 3, 2, 7, 5, 10, 9, 2, 3, 17, 3, 9, 6, 2, 2, 4, 15, 11, 10, 2,
+    1, 6, 3, 8, 13, 9, 9, 0, 2, 7, 1, 6, 13, 7, 0, 9, 1, 16, 2, 13, 9, 0, 12, 4, 11, 2, 3, 0, 0, 2, 9, 11, 12, 11, 18,
+    1, 0, 4, 21, 3, 7, 2, 5, 7, 5, 4, 1, 12, 0, 14, 3, 17, 8, 11, 8, 9, 5, 8, 0, 3, 3, 7, 11, 8, 3, 15, 1, 15, 3, 7, 3,
+    17, 10, 7, 18, 11, 0, 2, 9, 10, 4, 16, 17, 0, 7, 7, 4, 8, 13, 7, 12, 7, 0, 1, 19, 15, 3, 4, 12, 18, 8, 2, 3, 0, 13,
+    22, 6, 14, 3, 1, 7, 8, 2, 6, 6, 10, 18, 12, 12, 7, 15, 1, 0, 9, 5, 11, 4, 2, 0, 1, 0, 6, 11, 2, 8, 13, 17, 4, 1, 8,
+    12, 12, 1, 3, 1, 5, 19, 5, 12, 1, 11, 11, 3, 8, 3, 12, 15, 6, 13, 5, 0, 5, 10, 1, 8, 5, 7, 11, 3, 22, 5, 9, 12, 1,
+    17, 0, 7, 12, 1, 8, 8, 3, 17, 3, 10, 5, 5, 3, 4, 3, 0, 9, 4, 1, 0, 9, 7, 4, 9, 1, 7, 1, 4, 3, 3, 7, 11, 4, 9, 9, 8,
+    8, 5, 1, 12, 10, 7, 7, 0, 0, 10, 4, 12, 4, 4, 2, 6, 13, 7, 7, 13, 8, 2, 0, 7, 3, 12, 7, 4, 7, 4, 8, 7, 8, 7, 3, 1,
+    12, 19, 17, 4, 1, 4, 12, 1, 0, 15, 0, 8, 0, 9, 1, 18, 0, 0, 7, 3, 2, 10, 12, 1, 11, 11, 18, 1, 17, 3, 13, 4, 6, 0,
+    9, 0, 1, 5, 2, 2, 10, 3, 10, 12, 1, 3, 5, 2, 2, 5, 1, 5, 3, 1, 25, 0, 18, 0, 4, 2, 9, 10, 10, 5, 7, 10, 8, 7, 9, 1,
+    4, 0, 0, 1, 14, 10, 7, 15, 4, 3, 7, 1, 12, 0, 6, 15, 1, 4, 12, 9, 3, 17, 1, 2, 16, 7, 0, 10, 1, 9, 10, 10, 11, 0, 7,
+    4, 17, 11, 4, 5, 16, 10, 0, 10, 1, 3, 9, 6, 1, 5, 15, 5, 9, 0, 3, 14, 6, 1, 9, 1, 6, 9, 5, 9, 0, 3, 9, 2, 9, 4, 7,
+    1, 1, 5, 0, 12, 6, 8, 11, 0, 1, 1, 5, 1, 7, 7, 11, 2, 11, 1, 7, 2, 4, 1, 7, 4, 15, 12, 1, 17, 16, 12, 3, 1, 10, 11,
+    12, 7, 11, 11, 4, 18, 6, 5, 3, 10, 7, 3, 4, 2, 6, 9, 15, 9, 17, 4, 8, 3, 4, 4, 4, 4, 0, 1, 12, 1, 13, 13, 4, 7, 7,
+    9, 9, 19, 1, 12, 16, 4, 14, 1, 5, 8, 9, 12, 2, 12, 15, 11, 10, 5, 1, 13, 6, 7, 8, 9, 1, 0, 9, 6, 14, 1, 15, 1, 5,
+    13, 7, 15, 9, 3, 1, 14, 2, 10, 9, 11, 7, 2, 18, 11, 0, 8, 16, 20, 7, 11, 14, 22, 13, 1, 11, 15, 7, 5, 7, 8, 6, 7, 6,
+    1, 11, 6, 12, 2, 6, 6, 1, 10, 2, 9, 15, 7, 8, 0, 12, 10, 17, 1, 0, 7, 12, 0, 2, 2, 18, 17, 0, 12, 0, 3, 1, 7, 12,
+    11, 6, 5, 0, 5, 4, 3, 3, 11, 22, 1, 3, 0, 7, 14, 11, 3, 0, 2, 6, 19, 6, 10, 11, 3, 8, 4, 7, 5, 1, 2, 4, 11, 10, 4,
+    9, 9, 3, 8, 1, 3, 15, 17, 1, 0, 5, 15, 0, 7, 2, 10, 1, 4, 3, 1, 8, 9, 12, 2, 6, 7, 9, 7, 1, 4, 0, 10, 11, 2, 12, 4,
+    11, 3, 1, 13, 3, 2, 11, 4, 1, 5, 6, 7, 7, 12, 7, 4, 5, 10, 9, 11, 0, 9, 0, 11, 2, 6, 4, 3, 0, 10, 1, 17, 9, 10, 15,
+    6, 5, 11, 4, 3, 11, 0, 13, 9, 4, 1, 14, 6, 14, 7, 4, 3, 1, 1, 0, 4, 5, 11, 2, 5, 2, 4, 13, 7, 19, 10, 3, 10, 14, 4,
+    5, 3, 3, 4, 17, 2, 5, 20, 1, 9, 1, 18, 7, 7, 3, 8, 9, 12, 5, 9, 4, 11, 1, 12, 17, 0, 12, 11, 21, 13, 9, 18, 4, 4, 7,
+    13, 1, 17, 0, 12, 3, 7, 0, 9, 16, 9, 13, 11, 3, 10, 5, 0, 13, 9, 0, 6, 6, 1, 12, 3, 1, 3, 9, 10, 2, 15, 8, 4, 11, 7,
+    0, 9, 15, 12, 0, 12, 4, 4, 7, 2, 0, 4, 3, 1, 0, 15, 9, 0, 0, 12, 3, 6, 0, 10, 17, 10, 5, 9, 14, 2, 2, 7, 8, 7, 10,
+    9, 7, 7, 4, 1, 12, 12, 5, 12, 9, 6, 7, 12, 3, 9, 14, 4, 2, 4, 6, 4, 8, 3, 1, 1, 5, 7, 0, 11, 7, 14, 7, 2, 24, 11, 4,
+    13, 9, 5, 0, 17, 5, 2, 14, 7, 1, 7, 8, 1, 9, 2, 1, 1, 7, 12, 10, 21, 1, 17, 4, 9, 7, 12, 0, 1, 9, 0, 2, 6, 1, 4, 3,
+    0, 11, 6, 9, 11, 12, 0, 2, 8, 0, 0, 8, 9, 1, 0, 19, 13, 3, 0, 3, 0, 7, 6, 12, 2, 6, 9, 12, 4, 1, 4, 12, 10, 15, 4,
+    3, 9, 15, 1, 14, 4, 12, 9, 3, 4, 15, 0, 15, 7, 1, 9, 0, 9, 3, 4, 7, 17, 1, 6, 8, 4, 17, 7, 0, 0, 11, 2, 12, 17, 3,
+    13, 7, 3, 16, 13, 0, 2, 8, 8, 8, 9, 7, 13, 14, 19, 4, 7, 12, 11, 11, 4, 6, 7, 11, 0, 0, 12, 2, 11, 14, 15, 3, 5, 9,
+    0, 13, 3, 0, 7, 3, 8, 7, 14, 14, 15, 3, 0, 13, 8, 11, 1, 7, 9, 3, 9, 11, 18, 7, 3, 12, 4, 9, 21, 0, 1, 8, 0, 6, 7,
+    12, 3, 1, 2, 12, 13, 3, 2, 9, 1, 9, 8, 10, 7, 11, 15, 17, 7, 0, 5, 11, 4, 13, 8, 12, 1, 3, 1, 0, 11, 5, 5, 5, 8, 7,
+    5, 3, 8, 9, 5, 9, 8, 1, 7, 15, 4, 2, 1, 14, 7, 10, 17, 16, 1, 18, 8, 8, 0, 2, 1, 15, 0, 1, 3, 4, 3, 7, 4, 14, 15,
+    10, 9, 1, 9, 18, 3, 0, 1, 5, 11, 11, 10, 7, 7, 9, 4, 9, 9, 1, 18, 10, 3, 20, 0, 0, 9, 0, 3, 7, 7, 4, 21, 9, 15, 7,
+    5, 10, 7, 0, 6, 17, 7, 5, 16, 7, 11, 10, 10, 0, 6, 7, 7, 4, 0, 12, 4, 1, 2, 9, 2, 8, 3, 7, 2, 3, 0, 15, 11, 7, 7, 4,
+    17, 9, 3, 1, 4, 4, 1, 9, 7, 5, 1, 7, 4, 6, 18, 4, 4, 0, 14, 3, 7, 11, 13, 13, 4, 11, 2, 5, 6, 9, 6, 11, 8, 6, 0, 11,
+    7, 5, 0, 3, 8, 1, 0, 8, 1, 4, 7, 11, 0, 8, 8, 15, 9, 1, 19, 4, 10, 3, 11, 3, 19, 1, 2, 1, 2, 1, 9, 7, 10, 1, 0, 3,
+    24, 4, 11, 15, 9, 11, 0, 3, 11, 9, 3, 13, 4, 12, 11, 1, 7, 15, 2, 1, 0, 3, 1, 6, 7, 11, 2, 4, 1, 9, 1, 5, 1, 7, 12,
+    7, 5, 9, 1, 7, 9, 6, 0, 6, 9, 0, 1, 14, 21, 15, 11, 5, 9, 5, 10, 7, 12, 16, 10, 10, 3, 16, 7, 8, 12, 1, 2, 0, 8, 1,
+    2, 1, 5, 0, 4, 4, 0, 4, 0, 14, 3, 2, 17, 6, 10, 17, 4, 19, 6, 0, 0, 9, 5, 3, 0, 4, 10, 1, 1, 5, 2, 9, 1, 7, 4, 0, 4,
+    2, 4, 2, 11, 2, 5, 4, 5, 6, 1, 7, 4, 0, 11, 11, 3, 13, 8, 12, 1, 0, 1, 14, 7, 9, 11, 1, 7, 4, 7, 7, 0, 13, 9, 19,
+    12, 8, 5, 8, 1, 5, 10, 1, 7, 2, 12, 6, 0, 15, 13, 2, 0, 8, 7, 13, 7, 0, 7, 1, 5, 1, 5, 4, 13, 3, 8, 0, 0, 0, 1, 6,
+    14, 4, 0, 1, 12, 4, 5, 9, 15, 15, 9, 5, 2, 19, 1, 0, 3, 4, 2, 0, 4, 4, 3, 20, 9, 3, 4, 12, 0, 6, 4, 4, 4, 3, 1, 12,
+    7, 0, 5, 3, 10, 6, 9, 8, 0, 3, 14, 9, 3, 0, 1, 11, 3, 12, 7, 0, 7, 7, 4, 8, 8, 10, 7, 14, 10, 0, 0, 15, 5, 2, 8, 9,
+    6, 4, 22, 16, 13, 11, 3, 6, 6, 14, 1, 3, 4, 7, 17, 14, 5, 9, 3, 9, 0, 1, 12, 6, 2, 7, 0, 0, 5, 1, 7, 7, 4, 4, 4, 21,
+    3, 3, 4, 12, 0, 9, 14, 4, 12, 0, 9, 4, 14, 14, 1, 7, 3, 14, 19, 7, 2, 11, 3, 1, 3, 14, 11, 4, 1, 9, 0, 1, 4, 1, 12,
+    5, 0, 2, 14, 13, 0, 1, 1, 4, 0,
     14, 11, 16, 6, 3, 7, 6, 13, 13, 0, 1, 8, 0, 2, 1, 8, ];
 pub(crate) const DENSE_POINTS: [(u16, u16); 64] = [
     (2048, 52), (2618, 54), (2826, 60), (3725, 62), (3962, 67), (4277, 65), (4547, 60), (5065, 64), (5224, 76),

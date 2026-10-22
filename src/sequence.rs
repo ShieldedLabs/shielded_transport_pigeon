@@ -1,11 +1,10 @@
-//! Connected packet nonces: dense data [0,2^63), independent ACK [2^63,2^64). The wire carries low 31 counter bits; ACK class
-//! restores bit 63 internally.
+//! Connected packet nonces: dense data [0,2^63), independent ACK [2^63,2^64). The wire carries low 31 counter bits; ACK
+//! class restores bit 63 internally.
 pub const ACK_SPACE: u64 = 1 << 63; const REPLAY_BITS: u64 = 262144; pub const COUNTER_MASK: u32 = 0x7fff_ffff;
 const COUNTER_CYCLE: u64 = 1 << 31; const MAX_COUNTER: u64 = ACK_SPACE - 2;
-/// Nearest legal full counter to the largest authenticated counter (initially 0). At an exact half-cycle tie choose the smaller
-/// counter. No wrap at either end.
-pub fn reconstruct(low: u32, largest: Option<u64>, ack: bool) -> u64 {
-    let anchor = largest.unwrap_or(0) & !ACK_SPACE;
+/// Nearest legal full counter to the largest authenticated counter (initially 0). At an exact half-cycle tie choose the
+/// smaller counter. No wrap at either end.
+pub fn reconstruct(low: u32, largest: Option<u64>, ack: bool) -> u64 { let anchor = largest.unwrap_or(0) & !ACK_SPACE;
     let base = (anchor & !(COUNTER_CYCLE - 1)) | (low & COUNTER_MASK) as u64; let mut best = None;
     for candidate in [base.checked_sub(COUNTER_CYCLE), Some(base), base.checked_add(COUNTER_CYCLE)].into_iter().flatten() {
         if candidate > MAX_COUNTER { continue; }
@@ -18,8 +17,7 @@ pub fn is_ack_space(wire: u64) -> bool { wire & ACK_SPACE != 0 }
 impl Default for Space {
     fn default() -> Self { Self { highest: None, history: vec![0; (REPLAY_BITS / 64) as usize].into_boxed_slice() } } }
 impl Space {
-    fn fresh(&self,seq:u64)->bool {
-        let Some(h)=self.highest else {return true};
+    fn fresh(&self,seq:u64)->bool { let Some(h)=self.highest else {return true};
         if seq>h {return true;}
         seq>=h.saturating_sub(REPLAY_BITS-1) && self.history[(seq%REPLAY_BITS/64) as usize] & (1<<(seq%64))==0 }
     fn commit(&mut self, seq: u64) -> bool {
@@ -32,10 +30,12 @@ impl Space {
         if *word & bit != 0 { return false; }
         *word |= bit; self.highest = Some(self.highest.unwrap_or(seq).max(seq));
         true } }
-#[derive(Debug, Clone, Default)] pub struct ReceiveSequences { data: Space, ack: Space, authenticated: [Option<u64>; 2] }
+#[derive(Debug, Clone, Default)]
+pub struct ReceiveSequences { data: Space, ack: Space, authenticated: [Option<u64>; 2] }
 impl ReceiveSequences {
     pub fn candidate(&self, wire: u64) -> u64 { wire }
-    pub fn compact_candidate(&self, wire: u32, ack: bool) -> u64 { reconstruct(wire, self.authenticated[ack as usize], ack) }
+    pub fn compact_candidate(&self, wire: u32, ack: bool) -> u64 {
+        reconstruct(wire, self.authenticated[ack as usize], ack) }
     pub fn authenticated(&mut self, nonce: u64) {
         let anchor = &mut self.authenticated[is_ack_space(nonce) as usize]; let counter = nonce & !ACK_SPACE;
         *anchor = Some(anchor.unwrap_or(counter).max(counter)); }

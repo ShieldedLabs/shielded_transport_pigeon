@@ -1,23 +1,22 @@
-//! Safe wrapper over the in-crate Rust Wirehair fountain code. Equations and repair symbols match the previously vendored classic
-//! C++ codec.
+//! Safe wrapper over the in-crate Rust Wirehair fountain code. Equations and repair symbols match the previously
+//! vendored classic C++ codec.
 //!
-//! A message of `len` bytes is split into K = ceil(len / block_bytes) source blocks. The encoder can produce any block id: ids
-//! 0..K-1 are the message itself ("systematic": block i is `message[i*block_bytes..]`, the last one short), ids >= K are repair
-//! blocks of exactly `block_bytes`. A decoder recovers the message from any ~K distinct ids (K + 0.02 on average). Wirehair
-//! accepts 2 <= K <= 64000.
+//! A message of `len` bytes is split into K = ceil(len / block_bytes) source blocks. The encoder can produce any block
+//! id: ids 0..K-1 are the message itself ("systematic": block i is `message[i*block_bytes..]`, the last one short), ids
+//! >= K are repair blocks of exactly `block_bytes`. A decoder recovers the message from any ~K distinct ids (K + 0.02
+//! on average). Wirehair accepts 2 <= K <= 64000.
 //!
 use std::sync::Arc; pub const MIN_BLOCKS: usize = 2; pub const MAX_BLOCKS: usize = 64000;
-/// Hard codec-arena cap, including input, workspace, dedup and GE matrix. Per-symbol charge matters even when a malicious peer
-/// chooses one-byte blocks. Wirehair refuses a solve/regrow exceeding this cap rather than overallocating.
-pub fn decoder_memory_limit(len: usize, block_bytes: usize) -> Option<usize> {
-    let k = block_count(len, block_bytes)?;
+/// Hard codec-arena cap, including input, workspace, dedup and GE matrix. Per-symbol charge matters even when a
+/// malicious peer chooses one-byte blocks. Wirehair refuses a solve/regrow exceeding this cap rather than
+/// overallocating.
+pub fn decoder_memory_limit(len: usize, block_bytes: usize) -> Option<usize> { let k = block_count(len, block_bytes)?;
     len.checked_mul(2)?.checked_add(k.checked_mul(256)?)?.checked_add(1 << 20) }
 pub fn ingress_slots(bytes: usize, block_bytes: usize) -> usize {
     (bytes / (block_bytes + std::mem::size_of::<(u32, Vec<u8>)>() + 128)).max(1) }
 pub fn receive_memory_charge(layout: MessageLayout, worker: bool, ingress_bytes: usize) -> Option<usize> {
     let mut bytes = layout.len;
-    for group in 0..layout.groups {
-        let (_, len) = layout.group_bytes(group);
+    for group in 0..layout.groups { let (_, len) = layout.group_bytes(group);
         bytes = bytes.checked_add(decoder_memory_limit(len, layout.block_bytes)?)?.checked_add(4096)?; }
     if worker { bytes = bytes.checked_add(ingress_bytes.checked_mul(2)?)?.checked_add(256 << 10)?; }
     Some(bytes) }
@@ -27,12 +26,10 @@ pub fn block_count(message_len: usize, block_bytes: usize) -> Option<usize> {
     if block_bytes == 0 || block_bytes > u32::MAX as usize { return None; }
     let k = message_len.div_ceil(block_bytes);
     (MIN_BLOCKS..=MAX_BLOCKS).contains(&k).then_some(k) }
-pub fn block_len(message_len: usize, block_bytes: usize, id: u32) -> usize {
-    let start = id as usize * block_bytes;
+pub fn block_len(message_len: usize, block_bytes: usize, id: u32) -> usize { let start = id as usize * block_bytes;
     if start >= message_len { block_bytes } else { (message_len - start).min(block_bytes) } }
 pub struct Encoder { codec: Box<wirehair::Codec>, message: Arc<Vec<u8>>, block_bytes: usize, }
-pub fn encode(message: Arc<Vec<u8>>, block_bytes: usize) -> Option<Encoder> {
-    let len = message.len();
+pub fn encode(message: Arc<Vec<u8>>, block_bytes: usize) -> Option<Encoder> { let len = message.len();
     encode_range(message, 0, len, block_bytes) }
 fn encode_range(message: Arc<Vec<u8>>, start: usize, len: usize, block_bytes: usize) -> Option<Encoder> {
     block_count(len, block_bytes)?;
@@ -44,7 +41,8 @@ impl Encoder {
     pub fn message(&self) -> &Arc<Vec<u8>> { &self.message }
     pub fn block_into(&mut self, id: u32, out: &mut [u8]) -> Option<usize> {
         if out.len() < self.block_bytes { return None; }
-        let cap = out.len().min(u32::MAX as usize); let written = self.codec.wirehair_encode(id, &mut out[..cap]).ok()? as usize;
+        let cap = out.len().min(u32::MAX as usize);
+        let written = self.codec.wirehair_encode(id, &mut out[..cap]).ok()? as usize;
         (written <= self.block_bytes).then_some(written) }
     pub fn block(&mut self, id: u32) -> Option<Vec<u8>> {
         let mut v = vec![0u8; self.block_bytes]; let n = self.block_into(id, &mut v)?; v.truncate(n);
@@ -53,8 +51,7 @@ impl Encoder {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)] pub enum DecodeError { BadBlock, Failed(i32), }
 pub struct Decoder { codec: Box<wirehair::Codec>, message_len: usize, block_bytes: usize, done: bool, }
 impl Decoder {
-    pub fn new(message_len: usize, block_bytes: usize) -> Option<Decoder> {
-        block_count(message_len, block_bytes)?;
+    pub fn new(message_len: usize, block_bytes: usize) -> Option<Decoder> { block_count(message_len, block_bytes)?;
         if !init() { return None; }
         let codec = Box::new(wirehair::decoder_create_limited(message_len as u64, block_bytes as u32,
             decoder_memory_limit(message_len, block_bytes)? as u64).ok()?);
@@ -70,19 +67,19 @@ impl Decoder {
             WirehairResult::NeedMore => Ok(DecodeStatus::NeedMore),
             WirehairResult::InvalidInput => Err(DecodeError::BadBlock),
             e => Err(DecodeError::Failed(e.code())), } }
-    pub fn recover(&mut self) -> Option<Vec<u8>> {
-        let mut out = vec![0u8; self.message_len];
+    pub fn recover(&mut self) -> Option<Vec<u8>> { let mut out = vec![0u8; self.message_len];
         self.recover_into(&mut out).then_some(out) }
     pub fn recover_into(&mut self, out: &mut [u8]) -> bool {
         if !self.done || out.len() != self.message_len { return false; }
         self.codec.wirehair_recover(out) == WirehairResult::Success } }
-/// Giant-message wire kind 2 partitions source blocks into balanced contiguous groups. This is a wire-format constant: changing
-/// it requires a new extended-fragment kind.
+/// Giant-message wire kind 2 partitions source blocks into balanced contiguous groups. This is a wire-format constant:
+/// changing it requires a new extended-fragment kind.
 pub const GROUP_MAX_BLOCKS: usize = 32000;
 #[derive(Debug, Clone, Copy)]
 pub struct MessageLayout { pub len: usize, pub block_bytes: usize, pub k: usize, pub groups: usize, }
 impl MessageLayout {
-    pub fn new(len: usize, block_bytes: usize) -> Option<Self> { Self::with_group_limit(len, block_bytes, GROUP_MAX_BLOCKS) }
+    pub fn new(len: usize, block_bytes: usize) -> Option<Self> {
+        Self::with_group_limit(len, block_bytes, GROUP_MAX_BLOCKS) }
     pub fn with_group_limit(len: usize, block_bytes: usize, limit: usize) -> Option<Self> {
         if block_bytes == 0 || block_bytes > u16::MAX as usize || len > u32::MAX as usize || !(MIN_BLOCKS..=MAX_BLOCKS).contains(&limit) { return None; }
         let k = len.div_ceil(block_bytes);
@@ -95,16 +92,13 @@ impl MessageLayout {
     pub fn group_bytes(&self, group: usize) -> (usize, usize) {
         let (start, k) = self.group(group); let start = start * self.block_bytes;
         (start, (k * self.block_bytes).min(self.len - start)) }
-    pub fn wire_id(&self, sent: u32) -> u32 {
-        let sent = sent as usize;
+    pub fn wire_id(&self, sent: u32) -> u32 { let sent = sent as usize;
         if sent >= self.k || self.groups == 1 { return sent as u32; }
         let base = self.k / self.groups; let full_rows = base * self.groups;
         let (group, row) = if sent < full_rows { (sent % self.groups, sent / self.groups) } else { (sent - full_rows, base) };
         (self.group(group).0 + row) as u32 }
-    pub fn local_id(&self, id: u32) -> (usize, u32) {
-        let id = id as usize;
-        if id >= self.k {
-            let repair = id - self.k; let group = repair % self.groups;
+    pub fn local_id(&self, id: u32) -> (usize, u32) { let id = id as usize;
+        if id >= self.k { let repair = id - self.k; let group = repair % self.groups;
             return (group, (self.group(group).1 + repair / self.groups) as u32); }
         let base = self.k / self.groups; let extra = self.k % self.groups; let wide = (base + 1) * extra;
         let group = if id < wide { id / (base + 1) } else { extra + (id - wide) / base };
@@ -118,11 +112,9 @@ pub fn encode_message(message: Arc<Vec<u8>>, block_bytes: usize) -> Option<Messa
     encode_message_layout(message, layout) }
 pub fn encode_message_layout(message: Arc<Vec<u8>>, layout: MessageLayout) -> Option<MessageEncoder> {
     if message.len() != layout.len { return None; }
-    if layout.groups == 1 {
-        let encoder = encode(message, layout.block_bytes)?;
+    if layout.groups == 1 { let encoder = encode(message, layout.block_bytes)?;
         return Some(MessageEncoder { layout, encoders: vec![encoder] }); }
-    let encoders = (0..layout.groups).map(|group| {
-        let (start, len) = layout.group_bytes(group);
+    let encoders = (0..layout.groups).map(|group| { let (start, len) = layout.group_bytes(group);
         encode_range(message.clone(), start, len, layout.block_bytes) }).collect::<Option<Vec<_>>>()?;
     Some(MessageEncoder { layout, encoders }) }
 impl MessageEncoder {
@@ -153,15 +145,16 @@ impl SourceOnly {
     pub(crate) fn decoder(&self) -> Result<MessageDecoder, DecodeError> {
         let mut dec = MessageDecoder::with_layout(self.layout).ok_or(DecodeError::Failed(-1))?;
         for id in 0..self.layout.k {
-            if self.has(id) {
-                let start = id * self.layout.block_bytes; let end = (start + self.layout.block_bytes).min(self.layout.len);
+            if self.has(id) { let start = id * self.layout.block_bytes;
+                let end = (start + self.layout.block_bytes).min(self.layout.len);
                 dec.add(id as u32, &self.output[start..end])?; } }
         Ok(dec) } }
 pub struct MessageDecoder {
     layout: MessageLayout, decoders: Vec<Option<Decoder>>, complete: Vec<bool>, remaining: usize,
     output: Vec<u8>, }
 impl MessageDecoder {
-    pub fn new(len: usize, block_bytes: usize) -> Option<Self> { Self::with_layout(MessageLayout::new(len, block_bytes)?) }
+    pub fn new(len: usize, block_bytes: usize) -> Option<Self> {
+        Self::with_layout(MessageLayout::new(len, block_bytes)?) }
     pub fn with_layout(layout: MessageLayout) -> Option<Self> {
         if !init() { return None; }
         Some(Self { layout, decoders: (0..layout.groups).map(|_| None).collect(), complete: vec![false; layout.groups], remaining: layout.groups, output: vec![0u8; layout.len] })
@@ -172,8 +165,7 @@ impl MessageDecoder {
         let expect = block_len(self.layout.len, self.layout.block_bytes, id);
         if data.len() != expect { return Err(DecodeError::BadBlock); }
         let (group, local) = self.layout.local_id(id);
-        if !self.complete[group] {
-            let (start, len) = self.layout.group_bytes(group);
+        if !self.complete[group] { let (start, len) = self.layout.group_bytes(group);
             if self.decoders[group].is_none() {
                 self.decoders[group] = Some(Decoder::new(len, self.layout.block_bytes).ok_or(DecodeError::Failed(-1))?); }
             let decoder = self.decoders[group].as_mut().unwrap();
