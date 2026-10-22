@@ -410,6 +410,24 @@ A positive STP ACK is therefore packet feedback, **not** a reliable application
 receipt. In particular the public receive ring may drop a completed message
 when full while normal ACK processing continues. Neither replay admission nor
 whole-duplication suppression is rolled back on such an application-side drop.
+Application receive-ring fullness is also congestion evidence: this implementation
+samples the shared ring after processing each admitted data-class packet and
+counts it as CE while full, whether or not any message completed. Kernel CE and
+local overload contribute at most once per unique packet. Existing independent
+receive-memory/table/decoder admission refusals still withhold that packet's
+receipt and cumulative CE contribution; application-ring drops do not.
+
+At every actual ACK send attempt it also samples current receive-ring fullness
+and requests IP ECN CE while full, including any retry of a frozen ACK. This is
+level-triggered across all peers sharing that application ring, not tied to the
+peer whose last message filled it. IP marking is best effort (OS support and
+path bleaching can remove it); the authenticated cumulative count supplies
+feedback independently on fresh admitted packets. Async FEC completion or a
+lifecycle event can fill the ring between receipt and ACK generation: the IP CE
+request reflects that current state without inventing or altering packet receipts.
+Draining stops new local marks, but cannot erase historical cumulative CE. No
+ACK-of-ACK or new timer is introduced, and the existing sender ECN cut and event
+guard remain unchanged; old feedback need not cause a fresh cut.
 
 ## Frame stream
 
@@ -686,7 +704,7 @@ size is 158 bytes. No other connected traffic uses that size.
 |---|---:|---|
 | 0 | 8 | receipt_base |
 | 8 | 8 | sample_seq (also positively acknowledged) |
-| 16 | 8 | cumulative unique CE-marked data-class packet count |
+| 16 | 8 | cumulative unique kernel-CE or receiver-overload-marked data-class packet count |
 | 24 | 4 | delay_us for sample_seq only |
 | 28 | 1 | receipt encoding (1 = bitmap with sampled UDP payload size) |
 | 29 | 1 | reserved zero |
@@ -732,7 +750,8 @@ to generation of this ACK snapshot. The declared 10000 us is the maximum
 guarantee: a caller that does not drive Pump, local socket refusal or retained
 feedback pages can make the actual sample age larger. CE is a monotone u64
 cumulative count of
-unique admitted data/probe/keepalive packets; old/repeated counts do not move
+unique admitted data/probe/keepalive packets marked by kernel CE or receiver
+application-ring overload (coalesced per packet); old/repeated counts do not move
 the sender's remembered count backwards. Exhaustion requires a fresh
 handshake; it must never wrap. Counts decreasing or greater than the sender's
 total sent data-class packets MUST NOT change its remembered CE baseline.
