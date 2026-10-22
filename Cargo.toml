@@ -6,6 +6,16 @@ license = "MIT"
 repository = "https://github.com/ShieldedLabs/shielded_transport_pigeon"
 description = "Encrypted, caller-driven UDP message transport with bounded lock-free rings and forward error correction."
 
+[dependencies]
+curve25519-dalek = "4.1.3"
+blake3 = { version = "1.8.2", default-features = false, features = ["std", "pure"] }
+
+[dependencies.snow]
+package = "shielded_labs_snow"
+version = "0.10.0"
+default-features = false
+features = ["use-curve25519", "use-chacha20poly1305", "use-blake2", "use-getrandom"]
+
 [features]
 # RESEARCH-ONLY observation telemetry for size-sweep-cohort (no behaviour change). Off by default.
 research_cohort_observer = []

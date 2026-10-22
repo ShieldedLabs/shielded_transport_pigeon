@@ -3,7 +3,7 @@
 #[cfg(feature = "research_budget_diagnostic")]
 use crate::budget_diagnostic as diag;
 use std::collections::{HashMap, VecDeque};
-use crate::crypto::{noise as snow, blake3};
+use crate::{blake3, helpers::noise as snow};
 
 
 // LSB of this 48 bit value must be 1 for this to be recognized as an incoming connect handshake.
@@ -232,7 +232,7 @@ pub fn new_keypair_from_connect_magic1(magic1: u64) -> Option<IdentityKeyPair> {
     }
     if let Some(crypto_string) = crypto_string_from_connect_magic1(magic1) {
         let private = crate::helpers::crypto_random().ok()?;
-        let public = snow::public_key(&private);
+        let public = curve25519_dalek::montgomery::MontgomeryPoint::mul_base_clamped(private).to_bytes();
         Some(IdentityKeyPair { magic1, private: private.to_vec(), public: public.to_vec() })
     } else { None }
 }
@@ -247,7 +247,7 @@ pub fn new_keypair_from_connect_magic1_with_seed(magic1: u64, seed: [u8; 32]) ->
         let mut rng = crate::crypto::rng::ChaCha20Rng::from_seed(seed);
         let mut private = [0; 32];
         rng.fill_bytes(&mut private);
-        let public = snow::public_key(&private);
+        let public = curve25519_dalek::montgomery::MontgomeryPoint::mul_base_clamped(private).to_bytes();
         Some(IdentityKeyPair { magic1, private: private.to_vec(), public: public.to_vec() })
     } else { None }
 }

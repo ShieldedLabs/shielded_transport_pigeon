@@ -5,8 +5,6 @@
 //! MIT OR Apache-2.0: see LICENSE-chacha20-MIT and LICENSE-RustCrypto-APACHE.
 
 /// Original ChaCha layout: 64-bit block counter and 64-bit stream identifier.
-/// For Noise's IETF layout the block counter fits u32, the nonce prefix is
-/// zero, and `stream` is the little-endian 64-bit Noise nonce.
 pub(crate) fn block(key: &[u8; 32], counter: u64, stream: u64) -> [u8; 64] {
     let mut state = [0u32; 16];
     state[..4].copy_from_slice(&[0x61707865, 0x3320646e, 0x79622d32, 0x6b206574]);

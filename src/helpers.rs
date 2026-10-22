@@ -158,8 +158,32 @@ impl std::fmt::Debug for BytesPerSecond {
     }
 }
 
-// The Noise implementation is part of this crate, not a separate dependency.
-pub use crate::crypto::noise;
+// Preserve the existing facade while using the upstream Snow implementation.
+pub use snow as noise;
+
+struct OsRandom;
+impl noise::types::Random for OsRandom {
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), noise::Error> {
+        crate::platform::fill_random(dest).map_err(|_| noise::Error::Rng)
+    }
+}
+
+struct OsRandomResolver;
+impl noise::resolvers::CryptoResolver for OsRandomResolver {
+    fn resolve_rng(&self) -> Option<Box<dyn noise::types::Random>> {
+        Some(Box::new(OsRandom))
+    }
+    fn resolve_dh(&self, _: &noise::params::DHChoice) -> Option<Box<dyn noise::types::Dh>> { None }
+    fn resolve_hash(&self, _: &noise::params::HashChoice) -> Option<Box<dyn noise::types::Hash>> { None }
+    fn resolve_cipher(&self, _: &noise::params::CipherChoice) -> Option<Box<dyn noise::types::Cipher>> { None }
+}
+
+fn noise_builder(protocol: &str) -> Result<noise::Builder<'_>, noise::Error> {
+    let resolver = noise::resolvers::FallbackResolver::new(
+        Box::new(OsRandomResolver), Box::new(noise::resolvers::DefaultResolver),
+    );
+    Ok(noise::Builder::with_resolver(protocol.parse()?, Box::new(resolver)))
+}
 
 pub(crate) fn crypto_random() -> Result<[u8; 32], noise::Error> {
     let mut bytes = [0u8; 32];
@@ -167,12 +191,12 @@ pub(crate) fn crypto_random() -> Result<[u8; 32], noise::Error> {
     Ok(bytes)
 }
 
-/// Construct an IK initiator with a fresh operating-system-seeded ephemeral key.
+/// Construct an IK initiator with a fresh operating-system-generated ephemeral key.
 #[doc(hidden)]
 pub fn noise_initiator(protocol: &str, prologue: &[u8], private: &[u8], remote: &[u8]) -> Result<noise::HandshakeState, noise::Error> {
-    noise::HandshakeState::initiator(protocol, prologue, private, remote, crypto_random()?)
+    noise_builder(protocol)?.prologue(prologue)?.local_private_key(private)?.remote_public_key(remote)?.build_initiator()
 }
 
 pub(crate) fn noise_responder(protocol: &str, prologue: &[u8], private: &[u8]) -> Result<noise::HandshakeState, noise::Error> {
-    noise::HandshakeState::responder(protocol, prologue, private, crypto_random()?)
+    noise_builder(protocol)?.prologue(prologue)?.local_private_key(private)?.build_responder()
 }

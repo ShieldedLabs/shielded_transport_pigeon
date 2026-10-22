@@ -17,7 +17,7 @@ mod encoding;
 mod crypto;
 mod wirehair;
 #[doc(hidden)]
-pub mod blake3 { pub use crate::crypto::blake3::*; }
+pub mod blake3 { pub use ::blake3::*; }
 mod platform;
 #[doc(hidden)]
 pub mod random;
