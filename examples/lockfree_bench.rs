@@ -13,11 +13,7 @@ use super::common::*; use std::io::Write; use std::os::fd::AsRawFd; use std::tim
 struct QuietStdout(i32);
 impl QuietStdout {
     fn new() -> Self {
-        std::io::stdout().flush().unwrap();
-        let null = std::fs::OpenOptions::new()
-            .write(true)
-            .open("/dev/null")
-            .unwrap();
+        std::io::stdout().flush().unwrap(); let null = std::fs::OpenOptions::new().write(true).open("/dev/null").unwrap();
         let saved = unsafe { libc::dup(libc::STDOUT_FILENO) }; assert!(saved >= 0);
         assert!(unsafe { libc::dup2(null.as_raw_fd(), libc::STDOUT_FILENO) } >= 0);
         Self(saved) } }
@@ -31,12 +27,7 @@ fn cpu_ns() -> u64 {
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64 }
 fn cpu_ticks() -> u64 {
     let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
-    let fields: Vec<_> = stat
-        .rsplit_once(')')
-        .unwrap()
-        .1
-        .split_whitespace()
-        .collect();
+    let fields: Vec<_> = stat.rsplit_once(')').unwrap().1.split_whitespace().collect();
     fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap() }
 pub fn main() {
     let quiet = QuietStdout::new(); let (pa, mut a, _) = setup(); let (pb, mut b, address) = setup();
@@ -50,8 +41,7 @@ pub fn main() {
     let mut received = 0usize; let mut seen = vec![false; 4096];
     while received < 4096 {
         while sent < 4096 && sent - received < 32 {
-            let mut bytes = vec![0; 100]; bytes[..8].copy_from_slice(&(sent as u64).to_le_bytes());
-            send(&mut a, peer, bytes);
+            let mut bytes = vec![0; 100]; bytes[..8].copy_from_slice(&(sent as u64).to_le_bytes()); send(&mut a, peer, bytes);
             sent += 1; }
         for (_, payload) in receive(&mut b, 1) {
             assert_eq!(payload.len(), 100); let id = u64::from_le_bytes(payload[..8].try_into().unwrap()) as usize;
@@ -69,14 +59,7 @@ pub fn main() {
         assert_eq!(receive(&mut b, 1)[0].1, vec![n; 100]); latency_us.push(start.elapsed().as_secs_f64() * 1e6);
         drain(&mut a); }
     latency_us.sort_by(f64::total_cmp); let status = std::fs::read_to_string("/proc/self/status").unwrap();
-    let rss_kib: u64 = status
-        .lines()
-        .find(|l| l.starts_with("VmHWM:"))
-        .unwrap()
-        .split_whitespace()
-        .nth(1)
-        .unwrap()
-        .parse()
+    let rss_kib: u64 = status.lines().find(|l| l.starts_with("VmHWM:")).unwrap().split_whitespace().nth(1).unwrap().parse()
         .unwrap();
     drop(quiet); println!("metric,value,unit"); println!("stop_wait_100x1MB,{mbps:.3},MB/s");
     println!("window32_4096x100B,{msgps:.3},msg/s"); println!("idle_cpu_10s,{idle_cpu:.6},CPU-s");

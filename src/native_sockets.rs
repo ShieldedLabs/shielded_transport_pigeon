@@ -46,21 +46,15 @@ impl Dscp {
             46 => Dscp::Ef,
             _ => Dscp::BestEffort, } } }
 const PROBE_V4: [u8; 4] = [1, 1, 1, 1];
-const PROBE_V6: [u8; 16] = [
-    0x26, 0x06, 0x47, 0x00, 0x47, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x11, 0x11, ];
+const PROBE_V6: [u8; 16] = [0x26, 0x06, 0x47, 0x00, 0x47, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11, 0x11, ];
 fn usable_probed_v4(addr: Ipv6Addr) -> Option<Ipv6Addr> {
     if addr.is_unspecified() || addr.is_loopback() || addr.is_unicast_link_local() { None } else { Some(addr) } }
 fn usable_probed_v6(addr: Ipv6Addr) -> Option<Ipv6Addr> {
     let seg = addr.segments();
-    if addr.is_unspecified()
-        || addr.is_loopback()
-        || addr.is_multicast()
-        || addr.is_unicast_link_local()
+    if addr.is_unspecified() || addr.is_loopback() || addr.is_multicast() || addr.is_unicast_link_local()
         || (seg[4] == 0 && seg[5] == 0 && seg[6] == 0 && seg[7] == 0)
     { None } else { Some(addr) } }
-#[inline]
-fn tclass_byte(dscp: Dscp, ecn_signal: bool) -> u8 { ((dscp as u8) << 2) | if ecn_signal { 0b11 } else { 0b10 } }
+#[inline] fn tclass_byte(dscp: Dscp, ecn_signal: bool) -> u8 { ((dscp as u8) << 2) | if ecn_signal { 0b11 } else { 0b10 } }
 #[inline] fn decode_tclass(tclass: u8) -> (bool, bool, Dscp) {
     let ecn_bits = tclass & 0b11;
     (ecn_bits == 0b11, ecn_bits != 0, Dscp::from_u8(tclass >> 2)) }
@@ -98,8 +92,7 @@ fn tclass_byte(dscp: Dscp, ecn_signal: bool) -> u8 { ((dscp as u8) << 2) | if ec
                 let err = std::io::Error::last_os_error();
                 match err.raw_os_error() {
                     Some(sys::ENETUNREACH) | Some(sys::EHOSTUNREACH) | Some(sys::EADDRNOTAVAIL) => None,
-                    _ => panic!("{ip} probe connect() failed: {}", err), }
-            } else {
+                    _ => panic!("{ip} probe connect() failed: {}", err), } } else {
                 let mut local: T = std::mem::zeroed(); let mut local_len = len;
                 if sys::getsockname(fd, &mut local as *mut T as *mut sys::sockaddr, &mut local_len) != 0 {
                     panic!("{ip} probe getsockname() failed: {}", std::io::Error::last_os_error()); }
@@ -128,8 +121,7 @@ fn tclass_byte(dscp: Dscp, ecn_signal: bool) -> u8 { ((dscp as u8) << 2) | if ec
     #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)] pub struct SockHandle(sys::c_int, Option<Ipv6Addr>);
     impl SockHandle {
         pub(crate) fn wait_readable(self, wake: sys::c_int, timeout: std::time::Duration) {
-            let mut fds = [
-                sys::pollfd { fd: self.0, events: sys::POLLIN, revents: 0 },
+            let mut fds = [sys::pollfd { fd: self.0, events: sys::POLLIN, revents: 0 },
                 sys::pollfd { fd: wake, events: sys::POLLIN, revents: 0 }, ];
             let ts = sys::timespec { tv_sec: timeout.as_secs() as _, tv_nsec: timeout.subsec_nanos() as _ };
             unsafe {
@@ -145,8 +137,7 @@ fn tclass_byte(dscp: Dscp, ecn_signal: bool) -> u8 { ((dscp as u8) << 2) | if ec
         let r = unsafe { sys::getsockopt(sock.0, sys::SOL_SOCKET, SO_MEMINFO, mi.as_mut_ptr() as *mut sys::c_void, &mut len) };
         if r == 0 && len as usize >= SK_MEMINFO_VARS * 4 { return Some(mi[8] as u64); }
         let file = std::mem::ManuallyDrop::new(unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(sock.0) });
-        let Ok(st) = file.metadata() else { return None };
-        let inode = std::os::unix::fs::MetadataExt::ino(&st).to_string();
+        let Ok(st) = file.metadata() else { return None }; let inode = std::os::unix::fs::MetadataExt::ino(&st).to_string();
         for f in ["/proc/net/udp6", "/proc/net/udp"] {
             let Ok(text) = std::fs::read_to_string(f) else { continue };
             for line in text.lines().skip(1) {
@@ -160,15 +151,11 @@ fn tclass_byte(dscp: Dscp, ecn_signal: bool) -> u8 { ((dscp as u8) << 2) | if ec
             let mut index = 0; let mut first_is_loopback = false; let mut cur = ifap;
             while !cur.is_null() {
                 let ifa = &*cur;
-                if !ifa.ifa_addr.is_null()
-                    && (*ifa.ifa_addr).sa_family as i32 == sys::AF_INET6
+                if !ifa.ifa_addr.is_null() && (*ifa.ifa_addr).sa_family as i32 == sys::AF_INET6
                 {
                     index += 1; let sin6 = &*(ifa.ifa_addr as *const sys::sockaddr_in6);
                     let addr = Ipv6Addr::from(sin6.sin6_addr.s6_addr);
-                    if addr.is_loopback() {
-                        cur = (*cur).ifa_next;
-                        if index == 1 { first_is_loopback = true; }
-                        continue; }
+                    if addr.is_loopback() { cur = (*cur).ifa_next; if index == 1 { first_is_loopback = true; } continue; }
                     if addr.is_multicast() { cur = (*cur).ifa_next; continue; }
                     if (addr.segments()[0] & 0xffc0) == 0xfe80 { cur = (*cur).ifa_next; continue; }
                     let seg = addr.segments();
@@ -185,16 +172,13 @@ fn tclass_byte(dscp: Dscp, ecn_signal: bool) -> u8 { ((dscp as u8) << 2) | if ec
             (sys::IPPROTO_IP, sys::IP_MTU_DISCOVER, sys::IP_PMTUDISC_PROBE, "IP_MTU_DISCOVER=IP_PMTUDISC_PROBE"),
             (sys::IPPROTO_IPV6, sys::IPV6_MTU_DISCOVER, sys::IPV6_PMTUDISC_PROBE, "IPV6_MTU_DISCOVER=IPV6_PMTUDISC_PROBE"), ];
         #[cfg(cosmo)] let probe: &[(sys::c_int, sys::c_int, sys::c_int, &str)] = if sys::host() == sys::Host::Xnu {
-            &[(sys::IPPROTO_IPV6, sys::IPV6_DONTFRAG, 1, "IPV6_DONTFRAG=1")]
-        } else { probe };
+            &[(sys::IPPROTO_IPV6, sys::IPV6_DONTFRAG, 1, "IPV6_DONTFRAG=1")] } else { probe };
         for &(level, option, value, name) in probe {
             if unsafe { setsockopt_int(fd, level, option, value) } != 0 {
                 return setup_failed(Some(fd), format_args!("Failed to set {name}")); } }
         Some(()) }
-    #[inline]
-    fn linux_host() -> bool { #[cfg(cosmo)] return sys::host() == sys::Host::Linux; #[cfg(not(cosmo))] return true; }
-    #[inline]
-    pub fn setup_and_bind_udp_socket(port: u16) -> Option<SockHandle> { setup_and_bind_udp_socket_on(port, None) }
+    #[inline] fn linux_host() -> bool { #[cfg(cosmo)] return sys::host() == sys::Host::Linux; #[cfg(not(cosmo))] return true; }
+    #[inline] pub fn setup_and_bind_udp_socket(port: u16) -> Option<SockHandle> { setup_and_bind_udp_socket_on(port, None) }
     pub fn setup_and_bind_udp_socket_on(port: u16, bind_ip: Option<std::net::IpAddr>) -> Option<SockHandle> {
         let bind_addr: Ipv6Addr = match bind_ip {
             None => Ipv6Addr::UNSPECIFIED,
@@ -280,8 +264,7 @@ fn tclass_byte(dscp: Dscp, ecn_signal: bool) -> u8 { ((dscp as u8) << 2) | if ec
                     #[cfg(feature = "research_cohort_observer")] crate::cohort_observe::udp_send_backpressure(payload);
                     return None; }
                 if matches!(err.raw_os_error(), Some(sys::EMSGSIZE | sys::ENETUNREACH | sys::EHOSTUNREACH | sys::ENETDOWN | sys::ECONNREFUSED
-                    | sys::EHOSTDOWN
-                    | sys::EAFNOSUPPORT)) {
+                    | sys::EHOSTDOWN | sys::EAFNOSUPPORT)) {
                     #[cfg(feature = "research_cohort_observer")]
                     crate::cohort_observe::udp_send_tolerated(payload, err.raw_os_error().unwrap_or(0));
                     return Some(timestamp_ns); }
@@ -293,28 +276,21 @@ fn tclass_byte(dscp: Dscp, ecn_signal: bool) -> u8 { ((dscp as u8) << 2) | if ec
     #[inline] pub fn udp_recv_with_congestion_and_dscp(
         udp_socket: SockHandle, buf: &mut [u8],
     ) -> std::io::Result<(usize, Ipv6Addr, u16, bool, bool, Dscp, u64)> {
-        let fd = udp_socket.0;
-        let mut iov = sys::iovec { iov_base: buf.as_mut_ptr() as *mut sys::c_void, iov_len: buf.len(), };
+        let fd = udp_socket.0; let mut iov = sys::iovec { iov_base: buf.as_mut_ptr() as *mut sys::c_void, iov_len: buf.len(), };
         let mut addr_storage: sys::sockaddr_storage = unsafe { std::mem::zeroed() }; let mut cbuf = [0u8; 128];
         let addr_len = std::mem::size_of::<sys::sockaddr_storage>() as sys::socklen_t;
         let mut msg = msghdr((&mut addr_storage as *mut _) as *mut sys::c_void, addr_len, &mut iov, &mut cbuf);
         let n = unsafe { sys::recvmsg(fd, &mut msg as *mut sys::msghdr, 0) }; let timestamp_ns = monotonic_clock_ns();
         if n < 0 { return Err(std::io::Error::last_os_error()); }
         if (msg.msg_flags & sys::MSG_TRUNC) != 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "UDP datagram truncated (buffer too small)", )); }
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "UDP datagram truncated (buffer too small)", )); }
         let (src_ip6, src_port) = if (addr_storage.ss_family as i32) == sys::AF_INET {
-            let sin: &sys::sockaddr_in =
-                unsafe { &*(&addr_storage as *const _ as *const sys::sockaddr_in) };
+            let sin: &sys::sockaddr_in = unsafe { &*(&addr_storage as *const _ as *const sys::sockaddr_in) };
             let ip4 = std::net::Ipv4Addr::from(sin.sin_addr.s_addr); let port = u16::from_be(sin.sin_port);
-            (ip4.to_ipv6_mapped(), port)
-        } else if (addr_storage.ss_family as i32) == sys::AF_INET6 {
-            let sin6: &sys::sockaddr_in6 =
-                unsafe { &*(&addr_storage as *const _ as *const sys::sockaddr_in6) };
+            (ip4.to_ipv6_mapped(), port) } else if (addr_storage.ss_family as i32) == sys::AF_INET6 {
+            let sin6: &sys::sockaddr_in6 = unsafe { &*(&addr_storage as *const _ as *const sys::sockaddr_in6) };
             let ip6 = Ipv6Addr::from(sin6.sin6_addr.s6_addr); let port = u16::from_be(sin6.sin6_port);
-            (ip6, port)
-        } else { return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "unknown sockaddr family")); };
+            (ip6, port) } else { return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "unknown sockaddr family")); };
         let mut congested = false; let mut ecn_enabled = false; let mut dscp = Dscp::BestEffort;
         unsafe {
             let mut cmsg_ptr = sys::CMSG_FIRSTHDR(&msg as *const _);
@@ -323,8 +299,7 @@ fn tclass_byte(dscp: Dscp, ecn_signal: bool) -> u8 { ((dscp as u8) << 2) | if ec
                 let tclass_opt = if cmsg.cmsg_level == sys::IPPROTO_IP && cmsg.cmsg_type == sys::IP_TOS {
                     Some(*(sys::CMSG_DATA(cmsg_ptr) as *const u8))
                 } else if cmsg.cmsg_level == sys::IPPROTO_IPV6 && cmsg.cmsg_type == sys::IPV6_TCLASS {
-                    Some(*(sys::CMSG_DATA(cmsg_ptr) as *const sys::c_int) as u8)
-                } else { None };
+                    Some(*(sys::CMSG_DATA(cmsg_ptr) as *const sys::c_int) as u8) } else { None };
                 if let Some(tclass) = tclass_opt { (congested, ecn_enabled, dscp) = decode_tclass(tclass); break; }
                 cmsg_ptr = sys::CMSG_NXTHDR(&msg as *const _, cmsg_ptr); } }
         Ok((n as usize, src_ip6, src_port, congested, ecn_enabled, dscp, timestamp_ns)) }
@@ -334,9 +309,7 @@ fn tclass_byte(dscp: Dscp, ecn_signal: bool) -> u8 { ((dscp as u8) << 2) | if ec
         (ipv4, probe_v6_source()) } }
 #[cfg(not(target_os = "linux"))]
 pub fn setup_and_bind_udp_socket_on(port: u16, bind_ip: Option<std::net::IpAddr>) -> Option<SockHandle> {
-    if let Some(ip) = bind_ip {
-        eprintln!("binding a specific address ({ip}) is only supported on Linux");
-        return None; }
+    if let Some(ip) = bind_ip { eprintln!("binding a specific address ({ip}) is only supported on Linux"); return None; }
     setup_and_bind_udp_socket(port) }
 #[cfg(not(target_os = "linux"))] pub fn udp_socket_kernel_rx_drops(_sock: SockHandle) -> Option<u64> { None }
 #[cfg(target_os = "windows")] pub use windows::*;
@@ -393,9 +366,7 @@ pub fn setup_and_bind_udp_socket_on(port: u16, bind_ip: Option<std::net::IpAddr>
             recvmsg_opt.expect("WSARecvMsg extension pointer was null") } }
     #[inline] pub fn setup_and_bind_udp_socket(port: u16) -> Option<SockHandle> {
         let sock = unsafe { socket(AF_INET6 as i32, SOCK_DGRAM as i32, IPPROTO_UDP as i32) };
-        if sock == INVALID_SOCKET {
-            eprintln!("socket(AF_INET6, SOCK_DGRAM, UDP) failed: {}", wsa_last_error());
-            return None; }
+        if sock == INVALID_SOCKET { eprintln!("socket(AF_INET6, SOCK_DGRAM, UDP) failed: {}", wsa_last_error()); return None; }
         use std::os::windows::io::{FromRawSocket, IntoRawSocket, OwnedSocket};
         let owned = unsafe { OwnedSocket::from_raw_socket(sock as _) };
         unsafe {
@@ -442,14 +413,12 @@ pub fn setup_and_bind_udp_socket_on(port: u16, bind_ip: Option<std::net::IpAddr>
             sin6_scope_id: 0, };
         let timestamp_ns = monotonic_clock_ns();
         let n = unsafe {
-            sendto(
-                sock, payload.as_ptr() as *const u8, payload.len() as i32, 0, &dst as *const _ as *const SOCKADDR,
+            sendto(sock, payload.as_ptr() as *const u8, payload.len() as i32, 0, &dst as *const _ as *const SOCKADDR,
                 size_of::<SockAddrIn6Raw>() as i32, ) };
         if n == SOCKET_ERROR {
             let e = unsafe { WSAGetLastError() };
             if e == WSAEWOULDBLOCK || e == WSAENOBUFS { return None; }
-            if e == WSAEMSGSIZE || e == WSAENETUNREACH
-                || e == WSAEHOSTUNREACH || e == WSAECONNREFUSED || e == WSAECONNRESET
+            if e == WSAEMSGSIZE || e == WSAENETUNREACH || e == WSAEHOSTUNREACH || e == WSAECONNREFUSED || e == WSAECONNRESET
                 || e == WSAEINVAL || e == WSAEHOSTDOWN { return Some(timestamp_ns); }
             panic!("UDP Socket error: {}", std::io::Error::from_raw_os_error(e)); }
         if n as usize != payload.len() { panic!("partial UDP send: {} of {}", n, payload.len()); }
@@ -470,30 +439,22 @@ pub fn setup_and_bind_udp_socket_on(port: u16, bind_ip: Option<std::net::IpAddr>
         if rc == SOCKET_ERROR {
             let e = unsafe { WSAGetLastError() };
             if e == WSAEMSGSIZE {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "UDP datagram truncated (buffer too small)", )); }
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "UDP datagram truncated (buffer too small)", )); }
             return Err(std::io::Error::from_raw_os_error(e)); }
         if (msg.dwFlags & (MSG_TRUNC as u32)) != 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "UDP datagram truncated (buffer too small)", )); }
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "UDP datagram truncated (buffer too small)", )); }
         let family = u16::from_ne_bytes([name_storage[0], name_storage[1]]) as i32;
         let (src_ip6, src_port) = if family == AF_INET6 as i32 {
             if (msg.namelen as usize) < size_of::<SockAddrIn6Raw>() {
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "short sockaddr_in6")); }
             let sin6 = unsafe { &*(name_storage.as_ptr() as *const SockAddrIn6Raw) };
-            (Ipv6Addr::from(sin6.sin6_addr), u16::from_be(sin6.sin6_port))
-        } else if family == AF_INET as i32 {
+            (Ipv6Addr::from(sin6.sin6_addr), u16::from_be(sin6.sin6_port)) } else if family == AF_INET as i32 {
             if (msg.namelen as usize) < size_of::<SockAddrInRaw>() {
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "short sockaddr_in")); }
             let sin = unsafe { &*(name_storage.as_ptr() as *const SockAddrInRaw) };
             let ip4 = std::net::Ipv4Addr::new(sin.sin_addr[0], sin.sin_addr[1], sin.sin_addr[2], sin.sin_addr[3]);
-            (ip4.to_ipv6_mapped(), u16::from_be(sin.sin_port))
-        } else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("unknown sockaddr family: {}", family), )); };
+            (ip4.to_ipv6_mapped(), u16::from_be(sin.sin_port)) } else {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("unknown sockaddr family: {}", family), )); };
         let mut congested = false; let mut ecn_enabled = false; let mut dscp = Dscp::BestEffort;
         let ctl_len = msg.Control.len as usize; let hdr_aligned = cmsg_hdr_aligned_len(); let mut off = 0usize;
         while off + size_of::<CMSGHDR>() <= ctl_len {
@@ -502,14 +463,12 @@ pub fn setup_and_bind_udp_socket_on(port: u16, bind_ip: Option<std::net::IpAddr>
             if off + cmsg_len > ctl_len { break; }
             let data_off = off + hdr_aligned; let data_len = cmsg_len - hdr_aligned; let level = hdr.cmsg_level;
             let ty = hdr.cmsg_type;
-            if (level == IPPROTO_IP as i32 && ty == IP_TOS as i32)
-                || (level == IPPROTO_IPV6 as i32 && ty == IPV6_TCLASS as i32)
+            if (level == IPPROTO_IP as i32 && ty == IP_TOS as i32) || (level == IPPROTO_IPV6 as i32 && ty == IPV6_TCLASS as i32)
             {
                 let tclass: u8 = if data_len >= 1 { control[data_off] } else { 0 };
                 (congested, ecn_enabled, dscp) = decode_tclass(tclass);
                 break; }
-            if (level == IPPROTO_IP as i32 && ty == CMSG_IP_ECN)
-                || (level == IPPROTO_IPV6 as i32 && ty == CMSG_IPV6_ECN)
+            if (level == IPPROTO_IP as i32 && ty == CMSG_IP_ECN) || (level == IPPROTO_IPV6 as i32 && ty == CMSG_IPV6_ECN)
             {
                 if data_len >= size_of::<i32>() {
                     let ecn_val = unsafe { *(control.as_ptr().add(data_off) as *const i32) } as u8;
@@ -528,8 +487,7 @@ pub fn setup_and_bind_udp_socket_on(port: u16, bind_ip: Option<std::net::IpAddr>
             let ret = if connect(probe_sock, dst as *const T as *const SOCKADDR, size_of::<T>() as i32) == SOCKET_ERROR {
                 match WSAGetLastError() {
                     WSAENETUNREACH | WSAEHOSTUNREACH | WSAEADDRNOTAVAIL => None,
-                    e => panic!("{ip} probe connect() failed: {}", std::io::Error::from_raw_os_error(e)), }
-            } else {
+                    e => panic!("{ip} probe connect() failed: {}", std::io::Error::from_raw_os_error(e)), } } else {
                 let mut local: T = zeroed(); let mut local_len = size_of::<T>() as i32;
                 if getsockname(probe_sock, &mut local as *mut T as *mut SOCKADDR, &mut local_len as *mut _) == SOCKET_ERROR {
                     panic!("{ip} probe getsockname() failed: {}", wsa_last_error()); }
@@ -593,8 +551,7 @@ pub fn setup_and_bind_udp_socket_on(port: u16, bind_ip: Option<std::net::IpAddr>
                 panic!("UDP Socket error: {}", std::io::Error::last_os_error()); } }
         let mut sin6 = sockaddr_in6(dst_ip6.octets(), dst_port);
         let mut iov = sys::iovec { iov_base: payload.as_ptr() as *mut sys::c_void, iov_len: payload.len(), };
-        let cmsg_space =
-            unsafe { sys::CMSG_SPACE(std::mem::size_of::<sys::c_int>() as _) } as usize;
+        let cmsg_space = unsafe { sys::CMSG_SPACE(std::mem::size_of::<sys::c_int>() as _) } as usize;
         let mut cbuf = vec![0u8; cmsg_space]; let sin6_len = std::mem::size_of::<sys::sockaddr_in6>() as sys::socklen_t;
         let mut msg = msghdr((&mut sin6 as *mut sys::sockaddr_in6).cast::<sys::c_void>(), sin6_len, &mut iov, &mut cbuf);
         let tclass_byte = tclass_byte(dscp, ecn_signal);
@@ -602,11 +559,9 @@ pub fn setup_and_bind_udp_socket_on(port: u16, bind_ip: Option<std::net::IpAddr>
             let cmsg = sys::CMSG_FIRSTHDR(&msg as *const _ as *mut _);
             if cmsg.is_null() { panic!("CMSG_FIRSTHDR returned null"); }
             (*cmsg).cmsg_level = sys::IPPROTO_IPV6; (*cmsg).cmsg_type = sys::IPV6_TCLASS;
-            (*cmsg).cmsg_len =
-                sys::CMSG_LEN(std::mem::size_of::<sys::c_int>() as _) as _;
+            (*cmsg).cmsg_len = sys::CMSG_LEN(std::mem::size_of::<sys::c_int>() as _) as _;
             let data = sys::CMSG_DATA(cmsg).cast::<sys::c_int>(); *data = tclass_byte as sys::c_int;
-            msg.msg_controllen =
-                sys::CMSG_SPACE(std::mem::size_of::<sys::c_int>() as _) as _;
+            msg.msg_controllen = sys::CMSG_SPACE(std::mem::size_of::<sys::c_int>() as _) as _;
             let timestamp_ns = monotonic_clock_ns(); let n = sys::sendmsg(fd, &msg as *const _ as *mut _, 0);
             if n < 0 {
                 let err = std::io::Error::last_os_error();
@@ -620,29 +575,21 @@ pub fn setup_and_bind_udp_socket_on(port: u16, bind_ip: Option<std::net::IpAddr>
     #[inline] pub fn udp_recv_with_congestion_and_dscp(
         udp_socket: SockHandle, buf: &mut [u8],
     ) -> std::io::Result<(usize, Ipv6Addr, u16, bool, bool, Dscp, u64)> {
-        let fd = udp_socket.0;
-        let mut iov = sys::iovec { iov_base: buf.as_mut_ptr() as *mut sys::c_void, iov_len: buf.len(), };
+        let fd = udp_socket.0; let mut iov = sys::iovec { iov_base: buf.as_mut_ptr() as *mut sys::c_void, iov_len: buf.len(), };
         let mut addr_storage: sys::sockaddr_storage = unsafe { std::mem::zeroed() }; let mut cbuf = [0u8; 128];
         let addr_len = std::mem::size_of::<sys::sockaddr_storage>() as sys::socklen_t;
         let mut msg = msghdr((&mut addr_storage as *mut _) as *mut sys::c_void, addr_len, &mut iov, &mut cbuf);
         let n = unsafe { sys::recvmsg(fd, &mut msg as *mut sys::msghdr, 0) }; let timestamp_ns = monotonic_clock_ns();
         if n < 0 { return Err(std::io::Error::last_os_error()); }
         if (msg.msg_flags & sys::MSG_TRUNC) != 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "UDP datagram truncated (buffer too small)", )); }
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "UDP datagram truncated (buffer too small)", )); }
         let (src_ip6, src_port) = if (addr_storage.ss_family as i32) == sys::AF_INET {
-            let sin: &sys::sockaddr_in =
-                unsafe { &*(&addr_storage as *const _ as *const sys::sockaddr_in) };
-            let ip4 = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
-            let port = u16::from_be(sin.sin_port);
-            (ip4.to_ipv6_mapped(), port)
-        } else if (addr_storage.ss_family as i32) == sys::AF_INET6 {
-            let sin6: &sys::sockaddr_in6 =
-                unsafe { &*(&addr_storage as *const _ as *const sys::sockaddr_in6) };
+            let sin: &sys::sockaddr_in = unsafe { &*(&addr_storage as *const _ as *const sys::sockaddr_in) };
+            let ip4 = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr)); let port = u16::from_be(sin.sin_port);
+            (ip4.to_ipv6_mapped(), port) } else if (addr_storage.ss_family as i32) == sys::AF_INET6 {
+            let sin6: &sys::sockaddr_in6 = unsafe { &*(&addr_storage as *const _ as *const sys::sockaddr_in6) };
             let ip6 = Ipv6Addr::from(sin6.sin6_addr.s6_addr); let port = u16::from_be(sin6.sin6_port);
-            (ip6, port)
-        } else { return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "unknown sockaddr family", )); };
+            (ip6, port) } else { return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "unknown sockaddr family", )); };
         let mut congested = false; let mut ecn_enabled = false; let mut dscp = Dscp::BestEffort;
         unsafe {
             let mut cmsg_ptr = sys::CMSG_FIRSTHDR(&msg as *const _ as *mut _);

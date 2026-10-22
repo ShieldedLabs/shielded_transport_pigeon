@@ -1,16 +1,14 @@
-//! Safe wrapper over the in-crate Rust Wirehair fountain code.
-//! Equations and repair symbols match the previously vendored classic C++ codec.
+//! Safe wrapper over the in-crate Rust Wirehair fountain code. Equations and repair symbols match the previously vendored classic
+//! C++ codec.
 //!
-//! A message of `len` bytes is split into K = ceil(len / block_bytes) source blocks. The
-//! encoder can produce any block id: ids 0..K-1 are the message itself ("systematic": block i
-//! is `message[i*block_bytes..]`, the last one short), ids >= K are repair blocks of exactly
-//! `block_bytes`. A decoder recovers the message from any ~K distinct ids (K + 0.02 on
-//! average). Wirehair accepts 2 <= K <= 64000.
+//! A message of `len` bytes is split into K = ceil(len / block_bytes) source blocks. The encoder can produce any block id: ids
+//! 0..K-1 are the message itself ("systematic": block i is `message[i*block_bytes..]`, the last one short), ids >= K are repair
+//! blocks of exactly `block_bytes`. A decoder recovers the message from any ~K distinct ids (K + 0.02 on average). Wirehair
+//! accepts 2 <= K <= 64000.
 //!
 use std::sync::Arc; pub const MIN_BLOCKS: usize = 2; pub const MAX_BLOCKS: usize = 64000;
-/// Hard codec-arena cap, including input, workspace, dedup and GE matrix.
-/// Per-symbol charge matters even when a malicious peer chooses one-byte blocks.
-/// Wirehair refuses a solve/regrow exceeding this cap rather than overallocating.
+/// Hard codec-arena cap, including input, workspace, dedup and GE matrix. Per-symbol charge matters even when a malicious peer
+/// chooses one-byte blocks. Wirehair refuses a solve/regrow exceeding this cap rather than overallocating.
 pub fn decoder_memory_limit(len: usize, block_bytes: usize) -> Option<usize> {
     let k = block_count(len, block_bytes)?;
     len.checked_mul(2)?.checked_add(k.checked_mul(256)?)?.checked_add(1 << 20) }
@@ -46,8 +44,7 @@ impl Encoder {
     pub fn message(&self) -> &Arc<Vec<u8>> { &self.message }
     pub fn block_into(&mut self, id: u32, out: &mut [u8]) -> Option<usize> {
         if out.len() < self.block_bytes { return None; }
-        let cap = out.len().min(u32::MAX as usize);
-        let written = self.codec.wirehair_encode(id, &mut out[..cap]).ok()? as usize;
+        let cap = out.len().min(u32::MAX as usize); let written = self.codec.wirehair_encode(id, &mut out[..cap]).ok()? as usize;
         (written <= self.block_bytes).then_some(written) }
     pub fn block(&mut self, id: u32) -> Option<Vec<u8>> {
         let mut v = vec![0u8; self.block_bytes]; let n = self.block_into(id, &mut v)?; v.truncate(n);
@@ -79,14 +76,13 @@ impl Decoder {
     pub fn recover_into(&mut self, out: &mut [u8]) -> bool {
         if !self.done || out.len() != self.message_len { return false; }
         self.codec.wirehair_recover(out) == WirehairResult::Success } }
-/// Giant-message wire kind 2 partitions source blocks into balanced contiguous groups.
-/// This is a wire-format constant: changing it requires a new extended-fragment kind.
+/// Giant-message wire kind 2 partitions source blocks into balanced contiguous groups. This is a wire-format constant: changing
+/// it requires a new extended-fragment kind.
 pub const GROUP_MAX_BLOCKS: usize = 32000;
 #[derive(Debug, Clone, Copy)]
 pub struct MessageLayout { pub len: usize, pub block_bytes: usize, pub k: usize, pub groups: usize, }
 impl MessageLayout {
-    pub fn new(len: usize, block_bytes: usize) -> Option<Self> {
-        Self::with_group_limit(len, block_bytes, GROUP_MAX_BLOCKS) }
+    pub fn new(len: usize, block_bytes: usize) -> Option<Self> { Self::with_group_limit(len, block_bytes, GROUP_MAX_BLOCKS) }
     pub fn with_group_limit(len: usize, block_bytes: usize, limit: usize) -> Option<Self> {
         if block_bytes == 0 || block_bytes > u16::MAX as usize || len > u32::MAX as usize || !(MIN_BLOCKS..=MAX_BLOCKS).contains(&limit) { return None; }
         let k = len.div_ceil(block_bytes);
@@ -127,8 +123,7 @@ pub fn encode_message_layout(message: Arc<Vec<u8>>, layout: MessageLayout) -> Op
         return Some(MessageEncoder { layout, encoders: vec![encoder] }); }
     let encoders = (0..layout.groups).map(|group| {
         let (start, len) = layout.group_bytes(group);
-        encode_range(message.clone(), start, len, layout.block_bytes)
-    }).collect::<Option<Vec<_>>>()?;
+        encode_range(message.clone(), start, len, layout.block_bytes) }).collect::<Option<Vec<_>>>()?;
     Some(MessageEncoder { layout, encoders }) }
 impl MessageEncoder {
     pub fn block_into(&mut self, id: u32, out: &mut [u8]) -> Option<usize> {
@@ -159,16 +154,14 @@ impl SourceOnly {
         let mut dec = MessageDecoder::with_layout(self.layout).ok_or(DecodeError::Failed(-1))?;
         for id in 0..self.layout.k {
             if self.has(id) {
-                let start = id * self.layout.block_bytes;
-                let end = (start + self.layout.block_bytes).min(self.layout.len);
+                let start = id * self.layout.block_bytes; let end = (start + self.layout.block_bytes).min(self.layout.len);
                 dec.add(id as u32, &self.output[start..end])?; } }
         Ok(dec) } }
 pub struct MessageDecoder {
     layout: MessageLayout, decoders: Vec<Option<Decoder>>, complete: Vec<bool>, remaining: usize,
     output: Vec<u8>, }
 impl MessageDecoder {
-    pub fn new(len: usize, block_bytes: usize) -> Option<Self> {
-        Self::with_layout(MessageLayout::new(len, block_bytes)?) }
+    pub fn new(len: usize, block_bytes: usize) -> Option<Self> { Self::with_layout(MessageLayout::new(len, block_bytes)?) }
     pub fn with_layout(layout: MessageLayout) -> Option<Self> {
         if !init() { return None; }
         Some(Self { layout, decoders: (0..layout.groups).map(|_| None).collect(), complete: vec![false; layout.groups], remaining: layout.groups, output: vec![0u8; layout.len] })

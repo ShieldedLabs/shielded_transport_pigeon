@@ -27,8 +27,7 @@ impl<const N: usize> SliceRead for [u8; N] {
 #[inline] pub fn store_u64(buf: &mut [u8], value: u64) {
     debug_assert!(buf.len() == 8);
     buf[..8].copy_from_slice(&value.to_le_bytes()); }
-#[inline]
-pub fn load_u64(buf: &[u8]) -> u64 { debug_assert!(buf.len() == 8); u64::from_le_bytes(buf[..8].try_into().unwrap()) }
+#[inline] pub fn load_u64(buf: &[u8]) -> u64 { debug_assert!(buf.len() == 8); u64::from_le_bytes(buf[..8].try_into().unwrap()) }
 #[inline] pub fn store_u48(buf: &mut [u8], value: u64) {
     debug_assert!(buf.len() == 6);
     buf.copy_from_slice(&value.to_le_bytes()[..6]); }
@@ -59,10 +58,8 @@ impl BytesPerSecond {
     const TIB: u64 = 1024 * 1024 * 1024 * 1024;
     pub fn best_unit(bps: u64) -> (u64, &'static str) {
         if bps >= Self::TIB { (Self::TIB, "TiB/s") } else if bps >= Self::GIB {
-            (Self::GIB, "GiB/s")
-        } else if bps >= Self::MIB { (Self::MIB, "MiB/s") } else if bps >= Self::KIB {
-            (Self::KIB, "KiB/s")
-        } else { (1, "B/s") } }
+            (Self::GIB, "GiB/s") } else if bps >= Self::MIB { (Self::MIB, "MiB/s") } else if bps >= Self::KIB {
+            (Self::KIB, "KiB/s") } else { (1, "B/s") } }
     pub fn format_value(value: u64, unit: u64) -> (u64, u64) {
         let scaled = (value.saturating_mul(100) + unit / 2) / unit;
         (scaled / 100, scaled % 100) } }
@@ -77,10 +74,7 @@ impl std::fmt::Display for BytesPerSecond {
         } else { write!(f, "{}.{:02} {}", whole, frac, suffix) } } }
 impl std::fmt::Debug for BytesPerSecond {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("BytesPerSecond")
-            .field(&format_args!("{}", self))
-            .field(&self.0)
-            .finish() } }
+        f.debug_tuple("BytesPerSecond").field(&format_args!("{}", self)).field(&self.0).finish() } }
 pub use snow as noise; struct OsRandom;
 impl noise::types::Random for OsRandom {
     fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), noise::Error> {

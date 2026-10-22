@@ -20,8 +20,7 @@ pub struct sockaddr_storage { pub ss_family: sa_family_t, __ss_padding: [u8; 118
     pub msg_name: *mut c_void, pub msg_namelen: socklen_t, pub msg_iov: *mut iovec, pub msg_iovlen: size_t,
     pub msg_control: *mut c_void, pub msg_controllen: size_t,
     pub msg_flags: c_int, }
-#[repr(C)] #[derive(Copy, Clone, Debug)]
-pub struct cmsghdr { pub cmsg_len: size_t, pub cmsg_level: c_int, pub cmsg_type: c_int }
+#[repr(C)] #[derive(Copy, Clone, Debug)] pub struct cmsghdr { pub cmsg_len: size_t, pub cmsg_level: c_int, pub cmsg_type: c_int }
 #[repr(C)] #[derive(Copy, Clone, Debug)] pub struct in6_pktinfo { pub ipi6_addr: in6_addr, pub ipi6_ifindex: c_uint }
 #[repr(C)] #[derive(Copy, Clone, Debug)] pub struct pollfd { pub fd: c_int, pub events: c_short, pub revents: c_short }
 #[repr(C)] #[derive(Copy, Clone, Debug)] pub struct timespec { pub tv_sec: time_t, pub tv_nsec: c_long }
@@ -72,8 +71,7 @@ unsafe extern "C" {
     pub fn sendmsg(fd: c_int, msg: *const msghdr, flags: c_int) -> ssize_t;
     pub fn recvmsg(fd: c_int, msg: *mut msghdr, flags: c_int) -> ssize_t; pub fn close(fd: c_int) -> c_int;
     pub fn read(fd: c_int, buf: *mut c_void, count: size_t) -> ssize_t;
-    pub fn write(fd: c_int, buf: *const c_void, count: size_t) -> ssize_t;
-    pub fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
+    pub fn write(fd: c_int, buf: *const c_void, count: size_t) -> ssize_t; pub fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
     pub fn poll(fds: *mut pollfd, nfds: nfds_t, timeout_ms: c_int) -> c_int;
     pub fn ppoll(fds: *mut pollfd, nfds: nfds_t, timeout: *const timespec, sigmask: *const c_void) -> c_int;
     pub fn eventfd(initval: c_uint, flags: c_int) -> c_int;

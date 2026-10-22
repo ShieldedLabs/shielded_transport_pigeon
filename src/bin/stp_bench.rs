@@ -5,49 +5,43 @@
 //!                   [--timeout 600] [--idle 10] [--out report.json]
 //!                   [--giant 256M|1G] (one whole framed message, binary units)
 //!                   [--giant-warmup S] (wait up to S seconds for TU stabilization; giant default 5)
-//! Report: udp_payload_tu, fec_block_bytes_by_id, receiver_fec_decode_last_tail_ms.
-//! Decode tail uses the receiver clock: last accepted FEC block to delivery, excludes surplus repairs.
-//! Giant demo: send --to STPADDR --giant 1G --timeout 600 --idle 30.
+//! Report: udp_payload_tu, fec_block_bytes_by_id, receiver_fec_decode_last_tail_ms. Decode tail uses the receiver clock: last
+//! accepted FEC block to delivery, excludes surplus repairs. Giant demo: send --to STPADDR --giant 1G --timeout 600 --idle 30.
 //! Both endpoints must support extended FEC kind 2 for messages above 64000 source blocks.
 //!                   [--loss-trace events.csv] (S/F/L/A sender event CSV; see loss_trace.rs)
 //!
-//! Both: [--queue-us 1000000] [--queue-min 4194304] [--queue-max 67108864] [--max-pps N]
-//! (the pre-existing send_buffer_params and max_pps resource limits).
-//! Transport policy is fixed: slow110 loss/ECN packet-rate control, precise pacing,
-//! adaptive bitmap ACKs and grouped Wirehair span-tail FEC with closed-loop top-up.
-//! There are no CC, ACK, FEC or pacer tuning flags.
+//! Both: [--queue-us 1000000] [--queue-min 4194304] [--queue-max 67108864] [--max-pps N] (the pre-existing send_buffer_params and
+//! max_pps resource limits). Transport policy is fixed: slow110 loss/ECN packet-rate control, precise pacing, adaptive bitmap
+//! ACKs and grouped Wirehair span-tail FEC with closed-loop top-up. There are no CC, ACK, FEC or pacer tuning flags.
 //! --queues N: fixed sender magazines; ordinary data ids map to id % N.
 //! --traffic-classes be,af11,af21,ef: one class or one per queue.
 //! --workload bulk|bulk-small|dueling --duration S: saturated 50 MiB trains;
-//! bulk-small adds independent 1000 B Poisson arrivals (--small-rate 20, --small-class ef).
-//! With one queue they share its FIFO, with >=2 queues small messages use queue 1.
-//! dueling saturates every configured queue (--bulk-size B can shorten trains).
-//! These modes stop producing at S, then drain accepted messages up to --timeout seconds.
-//! Reports include per-queue completion goodput/last-byte p50,p99, plus fixed-window goodput.
+//! bulk-small adds independent 1000 B Poisson arrivals (--small-rate 20, --small-class ef). With one queue they share its FIFO,
+//! with >=2 queues small messages use queue 1. dueling saturates every configured queue (--bulk-size B can shorten trains). These
+//! modes stop producing at S, then drain accepted messages up to --timeout seconds. Reports include per-queue completion
+//! goodput/last-byte p50,p99, plus fixed-window goodput.
 //! --duration S: saturated measurement for S seconds; requests receiver status while sending.
 //! --send-on-ms N --send-off-ms N: application submission duty cycle (queued packets drain normally).
 //! --loss-episodes 1: record loss episode diagnostics without changing control behaviour.
 //! estimator_series: [seconds, FEC estimate, sample, sent, lost, UDP bytes, RTT us, CC pps, app-limited entries].
 //! --mix classes [--classes "SIZE:COUNT,..."] sends fixed counts per size class (default
-//! 1000:200,65536:200,1048576:50,5242880:20,52428800:5), shuffled by --seed; the report then
-//! groups by class instead of size bucket. Per class: delivery, mean redundancy actually sent.
-//! Test loss injection: STP_TEST_DROP_PPM=n in the environment drops n per million outgoing
-//! data packets in that process's network thread; STP_TEST_DROP_SCHEDULE="0:0.5,20:4,24:0.5,@60"
-//! (seconds:percent from network thread start, optional @period repeat) varies it over time, and
-//! STP_TEST_DROP_BURST=n makes drops come in runs of n packets.
+//! 1000:200,65536:200,1048576:50,5242880:20,52428800:5), shuffled by --seed; the report then groups by class instead of size
+//! bucket. Per class: delivery, mean redundancy actually sent. Test loss injection: STP_TEST_DROP_PPM=n in the environment drops
+//! n per million outgoing data packets in that process's network thread; STP_TEST_DROP_SCHEDULE="0:0.5,20:4,24:0.5,@60"
+//! (seconds:percent from network thread start, optional @period repeat) varies it over time, and STP_TEST_DROP_BURST=n makes
+//! drops come in runs of n packets.
 //!
-//! Every message, data or control, is framed `[id u32 LE][total len u32 LE][blake3(payload) 32B][payload]`.
-//! Data ids are 0..count; ids from CTRL_BASE up are control messages:
+//! Every message, data or control, is framed `[id u32 LE][total len u32 LE][blake3(payload) 32B][payload]`. Data ids are
+//! 0..count; ids from CTRL_BASE up are control messages:
 //!   PING        sender -> server  payload [sender_ns u64]
 //!   PONG        server -> sender  payload [sender_ns u64][server_ns u64]
 //!   STATUS_REQ  sender -> server  payload [expected count u32]
 //!   STATUS      server -> sender  payload [n u32] then n x [id u32][ok u8][server_recv_ns u64]
 //!                                 then [m u32] then m x u64 receiver counters (see RxReport)
-//! The sender polls STATUS_REQ every second once all data is queued, and stops when the
-//! server has an entry for every id, at --timeout, or when its send queue has drained and the
-//! server's count has not grown for --idle seconds. The unreliable channel does not retransmit:
-//! one lost UDP fragment loses the whole message, so a drained queue plus silence means lost. Control messages that are lost are
-//! simply asked for again.
+//! The sender polls STATUS_REQ every second once all data is queued, and stops when the server has an entry for every id, at
+//! --timeout, or when its send queue has drained and the server's count has not grown for --idle seconds. The unreliable channel
+//! does not retransmit: one lost UDP fragment loses the whole message, so a drained queue plus silence means lost. Control
+//! messages that are lost are simply asked for again.
 extern crate shielded_transport_pigeon as stp_core;
 #[path = "../../tests/support/pump_thread.rs"] mod pump_thread;
 use pump_thread::*; use shielded_transport_pigeon::stp::*; use std::collections::{HashMap, VecDeque};
@@ -85,8 +79,7 @@ impl Args {
         while i < v.len() {
             let Some(k) = v[i].strip_prefix("--") else { die(&format!("unexpected argument {}", v[i])) };
             if !Self::allowed(k) { die(&format!("unknown flag --{k}; transport tuning is not supported")); }
-            let Some(val) = v.get(i + 1) else { die(&format!("--{k} needs a value")) };
-            m.insert(k.to_string(), val.clone());
+            let Some(val) = v.get(i + 1) else { die(&format!("--{k} needs a value")) }; m.insert(k.to_string(), val.clone());
             i += 2; }
         Args(m) }
     fn str(&self, k: &str) -> Option<&str> { self.0.get(k).map(|s| s.as_str()) }
@@ -117,8 +110,7 @@ impl RxReport {
         v.extend_from_slice(&[s.fec_decode_admission_refusals, s.fec_decode_timeouts, s.fec_decode_preemptions, s.fec_worker_limit_events, s.fec_decode_peak_workers, s.rx_plain_admission_refusals, s.rx_stale_identity_frames]);
         v }
     fn worker_limit_json(&self) -> String {
-        let retired = self.st.fec_decode_preemptions;
-        let refused = self.st.fec_worker_limit_events.saturating_sub(retired);
+        let retired = self.st.fec_decode_preemptions; let refused = self.st.fec_worker_limit_events.saturating_sub(retired);
         format!(",\"receiver_fec_worker_refusals\":{refused},\"receiver_fec_worker_pressure_retirements\":{retired},\"receiver_stale_identity_frames\":{}", self.st.rx_stale_identity_frames)
     }
     const WORDS: usize = 44;
@@ -127,15 +119,13 @@ impl RxReport {
         let mut st = ConnectionStats { rx_packets: w[0], rx_seq_span: w[1], rx_lost: w[2], rx_reordered: w[3], rx_late_beyond_window: w[4], rx_duplicates: w[5], rx_bursts: w[6], ..Default::default() };
         st.rx_burst_hist.copy_from_slice(&w[7..14]); st.fec_decode_last_tail_ns = w.get(28).copied().unwrap_or(0);
         st.fec_decode_max_tail_ns = w.get(29).copied().unwrap_or(0);
-        st.fec_ingress_dropped_blocks = w.get(30).copied().unwrap_or(0);
-        st.udp_payload_tu = w.get(31).copied().unwrap_or(0);
+        st.fec_ingress_dropped_blocks = w.get(30).copied().unwrap_or(0); st.udp_payload_tu = w.get(31).copied().unwrap_or(0);
         (st.rx_messages_completed, st.rx_partial_evicted, st.rx_partial_evicted_bytes, st.rx_insert_failures, st.rx_stale_fragments) = (w[23], w[24], w[25], w[26], w[27]);
         let th = NetworkThreadStats { kernel_rx_drops: if w[14] == u64::MAX { None } else { Some(w[14]) }, max_loop_gap_ns: w[15], loop_gaps_over_1ms: w[16],
             loop_gaps_over_10ms: w[17], loop_gaps_over_100ms: w[18], loop_iterations: w[19], recv_queue_dropped_messages: w[20] };
         (st.ack_packets_sent, st.ack_bytes_sent, st.ack_packets_received, st.ack_delay_us_max, st.rtt_samples) = (w[32], w[33], w[34], w[35] as u32, w[36]);
         st.fec_decode_admission_refusals = w.get(37).copied().unwrap_or(0);
-        st.fec_decode_timeouts = w.get(38).copied().unwrap_or(0);
-        st.fec_decode_preemptions = w.get(39).copied().unwrap_or(0);
+        st.fec_decode_timeouts = w.get(38).copied().unwrap_or(0); st.fec_decode_preemptions = w.get(39).copied().unwrap_or(0);
         st.fec_worker_limit_events = w.get(40).copied().unwrap_or(0);
         st.fec_decode_peak_workers = w.get(41).copied().unwrap_or(0);
         st.rx_plain_admission_refusals = w.get(42).copied().unwrap_or(0);
@@ -156,8 +146,7 @@ fn send_buffer_params(a: &Args) -> (u32, u32, u32) {
     (a.num("queue-us", 1_000_000), a.num("queue-min", 4 << 20), a.num("queue-max", 64 << 20)) }
 fn max_pps(a: &Args) -> Option<u64> { a.str("max-pps").map(|s| s.parse().unwrap_or_else(|_| die("bad --max-pps"))) }
 fn load_average() -> String {
-    std::fs::read_to_string("/proc/loadavg").unwrap_or_default().split_whitespace()
-        .take(3).collect::<Vec<_>>().join(",") }
+    std::fs::read_to_string("/proc/loadavg").unwrap_or_default().split_whitespace().take(3).collect::<Vec<_>>().join(",") }
 fn to_v6(ip: std::net::IpAddr) -> std::net::Ipv6Addr {
     match ip { std::net::IpAddr::V4(v4) => v4.to_ipv6_mapped(), std::net::IpAddr::V6(v6) => v6 } }
 fn main() {
@@ -188,8 +177,7 @@ fn serve(a: &Args) {
         None => *blake3::hash(b"stp_bench default server key").as_bytes(), };
     let kp = new_keypair_from_connect_magic1_with_seed(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b, seed).unwrap();
     let addr = STPAddress::from(to_v6(advertise), port, &kp);
-    let max_message_size = a.num("max-message-size", MAX_JUMBOGRAM_LEN).min(MAX_JUMBOGRAM_LEN);
-    let queues = a.num("queues", 1);
+    let max_message_size = a.num("max-message-size", MAX_JUMBOGRAM_LEN).min(MAX_JUMBOGRAM_LEN); let queues = a.num("queues", 1);
     let handle = new_network_thread_with_options(vec![kp], port, max_pps(a), send_buffer_params(a), max_message_size, NetworkThreadOptions { receive_memory: Some(bench_receive_budget(max_message_size, queues)), bind_ip: bind, send_queue_count: queues, ..Default::default() });
     println!("stp_bench serve: bound {}:{port}", bind.map(|b| b.to_string()).unwrap_or("[::]".into()));
     println!("STP address: {:?}", addr); let epoch = Instant::now(); let mut wanted = Vec::new();
@@ -206,9 +194,7 @@ fn serve(a: &Args) {
             let p = peers.entry(key).or_default();
             match parse(&data) {
                 Parsed::Malformed => p.malformed += 1,
-                Parsed::Corrupt(id) => {
-                    p.corrupt += 1;
-                    if id < CTRL_BASE { p.recs.entry(id).or_insert((false, now_ns)); } }
+                Parsed::Corrupt(id) => { p.corrupt += 1; if id < CTRL_BASE { p.recs.entry(id).or_insert((false, now_ns)); } }
                 Parsed::Ok(PING, pl) if pl.len() == 8 => {
                     let mut r = pl.to_vec(); r.extend_from_slice(&now_ns.to_le_bytes());
                     outbox.push((key, 0, Dscp::BestEffort, ctrl(PONG, &r))); }
@@ -229,8 +215,7 @@ fn serve(a: &Args) {
                         print_peer(&key, p); } }
                 Parsed::Ok(id, _) if id >= CTRL_BASE => p.malformed += 1,
                 Parsed::Ok(id, _) => {
-                    p.first_ns.get_or_insert(now_ns); p.last_ns = now_ns;
-                    let e = p.recs.entry(id).or_insert((false, now_ns));
+                    p.first_ns.get_or_insert(now_ns); p.last_ns = now_ns; let e = p.recs.entry(id).or_insert((false, now_ns));
                     if !e.0 { *e = (true, now_ns); p.ok_bytes += data.len() as u64; }
                     progress_dirty = true; } } }
         if progress_dirty && last_progress.elapsed() > Duration::from_secs(5) {
@@ -256,9 +241,7 @@ fn jnum(v: Option<f64>) -> String { v.map(|x| format!("{x:.3}")).unwrap_or("null
 fn giant_size(s: &str) -> Option<usize> {
     let (number, scale) = match s.strip_suffix('G').or_else(|| s.strip_suffix("GiB")) {
         Some(n) => (n, 1usize << 30),
-        None => match s.strip_suffix('M').or_else(|| s.strip_suffix("MiB")) {
-            Some(n) => (n, 1usize << 20),
-            None => (s, 1), }, };
+        None => match s.strip_suffix('M').or_else(|| s.strip_suffix("MiB")) { Some(n) => (n, 1usize << 20), None => (s, 1), }, };
     let bytes = number.parse::<usize>().ok()?.checked_mul(scale)?;
     (HEADER..=MAX_JUMBOGRAM_LEN).contains(&bytes).then_some(bytes) }
 type Outbox = Vec<(ConnectionKey, usize, Dscp, Vec<u8>)>; type Wanted = Vec<(STPAddress, [u8; 64])>;
@@ -269,8 +252,7 @@ fn poll(handle: &NetworkThreadHandle, outbox: &mut Outbox, wanted: &mut Wanted) 
     p }
 fn mean_transmitted_redundancy(sum_repair_ratios: f64, sent_messages: u64) -> f64 {
     if sent_messages == 0 { 0.0 } else { 100.0 * sum_repair_ratios / sent_messages as f64 } }
-fn send_duty_off(elapsed_ns: u64, on_ns: u64, off_ns: u64) -> bool {
-    off_ns != 0 && elapsed_ns % (on_ns + off_ns) >= on_ns }
+fn send_duty_off(elapsed_ns: u64, on_ns: u64, off_ns: u64) -> bool { off_ns != 0 && elapsed_ns % (on_ns + off_ns) >= on_ns }
 fn category_bonus_json(percent: u32, messages: u64, planned_repairs: u64) -> String {
     format!(",\"category_bonus_percent\":{percent},\"category_bonus_messages\":{messages},\"category_bonus_repairs\":{planned_repairs},\"category_bonus_repairs_kind\":\"planned_layout_additions_not_emitted\"")
 }
@@ -300,8 +282,7 @@ fn send(a: &Args) {
     let mut min: usize = giant.unwrap_or_else(|| a.num("min", 100));
     let max: usize = giant.unwrap_or_else(|| a.num("max", 50_000_000));
     let timeout = Duration::from_secs(a.num("duration", a.num("timeout", 600)));
-    let idle = Duration::from_secs(a.num("idle", 10));
-    let on_ns = a.num::<u64>("send-on-ms", 2000).saturating_mul(1_000_000);
+    let idle = Duration::from_secs(a.num("idle", 10)); let on_ns = a.num::<u64>("send-on-ms", 2000).saturating_mul(1_000_000);
     let off_ns = a.num::<u64>("send-off-ms", 0).saturating_mul(1_000_000);
     if on_ns == 0 || on_ns.checked_add(off_ns).is_none() { die("invalid send duty cycle"); }
     let out = a.str("out").unwrap_or("stp_bench_report.json").to_string(); let fec_mode = "adaptive:span";
@@ -326,8 +307,7 @@ fn send(a: &Args) {
     let group_names: Vec<String> = match &classes { Some(c) => c.iter().map(|x| x.0.to_string()).collect(), None => BUCKET_NAMES.iter().map(|s| s.to_string()).collect() };
     let group_of = |size: usize| -> usize { match &classes { Some(c) => c.iter().position(|x| x.0 == size).unwrap(), None => bucket_of(size) } };
     let ngroups = group_names.len(); let mut order: Vec<u32> = (0..count).collect(); order.shuffle(&mut rng);
-    let total_bytes: u64 = sizes.iter().map(|&s| s as u64).sum();
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
+    let total_bytes: u64 = sizes.iter().map(|&s| s as u64).sum(); let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
     {
         let sizes = sizes.clone(); let order = order.clone();
         std::thread::spawn(move || {
@@ -356,8 +336,7 @@ fn send(a: &Args) {
     println!("connected to {:?}", to); let mut pings: Vec<(u64, i128)> = Vec::new(); let ping_phase = Instant::now();
     let mut sent_pings = 0;
     while pings.len() < 10 && ping_phase.elapsed() < Duration::from_secs(40) {
-        sent_pings += 1; let before = pings.len();
-        outbox.push((key, 0, Dscp::BestEffort, ctrl(PING, &ns().to_le_bytes())));
+        sent_pings += 1; let before = pings.len(); outbox.push((key, 0, Dscp::BestEffort, ctrl(PING, &ns().to_le_bytes())));
         let until = Instant::now() + Duration::from_secs(3);
         while Instant::now() < until && pings.len() == before {
             let p = poll(&handle, &mut outbox, &mut wanted); outbox.extend(p.send_unreliable_rejected);
@@ -406,8 +385,7 @@ fn send(a: &Args) {
             if blocked[q] || (budget[q] == u64::MAX && sent_empty[q]) || (budget[q] != u64::MAX && len > budget[q]) {
                 blocked[q] = true; index += 1; continue; }
             if budget[q] == u64::MAX { sent_empty[q] = true; } else { budget[q] -= len; }
-            let m = pending.remove(index).unwrap(); let t = ns(); start_ns.get_or_insert(t);
-            first_submit_ns[id].get_or_insert(t);
+            let m = pending.remove(index).unwrap(); let t = ns(); start_ns.get_or_insert(t); first_submit_ns[id].get_or_insert(t);
             send_now.push((key, q, traffic[q], m)); }
         let mut sent_status = false;
         if (all_queued || a.str("duration").is_some()) && last_status_req.is_none_or(|t| t.elapsed() > Duration::from_secs(1)) {
@@ -519,8 +497,7 @@ fn send(a: &Args) {
     for b in 0..ngroups {
         if b_count[b] == 0 { continue; }
         let red = mean_transmitted_redundancy(b_red[b], b_sent[b]);
-        let red_plan = mean_transmitted_redundancy(b_red_plan[b], b_sent[b]);
-        b_lat[b].sort_by(|x, y| x.partial_cmp(y).unwrap());
+        let red_plan = mean_transmitted_redundancy(b_red_plan[b], b_sent[b]); b_lat[b].sort_by(|x, y| x.partial_cmp(y).unwrap());
         let rate = if b_count[b] > 0 { Some(b_deliv[b] as f64 / b_count[b] as f64) } else { None };
         let (p50, p99) = (pct(&b_lat[b], 50.0), pct(&b_lat[b], 99.0));
         println!("{:<9} {:>6} {:>9} {:>8} {:>12} {:>12} {:>7} {:>9.2} {:>9.2}", group_names[b], b_count[b], b_deliv[b],
@@ -591,8 +568,7 @@ fn send(a: &Args) {
 fn traffic_classes(a: &Args, queues: usize) -> Vec<Dscp> {
     let v: Vec<Dscp> = a.str("traffic-classes").unwrap_or("be").split(',').map(|c| match c {
         "be" => Dscp::BestEffort, "af11" => Dscp::Af11, "af21" => Dscp::Af21, "ef" => Dscp::Ef,
-        _ => die("--traffic-classes needs be,af11,af21,ef (one or one per queue)"),
-    }).collect();
+        _ => die("--traffic-classes needs be,af11,af21,ef (one or one per queue)"), }).collect();
     if v.len() == 1 { vec![v[0]; queues] } else if v.len() == queues { v } else { die("wrong number of traffic classes") } }
 fn queue_report(n: usize, sizes: &[usize], queue_ids: &[usize], submitted: &[Option<u64>], recs: &HashMap<u32, (bool, u64)>, offset: i128, wall: f64, cutoff: Option<f64>) -> Vec<String> {
     (0..n).map(|q| {

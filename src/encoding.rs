@@ -5,8 +5,7 @@ pub(crate) fn encode(input: &[u8]) -> String {
         let a = chunk[0]; out.push(ALPHABET[(a >> 2) as usize] as char); let b = chunk.get(1).copied().unwrap_or(0);
         out.push(ALPHABET[(((a & 3) << 4) | (b >> 4)) as usize] as char);
         if chunk.len() > 1 {
-            let c = chunk.get(2).copied().unwrap_or(0);
-            out.push(ALPHABET[(((b & 15) << 2) | (c >> 6)) as usize] as char);
+            let c = chunk.get(2).copied().unwrap_or(0); out.push(ALPHABET[(((b & 15) << 2) | (c >> 6)) as usize] as char);
             if chunk.len() > 2 { out.push(ALPHABET[(c & 63) as usize] as char); } } }
     out }
 fn digit(byte: u8) -> Option<u8> {

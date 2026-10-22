@@ -8,8 +8,7 @@ impl BitmapAck {
     pub fn base(&self) -> u64 { self.receipt_base }
     pub fn encode(&self) -> [u8; ACK_PAYLOAD_LEN] {
         let mut b = [0; ACK_PAYLOAD_LEN]; b[..8].copy_from_slice(&self.receipt_base.to_le_bytes());
-        b[8..16].copy_from_slice(&self.sample_seq.to_le_bytes());
-        b[16..24].copy_from_slice(&self.ce_count.to_le_bytes());
+        b[8..16].copy_from_slice(&self.sample_seq.to_le_bytes()); b[16..24].copy_from_slice(&self.ce_count.to_le_bytes());
         b[24..28].copy_from_slice(&self.delay_us.to_le_bytes()); b[28] = 1;
         b[30..32].copy_from_slice(&self.sample_udp_payload_bytes.to_le_bytes());
         for (i, w) in self.bitmap.iter().enumerate() { b[32+i*8..40+i*8].copy_from_slice(&w.to_le_bytes()); }
@@ -18,8 +17,7 @@ impl BitmapAck {
         if b.len() != ACK_PAYLOAD_LEN || b[28] != 1 || b[29] != 0 || b[30..32] == [0; 2] { return None; }
         let mut a = Self {
             highest: 0, receipt_base: u64::from_le_bytes(b[..8].try_into().ok()?),
-            sample_seq: u64::from_le_bytes(b[8..16].try_into().ok()?),
-            ce_count: u64::from_le_bytes(b[16..24].try_into().ok()?),
+            sample_seq: u64::from_le_bytes(b[8..16].try_into().ok()?), ce_count: u64::from_le_bytes(b[16..24].try_into().ok()?),
             sample_udp_payload_bytes: u16::from_le_bytes(b[30..32].try_into().ok()?),
             delay_us: u32::from_le_bytes(b[24..28].try_into().ok()?), bitmap: [0; 15], };
         if a.receipt_base >= crate::sequence::ACK_SPACE || a.sample_seq >= crate::sequence::ACK_SPACE { return None; }
@@ -35,14 +33,10 @@ impl BitmapAck {
         let Some(bit) = seq.checked_sub(self.base()).filter(|&n| n < ACK_BITMAP_BITS) else { return false; };
         self.bitmap[(bit / 64) as usize] & (1 << (bit % 64)) != 0 }
     pub fn relevant(&self, waiting: &[u64], lost: &[u64]) -> Self {
-        debug_assert_eq!(waiting.len(), lost.len()); let mut a = self.clone(); let base = self.base();
-        let shift = base % 64;
+        debug_assert_eq!(waiting.len(), lost.len()); let mut a = self.clone(); let base = self.base(); let shift = base % 64;
         for (i, w) in a.bitmap.iter_mut().enumerate() {
-            let slot = (base / 64 + i as u64) as usize % waiting.len();
-            let mut mask = (waiting[slot] | lost[slot]) >> shift;
-            if shift != 0 {
-                let next = (slot + 1) % waiting.len();
-                mask |= (waiting[next] | lost[next]) << (64 - shift); }
+            let slot = (base / 64 + i as u64) as usize % waiting.len(); let mut mask = (waiting[slot] | lost[slot]) >> shift;
+            if shift != 0 { let next = (slot + 1) % waiting.len(); mask |= (waiting[next] | lost[next]) << (64 - shift); }
             *w &= mask; }
         a }
     pub fn acknowledged(&self) -> impl Iterator<Item=u64> + '_ {
@@ -75,8 +69,7 @@ impl AckReceiver {
                 else { for s in h+1..=seq { self.history[(s % HISTORY_BITS / 64) as usize] &= !(1 << (s % 64)); } } } }
         let word = &mut self.history[(seq % HISTORY_BITS / 64) as usize]; let mask = 1 << (seq % 64);
         if *word & mask != 0 {
-            let deadline = {
-                self.last_ack_ns.map_or(now, |last| last.saturating_add((rtt_us * 1000 / 16).max(1_000_000))) };
+            let deadline = { self.last_ack_ns.map_or(now, |last| last.saturating_add((rtt_us * 1000 / 16).max(1_000_000))) };
             *timer = (*timer).min(deadline); return false; }
         *word |= mask; self.highest = Some(old_highest.unwrap_or(seq).max(seq)); self.sample_seq = seq;
         self.sample_time_ns = now; self.sample_udp_payload_bytes = sample_udp_payload_bytes;
@@ -112,8 +105,7 @@ impl AckReceiver {
         *timer = (*timer).min(deadline);
         true }
     fn policy(&self, rtt_us: u64, wire_bytes: usize) -> (u16, u32) {
-        let AckPolicy { every_packets, max_delay_us } = crate::ship::ACK;
-        let pps = 1_000_000_000 / self.mean_gap_ns.max(1);
+        let AckPolicy { every_packets, max_delay_us } = crate::ship::ACK; let pps = 1_000_000_000 / self.mean_gap_ns.max(1);
         let ack_bytes = (crate::stp::CONNECTED_HEADER_SIZE + ACK_PAYLOAD_LEN + 16) as u64;
         let budget_packets = (ack_bytes * 50).div_ceil(wire_bytes.max(1) as u64);
         let minimum = (every_packets as u64).max(budget_packets).clamp(1, 64);

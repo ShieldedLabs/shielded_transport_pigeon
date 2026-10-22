@@ -43,13 +43,10 @@ pub fn service_connections(handle: &NetworkThreadHandle, request: NetworkThreadP
             return Some(stats); }
         if app.endpoint.is_finished() || Instant::now() >= deadline { return None; }
         std::thread::sleep(Duration::from_micros(25)); } }
-fn reject_suffix(
-    messages: Vec<(ConnectionKey, usize, Dscp, Vec<u8>)>,
+fn reject_suffix(messages: Vec<(ConnectionKey, usize, Dscp, Vec<u8>)>,
     mut send: impl FnMut(ConnectionKey, usize, Dscp, &mut Vec<u8>) -> bool,
 ) -> Vec<(ConnectionKey, usize, Dscp, Vec<u8>)> {
     let mut rejected = Vec::new(); let mut blocked = false;
     for (peer, queue, class, mut payload) in messages {
-        if blocked || !send(peer, queue, class, &mut payload) {
-            blocked = true;
-            rejected.push((peer, queue, class, payload)); } }
+        if blocked || !send(peer, queue, class, &mut payload) { blocked = true; rejected.push((peer, queue, class, payload)); } }
     rejected }

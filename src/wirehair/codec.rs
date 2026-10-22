@@ -1,11 +1,10 @@
-// Pure Rust port of the vendored Wirehair codec core (third_party/wirehair/WirehairCodec.cpp,
-// WirehairCodec.h and the classic wirehair.cpp API semantics), equation profile and
-// failure behavior compatible with the STP-vendored C++ build.
+// Pure Rust port of the vendored Wirehair codec core (third_party/wirehair/WirehairCodec.cpp, WirehairCodec.h and the classic
+// wirehair.cpp API semantics), equation profile and failure behavior compatible with the STP-vendored C++ build.
 //
-// Copyright (c) 2012-2018 Christopher A. Taylor.  All rights reserved.
+// Copyright (c) 2012-2018 Christopher A. Taylor. All rights reserved.
 //
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions are met:
+// Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following
+// conditions are met:
 //
 // * Redistributions of source code must retain the above copyright notice,
 //   this list of conditions and the following disclaimer.
@@ -16,27 +15,19 @@
 //   used to endorse or promote products derived from this software without
 //   specific prior written permission.
 //
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-// ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
-// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
-// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
-// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
-// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
-// POSSIBILITY OF SUCH DAMAGE.
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING,
+// BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT
+// SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+// DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+// NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 //
-// Port notes: the C++ raw arrays become Vec workspaces; every index is bounds
-// checked by Rust. Byte accounting for the decoder memory limit reproduces the
-// C++ sizeof() values (see the *_BYTES constants) so the same allocations are
-// refused. Only the default build configuration is ported (CAT_COPY_FIRST_N,
-// CAT_HEAVY_WIN_MULT, CAT_WINDOWED_BACKSUB, CAT_WINDOWED_LOWERTRI,
+// Port notes: the C++ raw arrays become Vec workspaces; every index is bounds checked by Rust. Byte accounting for the decoder
+// memory limit reproduces the C++ sizeof() values (see the *_BYTES constants) so the same allocations are refused. Only the
+// default build configuration is ported (CAT_COPY_FIRST_N, CAT_HEAVY_WIN_MULT, CAT_WINDOWED_BACKSUB, CAT_WINDOWED_LOWERTRI,
 // CAT_ALL_ORIGINAL; no WH_* experiment knobs, no debug dump/oplog hooks).
 #![forbid(unsafe_code)]
-use std::sync::Arc; use super::gf256;
-use super::tools::{self, PcgRandom, PeelRowIterator, PeelRowParameters, RowMixIterator};
+use std::sync::Arc; use super::gf256; use super::tools::{self, PcgRandom, PeelRowIterator, PeelRowParameters, RowMixIterator};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)] #[repr(i32)] pub enum WirehairResult {
     Success = 0, NeedMore = 1, InvalidInput = 2, BadDenseSeed = 3, BadPeelSeed = 4, BadInputSmallN = 5,
     BadInputLargeN = 6, ExtraInsufficient = 7, Error = 8, Oom = 9,
@@ -76,8 +67,7 @@ pub fn packet_fingerprint128(data: &[u8]) -> (u64, u64) {
     let mut a0 = 0x736f6d6570736575u64 ^ key00; let mut a1 = 0x646f72616e646f6du64 ^ key01;
     let mut a2 = 0x6c7967656e657261u64 ^ key00; let mut a3 = 0x7465646279746573u64 ^ key01;
     let mut b0 = 0x736f6d6570736575u64 ^ key10; let mut b1 = 0x646f72616e646f6du64 ^ key11;
-    let mut b2 = 0x6c7967656e657261u64 ^ key10; let mut b3 = 0x7465646279746573u64 ^ key11;
-    let whole = (bytes & !7u32) as usize;
+    let mut b2 = 0x6c7967656e657261u64 ^ key10; let mut b3 = 0x7465646279746573u64 ^ key11; let whole = (bytes & !7u32) as usize;
     for c in data[..whole].chunks_exact(8) {
         let word = u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]); a3 ^= word;
         sip_round(&mut a0, &mut a1, &mut a2, &mut a3); sip_round(&mut a0, &mut a1, &mut a2, &mut a3); a0 ^= word;
@@ -102,34 +92,26 @@ fn new_packet_id_hash_salt(codec_address: u64) -> u64 {
     let serial = SEQUENCE.fetch_add(0x9e3779b9, Ordering::Relaxed) as u64;
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     let start = *START.get_or_init(std::time::Instant::now);
-    let wall = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
+    let wall = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);
     let ticks = wall ^ (start.elapsed().as_nanos() as u64);
     mix_packet_id_hash(serial ^ ticks ^ rol64(codec_address, 23)) }
 #[inline(always)] fn packet_id_hash(id: u32, salt: u64) -> u32 { mix_packet_id_hash(id as u64 ^ salt) as u32 }
 struct Split<'a, T> { lo: &'a [T], hi: &'a [T], d: usize, stride: usize, }
 impl<'a, T> Split<'a, T> {
     fn new(v: &'a mut [T], stride: usize, d: usize) -> (&'a mut [T], Split<'a, T>) {
-        let (lo, rest) = v.split_at_mut(d * stride); let take = stride.min(rest.len());
-        let (dst, hi) = rest.split_at_mut(take);
+        let (lo, rest) = v.split_at_mut(d * stride); let take = stride.min(rest.len()); let (dst, hi) = rest.split_at_mut(take);
         (dst, Split { lo, hi, d, stride }) }
     #[inline(always)] fn get(&self, s: usize, off: usize, len: usize) -> &'a [T] {
         assert!(s != self.d);
         if s < self.d {
             let b = s * self.stride + off;
-            &self.lo[b..b + len]
-        } else { let b = (s - self.d - 1) * self.stride + off; &self.hi[b..b + len] } } }
+            &self.lo[b..b + len] } else { let b = (s - self.d - 1) * self.stride + off; &self.hi[b..b + len] } } }
 #[inline(always)] fn split_ranges<T>(v: &mut [T], dst: usize, src: usize, len: usize) -> (&mut [T], &[T]) {
     if dst < src {
         assert!(dst + len <= src || len == 0); let (a, b) = v.split_at_mut(src);
         (&mut a[dst..dst + len], &b[..len])
-    } else {
-        assert!(src + len <= dst || len == 0); let (a, b) = v.split_at_mut(dst);
-        (&mut b[..len], &a[src..src + len]) } }
-#[inline(always)]
-fn xor_words(dst: &mut [u64], src: &[u64]) { for (d, s) in dst.iter_mut().zip(src.iter()) { *d ^= *s; } }
+    } else { assert!(src + len <= dst || len == 0); let (a, b) = v.split_at_mut(dst); (&mut b[..len], &a[src..src + len]) } }
+#[inline(always)] fn xor_words(dst: &mut [u64], src: &[u64]) { for (d, s) in dst.iter_mut().zip(src.iter()) { *d ^= *s; } }
 #[inline(always)] fn xor_words_within(m: &mut [u64], dst: usize, src: usize, len: usize) {
     let (d, s) = split_ranges(m, dst, src, len);
     xor_words(d, s); }
@@ -143,8 +125,7 @@ impl PeelRow {
 #[derive(Clone, Copy, Default)] struct PeelColumn { next: u16, value: u16, mark: u8, }
 #[derive(Clone, Copy)] struct PeelRefs { row_count: u16, rows: [u16; CAT_REF_LIST_MAX], }
 impl Default for PeelRefs { fn default() -> Self { PeelRefs { row_count: 0, rows: [0; CAT_REF_LIST_MAX] } } }
-#[derive(Clone, Copy, Default)]
-struct PeelAvalancheFrame { column: u16, solved_row: u16, next_ref: u16, ref_count: u16, }
+#[derive(Clone, Copy, Default)] struct PeelAvalancheFrame { column: u16, solved_row: u16, next_ref: u16, ref_count: u16, }
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 struct ReceivedPacketRecord { hash0: u64, hash1: u64, block_id: u32, occupied: u32, }
 enum ReceivedPacketLookup { New, Existing, Full, }
@@ -264,8 +245,7 @@ impl Codec {
         self.peel_cols[column_i as usize].mark = MARK_PEEL;
         { let row = &mut self.peel_rows[row_i as usize]; row.set_peel_column(column_i); }
         if let Some(tail) = self.peel_tail_rows {
-            self.peel_rows[tail as usize].next_row = row_i;
-        } else { self.peel_head_rows = row_i; }
+            self.peel_rows[tail as usize].next_row = row_i; } else { self.peel_head_rows = row_i; }
         let row = &mut self.peel_rows[row_i as usize]; row.next_row = LIST_TERM; self.peel_tail_rows = Some(row_i);
         row.set_is_copied(0); }
     fn solve_with_peel(&mut self, row_i: u16, column_i: u16) -> bool {
@@ -304,8 +284,7 @@ impl Codec {
             column.value = ge_column_i; defer_i = column.next;
             ge_column_i = ge_column_i.wrapping_add(1); }
         for added_i in 0..self.mix_count {
-            let ge_column_i = self.defer_count.wrapping_add(added_i);
-            let column_i = self.block_count.wrapping_add(added_i);
+            let ge_column_i = self.defer_count.wrapping_add(added_i); let column_i = self.block_count.wrapping_add(added_i);
             self.ge_col_map[ge_column_i as usize] = column_i; } }
     #[inline(always)] fn add_mix_bits(&mut self, row_i: u16, params: &PeelRowParameters) {
         let base = self.ge_pitch * row_i as usize; let defer_count = self.defer_count as usize;
@@ -318,8 +297,7 @@ impl Codec {
         while defer_row_i != LIST_TERM {
             let params; let next;
             {
-                let row = &mut self.peel_rows[defer_row_i as usize]; row.set_peel_column(LIST_TERM);
-                params = row.params;
+                let row = &mut self.peel_rows[defer_row_i as usize]; row.set_peel_column(LIST_TERM); params = row.params;
                 next = row.next_row; }
             self.add_mix_bits(defer_row_i, &params);
             defer_row_i = next; } }
@@ -347,9 +325,7 @@ impl Codec {
                     let (dst, src) = split_ranges(&mut self.recovery_blocks, dst_off, src_off, bb);
                     if ref_row.is_copied() { gf256::add_mem(dst, src); } else {
                         let input = self.input.bytes(); let block_off = bb * ref_row_i as usize;
-                        if ref_row_i != last_row {
-                            gf256::addset_mem(dst, src, &input[block_off..block_off + bb]);
-                        } else {
+                        if ref_row_i != last_row { gf256::addset_mem(dst, src, &input[block_off..block_off + bb]); } else {
                             gf256::addset_mem(&mut dst[..final_bytes], &src[..final_bytes], &input[block_off..block_off + final_bytes]);
                             dst[final_bytes..].copy_from_slice(&src[final_bytes..]); }
                         self.peel_rows[ref_row_i as usize].set_is_copied(1); } } }
@@ -359,8 +335,7 @@ impl Codec {
         while defer_row_i != LIST_TERM {
             let dst = pitch * ge_row_i as usize; let src = pitch * defer_row_i as usize;
             self.ge_matrix[dst..dst + pitch].copy_from_slice(&self.compress_matrix[src..src + pitch]);
-            self.ge_row_map[ge_row_i as usize] = defer_row_i;
-            defer_row_i = self.peel_rows[defer_row_i as usize].next_row;
+            self.ge_row_map[ge_row_i as usize] = defer_row_i; defer_row_i = self.peel_rows[defer_row_i as usize].next_row;
             ge_row_i = ge_row_i.wrapping_add(1); } }
     #[inline(always)] fn dense_flip(&self, temp_row: &mut [u64], column_base: usize, bit: usize, max_x: usize) {
         if bit < max_x {
@@ -368,9 +343,7 @@ impl Codec {
             if column.mark == MARK_PEEL {
                 let pitch = self.ge_pitch; let off = pitch * column.value as usize;
                 xor_words(temp_row, &self.compress_matrix[off..off + pitch]);
-            } else {
-                let ge_column_i = column.value as usize;
-                temp_row[ge_column_i >> 6] ^= 1u64 << (ge_column_i & 63); } } }
+            } else { let ge_column_i = column.value as usize; temp_row[ge_column_i >> 6] ^= 1u64 << (ge_column_i & 63); } } }
     fn multiply_dense_rows(&mut self) {
         let mut prng = PcgRandom::new(); prng.seed(self.d_seed as u64, 0); let pitch = self.ge_pitch;
         let dense_count = self.dense_count as usize; let block_count = self.block_count as usize;
@@ -405,8 +378,7 @@ impl Codec {
         let pitch = self.heavy_pitch; let base = pitch * self.extra_count as usize;
         for row_i in 0..K_HEAVY_ROWS {
             let off = base + pitch * row_i;
-            for col_i in 0..self.heavy_columns as usize {
-                self.heavy_matrix[off + col_i] = K_HEAVY_MATRIX[row_i][col_i]; } } } }
+            for col_i in 0..self.heavy_columns as usize { self.heavy_matrix[off + col_i] = K_HEAVY_MATRIX[row_i][col_i]; } } } }
 impl Codec {
     fn setup_triangle(&mut self) {
         let pivot_count = self.defer_count.wrapping_add(self.dense_count);
@@ -414,8 +386,7 @@ impl Codec {
         self.next_pivot = 0; self.pivot_count = pivot_count as u32;
         if self.first_heavy_column == 0 { self.insert_heavy_rows(); } }
     fn insert_heavy_rows(&mut self) {
-        let mut first_heavy_pivot = self.pivot_count;
-        let column_count = self.defer_count as u32 + self.mix_count as u32;
+        let mut first_heavy_pivot = self.pivot_count; let column_count = self.defer_count as u32 + self.mix_count as u32;
         let first_heavy_row = self.defer_count.wrapping_add(self.dense_count); let pitch = self.ge_pitch;
         let hpitch = self.heavy_pitch; let fhc = self.first_heavy_column; let mut pivot_j = self.pivot_count as i64 - 1;
         while pivot_j >= 0 {
@@ -435,8 +406,7 @@ impl Codec {
         self.pivot_count += K_HEAVY_ROWS as u32; }
     #[inline(always)] fn ge_eliminate(&mut self, j: usize, k: usize, word_offset: usize, row0: u64) {
         let pitch = self.ge_pitch; let len = pitch - word_offset;
-        let (dst, src) = split_ranges(&mut self.ge_matrix, pitch * k + word_offset, pitch * j + word_offset, len);
-        dst[0] ^= row0;
+        let (dst, src) = split_ranges(&mut self.ge_matrix, pitch * k + word_offset, pitch * j + word_offset, len); dst[0] ^= row0;
         xor_words(&mut dst[1..], &src[1..]); }
     fn triangle_non_heavy(&mut self) -> bool {
         let pivot_count = self.pivot_count as usize; let first_heavy_column = self.first_heavy_column as usize;
@@ -461,8 +431,7 @@ impl Codec {
     fn triangle(&mut self) -> bool {
         let first_heavy_column = self.first_heavy_column as usize;
         if (self.next_pivot as usize) < first_heavy_column && !self.triangle_non_heavy() { return false; }
-        let pivot_count = self.pivot_count as usize;
-        let column_count = self.defer_count as usize + self.mix_count as usize;
+        let pivot_count = self.pivot_count as usize; let column_count = self.defer_count as usize + self.mix_count as usize;
         let first_heavy_row = self.defer_count as usize + self.dense_count as usize;
         let mut first_heavy_pivot = self.first_heavy_pivot as usize; let pitch = self.ge_pitch;
         let hpitch = self.heavy_pitch; let heavy_columns = self.heavy_columns as usize;
@@ -506,9 +475,7 @@ impl Codec {
                     let prow_off = hpitch * heavy_row_j; let code_value = self.heavy_matrix[prow_off + heavy_col_i];
                     if code_value == 0 { pivot_j += 1; continue; }
                     found = true; self.pivots[pivot_j] = self.pivots[pivot_i]; self.pivots[pivot_i] = ge_row_j as u16;
-                    if pivot_i < first_heavy_pivot {
-                        self.pivots.swap(first_heavy_pivot, pivot_j);
-                        first_heavy_pivot += 1; }
+                    if pivot_i < first_heavy_pivot { self.pivots.swap(first_heavy_pivot, pivot_j); first_heavy_pivot += 1; }
                     let mut pivot_k = pivot_j + 1;
                     while pivot_k < pivot_count {
                         let heavy_row_k = self.pivots[pivot_k] as usize - first_heavy_row; pivot_k += 1;
@@ -519,9 +486,7 @@ impl Codec {
                         let (dst, src) = split_ranges(&mut self.heavy_matrix, rem_off + offset, prow_off + offset, len);
                         gf256::muladd_mem(dst, x, src); }
                     break; } }
-            if !found {
-                self.next_pivot = pivot_i as u32; self.first_heavy_pivot = first_heavy_pivot as u32;
-                return false; }
+            if !found { self.next_pivot = pivot_i as u32; self.first_heavy_pivot = first_heavy_pivot as u32; return false; }
             pivot_i += 1;
             ge_mask = rol64(ge_mask, 1); }
         true } }
@@ -532,18 +497,15 @@ impl Codec {
         let final_bytes = self.input_final_bytes as usize; let mut pivot_i: u16 = 0;
         while pivot_i < column_count {
             let dest_column_i = self.ge_col_map[pivot_i as usize]; let ge_row_i = self.pivots[pivot_i as usize];
-            assert!((dest_column_i as u32) < self.recovery_rows); let dest_off = bb * dest_column_i as usize;
-            pivot_i += 1;
+            assert!((dest_column_i as u32) < self.recovery_rows); let dest_off = bb * dest_column_i as usize; pivot_i += 1;
             if ge_row_i < self.dense_count || ge_row_i as u32 >= first_heavy_row as u32 + self.extra_count as u32 {
-                self.recovery_blocks[dest_off..dest_off + bb].fill(0);
-                self.ge_row_map[ge_row_i as usize] = dest_column_i;
+                self.recovery_blocks[dest_off..dest_off + bb].fill(0); self.ge_row_map[ge_row_i as usize] = dest_column_i;
                 continue; }
             let row_i = self.ge_row_map[ge_row_i as usize]; let combo_off = bb * row_i as usize; let mut combo = true;
             let params = self.peel_rows[row_i as usize].params;
             if row_i == self.block_count.wrapping_sub(1) {
                 let input = self.input.bytes(); let dst = &mut self.recovery_blocks[dest_off..dest_off + bb];
-                dst[..final_bytes].copy_from_slice(&input[combo_off..combo_off + final_bytes]);
-                dst[final_bytes..].fill(0);
+                dst[..final_bytes].copy_from_slice(&input[combo_off..combo_off + final_bytes]); dst[final_bytes..].fill(0);
                 combo = false; }
             let mut iter = PeelRowIterator::new(&params, self.block_count, self.block_next_prime);
             loop {
@@ -621,8 +583,7 @@ impl Codec {
                 let count = if half == 0 { loop_count } else { second_loop_count };
                 for ii in 0..count {
                     let bit0 = bits[ii] as usize; let bit1 = bits[set_count + ii] as usize;
-                    let p0 = self.is_peeled_bit(column_i, bit0, max_x);
-                    let p1 = self.is_peeled_bit(column_i, bit1, max_x);
+                    let p0 = self.is_peeled_bit(column_i, bit0, max_x); let p1 = self.is_peeled_bit(column_i, bit1, max_x);
                     if p0 {
                         if p1 {
                             rb_add2(&mut self.recovery_blocks, bb, temp, column_i + bit0, column_i + bit1);
@@ -652,8 +613,7 @@ impl Codec {
                 rb_addset(&mut self.recovery_blocks, bb, win_table[7] as usize, win_table[1] as usize, win_table[6] as usize);
                 continue; }
             for ii in 1..base {
-                rb_addset(
-                    &mut self.recovery_blocks, bb, win_table[base + ii] as usize, win_table[ii] as usize,
+                rb_addset(&mut self.recovery_blocks, bb, win_table[base + ii] as usize, win_table[ii] as usize,
                     win_table[base] as usize, ); } } }
     fn add_subdiagonal_values(&mut self) {
         let bb = self.block_bytes; let pitch = self.ge_pitch;
@@ -662,10 +622,8 @@ impl Codec {
         let first_non_binary_row = first_heavy_row.wrapping_add(self.extra_count);
         if column_count >= CAT_UNDER_WIN_THRESH_5 {
             let (mut w, mut next_check_i): (u32, u32) = if column_count >= CAT_UNDER_WIN_THRESH_7 {
-                (7, column_count - CAT_UNDER_WIN_THRESH_7)
-            } else if column_count >= CAT_UNDER_WIN_THRESH_6 {
-                (6, column_count - CAT_UNDER_WIN_THRESH_6)
-            } else { (5, column_count - CAT_UNDER_WIN_THRESH_5) };
+                (7, column_count - CAT_UNDER_WIN_THRESH_7) } else if column_count >= CAT_UNDER_WIN_THRESH_6 {
+                (6, column_count - CAT_UNDER_WIN_THRESH_6) } else { (5, column_count - CAT_UNDER_WIN_THRESH_5) };
             let mut win_lim: u32 = 1 << w; let mut win_table = [0u32; CAT_WIN_TABLE_SIZE];
             if self.gather_window_scratch(&mut win_table, win_lim) {
                 loop {
@@ -681,15 +639,13 @@ impl Codec {
                                 rb_add(&mut self.recovery_blocks, bb, dest_col_i, src); } }
                         ge_mask = rol64(ge_mask, 1); }
                     self.build_window_table(&mut win_table, pivot_i as usize, w);
-                    let first_word = (pivot_i >> 6) as usize; let shift0 = pivot_i & 63;
-                    let last_word = (final_i >> 6) as usize;
+                    let first_word = (pivot_i >> 6) as usize; let shift0 = pivot_i & 63; let last_word = (final_i >> 6) as usize;
                     for ge_below_i in final_i + 1..column_count {
                         let ge_row_i = self.pivots[ge_below_i as usize];
                         if ge_row_i >= first_non_binary_row { continue; }
                         let off = first_word + pitch * ge_row_i as usize;
                         let win_bits = if first_word == last_word {
-                            ((self.ge_matrix[off] >> shift0) as u32) & (win_lim - 1)
-                        } else {
+                            ((self.ge_matrix[off] >> shift0) as u32) & (win_lim - 1) } else {
                             let shift1 = 64 - shift0;
                             (((self.ge_matrix[off] >> shift0) as u32) | ((self.ge_matrix[off + 1] << shift1) as u32))
                                 & (win_lim - 1) };
@@ -704,8 +660,7 @@ impl Codec {
                         } else if remaining_columns >= CAT_UNDER_WIN_THRESH_5 {
                             w = 5; next_check_i = remaining_columns - CAT_UNDER_WIN_THRESH_5;
                         } else if remaining_columns >= CAT_UNDER_WIN_THRESH_4 {
-                            w = 4; next_check_i = remaining_columns - CAT_UNDER_WIN_THRESH_4;
-                        } else { break; }
+                            w = 4; next_check_i = remaining_columns - CAT_UNDER_WIN_THRESH_4; } else { break; }
                         win_lim = 1 << w; } } } }
         let fhc = self.first_heavy_column; let hpitch = self.heavy_pitch;
         for ge_column_i in pivot_i + 1..column_count {
@@ -726,8 +681,7 @@ impl Codec {
             let roff = pitch * ge_row_i as usize; let mut ge_mask = 1u64 << (pivot_i & 63);
             for bit_j in pivot_i..ge_limit {
                 if self.ge_matrix[roff + (bit_j >> 6) as usize] & ge_mask != 0 {
-                    let column_j = self.ge_col_map[bit_j as usize] as usize;
-                    assert!((column_j as u32) < self.recovery_rows);
+                    let column_j = self.ge_col_map[bit_j as usize] as usize; assert!((column_j as u32) < self.recovery_rows);
                     rb_add(&mut self.recovery_blocks, bb, column_i, column_j); }
                 ge_mask = rol64(ge_mask, 1); } } } }
 impl Codec {
@@ -742,8 +696,7 @@ impl Codec {
             if code_value != 1 {
                 let bb = self.block_bytes; let src = bb * self.ge_col_map[pivot_i as usize] as usize;
                 gf256::div_mem_inplace(&mut self.recovery_blocks[src..src + bb], code_value); } } }
-    #[inline(always)]
-    fn backsub_one(&mut self, src_pivot_i: u32, dest_pivot_i: u32, first_heavy_row: u16, ge_mask: u64) {
+    #[inline(always)] fn backsub_one(&mut self, src_pivot_i: u32, dest_pivot_i: u32, first_heavy_row: u16, ge_mask: u64) {
         let bb = self.block_bytes; let dest_row_i = self.pivots[dest_pivot_i as usize];
         let src = self.ge_col_map[src_pivot_i as usize] as usize; assert!((src as u32) < self.recovery_rows);
         if dest_row_i >= first_heavy_row && src_pivot_i >= self.first_heavy_column {
@@ -754,8 +707,7 @@ impl Codec {
             let dest = self.ge_col_map[dest_pivot_i as usize] as usize; assert!((dest as u32) < self.recovery_rows);
             if code_value == 1 {
                 rb_add(&mut self.recovery_blocks, bb, dest, src);
-            } else { rb_muladd(&mut self.recovery_blocks, bb, dest, code_value, src); }
-        } else {
+            } else { rb_muladd(&mut self.recovery_blocks, bb, dest, code_value, src); } } else {
             let word = (src_pivot_i >> 6) as usize;
             if self.ge_matrix[word + self.ge_pitch * dest_row_i as usize] & ge_mask != 0 {
                 let dest = self.ge_col_map[dest_pivot_i as usize] as usize; assert!((dest as u32) < self.recovery_rows);
@@ -763,19 +715,15 @@ impl Codec {
     fn back_substitute_above_diagonal(&mut self) {
         let bb = self.block_bytes; let pitch = self.ge_pitch;
         let pivot_count = self.defer_count as u32 + self.mix_count as u32; let mut pivot_i: u32 = pivot_count - 1;
-        let first_heavy_row = self.defer_count.wrapping_add(self.dense_count);
-        let first_heavy_column = self.first_heavy_column;
+        let first_heavy_row = self.defer_count.wrapping_add(self.dense_count); let first_heavy_column = self.first_heavy_column;
         if pivot_i >= CAT_ABOVE_WIN_THRESH_5 {
             let (mut w, mut next_check_i): (u32, u32) = if pivot_i >= CAT_ABOVE_WIN_THRESH_7 {
                 (7, CAT_ABOVE_WIN_THRESH_7)
-            } else if pivot_i >= CAT_ABOVE_WIN_THRESH_6 {
-                (6, CAT_ABOVE_WIN_THRESH_6)
-            } else { (5, CAT_ABOVE_WIN_THRESH_5) };
+            } else if pivot_i >= CAT_ABOVE_WIN_THRESH_6 { (6, CAT_ABOVE_WIN_THRESH_6) } else { (5, CAT_ABOVE_WIN_THRESH_5) };
             let mut win_lim: u32 = 1 << w; let mut win_table = [0u32; CAT_WIN_TABLE_SIZE];
             if self.gather_window_scratch(&mut win_table, win_lim) {
                 loop {
-                    let backsub_i = pivot_i - w + 1; let mut ge_mask = 1u64 << (pivot_i & 63);
-                    let mut src_pivot_i = pivot_i;
+                    let backsub_i = pivot_i - w + 1; let mut ge_mask = 1u64 << (pivot_i & 63); let mut src_pivot_i = pivot_i;
                     while src_pivot_i > backsub_i {
                         self.normalize_heavy_diagonal(src_pivot_i, first_heavy_row);
                         for dest_pivot_i in backsub_i..src_pivot_i {
@@ -804,13 +752,11 @@ impl Codec {
                                 let code_value = self.heavy_at(heavy_row_i, (ge_column_j - first_heavy_column) as usize);
                                 let col = ge_column_j; ge_column_j += 1;
                                 if code_value == 0 { continue; }
-                                let src = self.ge_col_map[col as usize] as usize;
-                                assert!((src as u32) < self.recovery_rows);
+                                let src = self.ge_col_map[col as usize] as usize; assert!((src as u32) < self.recovery_rows);
                                 if code_value == 1 {
                                     rb_add(&mut self.recovery_blocks, bb, dest, src);
                                 } else { rb_muladd(&mut self.recovery_blocks, bb, dest, code_value, src); } } } }
-                    let window_row_limit: u32 =
-                        if pivot_i >= first_heavy_column { first_heavy_row as u32 } else { 0x10000 };
+                    let window_row_limit: u32 = if pivot_i >= first_heavy_column { first_heavy_row as u32 } else { 0x10000 };
                     let first_word = (backsub_i >> 6) as usize; let shift0 = backsub_i & 63;
                     let last_word = (pivot_i >> 6) as usize;
                     for above_pivot_i in 0..backsub_i {
@@ -818,8 +764,7 @@ impl Codec {
                         if ge_row_k >= window_row_limit { continue; }
                         let off = first_word + pitch * ge_row_k as usize;
                         let win_bits = if first_word == last_word {
-                            ((self.ge_matrix[off] >> shift0) as u32) & (win_lim - 1)
-                        } else {
+                            ((self.ge_matrix[off] >> shift0) as u32) & (win_lim - 1) } else {
                             let shift1 = 64 - shift0;
                             (((self.ge_matrix[off] >> shift0) as u32) | ((self.ge_matrix[off + 1] << shift1) as u32))
                                 & (win_lim - 1) };
@@ -830,12 +775,9 @@ impl Codec {
                     pivot_i -= w;
                     if pivot_i < next_check_i {
                         if pivot_i >= CAT_ABOVE_WIN_THRESH_6 {
-                            w = 6; next_check_i = CAT_ABOVE_WIN_THRESH_6;
-                        } else if pivot_i >= CAT_ABOVE_WIN_THRESH_5 {
-                            w = 5; next_check_i = CAT_ABOVE_WIN_THRESH_5;
-                        } else if pivot_i >= CAT_ABOVE_WIN_THRESH_4 {
-                            w = 4; next_check_i = CAT_ABOVE_WIN_THRESH_4;
-                        } else { break; }
+                            w = 6; next_check_i = CAT_ABOVE_WIN_THRESH_6; } else if pivot_i >= CAT_ABOVE_WIN_THRESH_5 {
+                            w = 5; next_check_i = CAT_ABOVE_WIN_THRESH_5; } else if pivot_i >= CAT_ABOVE_WIN_THRESH_4 {
+                            w = 4; next_check_i = CAT_ABOVE_WIN_THRESH_4; } else { break; }
                         win_lim = 1 << w; } } } }
         let mut ge_mask = 1u64 << (pivot_i & 63);
         loop {
@@ -895,8 +837,7 @@ impl Codec {
             self.dense_count = tools::get_dense_count(self.block_count as u32);
             if self.wire_profile == WireProfile::LegacyPreFixup {
                 self.d_seed = tools::get_dense_seed_pre_fixup(self.block_count as u32, self.dense_count as u32) as u32;
-                self.p_seed = tools::get_peel_seed_pre_fixup(self.block_count as u32) as u32;
-            } else {
+                self.p_seed = tools::get_peel_seed_pre_fixup(self.block_count as u32) as u32; } else {
                 self.d_seed = tools::get_dense_seed(self.block_count as u32, self.dense_count as u32) as u32;
                 self.p_seed = tools::get_peel_seed(self.block_count as u32) as u32; } }
         if !is_dense_count_valid(self.dense_count as u32) { return R::InvalidInput; }
@@ -909,8 +850,7 @@ impl Codec {
         if !self.allocate_matrix() { return R::Oom; }
         self.set_deferred_columns(); self.set_mixing_columns_for_deferred_rows(); self.peel_diagonal();
         self.copy_deferred_rows(); self.multiply_dense_rows(); self.set_heavy_rows();
-        tools::add_invertible_gf2_matrix(
-            &mut self.ge_matrix, self.defer_count as u32, self.ge_pitch as u32,
+        tools::add_invertible_gf2_matrix(&mut self.ge_matrix, self.defer_count as u32, self.ge_pitch as u32,
             self.dense_count as u32, );
         self.setup_triangle();
         if !self.triangle() { return R::NeedMore; }
@@ -933,8 +873,7 @@ impl Codec {
                     break; } }
             if found_pivot == 0 { return R::ExtraInsufficient; }
             new_pivot_i = found_pivot; ge_row_i = self.pivots[new_pivot_i as usize] as u32;
-            row_i = self.ge_row_map[ge_row_i as usize] as u32;
-        } else {
+            row_i = self.ge_row_map[ge_row_i as usize] as u32; } else {
             new_pivot_i = self.pivot_count; self.pivot_count += 1; row_i = self.row_count as u32;
             self.row_count = self.row_count.wrapping_add(1);
             ge_row_i = (self.defer_count as u32 + self.dense_count as u32 + row_i).wrapping_sub(self.block_count as u32);
@@ -953,10 +892,8 @@ impl Codec {
                 let dst = &mut input[off..off + bb];
                 if !is_last { dst.copy_from_slice(&data[..bb]); } else {
                     dst[..ofb].copy_from_slice(&data[..ofb]);
-                    dst[ofb..].fill(0); }
-            } else { return R::Error; } }
-        let pitch = self.ge_pitch; let new_off = pitch * ge_row_i as usize;
-        self.ge_matrix[new_off..new_off + pitch].fill(0);
+                    dst[ofb..].fill(0); } } else { return R::Error; } }
+        let pitch = self.ge_pitch; let new_off = pitch * ge_row_i as usize; self.ge_matrix[new_off..new_off + pitch].fill(0);
         let params = {
             let row = &mut self.peel_rows[row_i as usize];
             row.params.initialize(id, self.p_seed, self.block_count, self.mix_count);
@@ -970,8 +907,7 @@ impl Codec {
             let column = iter.get_column(); let ref_col = self.peel_cols[column as usize];
             if ref_col.mark == MARK_PEEL {
                 let src = pitch * ref_col.value as usize;
-                xor_words(&mut self.ge_matrix[new_off..new_off + pitch], &self.compress_matrix[src..src + pitch]);
-            } else {
+                xor_words(&mut self.ge_matrix[new_off..new_off + pitch], &self.compress_matrix[src..src + pitch]); } else {
                 let ge_column_k = ref_col.value as usize;
                 self.ge_matrix[new_off + (ge_column_k >> 6)] ^= 1u64 << (ge_column_k & 63); }
             if !iter.iterate() { break; } }
@@ -988,8 +924,7 @@ impl Codec {
         if self.next_pivot < self.first_heavy_column {
             let bit = self.ge_matrix[new_off + (next_pivot >> 6)] & (1u64 << (next_pivot & 63));
             if bit == 0 { return R::NeedMore; }
-            self.pivots[new_pivot_i as usize] = self.pivots[next_pivot]; self.pivots[next_pivot] = ge_row_i as u16;
-        } else {
+            self.pivots[new_pivot_i as usize] = self.pivots[next_pivot]; self.pivots[next_pivot] = ge_row_i as u16; } else {
             let column_count = self.defer_count as u32 + self.mix_count as u32;
             let first_heavy_row = self.dense_count as u32 + self.defer_count as u32; let fhc = self.first_heavy_column;
             let hpitch = self.heavy_pitch; let heavy_columns = self.heavy_columns as usize;
@@ -1006,12 +941,10 @@ impl Codec {
                     let pivot_code = self.heavy_matrix[poff + heavy_col_j]; let start_column = heavy_col_j + 1;
                     let len = heavy_columns - start_column;
                     let coeff = if pivot_code == 1 { code_value } else {
-                        let eliminator = gf256::div(code_value, pivot_code);
-                        self.heavy_matrix[hoff + heavy_col_j] = eliminator;
+                        let eliminator = gf256::div(code_value, pivot_code); self.heavy_matrix[hoff + heavy_col_j] = eliminator;
                         eliminator };
                     let (dst, src) = split_ranges(&mut self.heavy_matrix, hoff + start_column, poff + start_column, len);
-                    gf256::muladd_mem(dst, coeff, src);
-                } else {
+                    gf256::muladd_mem(dst, coeff, src); } else {
                     let ooff = pitch * ge_row_j as usize; let mut ge_column_k = pivot_j + 1;
                     let mut ge_mask_k = 1u64 << (ge_column_k & 63);
                     while ge_column_k < column_count {
@@ -1067,8 +1000,7 @@ impl Codec {
     pub fn can_encode(&self) -> bool { self.mode == Mode::Encoder || self.mode == Mode::Converted }
     pub fn can_decode(&self) -> bool { self.mode == Mode::Decoder || self.mode == Mode::DecodeComplete }
     #[doc(hidden)] pub fn testing_state(&self) -> [u64; 18] {
-        [
-            self.input_allocated, self.workspace_allocated, self.ge_allocated, self.next_pivot as u64,
+        [self.input_allocated, self.workspace_allocated, self.ge_allocated, self.next_pivot as u64,
             self.row_count as u64, self.mode as u8 as u64, self.received_packet_count as u64,
             self.received_packet_slots as u64, self.defer_count as u64, self.dense_count as u64, self.p_seed as u64,
             self.d_seed as u64, self.recovery_rows as u64, self.pivot_count as u64, self.first_heavy_pivot as u64,
@@ -1084,19 +1016,15 @@ impl Codec {
     fn allocate_input(&mut self) -> bool {
         let size_bytes = (self.block_count as u64 + self.extra_count as u64) * self.block_bytes as u64;
         let limit = self.memory_limit;
-        if size_bytes > limit
-            || self.workspace_allocated > limit - size_bytes
+        if size_bytes > limit || self.workspace_allocated > limit - size_bytes
             || self.ge_allocated > limit - size_bytes - self.workspace_allocated
         { return false; }
         if self.input_allocated < size_bytes {
             self.free_input();
             if size_bytes > usize::MAX as u64 { return false; }
             if !self.testing_allow_allocation() { return false; }
-            match try_zeroed::<u8>(size_bytes as usize) {
-                Some(v) => self.input = InputSource::Owned(v),
-                None => return false, }
-            self.input_allocated = size_bytes;
-        } else if let InputSource::Owned(v) = &mut self.input {
+            match try_zeroed::<u8>(size_bytes as usize) { Some(v) => self.input = InputSource::Owned(v), None => return false, }
+            self.input_allocated = size_bytes; } else if let InputSource::Owned(v) = &mut self.input {
             if !reuse_resize(v, size_bytes as usize) {
                 *v = Vec::new();
                 match try_zeroed::<u8>(size_bytes as usize) { Some(nv) => *v = nv, None => return false, } } }
@@ -1113,8 +1041,7 @@ impl Codec {
         let heavy_pitch = (heavy_cols + 3 + 3) & !3u64; let heavy_bytes = heavy_pitch * heavy_rows;
         let size_bytes = compress_matrix_words * 8 + ge_matrix_words * 8 + heavy_bytes + pivot_words * 2;
         let limit = self.memory_limit;
-        if size_bytes > limit
-            || self.workspace_allocated > limit - size_bytes
+        if size_bytes > limit || self.workspace_allocated > limit - size_bytes
             || self.input_allocated > limit - size_bytes - self.workspace_allocated
         { return false; }
         let fresh = self.ge_allocated < size_bytes;
@@ -1122,18 +1049,14 @@ impl Codec {
             self.free_matrix();
             if size_bytes > usize::MAX as u64 { return false; }
             if !self.testing_allow_allocation() { return false; } }
-        let reused = !fresh
-            && reuse_resize(&mut self.compress_matrix, compress_matrix_words as usize)
+        let reused = !fresh && reuse_resize(&mut self.compress_matrix, compress_matrix_words as usize)
             && reuse_resize(&mut self.ge_matrix, ge_matrix_words as usize)
-            && reuse_resize(&mut self.heavy_matrix, heavy_bytes as usize)
-            && reuse_resize(&mut self.pivots, pivot_count as usize)
-            && reuse_resize(&mut self.ge_row_map, pivot_count as usize)
-            && reuse_resize(&mut self.ge_col_map, ge_cols as usize);
+            && reuse_resize(&mut self.heavy_matrix, heavy_bytes as usize) && reuse_resize(&mut self.pivots, pivot_count as usize)
+            && reuse_resize(&mut self.ge_row_map, pivot_count as usize) && reuse_resize(&mut self.ge_col_map, ge_cols as usize);
         let charged = if fresh { size_bytes } else { self.ge_allocated };
         let ok = reused || {
             self.free_matrix();
-            match (
-                try_zeroed::<u64>(compress_matrix_words as usize), try_zeroed::<u64>(ge_matrix_words as usize),
+            match (try_zeroed::<u64>(compress_matrix_words as usize), try_zeroed::<u64>(ge_matrix_words as usize),
                 try_zeroed::<u8>(heavy_bytes as usize), try_zeroed::<u16>(pivot_count as usize),
                 try_zeroed::<u16>(pivot_count as usize), try_zeroed::<u16>(ge_cols as usize),
             ) {
@@ -1159,13 +1082,8 @@ impl Codec {
         let recovery_size_bytes = recovery_rows as u64 * self.block_bytes as u64;
         let peel_offset_bytes = (recovery_size_bytes + 7) & !7u64;
         let row_count = self.block_count as u64 + self.extra_count as u64; let column_count = self.block_count as u64;
-        let base_size_bytes = peel_offset_bytes
-            + PEEL_ROW_BYTES * row_count
-            + PEEL_COLUMN_BYTES * column_count
-            + PEEL_REFS_BYTES * column_count
-            + PEEL_AVALANCHE_FRAME_BYTES * column_count
-            + 2 * column_count
-            + row_count;
+        let base_size_bytes = peel_offset_bytes + PEEL_ROW_BYTES * row_count + PEEL_COLUMN_BYTES * column_count
+            + PEEL_REFS_BYTES * column_count + PEEL_AVALANCHE_FRAME_BYTES * column_count + 2 * column_count + row_count;
         let mut received_packet_slots: u32 = 0; let mut size_bytes = base_size_bytes;
         if self.received_packet_limit > 0 {
             received_packet_slots = 1; let minimum_slots = self.received_packet_limit.wrapping_mul(2);
@@ -1173,8 +1091,7 @@ impl Codec {
             let received_packet_offset_bytes = (base_size_bytes + 7) & !7u64;
             size_bytes = received_packet_offset_bytes + received_packet_slots as u64 * RECEIVED_PACKET_RECORD_BYTES; }
         let limit = self.memory_limit;
-        if size_bytes > limit
-            || self.input_allocated > limit - size_bytes
+        if size_bytes > limit || self.input_allocated > limit - size_bytes
             || self.ge_allocated > limit - size_bytes - self.input_allocated
         { return false; }
         let fresh = self.workspace_allocated < size_bytes;
@@ -1183,10 +1100,8 @@ impl Codec {
             if size_bytes > usize::MAX as u64 { return false; }
             if !self.testing_allow_allocation() { return false; } }
         let rb_len = (recovery_rows as u64 * self.block_bytes as u64) as usize;
-        let reused = !fresh
-            && reuse_resize(&mut self.recovery_blocks, rb_len)
-            && reuse_resize(&mut self.peel_rows, row_count as usize)
-            && reuse_resize(&mut self.peel_cols, column_count as usize)
+        let reused = !fresh && reuse_resize(&mut self.recovery_blocks, rb_len)
+            && reuse_resize(&mut self.peel_rows, row_count as usize) && reuse_resize(&mut self.peel_cols, column_count as usize)
             && reuse_resize(&mut self.peel_col_refs, column_count as usize)
             && reuse_resize(&mut self.peel_avalanche, column_count as usize)
             && reuse_resize(&mut self.original_row, column_count as usize)
@@ -1196,17 +1111,14 @@ impl Codec {
         let charged = if fresh { size_bytes } else { self.workspace_allocated };
         let ok = reused || {
             self.free_workspace();
-            match (
-                try_zeroed::<u8>(rb_len), try_zeroed::<PeelRow>(row_count as usize),
+            match (try_zeroed::<u8>(rb_len), try_zeroed::<PeelRow>(row_count as usize),
                 try_zeroed::<PeelColumn>(column_count as usize), try_zeroed::<PeelRefs>(column_count as usize),
                 try_zeroed::<PeelAvalancheFrame>(column_count as usize), try_zeroed::<u16>(column_count as usize),
-                try_zeroed::<u8>(row_count as usize),
-                try_zeroed::<ReceivedPacketRecord>(received_packet_slots as usize),
+                try_zeroed::<u8>(row_count as usize), try_zeroed::<ReceivedPacketRecord>(received_packet_slots as usize),
             ) {
                 (Some(rb), Some(pr), Some(pc), Some(refs), Some(av), Some(orow), Some(co), Some(rp)) => {
                     self.recovery_blocks = rb; self.peel_rows = pr; self.peel_cols = pc; self.peel_col_refs = refs;
-                    self.peel_avalanche = av; self.original_row = orow; self.copied_original = co;
-                    self.received_packets = rp;
+                    self.peel_avalanche = av; self.original_row = orow; self.copied_original = co; self.received_packets = rp;
                     true }
                 _ => false, } };
         if !ok { self.free_workspace(); return false; }
@@ -1225,21 +1137,18 @@ impl Codec {
     fn find_received_packet(&self, block_id: u32) -> (ReceivedPacketLookup, usize) {
         if self.received_packets.is_empty() || self.received_packet_slots == 0 {
             return (ReceivedPacketLookup::Full, usize::MAX); }
-        let mask = self.received_packet_slots - 1;
-        let mut slot = packet_id_hash(block_id, self.received_id_hash_salt) & mask;
+        let mask = self.received_packet_slots - 1; let mut slot = packet_id_hash(block_id, self.received_id_hash_salt) & mask;
         for _probe in 0..self.received_packet_slots {
             let record = &self.received_packets[slot as usize];
             if record.occupied == 0 {
                 let r = if self.received_packet_count >= self.received_packet_limit {
-                    ReceivedPacketLookup::Full
-                } else { ReceivedPacketLookup::New };
+                    ReceivedPacketLookup::Full } else { ReceivedPacketLookup::New };
                 return (r, slot as usize); }
             if record.block_id == block_id { return (ReceivedPacketLookup::Existing, slot as usize); }
             slot = (slot + 1) & mask; }
         (ReceivedPacketLookup::Full, usize::MAX) }
     fn remember_received_packet(&mut self, slot: usize, block_id: u32, hash0: u64, hash1: u64) {
-        if slot >= self.received_packets.len()
-            || self.received_packets[slot].occupied != 0
+        if slot >= self.received_packets.len() || self.received_packets[slot].occupied != 0
             || self.received_packet_count >= self.received_packet_limit
         { return; }
         let record = &mut self.received_packets[slot]; record.hash0 = hash0; record.hash1 = hash1;
@@ -1249,23 +1158,19 @@ impl Codec {
     fn generate_row(&self, block_id: u32, out: &mut [u8], bytes: usize) {
         let bb = self.block_bytes; let block_count = self.block_count as usize; let rb = &self.recovery_blocks;
         let blk = |i: usize| -> &[u8] { assert!((i as u32) < self.recovery_rows); &rb[bb * i..bb * i + bytes] };
-        let out = &mut out[..bytes];
-        let params = PeelRowParameters::new(block_id, self.p_seed, self.block_count, self.mix_count);
+        let out = &mut out[..bytes]; let params = PeelRowParameters::new(block_id, self.p_seed, self.block_count, self.mix_count);
         let mut iter = PeelRowIterator::new(&params, self.block_count, self.block_next_prime);
         let mix = RowMixIterator::new(&params, self.mix_count, self.mix_next_prime);
-        let peel_0 = iter.get_column() as usize; let first = blk(peel_0);
-        let mix0 = blk(block_count + mix.columns[0] as usize);
+        let peel_0 = iter.get_column() as usize; let first = blk(peel_0); let mix0 = blk(block_count + mix.columns[0] as usize);
         if iter.iterate() {
             let peel_1 = iter.get_column() as usize; gf256::addset_mem(out, first, blk(peel_1));
             while iter.iterate() { let peel_x = iter.get_column() as usize; gf256::add_mem(out, blk(peel_x)); }
-            gf256::add_mem(out, mix0);
-        } else { gf256::addset_mem(out, first, mix0); }
+            gf256::add_mem(out, mix0); } else { gf256::addset_mem(out, first, mix0); }
         let mix1 = blk(block_count + mix.columns[1] as usize); let mix2 = blk(block_count + mix.columns[2] as usize);
         gf256::add2_mem(out, mix1, mix2); }
     pub fn reconstruct_output(&mut self, message_out: &mut [u8]) -> WirehairResult {
         let message_bytes = message_out.len() as u64;
-        if self.mode != Mode::DecodeComplete {
-            return if self.mode == Mode::Decoder { R::NeedMore } else { R::InvalidInput }; }
+        if self.mode != Mode::DecodeComplete { return if self.mode == Mode::Decoder { R::NeedMore } else { R::InvalidInput }; }
         let expected = self.block_bytes as u64 * (self.block_count as u64 - 1) + self.output_final_bytes as u64;
         if message_bytes != expected { return R::InvalidInput; }
         if self.decode_failed { return R::InvalidInput; }
@@ -1321,19 +1226,16 @@ impl Codec {
         let result = self.solve_matrix();
         if result == R::Success { self.generate_recovery_blocks(); R::Success } else if result == R::NeedMore {
             self.mode = Mode::Failed;
-            R::BadPeelSeed
-        } else { self.mode = Mode::Failed; result } }
+            R::BadPeelSeed } else { self.mode = Mode::Failed; result } }
     pub fn encode(&self, block_id: u32, block_out: &mut [u8], out_buffer_bytes: u32) -> u32 {
         if !self.can_encode() || !self.recovery_ready { return 0; }
         let copy_bytes = if block_id == (self.block_count as u32).wrapping_sub(1) {
-            self.input_final_bytes
-        } else { self.block_bytes as u32 };
+            self.input_final_bytes } else { self.block_bytes as u32 };
         let capacity = out_buffer_bytes.min(block_out.len().min(u32::MAX as usize) as u32);
         if capacity < copy_bytes { return 0; }
         let n = copy_bytes as usize;
         if block_id < self.block_count as u32 && !self.original_out_of_order {
-            let off = self.block_bytes * block_id as usize;
-            block_out[..n].copy_from_slice(&self.input.bytes()[off..off + n]);
+            let off = self.block_bytes * block_id as usize; block_out[..n].copy_from_slice(&self.input.bytes()[off..off + n]);
             return copy_bytes; }
         self.generate_row(block_id, block_out, n);
         copy_bytes } }
@@ -1376,8 +1278,7 @@ impl Codec {
         let row_i = self.row_count;
         if row_i >= self.block_count {
             let result = self.resume_solve_matrix_internal(block_id, Some(block_in), true);
-            if result == R::Success || result == R::NeedMore {
-                self.remember_received_packet(slot, block_id, hash0, hash1); }
+            if result == R::Success || result == R::NeedMore { self.remember_received_packet(slot, block_id, hash0, hash1); }
             if result == R::Success {
                 self.generate_recovery_blocks(); self.decode_complete = true; self.mode = Mode::DecodeComplete;
             } else if result != R::NeedMore { self.decode_failed = true; self.mode = Mode::Failed; }

@@ -3,8 +3,7 @@ use shielded_transport_pigeon::{pump::port::lockfree::*, stp::*}; use std::sync:
 use std::time::{Duration, Instant};
 pub fn setup() -> (Pump, LockfreeEndpoint, STPAddress) { setup_with(RingConfig::default(), 2_000_000) }
 pub fn setup_with(rings: RingConfig, maximum: usize) -> (Pump, LockfreeEndpoint, STPAddress) {
-    let probe = std::net::UdpSocket::bind("[::1]:0").unwrap();
-    let port = probe.local_addr().unwrap().port(); drop(probe);
+    let probe = std::net::UdpSocket::bind("[::1]:0").unwrap(); let port = probe.local_addr().unwrap().port(); drop(probe);
     let key = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b).unwrap();
     let address = STPAddress::from(std::net::Ipv6Addr::LOCALHOST, port, &key);
     let (pump, endpoint) = new_pump_with_options(vec![key], port, None, (1_000_000, 32 << 20, 32 << 20), maximum, NetworkThreadOptions { rings, ..Default::default() });
@@ -35,7 +34,6 @@ pub fn send(ep: &mut LockfreeEndpoint, peer: ConnectionKey, mut bytes: Vec<u8>) 
 pub fn receive(ep: &mut LockfreeEndpoint, count: usize) -> Vec<(ConnectionKey, Vec<u8>)> {
     let deadline = Instant::now() + Duration::from_secs(20); let mut messages = Vec::new();
     while messages.len() < count {
-        messages.extend(drain(ep));
-        assert!(Instant::now() < deadline, "receive timed out: {}/{}", messages.len(), count);
+        messages.extend(drain(ep)); assert!(Instant::now() < deadline, "receive timed out: {}/{}", messages.len(), count);
         if messages.len() < count { assert!(ep.park_until_ready()); } }
     messages }

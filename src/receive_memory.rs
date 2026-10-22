@@ -1,6 +1,5 @@
 use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
-#[derive(Debug)]
-pub struct ReceiveMemoryBudget { limit: usize, used: AtomicUsize, peak: AtomicUsize, parent: Option<Arc<Self>>,
+#[derive(Debug)] pub struct ReceiveMemoryBudget { limit: usize, used: AtomicUsize, peak: AtomicUsize, parent: Option<Arc<Self>>,
     workers: AtomicUsize, worker_peak: AtomicUsize, worker_limit: usize }
 impl ReceiveMemoryBudget {
     pub fn new(limit: usize) -> Arc<Self> { Arc::new(Self { limit, ..Default::default() }) }
@@ -14,8 +13,7 @@ impl ReceiveMemoryBudget {
     pub(crate) fn acquire_worker(&self) -> bool {
         if let Ok(old) = self.workers.fetch_update(Ordering::AcqRel, Ordering::Acquire,
             |n| (n < self.worker_limit).then_some(n + 1)) {
-            self.worker_peak.fetch_max(old + 1, Ordering::Relaxed); true
-        } else { false } }
+            self.worker_peak.fetch_max(old + 1, Ordering::Relaxed); true } else { false } }
     pub(crate) fn worker_peak(&self) -> usize { self.worker_peak.load(Ordering::Relaxed) }
     pub(crate) fn release_worker(&self) { self.workers.fetch_sub(1, Ordering::AcqRel); }
     pub(crate) fn worker_limit_reached(&self) -> bool { self.workers.load(Ordering::Acquire) >= self.worker_limit }
@@ -48,7 +46,6 @@ impl Reservation {
     pub(crate) fn bytes(&self) -> usize { self.bytes }
     pub(crate) fn absorb(&mut self, mut donor: Reservation) -> Result<(), Reservation> {
         if !Arc::ptr_eq(&self.budget, &donor.budget) { return Err(donor); }
-        let Some(bytes) = self.bytes.checked_add(donor.bytes) else { return Err(donor); }; self.bytes = bytes;
-        donor.bytes = 0;
+        let Some(bytes) = self.bytes.checked_add(donor.bytes) else { return Err(donor); }; self.bytes = bytes; donor.bytes = 0;
         Ok(()) } }
 impl Drop for Reservation { fn drop(&mut self) { self.budget.release(self.bytes); } }

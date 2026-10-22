@@ -1,8 +1,6 @@
-use std::sync::{Arc, Mutex, OnceLock}; use std::collections::BTreeMap;
-pub const PLAN_VERSION: &str = "frozen-target-v1";
+use std::sync::{Arc, Mutex, OnceLock}; use std::collections::BTreeMap; pub const PLAN_VERSION: &str = "frozen-target-v1";
 pub const FORECAST_SHA256: &str = "5e5081cd1ebdc9ddb78391fdb8f7eaaabdb74586bda86bbc6d590a238e153ef5";
-pub const MIX_SEED: u64 = 0x5354505f544d0001; pub const EVIDENCE_CAPACITY: usize = 4096;
-pub const MAX_PLAN_K: u32 = 32000;
+pub const MIX_SEED: u64 = 0x5354505f544d0001; pub const EVIDENCE_CAPACITY: usize = 4096; pub const MAX_PLAN_K: u32 = 32000;
 const fn adaptive_root_source_upper(total:usize)->u64 {
     if total==0 {return 0;}
     let units=total/crate::stp::ADAPTIVE_MIN_UNIT_LEN; let units=if units==0 {1}else{units};
@@ -17,8 +15,7 @@ pub(crate) fn initialize(selector:u32, profile:Option<&str>, cost:u32, cap:u32, 
         Some("g4") => ("g4",0.04354000000000002,333.33333333333337,MIX_SEED),
         Some("b20r20") => ("b20r20",0.005739999999999967,33.333333333333336,MIX_SEED),
         _ => return Err("target validation requires STP_COHORT_PROFILE=g4 or b20r20".into()) };
-    let _=risk_config(); let _=tail_config(); let _=dup_config(); let _=rand_config();
-    crate::stp::initialize_delay_event();
+    let _=risk_config(); let _=tail_config(); let _=dup_config(); let _=rand_config(); crate::stp::initialize_delay_event();
     let _=CONFIG.set(c); Ok(()) }
 static OVERRIDE: OnceLock<Option<(f64,f64,f64)>> = OnceLock::new();
 fn tv_override() -> Option<(f64,f64,f64)> {
@@ -89,8 +86,7 @@ fn background_risk(s:RiskSnapshot,c:RiskConfig)->f64 {
         4=>match (cc,queue) {(Some(a),Some(b))=>a.min(b),(a,b)=>a.or(b).unwrap_or(0.)},
         _=>unreachable!(), } }
 fn background_from(s:RiskSnapshot,cfg:Option<RiskConfig>,now:u64,outage:bool)->bool {
-    !outage && now>s.rand_guard_until_ns
-        && cfg.is_none_or(|c|background_risk(s,c)==0.) }
+    !outage && now>s.rand_guard_until_ns && cfg.is_none_or(|c|background_risk(s,c)==0.) }
 pub(crate) fn rand_enabled()->bool {rand_config().is_some()}
 pub(crate) fn rand_background(state: &RiskState,outage:bool)->bool {
     if !rand_enabled() {return false;}
@@ -182,8 +178,7 @@ pub(crate) fn duplicate_now(state: &RiskState,)->bool {
     let cfg=risk_config(); let mut s=state.0.lock().unwrap(); refresh_latch(&mut s);
     duplicate_from(*s,cfg) }
 pub(crate) fn risk_admission(state: &RiskState,) -> RiskAdmission {
-    let cfg=risk_config(); let rand=rand_config();
-    let base=if cfg.is_some() || rand.is_some() {tv_override().unwrap().0}else{0.};
+    let cfg=risk_config(); let rand=rand_config(); let base=if cfg.is_some() || rand.is_some() {tv_override().unwrap().0}else{0.};
     let mut s=state.0.lock().unwrap(); refresh_latch(&mut s); let a=rand_admission_from(*s,cfg,base,rand);
     if rand.is_some() {s.rand.p_base=a.p_base;}
     a }
@@ -204,8 +199,7 @@ fn tail_from(k:u32,remaining:u32,selector:u32,profile:&str,mix_draw:u64,s:RiskSn
     let tail_draw=draw(mix_draw^0x5441494c5f525356);
     let reserve=if kt==0 {0}else if kt<=MAX_PLAN_K {
         plan_for_risk(kt,selector,profile,tail_draw,a,Some(c))?.proactive
-    }else {
-        plan_with_policy_max(kt,selector,profile,tail_draw,Some((a.p_eff,c.eps)),tv_override(),MAX_TAIL_PLAN_K)?.proactive };
+    }else { plan_with_policy_max(kt,selector,profile,tail_draw,Some((a.p_eff,c.eps)),tv_override(),MAX_TAIL_PLAN_K)?.proactive };
     Ok(TailPlan{risk:a.risk,k:kt,added:reserve.saturating_sub(remaining)}) }
 pub(crate) fn tail_plan(state: &RiskState,k:u32,remaining:u32,selector:u32,mix_draw:u64,root_base:f64) -> Result<TailPlan,String> {
     let tail=tail_config();
@@ -216,8 +210,7 @@ pub fn configuration() -> (&'static str,f64,f64,u64) { CONFIG.get().copied().unw
 #[derive(Clone,Copy,Debug,Default,PartialEq)]
 pub struct Plan { pub k:u32, pub proactive:u32, pub lower:u32, pub upper:u32, pub upper_probability:f64, pub mix_threshold:u64, pub mix_draw:u64 }
 pub fn draw(sequence:u64) -> u64 {
-    let mut z=MIX_SEED.wrapping_add(sequence.wrapping_mul(0x9e3779b97f4a7c15));
-    z=(z^(z>>30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    let mut z=MIX_SEED.wrapping_add(sequence.wrapping_mul(0x9e3779b97f4a7c15)); z=(z^(z>>30)).wrapping_mul(0xbf58476d1ce4e5b9);
     z=(z^(z>>27)).wrapping_mul(0x94d049bb133111eb); z^(z>>31) }
 fn delivery(k:u32,r:u32,p:f64) -> f64 {
     let n=k+r; let mode=(((n+1) as f64*p).floor() as u32).min(n);
@@ -270,8 +263,7 @@ fn policy_parameters(profile:&str,policy:Option<(f64,f64,f64)>) -> Result<(f64,f
     match (policy,profile) {(Some(o),_)=>Ok(o),(None,"g4")=>Ok((0.04354000000000002,333.33333333333337,1.)),(None,"b20r20")=>Ok((0.005739999999999967,33.333333333333336,1.)),_=>Err("unknown frozen profile".into())}
 }
 fn unit_loss(profile:&str,loss:Option<(f64,Option<f64>)>,offset:u32,len:u32,total:u32,policy:Option<(f64,f64,f64)>) -> Result<(f64,Option<f64>),String> {
-    validate_unit_extent(offset,len,total)?; let (base,h,e)=policy_parameters(profile,policy)?;
-    let p=loss.map_or(base,|v|v.0);
+    validate_unit_extent(offset,len,total)?; let (base,h,e)=policy_parameters(profile,policy)?; let p=loss.map_or(base,|v|v.0);
     if !p.is_finite() || p<=0. || p>=1. || !h.is_finite() || h<=0. || !e.is_finite() || e<=0. {
         return Err("invalid unit admission loss/policy".into()); }
     let root_k=adaptive_root_source_upper(total as usize);
@@ -280,8 +272,7 @@ fn unit_loss(profile:&str,loss:Option<(f64,Option<f64>)>,offset:u32,len:u32,tota
     if !root_epsilon.is_finite() || root_epsilon<=0. || root_epsilon>1. || !epsilon.is_finite() || epsilon<=0. || epsilon>1. {
         return Err("invalid unit admission epsilon".into()); }
     Ok((p,Some(epsilon))) }
-#[cfg(feature="research_target_validation")]
-pub fn plan_from_evidence(r:&OwnerEvidence,profile:&str) -> Result<Plan,String> {
+#[cfg(feature="research_target_validation")] pub fn plan_from_evidence(r:&OwnerEvidence,profile:&str) -> Result<Plan,String> {
     let mut loss=risk_config().map(|c|(r.p_eff,c.eps)).or_else(||rand_config().map(|_|(r.p_eff,None)));
     if r.unit_len!=0 || r.root_total!=0 {
         validate_unit_extent(r.segment_offset,r.unit_len,r.root_total)?;
@@ -307,14 +298,12 @@ fn plan_with_policy_max(k:u32,selector:u32,profile:&str,mix_draw:u64,loss:Option
     }
     let cdf=|r| if k<=MAX_PLAN_K {delivery(k,r,p)}else{tail_delivery(k,r,p).0};
     let hi=reserve_upper(&cdf,target,max_k)?; let lo=hi.saturating_sub(1); let dlo=cdf(lo);let dhi=cdf(hi);
-    let w=if dhi>dlo {((1.-target-dlo)/(dhi-dlo)).clamp(0.,1.)}else{0.};
-    let threshold=(w*18446744073709551616.).floor() as u64;
+    let w=if dhi>dlo {((1.-target-dlo)/(dhi-dlo)).clamp(0.,1.)}else{0.}; let threshold=(w*18446744073709551616.).floor() as u64;
     let proactive=if selector==1 || w==1. || mix_draw<threshold {hi}else{lo};
     Ok(Plan{k,proactive,lower:lo,upper:hi,upper_probability:w,mix_threshold:threshold,mix_draw}) }
 #[cfg(feature="research_target_validation")] #[derive(Clone,Copy,Debug,Default,PartialEq)] pub struct OwnerEvidence {
     pub generation:u64, pub root_id:u64, pub package_id:u64, pub root_ordinal:u64, pub app_tag:[u8;8],
-    pub segment_offset:u32, pub selector:u32, pub k:u32, pub current_k:u32, pub groups:u32,
-    pub unit_len:u32, pub root_total:u32,
+    pub segment_offset:u32, pub selector:u32, pub k:u32, pub current_k:u32, pub groups:u32, pub unit_len:u32, pub root_total:u32,
     pub proactive:u32, pub lower:u32, pub upper:u32, pub w_bits:u64, pub mix_threshold:u64, pub mix_draw:u64,
     pub known_losses:u32, pub planned_repairs:u32, pub sources_emitted:u64, pub repairs_emitted:u64,
     pub started_ns:u64, pub sealed_ns:u64, pub sealed:bool, pub restarts:u32,
@@ -324,8 +313,7 @@ pub(crate) fn active()->bool {CONFIG.get().is_some()}
 #[cfg(feature="research_target_validation")] pub(crate) type Owner = Arc<Mutex<OwnerEvidence>>;
 #[cfg(feature="research_target_validation")] #[derive(Debug,Default)]
 pub struct Evidence {pub rows:Vec<OwnerEvidence>,pub dropped:u64}
-#[cfg(feature="research_target_validation")] #[derive(Default)]
-struct Audit {next:u64, rows:BTreeMap<u64,Owner>,dropped:u64}
+#[cfg(feature="research_target_validation")] #[derive(Default)] struct Audit {next:u64, rows:BTreeMap<u64,Owner>,dropped:u64}
 #[cfg(feature="research_target_validation")] static AUDIT:OnceLock<Mutex<Audit>>=OnceLock::new();
 #[cfg(feature="research_target_validation")] fn audit()->&'static Mutex<Audit> {AUDIT.get_or_init(Default::default)}
 #[cfg(feature="research_target_validation")] pub(crate) fn register(mut row:OwnerEvidence)->Owner {

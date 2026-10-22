@@ -1,22 +1,18 @@
 //! Wirehair tools for the in-crate Wirehair port.
 //!
-//! Pure-Rust port of `third_party/wirehair/WirehairTools.{h,cpp}` and
-//! `WirehairHeavy.h`, including the per-N seed fixup tables
-//! (`WirehairDenseFixups.inc`, `WirehairPeelFixups.inc`).  Every constant,
-//! table and PRNG step is preserved exactly; the tables at the bottom of this
-//! file are generated mechanically from the vendored C++ sources.
+//! Pure-Rust port of `third_party/wirehair/WirehairTools.{h,cpp}` and `WirehairHeavy.h`, including the per-N seed fixup tables
+//! (`WirehairDenseFixups.inc`, `WirehairPeelFixups.inc`). Every constant, table and PRNG step is preserved exactly; the tables at
+//! the bottom of this file are generated mechanically from the vendored C++ sources.
 //!
-//! Not ported: `SIMDSafeAllocate`/`SIMDSafeFree` (use a zeroed `Vec<u8>`),
-//! the `WH_SEED_KNOBS` / `WH_PEELCAP` experiment (off in the vendored build),
-//! and the debug-only `CAT_DEBUG_ASSERT` checks.  Preconditions that the C++
-//! leaves to the caller (for example an index past a table) panic here
-//! instead of reading out of bounds.
+//! Not ported: `SIMDSafeAllocate`/`SIMDSafeFree` (use a zeroed `Vec<u8>`), the `WH_SEED_KNOBS` / `WH_PEELCAP` experiment (off in
+//! the vendored build), and the debug-only `CAT_DEBUG_ASSERT` checks. Preconditions that the C++ leaves to the caller (for
+//! example an index past a table) panic here instead of reading out of bounds.
 //!
-//! Original code: Copyright (c) 2012-2018 Christopher A. Taylor.  All rights
-//! reserved.  Rust port derived from it under the same license:
+//! Original code: Copyright (c) 2012-2018 Christopher A. Taylor. All rights reserved. Rust port derived from it under the same
+//! license:
 //!
-//! Redistribution and use in source and binary forms, with or without
-//! modification, are permitted provided that the following conditions are met:
+//! Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following
+//! conditions are met:
 //!
 //! * Redistributions of source code must retain the above copyright notice,
 //!   this list of conditions and the following disclaimer.
@@ -27,16 +23,12 @@
 //!   used to endorse or promote products derived from this software without
 //!   specific prior written permission.
 //!
-//! THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-//! AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-//! IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-//! ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
-//! LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-//! CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
-//! SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
-//! INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-//! CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
-//! ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+//! THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING,
+//! BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT
+//! SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+//! CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+//! PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+//! TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 //! POSSIBILITY OF SUCH DAMAGE.
 #![allow(dead_code)]
 pub const REF_LIST_MAX: usize = 32; pub const MAX_DENSE_ROWS: usize = 500; pub const MAX_EXTRA_ROWS: usize = 32;
@@ -53,10 +45,7 @@ impl PcgRandom {
         self.state = 0; self.inc = (y << 1) | 1; self.next(); self.state = self.state.wrapping_add(x);
         self.next(); }
     #[inline(always)] pub fn next(&mut self) -> u32 {
-        let oldstate = self.state;
-        self.state = oldstate
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(self.inc);
+        let oldstate = self.state; self.state = oldstate.wrapping_mul(6364136223846793005).wrapping_add(self.inc);
         let xorshifted = (((oldstate >> 18) ^ oldstate) >> 27) as u32; let rot = (oldstate >> 59) as u32;
         xorshifted.rotate_right(rot) } }
 #[inline(always)] pub fn rol64(n: u64, r: u32) -> u64 { n.rotate_left(r) }
@@ -87,8 +76,7 @@ pub fn next_prime16(n: u16) -> u16 {
             if p > p_max { return n; }
             if n as u32 % p == 0 {
                 if offset >= SIEVE_TABLE_SIZE { offset -= SIEVE_TABLE_SIZE; }
-                next = SIEVE_TABLE[offset as usize] as u16; offset += next as u32 + 1;
-                n = n.wrapping_add(next).wrapping_add(1);
+                next = SIEVE_TABLE[offset as usize] as u16; offset += next as u32 + 1; n = n.wrapping_add(next).wrapping_add(1);
                 if p_max2 < n as u32 { p_max += 1; p_max2 = p_max * p_max; }
                 continue 'try_next; } }
         return n; } }
@@ -101,9 +89,7 @@ pub fn add_invertible_gf2_matrix(matrix: &mut [u64], offset: u32, pitch_words: u
         let mut row = 0usize;
         for ii in 0..n {
             let column_i = offset + ii; matrix[row + (column_i >> 6) as usize] ^= 1u64 << (column_i & 63);
-            if ii + 1 < n {
-                let column_j = column_i + 1;
-                matrix[row + (column_j >> 6) as usize] ^= 1u64 << (column_j & 63); }
+            if ii + 1 < n { let column_j = column_i + 1; matrix[row + (column_j >> 6) as usize] ^= 1u64 << (column_j & 63); }
             row += pitch; }
         return; }
     let seed = INVERTIBLE_MATRIX_SEEDS[n as usize]; let mut prng = PcgRandom::seeded(seed as u64, 0);
@@ -152,8 +138,7 @@ pub fn shuffle_deck16(prng: &mut PcgRandom, deck: &mut [u16], count: u32) {
                     let jj = (rv >> 8) as u8 as u32 % ii; deck_step(deck, ii, jj); ii += 1;
                     let jj = (rv >> 16) as u8 as u32 % ii; deck_step(deck, ii, jj); ii += 1;
                     let jj = (rv >> 24) as u8 as u32 % ii; deck_step(deck, ii, jj);
-                    ii += 1; } } }
-    } else {
+                    ii += 1; } } } } else {
         let mut ii: u32 = 1;
         loop {
             let rv = prng.next();
@@ -226,8 +211,7 @@ const HEAVY_BYTE_LOOKUP: [[u8; 4]; 16] = [
     [0, 0, 0, 0], [1, 0, 0, 0], [0, 1, 0, 0], [1, 1, 0, 0], [0, 0, 1, 0], [1, 0, 1, 0], [0, 1, 1, 0], [1, 1, 1, 0],
     [0, 0, 0, 1], [1, 0, 0, 1], [0, 1, 0, 1], [1, 1, 0, 1],
     [0, 0, 1, 1], [1, 0, 1, 1], [0, 1, 1, 1], [1, 1, 1, 1], ];
-#[inline(always)]
-pub fn heavy_window_word(bits: u32) -> u32 { u32::from_ne_bytes(HEAVY_BYTE_LOOKUP[(bits & 15) as usize]) }
+#[inline(always)] pub fn heavy_window_word(bits: u32) -> u32 { u32::from_ne_bytes(HEAVY_BYTE_LOOKUP[(bits & 15) as usize]) }
 #[inline(always)] pub fn add_heavy_window(destination: &mut [u8], bits: u32, coefficient: u8) {
     let d = &mut destination[..4]; let mut w = [0u8; 4]; w.copy_from_slice(d);
     let word = u32::from_ne_bytes(w) ^ heavy_window_word(bits).wrapping_mul(coefficient as u32);
@@ -242,8 +226,7 @@ pub fn get_dense_count(n: u32) -> u16 {
     if n < TINY_TABLE_COUNT + SMALL_TABLE_COUNT {
         if n < TINY_TABLE_COUNT { return TINY_DENSE_COUNTS[n as usize] as u16; } else if n <= 500 {
             low = (64, 26); high = (500, 35);
-        } else if n <= 1000 { low = (500, 35); high = (1000, 48); } else { low = (1000, 48); high = (2048, 62); }
-    } else {
+        } else if n <= 1000 { low = (500, 35); high = (1000, 48); } else { low = (1000, 48); high = (2048, 62); } } else {
         let mut lo = 0usize; let mut hi = DENSE_POINTS.len() - 1;
         loop {
             let mid = (hi + lo) / 2;
@@ -260,20 +243,17 @@ pub fn get_dense_count(n: u32) -> u16 {
     dense_count }
 pub fn get_dense_seed_pre_fixup(n: u32, dense_count: u32) -> u16 {
     if n < TINY_TABLE_COUNT { TINY_DENSE_SEEDS[n as usize] } else if n < TINY_TABLE_COUNT + SMALL_TABLE_COUNT {
-        SMALL_DENSE_SEEDS[(n - TINY_TABLE_COUNT) as usize] as u16
-    } else { DENSE_SEEDS[(dense_count / 4) as usize] as u16 } }
+        SMALL_DENSE_SEEDS[(n - TINY_TABLE_COUNT) as usize] as u16 } else { DENSE_SEEDS[(dense_count / 4) as usize] as u16 } }
 fn find_fixup(table: &[(u16, u8)], n: u32) -> Option<u8> {
     let (mut lo, mut hi) = (0usize, table.len());
     while lo < hi { let mid = (lo + hi) >> 1; if (table[mid].0 as u32) < n { lo = mid + 1; } else { hi = mid; } }
     if lo < table.len() && table[lo].0 as u32 == n { Some(table[lo].1) } else { None } }
 pub fn get_dense_seed(n: u32, dense_count: u32) -> u16 {
-    if let Some(seed) = find_fixup(&DENSE_SEED_FIXUPS, n) {
-        if dense_count == get_dense_count(n) as u32 { return seed as u16; } }
+    if let Some(seed) = find_fixup(&DENSE_SEED_FIXUPS, n) { if dense_count == get_dense_count(n) as u32 { return seed as u16; } }
     get_dense_seed_pre_fixup(n, dense_count) }
 pub fn get_peel_seed_pre_fixup(n: u32) -> u16 {
     if n < TINY_TABLE_COUNT + SMALL_TABLE_COUNT {
-        SMALL_PEEL_SEEDS[n as usize] as u16
-    } else { PEEL_SEEDS[(n % PEEL_SEED_SUBDIVISIONS) as usize] as u16 } }
+        SMALL_PEEL_SEEDS[n as usize] as u16 } else { PEEL_SEEDS[(n % PEEL_SEED_SUBDIVISIONS) as usize] as u16 } }
 pub fn get_peel_seed(n: u32) -> u16 {
     if let Some(seed) = find_fixup(&PEEL_SEED_FIXUPS, n) { return seed as u16; }
     get_peel_seed_pre_fixup(n) }

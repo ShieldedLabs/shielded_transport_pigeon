@@ -1,6 +1,6 @@
-//! Authenticated adversarial receive-memory probes. Each invocation is a fresh process.
-//! `stp_memory sparse|inline|workers|pending|complete COUNT SIZE [CONNECTIONS]`
-//! SIZE is bytes (plain end offset / FEC message length). Never sends outside loopback.
+//! Authenticated adversarial receive-memory probes. Each invocation is a fresh process. `stp_memory
+//! sparse|inline|workers|pending|complete COUNT SIZE [CONNECTIONS]` SIZE is bytes (plain end offset / FEC message length). Never
+//! sends outside loopback.
 extern crate shielded_transport_pigeon as stp_core;
 #[path = "../../tests/support/pump_thread.rs"] mod pump_thread;
 use pump_thread::*; use shielded_transport_pigeon::stp::*; use std::{net::UdpSocket, time::Duration};
@@ -11,8 +11,7 @@ impl Peer {
         let key = new_keypair_from_connect_magic1(magic).unwrap(); let prologue = &magic.to_le_bytes()[..6];
         let mut hs = shielded_transport_pigeon::helpers::noise_initiator(&params, prologue, &key.private, &server.public).unwrap();
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap(); socket.connect(("127.0.0.1", port)).unwrap();
-        socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-        let mut b = [0u8; 2048]; b[..6].copy_from_slice(prologue);
+        socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap(); let mut b = [0u8; 2048]; b[..6].copy_from_slice(prologue);
         let n = hs.write_message(&build_magic2_client_block(), &mut b[6..]).unwrap(); socket.send(&b[..6+n]).unwrap();
         let n = socket.recv(&mut b).ok()?; hs.read_message(&b[6..n], &mut [0;1024]).unwrap();
         Some(Self { socket, cipher: ConnectionCipherTriplet::new_from_old_init_only(hs.into_stateless_transport_mode().unwrap()),
@@ -27,8 +26,7 @@ impl Peer {
         if let Some(w) = word {
             payload[15..19].copy_from_slice(&(w as u32).to_le_bytes());
             payload[19..21].copy_from_slice(&((w >> 32) as u16).to_le_bytes()); }
-        payload[o..o+bytes.len()].copy_from_slice(bytes);
-        assert!(self.seq < shielded_transport_pigeon::sequence::ACK_SPACE - 1);
+        payload[o..o+bytes.len()].copy_from_slice(bytes); assert!(self.seq < shielded_transport_pigeon::sequence::ACK_SPACE - 1);
         let mut b = vec![0; payload.len()+CONNECTED_HEADER_SIZE+16]; b[..2].copy_from_slice(&self.prefix.to_le_bytes());
         let low = self.seq as u32 & shielded_transport_pigeon::sequence::COUNTER_MASK;
         b[2..6].copy_from_slice(&low.to_le_bytes()); let (ad, body) = b.split_at_mut(CONNECTED_HEADER_SIZE);

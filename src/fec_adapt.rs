@@ -26,8 +26,7 @@ pub(crate) fn parse_base_parity_model(value: Option<&str>, policy: RepairPolicy,
 static RESEARCH_BUDGET_BASE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
 #[doc(hidden)] pub fn research_p4_budget_base() -> u32 { RESEARCH_BUDGET_BASE.get().copied().unwrap_or(0) }
 pub(crate) fn parse_budget_base(value: Option<&str>, policy: RepairPolicy, width: usize, slipstream: bool, bonus: u32, event: u32, base: u32) -> Result<u32, String> {
-    let m = match value.unwrap_or("0") { "0" => 0, "1" => 1,
-        _ => return Err("STP_P4_BUDGET_BASE must be 0 or 1".to_string()) };
+    let m = match value.unwrap_or("0") { "0" => 0, "1" => 1, _ => return Err("STP_P4_BUDGET_BASE must be 0 or 1".to_string()) };
     if m != 0 && (policy != RepairPolicy::MessageBound || width != 1 || slipstream || bonus != 0 || event != 0 || base != 0) {
         return Err("STP_P4_BUDGET_BASE requires P4, STP_P4_INTERLEAVE_WIDTH=1, STP_P4_SLIPSTREAM=0, STP_P4_MEDIUM_BONUS_PERCENT=0, STP_P4_EVENT_REPAIR=0, STP_P4_BASE_PARITY_MODEL=0".to_string());
     }
@@ -42,8 +41,7 @@ static RESEARCH_COST_SMOOTH: std::sync::OnceLock<u32> = std::sync::OnceLock::new
 fn parse_cost_smooth(value: Option<&str>) -> Result<u32, String> {
     match value.unwrap_or("0") { "0" => Ok(0), "1" => Ok(1), _ => Err("STP_P4_COST_SMOOTH must be 0 or 1".into()) } }
 static RESEARCH_REPAIR_CAP_PERCENT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-#[doc(hidden)]
-pub fn research_p4_repair_cap_percent() -> u32 { RESEARCH_REPAIR_CAP_PERCENT.get().copied().unwrap_or(15) }
+#[doc(hidden)] pub fn research_p4_repair_cap_percent() -> u32 { RESEARCH_REPAIR_CAP_PERCENT.get().copied().unwrap_or(15) }
 pub(crate) fn parse_repair_cap_percent(value: Option<&str>, policy: RepairPolicy, width: usize, slipstream: bool, bonus: u32, event: u32, base: u32, budget: u32) -> Result<u32, String> {
     let cap = match value.unwrap_or("15") { "15" => 15, "25" => 25, "0" => 0,
         _ => return Err("STP_P4_REPAIR_CAP_PERCENT must be 15 or 25".to_string()) };
@@ -52,8 +50,7 @@ pub(crate) fn parse_repair_cap_percent(value: Option<&str>, policy: RepairPolicy
     }
     Ok(cap) }
 static RESEARCH_EMPIRICAL_TAIL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-#[doc(hidden)]
-pub fn research_p4_empirical_tail_calibration() -> u32 { RESEARCH_EMPIRICAL_TAIL.get().copied().unwrap_or(0) }
+#[doc(hidden)] pub fn research_p4_empirical_tail_calibration() -> u32 { RESEARCH_EMPIRICAL_TAIL.get().copied().unwrap_or(0) }
 pub(crate) fn parse_empirical_tail(value: Option<&str>, policy: RepairPolicy, width: usize, slipstream: bool, bonus: u32, event: u32, base: u32, budget: u32, cap: u32) -> Result<u32, String> {
     let q = match value.unwrap_or("0") { "0" => 0, "1" => 1,
         _ => return Err("STP_P4_EMPIRICAL_TAIL_CALIBRATION must be 0 or 1".into()) };
@@ -81,8 +78,7 @@ fn parse_interleave_width(value: Option<&str>) -> Result<usize, String> {
         _ => Err("STP_P4_INTERLEAVE_WIDTH must be 1, 2, or 4".to_string()), } }
 pub(crate) fn research_interleave_width() -> usize {
     if RepairPolicy::selected() == RepairPolicy::MessageBound {
-        RESEARCH_INTERLEAVE_WIDTH.get().copied().unwrap_or(1)
-    } else { 1 } }
+        RESEARCH_INTERLEAVE_WIDTH.get().copied().unwrap_or(1) } else { 1 } }
 impl RepairPolicy {
     fn selected() -> Self { RESEARCH_POLICY.get().copied().unwrap_or(Self::MessageBound) }
     fn parse(value: Option<&str>) -> Result<Self, String> {
@@ -130,8 +126,7 @@ fn policy_choice<T>(name: &str, invalid: &str, parse: impl FnOnce(Option<&str>) 
     Ok(()) }
 pub(crate) fn mean_repairs(k: u64, p: f64) -> u64 {
     if k == 0 { return 0; }
-    ((k as f64 * p.clamp(0.0, 0.9) / (1.0 - p.clamp(0.0, 0.9))).ceil() as u64)
-        .saturating_add(2).min(k) }
+    ((k as f64 * p.clamp(0.0, 0.9) / (1.0 - p.clamp(0.0, 0.9))).ceil() as u64).saturating_add(2).min(k) }
 #[derive(Clone, Copy, Debug)] pub(crate) struct AdaptiveFecConfig {
     pub eps: f64, pub min_loss: f64, pub initial_loss: f64, pub max_redundancy: f64, pub extra_blocks: u32,
     pub bucket_ns: u64, pub min_packets: u64, pub slot_ns: u64, pub slots: usize,
@@ -163,9 +158,7 @@ pub fn iid_count_quantile(n: u64, p: f64, eps: f64) -> u64 {
     let p = p.clamp(1e-9, 0.9); let eps = eps.clamp(1e-300, 0.5);
     if n <= EXACT_MAX_K {
         let (mut lo, mut hi) = (0u64, n);
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            if binomial_tail(n, p, mid + 1) <= eps { hi = mid; } else { lo = mid + 1; } }
+        while lo < hi { let mid = (lo + hi) / 2; if binomial_tail(n, p, mid + 1) <= eps { hi = mid; } else { lo = mid + 1; } }
         return lo; }
     let z = z_for_eps(eps); let np = n as f64 * p;
     let q = np + z * (np * (1.0 - p)).sqrt() + (z * z - 1.0) * (1.0 - 2.0 * p) / 6.0;
@@ -181,8 +174,7 @@ pub(crate) fn budget_repair_limit_for_cap(k: u64, cap_percent: u32) -> u64 {
     (cap_percent as u128 * k as u128 / 100) as u64 }
 const BASE_ITER_LIMIT: usize = 64;
 pub fn repair_blocks(k: u64, p: f64, z: f64, eps: f64, extra: u32, max_redundancy: f64) -> u64 {
-    let r = min_repair_blocks(k, p, z, eps) + extra as u64;
-    let cap = ((k as f64 * max_redundancy).ceil() as u64).max(1);
+    let r = min_repair_blocks(k, p, z, eps) + extra as u64; let cap = ((k as f64 * max_redundancy).ceil() as u64).max(1);
     r.clamp(1, cap) }
 #[derive(Clone, Copy, Debug)] struct ShortTerm { start_ns: u64, finalized: u64, lost: u64 }
 #[derive(Clone, Copy, Debug)] pub(crate) struct LossTracker {
@@ -213,8 +205,7 @@ impl LossTracker {
         self.last_refresh_ns = now_ns;
         if !self.have_sample { return; }
         let cfg = self.cfg; let n = cfg.slots.clamp(1, 16) as u64; let idx = now_ns / cfg.slot_ns.max(1);
-        let (finalized, lost) = self.ring.iter()
-            .filter(|s| s.0 != u64::MAX && s.0 + n > idx)
+        let (finalized, lost) = self.ring.iter().filter(|s| s.0 != u64::MAX && s.0 + n > idx)
             .fold((0u64, 0u64), |(f, l), s| (f + s.1, l + s.2));
         self.cached = lost as f64 / finalized.max(1) as f64; }
     pub fn estimate(&self) -> f64 { self.cached }
@@ -278,8 +269,7 @@ impl SpanLossProfile {
         self.tail_losses_latest_details(n,eps,latest.max(now_ns/(window_ns/2).max(1))) }
     fn tail_losses_latest_details(&self,n:u64,eps:f64,latest:u64)->(Option<u64>,u16,u64) {
         let pieces = n.div_ceil(65536).max(1); let n = n.div_ceil(pieces).max(2);
-        let scale = (64 - (n - 1).leading_zeros() as usize).saturating_sub(1).min(15);
-        let mut bins = [0u64; SPAN_LOSS_BINS];
+        let scale = (64 - (n - 1).leading_zeros() as usize).saturating_sub(1).min(15); let mut bins = [0u64; SPAN_LOSS_BINS];
         for h in 0..2 {
             if self.epochs[h] != u64::MAX && self.epochs[h] + 1 >= latest {
                 for (b, count) in bins.iter_mut().zip(self.hist[h][scale]) { *b += count as u64; } } }
@@ -316,8 +306,7 @@ impl SpanLossProfile {
     base_horizon: Option<u64>, }
 impl FecAdaptiveState {
     pub fn new(cfg: AdaptiveFecConfig, now_ns: u64) -> Self {
-        initialize_research_policy().expect("invalid transport research policy");
-        let tracker = LossTracker::new(cfg, now_ns);
+        initialize_research_policy().expect("invalid transport research policy"); let tracker = LossTracker::new(cfg, now_ns);
         FecAdaptiveState { tracker, policy: RepairPolicy::selected(), last_finalized: 0, last_lost: 0, p: tracker.estimate().max(cfg.min_loss), span: Box::new(SpanLossProfile::default()),
             base_parity: research_p4_base_parity_model() == 1, budget_base: research_p4_budget_base() == 1, repair_cap_percent: research_p4_repair_cap_percent(),
             empirical_tail: research_p4_empirical_tail_calibration() == 1, cost_smooth: research_p4_cost_smooth() == 1,
@@ -325,8 +314,7 @@ impl FecAdaptiveState {
             data_generation: { static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1); NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) }, base_now_ns: now_ns, base_horizon: None,
             diagnostic_created_ns:now_ns } }
     pub fn on_tick(&mut self, now_ns: u64) {
-        self.base_now_ns = self.base_now_ns.max(now_ns); let finalized = self.span.seen;
-        let lost = self.span.lost_total;
+        self.base_now_ns = self.base_now_ns.max(now_ns); let finalized = self.span.seen; let lost = self.span.lost_total;
         self.tracker.on_tick(now_ns, finalized - self.last_finalized, lost - self.last_lost);
         self.last_finalized = finalized; self.last_lost = lost;
         self.p = if self.policy == RepairPolicy::Reliability { self.tracker.estimate().max(self.tracker.cfg.min_loss) }
@@ -395,11 +383,10 @@ impl FecAdaptiveState {
         if p==0.0 || whole_k==0 || whole_k>u32::MAX as u64 {return None;}
         let h=self.base_horizon.unwrap_or(whole_k).max(1) as f64;
         let eps=(p/(1.0+whole_k as f64/h)/codecs.max(1) as f64).clamp(1e-12,0.5);
-        // Wirehair documents ~.02 mean extra symbols, not a worst-case bound. Model a
-        // geometric rank-risk prior .02 per extra equation, weighted by >=2 erasures;
-        // first repair is XOR and every sampled single erasure decodes without a reserve.
-        // This is an ASSUMED rank-tail heuristic, not a calibrated tail or bound.
-        // Native fixtures do NOT establish this geometric distribution.
+        // Wirehair documents ~.02 mean extra symbols, not a worst-case bound. Model a geometric rank-risk prior .02 per extra
+        // equation, weighted by >=2 erasures; first repair is XOR and every sampled single erasure decodes without a reserve.
+        // This is an ASSUMED rank-tail heuristic, not a calibrated tail or bound. Native fixtures do NOT establish this geometric
+        // distribution.
         let zero=(1.0-p).powf(whole_k as f64); let one=whole_k as f64*p*(1.0-p).powf(whole_k.saturating_sub(1) as f64);
         let multi=(1.0-zero-one).clamp(0.0,1.0);
         let empirical_multi=self.span.tail_losses_now(whole_k,eps*0.5,self.base_now_ns,self.tracker.cfg.window_ns).is_some_and(|q|q>=2);
@@ -427,19 +414,16 @@ impl FecAdaptiveState {
             let iid=if p<=0.9 {iid_count_quantile(n,p,eps*0.5)}else if n<=EXACT_MAX_K {
                 let(mut lo,mut hi)=(0,n);
                 while lo<hi {let mid=(lo+hi)/2;if 1.0-binomial_tail(n,1.0-p,n-mid)<=eps*0.5 {hi=mid;}else{lo=mid+1;}}
-                lo
-            }else{
+                lo }else{
                 let z=z_for_eps(eps*0.5);
                 (n as f64*p+z*(n as f64*p*(1.0-p)).sqrt()+((z*z-1.0)*(1.0-2.0*p)/6.0).max(0.0)).ceil().min(n as f64) as u64 };
-            let selected=empirical.unwrap_or(0).max(iid).min(n);
-            let Some(exposure)=ug.checked_add(e) else{return fail(capture);};
+            let selected=empirical.unwrap_or(0).max(iid).min(n); let Some(exposure)=ug.checked_add(e) else{return fail(capture);};
             let speculative=exposure.min(selected).saturating_add(rank);
             let Some(want)=d.checked_add(speculative) else{return fail(capture);}; let next=r.max(want);
             #[cfg(feature="research_budget_diagnostic")] if let Some(c)=capture.as_deref_mut() {
                 if i<crate::budget_diagnostic::DEMAND_ITERATION_LIMIT && next<=limit {
                     c.iterations[i]=crate::budget_diagnostic::DemandIteration {r,e,n,samples,empirical:empirical.unwrap_or(0),iid,selected,next_r:next as u32,scale,flags:u16::from(empirical.is_some())|if next==r {2}else{0}};
-                    c.header.iterations_count=(i+1)as u8;c.header.result_r=next as u32;
-                }else{c.header.flags|=16;} }
+                    c.header.iterations_count=(i+1)as u8;c.header.result_r=next as u32; }else{c.header.flags|=16;} }
             if next>limit {return fail(capture);}
             if next==r {return(r,false);}
             r=next; }
@@ -459,8 +443,7 @@ impl FecAdaptiveState {
                 if _iteration<crate::budget_diagnostic::DEMAND_ITERATION_LIMIT && next<=u32::MAX as u64 {
                     c.iterations[_iteration]=crate::budget_diagnostic::DemandIteration {r,e,n,samples:_samples,empirical:_empirical.unwrap_or(0),iid:_iid,selected,next_r:next as u32,scale:_scale,
                         flags:u16::from(_empirical.is_some())|if next==r {2}else{0}|if want>kg {4}else{0}|if _iteration+1==BASE_ITER_LIMIT&&next!=r {8}else{0}};
-                    c.header.iterations_count=(_iteration+1)as u8;
-                } else {c.header.flags|=16;}
+                    c.header.iterations_count=(_iteration+1)as u8; } else {c.header.flags|=16;}
                 c.header.result_r=next.min(u32::MAX as u64)as u32;
                 c.header.flags=(c.header.flags&!4)|if want>kg {4}else{0}; }
             if next==r {return(r,want>kg);}
@@ -483,8 +466,7 @@ impl FecAdaptiveState {
     pub fn base_initial_repairs(&self, kg: u64, eps: f64) -> (u64, bool) {
         let h = self.base_horizon.map_or(kg, |h| h.min(kg)); let mut b = 2.min(kg);
         for _ in 0..BASE_ITER_LIMIT {
-            let want = b.max(2u64.saturating_add(self.base_count_quantile(h.saturating_add(b), eps)));
-            let next = want.min(kg);
+            let want = b.max(2u64.saturating_add(self.base_count_quantile(h.saturating_add(b), eps))); let next = want.min(kg);
             if next == b { return (b, want > kg); }
             b = next; }
         (kg, true) }

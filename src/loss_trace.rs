@@ -22,8 +22,7 @@ impl LossTrace {
     pub fn outcome(&mut self, event: char, connection: u16, seq: u64, time: u64) {
         writeln!(self.0, "{event},{connection},{seq},{time},0,{},-1,-1,0,,,,,,,", (event == 'L') as u8).expect("write loss trace"); }
     pub fn sent(&mut self, connection: u16, seq: u64, time: u64, payload: &[u8]) {
-        if let Some(context) = self.1.get(&connection).copied() {
-            self.cc_row('C', connection, seq, time, 0, "", context); }
+        if let Some(context) = self.1.get(&connection).copied() { self.cc_row('C', connection, seq, time, 0, "", context); }
         writeln!(self.0, "S,{connection},{seq},{time},{},0,-1,-1,0,,,,,,,", payload.len()).expect("write loss trace");
         let mut cursor = 0;
         while let Some((frame, consumed)) = crate::stp::read_frame(&payload[cursor..]) {

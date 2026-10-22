@@ -9,8 +9,7 @@ fn exchange(family: u8) {
     if family == 4 { address.ip = std::net::Ipv4Addr::LOCALHOST.to_ipv6_mapped(); }
     let server_worker = Worker::start(server_pump);
     let server_app = std::thread::spawn(move || {
-        let _worker = server_worker; let deadline = Instant::now() + Duration::from_secs(120);
-        let mut response = response;
+        let _worker = server_worker; let deadline = Instant::now() + Duration::from_secs(120); let mut response = response;
         loop {
             if let Some(event) = server.try_recv() {
                 match event {
@@ -31,8 +30,7 @@ fn exchange(family: u8) {
             std::thread::sleep(Duration::from_micros(100)); } });
     let started = Instant::now(); let (client_pump, mut client, _) = setup_with(Default::default(), RESPONSE_BYTES);
     let mut client_worker = Worker::start(client_pump); let peer = address.connection_key();
-    assert!(client.try_connect(address)); let deadline = started + Duration::from_secs(120);
-    let mut request = REQUEST.to_vec();
+    assert!(client.try_connect(address)); let deadline = started + Duration::from_secs(120); let mut request = REQUEST.to_vec();
     let elapsed = 'receiving: loop {
         while let Some(event) = client.try_recv() {
             match event {

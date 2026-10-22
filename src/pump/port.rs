@@ -27,8 +27,7 @@ pub(crate) struct NativePort {
     pub stats_requested: AtomicBool, stats_active: AtomicBool, pub stats_result: AtomicPtr<NetworkThreadPull>, }
 impl NativePort {
     pub(crate) fn input_drained(&self, ready: &Ready, control: bool) {
-        std::sync::atomic::fence(Ordering::SeqCst);
-        let full = if control { &self.control_full } else { &self.send_full };
+        std::sync::atomic::fence(Ordering::SeqCst); let full = if control { &self.control_full } else { &self.send_full };
         if full.load(Ordering::SeqCst) { ready.notify(); } }
     pub(crate) fn emit(&self, ready: &Ready, event: Event) -> Result<(), Event> {
         unsafe { self.events.push(event) }?; ready.notify();
@@ -36,8 +35,7 @@ impl NativePort {
 struct ReferencePort { requests: Ring<NetworkThreadPush>, responses: Ring<NetworkThreadPull> }
 pub(crate) struct Port {
     reference: OnceLock<ReferencePort>, outstanding: AtomicBool, app: Mutex<()>, pub(crate) exchange: Mutex<()>,
-    pub(crate) stop: AtomicBool, pub(crate) exited: AtomicBool,
-    pub(crate) wake: Arc<NetworkWake>, pub(crate) ready: Arc<Ready>,
+    pub(crate) stop: AtomicBool, pub(crate) exited: AtomicBool, pub(crate) wake: Arc<NetworkWake>, pub(crate) ready: Arc<Ready>,
     pub(crate) native: OnceLock<NativePort>, max_payload: usize, send_queues: usize, }
 impl Port {
     pub(crate) fn new(max_payload: usize, send_queues: usize) -> Arc<Self> {
@@ -53,8 +51,7 @@ impl Port {
             if n.stats_result.load(Ordering::Acquire).is_null() && n.stats_requested.load(Ordering::Acquire) {
                 n.stats_active.store(true, Ordering::Relaxed); n.stats_requested.store(false, Ordering::Release);
                 return Some((NetworkThreadPush::default(), None)); }
-            None
-        } else { self.reference.get().and_then(|r| unsafe { r.requests.pop() }.map(|r| (r, None))) } }
+            None } else { self.reference.get().and_then(|r| unsafe { r.requests.pop() }.map(|r| (r, None))) } }
     pub(crate) fn has_request(&self) -> bool {
         if let Some(n) = self.native.get() { n.send.has_value() || n.control.has_value() || n.stats_requested.load(Ordering::Acquire) } else { self.reference.get().is_some_and(|r| r.requests.has_value()) }
     }
@@ -75,8 +72,7 @@ impl Endpoint {
         assert!(unsafe { reference.requests.push(request) }.is_ok());
         self.inner.wake.notify(); Ok(()) }
     pub(crate) fn try_take(&self) -> Option<NetworkThreadPull> {
-        let _app = self.inner.app.lock().unwrap();
-        let response = unsafe { self.inner.reference.get()?.responses.pop() }?;
+        let _app = self.inner.app.lock().unwrap(); let response = unsafe { self.inner.reference.get()?.responses.pop() }?;
         self.inner.outstanding.store(false, Ordering::Release); Some(response) }
     pub fn into_rings(self, config: RingConfig) -> LockfreeEndpoint {
         assert!(!self.inner.outstanding.load(Ordering::Acquire));

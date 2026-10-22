@@ -1,15 +1,11 @@
 //! Cosmopolitan (APE) build: `cfg(cosmo)` on an `os = "linux"` musl target.
 //!
-//! Contract with cosmo-compat (the shim cargo-cosmo links into every cosmo
-//! binary; STP has no Cargo dependency on it): STP speaks Linux numbering and
-//! Linux struct layouts through the plain libc names, and cosmo-compat
-//! translates to the running host at the libc boundary, including errno back
-//! to Linux values. So every type, constant and declaration is the Linux one.
-//! What is added here is what Linux does not have: the host the APE landed
-//! on (for capability decisions only; host-numbered values must never be
-//! passed into a wrapped call, where they would be translated a second
-//! time), a portable wake pair instead of eventfd (not in libcosmo), and
-//! entropy through cosmo's portable getrandom.
+//! Contract with cosmo-compat (the shim cargo-cosmo links into every cosmo binary; STP has no Cargo dependency on it): STP speaks
+//! Linux numbering and Linux struct layouts through the plain libc names, and cosmo-compat translates to the running host at the
+//! libc boundary, including errno back to Linux values. So every type, constant and declaration is the Linux one. What is added
+//! here is what Linux does not have: the host the APE landed on (for capability decisions only; host-numbered values must never
+//! be passed into a wrapped call, where they would be translated a second time), a portable wake pair instead of eventfd (not in
+//! libcosmo), and entropy through cosmo's portable getrandom.
 #![allow(non_camel_case_types, non_upper_case_globals, dead_code)]
 pub use super::linux::*; pub const SOCK_STREAM: c_int = 1; pub const SOCK_NONBLOCK: c_int = O_NONBLOCK;
 pub const SOCK_CLOEXEC: c_int = O_CLOEXEC;
@@ -38,8 +34,7 @@ pub fn fill_random(buf: &mut [u8]) -> std::io::Result<()> {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() == Some(EINTR) { continue; }
             return Err(err); }
-        if n == 0 || n as usize > rest.len() {
-            return Err(std::io::Error::other("getrandom returned an impossible length")); }
+        if n == 0 || n as usize > rest.len() { return Err(std::io::Error::other("getrandom returned an impossible length")); }
         rest = &mut rest[n as usize..]; }
     Ok(()) }
 pub fn thread_cpu_time_us() -> Option<(u64, u64)> {

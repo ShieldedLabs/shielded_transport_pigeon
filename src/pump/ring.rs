@@ -9,18 +9,11 @@ impl<T> Ring<T> {
         assert!(capacity.is_power_of_two() && capacity <= 65_536);
         Self {
             head: Cursor(AtomicUsize::new(0)), tail: Cursor(AtomicUsize::new(0)),
-            slots: (0..capacity)
-                .map(|_| UnsafeCell::new(MaybeUninit::uninit()))
-                .collect(),
+            slots: (0..capacity).map(|_| UnsafeCell::new(MaybeUninit::uninit())).collect(),
             mask: capacity - 1, } }
     pub(crate) fn has_space(&self) -> bool {
-        self.tail
-            .0
-            .load(Ordering::Acquire)
-            .wrapping_sub(self.head.0.load(Ordering::Acquire))
-            < self.slots.len() }
-    pub(crate) fn has_value(&self) -> bool {
-        self.tail.0.load(Ordering::Acquire) != self.head.0.load(Ordering::Acquire) }
+        self.tail.0.load(Ordering::Acquire).wrapping_sub(self.head.0.load(Ordering::Acquire)) < self.slots.len() }
+    pub(crate) fn has_value(&self) -> bool { self.tail.0.load(Ordering::Acquire) != self.head.0.load(Ordering::Acquire) }
     /// SAFETY: only the unique producer may call push; calls may not overlap.
     pub(crate) unsafe fn push(&self, value: T) -> Result<(), T> {
         let tail = self.tail.0.load(Ordering::Relaxed);

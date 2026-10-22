@@ -1,31 +1,22 @@
 pub mod port; pub(crate) use port::Endpoint;
 pub use port::lockfree::{LockfreeEndpoint, RingConfig, Control, Event, Stats, ConnectFailure, DisconnectReason};
 use std::time::{Duration, Instant};
-/// Exclusive socket/protocol owner. Move this value to a thread, or call it in
-/// frame slack. Application operations live on LockfreeEndpoint, never on Pump.
+/// Exclusive socket/protocol owner. Move this value to a thread, or call it in frame slack. Application operations live on
+/// LockfreeEndpoint, never on Pump.
 ///
-/// Protocol clock samples remain at packet boundaries. Traversals with no fresh
-/// sample check every eight bookkeeping units. Native admissions form bursts of
-/// at most 32 commands per protocol pass, checking the caller deadline before
-/// each command except the first owed admission. HOL-blocked sends stay queued.
-/// A native Wirehair encode/decode/recovery call cannot be preempted. OS
-/// scheduling and allocator latency are not hard real-time bounded. Logical
-/// messages up to 1 GiB use native codec units no larger than 2 MiB. Explicit
-/// protocol telemetry also incurs work proportional to connections/queues.
-/// Dropping Pump closes the UDP socket and publishes endpoint termination.
+/// Protocol clock samples remain at packet boundaries. Traversals with no fresh sample check every eight bookkeeping units.
+/// Native admissions form bursts of at most 32 commands per protocol pass, checking the caller deadline before each command
+/// except the first owed admission. HOL-blocked sends stay queued. A native Wirehair encode/decode/recovery call cannot be
+/// preempted. OS scheduling and allocator latency are not hard real-time bounded. Logical messages up to 1 GiB use native codec
+/// units no larger than 2 MiB. Explicit protocol telemetry also incurs work proportional to connections/queues. Dropping Pump
+/// closes the UDP socket and publishes endpoint termination.
 ///
-/// Forward progress: a `run_until` call entered before its deadline admits one
-/// eligible pending command and completes one unit (one received datagram, one
-/// data send, one FEC completion/sweep entry, one connection send step or eight
-/// bookkeeping units; an idle pass counts), even if the deadline passes during
-/// calibration/preemption. The cooperative overshoot bound is one admission
-/// plus one such unit. An unfinished 150 us active retry quantum is never
-/// shortened: only the owed command may be admitted inside it, and the owed
-/// unit waits for a call after it ends. Calls entered at/after their deadline
-/// return immediately without work.
-pub struct Pump {
-    pub(crate) run: Box<dyn FnMut(Deadline) -> Option<Instant> + Send>,
-    pub(crate) wakeup: Option<Instant>, }
+/// Forward progress: a `run_until` call entered before its deadline admits one eligible pending command and completes one unit
+/// (one received datagram, one data send, one FEC completion/sweep entry, one connection send step or eight bookkeeping units; an
+/// idle pass counts), even if the deadline passes during calibration/preemption. The cooperative overshoot bound is one admission
+/// plus one such unit. An unfinished 150 us active retry quantum is never shortened: only the owed command may be admitted inside
+/// it, and the owed unit waits for a call after it ends. Calls entered at/after their deadline return immediately without work.
+pub struct Pump { pub(crate) run: Box<dyn FnMut(Deadline) -> Option<Instant> + Send>, pub(crate) wakeup: Option<Instant>, }
 pub(crate) struct Deadline {
     pub(crate) instant: Instant, raw_ns: u64, now_ns: u64, unsampled: u8, command_owed: bool,
     unit_owed: bool, }

@@ -5,8 +5,7 @@ fn main() {
     let (mut pa, mut a, _) = setup(); let (mut pb, mut b, address) = setup();
     let peer = address.connection_key(); assert!(a.try_connect(address)); let mut sent = false;
     for frame_number in 0..400 {
-        let frame = Instant::now();
-        pa.run_until(frame + Duration::from_millis(1)); pb.run_for(Duration::from_millis(1));
+        let frame = Instant::now(); pa.run_until(frame + Duration::from_millis(1)); pb.run_for(Duration::from_millis(1));
         while let Some(event) = a.try_recv() {
             if matches!(event, Event::Connected { .. }) && !sent { send(&mut a, peer, b"message between frames".to_vec()); sent = true; } }
         while let Some(event) = b.try_recv() {

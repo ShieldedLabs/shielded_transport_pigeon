@@ -5,8 +5,7 @@ pub use core::ffi::c_void; pub type SOCKET = usize; pub type ADDRESS_FAMILY = u1
 #[repr(C)] #[derive(Copy, Clone, Debug)] pub struct WSAMSG {
     pub name: *mut SOCKADDR, pub namelen: i32, pub lpBuffers: *mut WSABUF, pub dwBufferCount: u32, pub Control: WSABUF,
     pub dwFlags: u32, }
-#[repr(C)] #[derive(Copy, Clone, Debug)]
-pub struct CMSGHDR { pub cmsg_len: usize, pub cmsg_level: i32, pub cmsg_type: i32 }
+#[repr(C)] #[derive(Copy, Clone, Debug)] pub struct CMSGHDR { pub cmsg_len: usize, pub cmsg_level: i32, pub cmsg_type: i32 }
 #[repr(C)] #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct GUID { pub data1: u32, pub data2: u16, pub data3: u16, pub data4: [u8; 8] }
 #[cfg(target_pointer_width = "64")] #[repr(C)] #[derive(Copy, Clone)] pub struct WSADATA {
@@ -21,8 +20,7 @@ pub struct GUID { pub data1: u32, pub data2: u16, pub data3: u16, pub data4: [u8
 pub struct OVERLAPPED { pub Internal: usize, pub InternalHigh: usize, pub Offset: u32, pub OffsetHigh: u32, pub hEvent: HANDLE }
 pub type LPWSAOVERLAPPED_COMPLETION_ROUTINE =
     Option<unsafe extern "system" fn(dwError: u32, cbTransferred: u32, lpOverlapped: *mut OVERLAPPED, dwFlags: u32)>;
-pub type LPFN_WSARECVMSG = Option<
-    unsafe extern "system" fn(
+pub type LPFN_WSARECVMSG = Option< unsafe extern "system" fn(
         s: SOCKET, lpMsg: *mut WSAMSG, lpdwNumberOfBytesRecvd: *mut u32, lpOverlapped: *mut OVERLAPPED,
         lpCompletionRoutine: LPWSAOVERLAPPED_COMPLETION_ROUTINE,
     ) -> i32,
@@ -53,8 +51,7 @@ pub const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
     pub fn connect(s: SOCKET, name: *const SOCKADDR, namelen: i32) -> i32;
     pub fn getsockname(s: SOCKET, name: *mut SOCKADDR, namelen: *mut i32) -> i32;
     pub fn sendto(s: SOCKET, buf: *const u8, len: i32, flags: i32, to: *const SOCKADDR, tolen: i32) -> i32;
-    pub fn WSAIoctl(
-        s: SOCKET, dwIoControlCode: u32, lpvInBuffer: *const c_void, cbInBuffer: u32, lpvOutBuffer: *mut c_void,
+    pub fn WSAIoctl(s: SOCKET, dwIoControlCode: u32, lpvInBuffer: *const c_void, cbInBuffer: u32, lpvOutBuffer: *mut c_void,
         cbOutBuffer: u32, lpcbBytesReturned: *mut u32, lpOverlapped: *mut OVERLAPPED,
         lpCompletionRoutine: LPWSAOVERLAPPED_COMPLETION_ROUTINE,
     ) -> i32; }

@@ -13,8 +13,7 @@ mod api {
         pub pump_cpu_us: u64, }
     pub enum AppEvent { Message(Vec<u8>), Rejected(Vec<u8>), Stats(Stats), }
     pub fn setup() -> (Pump, Ep, STPAddress) {
-        let probe = std::net::UdpSocket::bind("[::1]:0").unwrap(); let port = probe.local_addr().unwrap().port();
-        drop(probe);
+        let probe = std::net::UdpSocket::bind("[::1]:0").unwrap(); let port = probe.local_addr().unwrap().port(); drop(probe);
         let key = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b).unwrap();
         let address = STPAddress::from(std::net::Ipv6Addr::LOCALHOST, port, &key);
         let (pump, endpoint) = new_pump_with_options(vec![key], port, None, SEND_BUFFER, MAX_MESSAGE,
@@ -61,8 +60,7 @@ use api::{AppEvent, Ep, Peer, Stats};
 struct QuietStdout(i32);
 impl QuietStdout {
     fn new() -> Self {
-        std::io::stdout().flush().unwrap();
-        let null = std::fs::OpenOptions::new().write(true).open("/dev/null").unwrap();
+        std::io::stdout().flush().unwrap(); let null = std::fs::OpenOptions::new().write(true).open("/dev/null").unwrap();
         let saved = unsafe { libc::dup(libc::STDOUT_FILENO) }; assert!(saved >= 0);
         assert!(unsafe { libc::dup2(null.as_raw_fd(), libc::STDOUT_FILENO) } >= 0);
         Self(saved) } }
@@ -95,20 +93,16 @@ impl PumpThread {
         let t2 = tid.clone();
         let join = std::thread::Builder::new().name(name.into()).spawn(move || {
             t2.store(gettid(), Ordering::Release);
-            while !stop.load(Ordering::Acquire) { pump.run_for(Duration::from_millis(100)); }
-        }).unwrap();
+            while !stop.load(Ordering::Acquire) { pump.run_for(Duration::from_millis(100)); } }).unwrap();
         while tid.load(Ordering::Acquire) == 0 { std::thread::yield_now(); }
         Self { cancel, join: Some(join), tid: tid.load(Ordering::Acquire) } } }
 impl Drop for PumpThread {
-    fn drop(&mut self) {
-        self.cancel.store(true, Ordering::Release);
-        if let Some(j) = self.join.take() { j.join().unwrap(); } } }
+    fn drop(&mut self) { self.cancel.store(true, Ordering::Release); if let Some(j) = self.join.take() { j.join().unwrap(); } } }
 #[derive(Clone, Copy, PartialEq)] enum Kind { Msg, Bulk, Latency }
 #[derive(Clone)] struct Cell { name: String, kind: Kind, size: usize, window: usize, mode: &'static str, label: String,
     min_secs: f64, max_secs: f64, min_bytes: u64, fixed_count: Option<u64>, gap: Duration }
 #[derive(Default)] struct Shared {
-    received: AtomicU64, received_bytes: AtomicU64, sender_waiting: AtomicBool, receiver_done: AtomicBool,
-    t0_ns: AtomicU64,
+    received: AtomicU64, received_bytes: AtomicU64, sender_waiting: AtomicBool, receiver_done: AtomicBool, t0_ns: AtomicU64,
     last_recv_ns: AtomicU64, }
 struct SendOut { issued: u64, rejected: u64, stats: Vec<(u64, Stats)>, mid: Option<usize>, stop_idx: Option<usize> }
 struct RecvOut { received: u64, bytes: u64, bad: u64, dup: u64, latencies_us: Vec<f64>, stats: Vec<Stats> }
@@ -218,14 +212,12 @@ fn run_cell(cell: &Cell, a: Ep, b: Ep, peer: Peer, pumps: (i32, i32), pat: &Arc<
     let (c1, s1, p1, st1, tx1, g1, r1) = (cell.clone(), sh.clone(), pat.clone(), start.clone(), tid_tx.clone(), gate.clone(), release.clone());
     let send = std::thread::Builder::new().name("app-send".into()).spawn(move || {
         tx1.send(("send", gettid())).unwrap(); let r = sender(a, peer, c1, s1, p1, st1);
-        g1.wait(); r1.wait(); r
-    }).unwrap();
+        g1.wait(); r1.wait(); r }).unwrap();
     let send_thread = send.thread().clone();
     let (c2, s2, p2, st2, g2, r2) = (cell.clone(), sh.clone(), pat.clone(), start.clone(), gate.clone(), release.clone());
     let recv = std::thread::Builder::new().name("app-recv".into()).spawn(move || {
         tid_tx.send(("recv", gettid())).unwrap(); let r = receiver(b, c2, s2, p2, st2, send_thread);
-        g2.wait(); r2.wait(); r
-    }).unwrap();
+        g2.wait(); r2.wait(); r }).unwrap();
     let mut tids = vec![("pump_a", pumps.0), ("pump_b", pumps.1)];
     for _ in 0..2 { let (n, t) = tid_rx.recv().unwrap(); tids.push((if n == "send" { "app_send" } else { "app_recv" }, t)); }
     let cpu0: Vec<u64> = tids.iter().map(|t| thread_cpu_ns(t.1)).collect(); let pcpu0 = process_cpu_ns(); start.wait();
@@ -294,8 +286,7 @@ pub fn main() {
             min_secs: 0.0, max_secs: 1e9, min_bytes: 0, fixed_count: Some(100), gap: Duration::from_millis(100) };
         let (na, nb, mut l) = run_cell(&lat, a, b, peer, (wa.tid, wb.tid), &pat, &mut csv); a = na; b = nb;
         l.sort_by(f64::total_cmp); assert_eq!(l.len(), 100, "latency samples lost");
-        csv.row("latency_p50", "100B", "post_idle", l[49], "us");
-        csv.row("latency_p99", "100B", "post_idle", l[98], "us");
+        csv.row("latency_p50", "100B", "post_idle", l[49], "us"); csv.row("latency_p99", "100B", "post_idle", l[98], "us");
         csv.row("latency_max", "100B", "post_idle", l[99], "us"); }
     let status = std::fs::read_to_string("/proc/self/status").unwrap();
     let hwm: f64 = status.lines().find(|l| l.starts_with("VmHWM:")).unwrap().split_whitespace().nth(1).unwrap().parse().unwrap();

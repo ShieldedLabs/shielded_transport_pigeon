@@ -3,9 +3,7 @@ pub fn rng() -> ChaCha20Rng {
     let mut seed = [0u8; 32]; crate::platform::fill_random(&mut seed).expect("operating-system entropy unavailable");
     let rng = ChaCha20Rng::from_seed(seed); seed.fill(0);
     rng }
-pub trait RngCore {
-    fn next_u32(&mut self) -> u32; fn next_u64(&mut self) -> u64;
-    fn fill_bytes(&mut self, out: &mut [u8]); }
+pub trait RngCore { fn next_u32(&mut self) -> u32; fn next_u64(&mut self) -> u64; fn fill_bytes(&mut self, out: &mut [u8]); }
 impl RngCore for ChaCha20Rng {
     fn next_u32(&mut self) -> u32 { ChaCha20Rng::next_u32(self) }
     fn next_u64(&mut self) -> u64 { ChaCha20Rng::next_u64(self) }
@@ -16,8 +14,7 @@ impl SeedableRng for ChaCha20Rng {
     fn seed_from_u64(seed: u64) -> Self { ChaCha20Rng::seed_from_u64(seed) } }
 pub trait RandomValue { fn sample<R: RngCore + ?Sized>(rng: &mut R) -> Self; }
 impl RandomValue for f64 {
-    fn sample<R: RngCore + ?Sized>(rng: &mut R) -> Self {
-        (rng.next_u64() >> 11) as f64 * (1.0 / ((1u64 << 53) as f64)) } }
+    fn sample<R: RngCore + ?Sized>(rng: &mut R) -> Self { (rng.next_u64() >> 11) as f64 * (1.0 / ((1u64 << 53) as f64)) } }
 fn below<R: RngCore + ?Sized>(rng: &mut R, bound: u64) -> u64 {
     if bound == 0 { return rng.next_u64(); }
     let threshold = bound.wrapping_neg() % bound;

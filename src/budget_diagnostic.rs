@@ -1,7 +1,6 @@
 use std::cell::RefCell; use std::io::{self, Write}; pub const PACKET_LIMIT: usize = 65536;
 pub const FEEDBACK_LIMIT: usize = 131072; pub const LAYOUT_LIMIT: usize = 8192; pub const CONNECTION_LIMIT: usize = 8;
-pub const SCHEMA: &str = "stp-budget-diagnostic-evidence/1";
-pub const BUDGET25_SCHEMA: &str = "stp-budget25-evidence/1";
+pub const SCHEMA: &str = "stp-budget-diagnostic-evidence/1"; pub const BUDGET25_SCHEMA: &str = "stp-budget25-evidence/1";
 pub const EMPIRICAL_SCHEMA: &str = "stp-empirical-calibration-evidence/1"; pub const DEMAND_LIMIT: usize = 4096;
 pub const DEMAND_ITERATION_LIMIT: usize = 64; pub const ADAPTIVE_GENERATION_LIMIT:usize=64;
 #[derive(Debug,Clone,Copy,Default)]
@@ -17,8 +16,7 @@ pub struct DemandIteration { pub r:u64,pub e:u64,pub n:u64,pub samples:u64,pub e
     pub old_planned:u32,pub reserved:u32,pub emitted:u32,pub d:u32,pub own_finalized:u32,pub assembled:u32,
     pub rs:u32,pub start:u32,pub result_r:u32,pub requested:u32,pub plan_after:u32,pub segment_offset:u32,
     pub flags:u32,pub reason:u8,pub iterations_count:u8, }
-#[derive(Debug,Clone,Copy)]
-pub struct Demand { pub header:DemandHeader,pub iterations:[DemandIteration;DEMAND_ITERATION_LIMIT] }
+#[derive(Debug,Clone,Copy)] pub struct Demand { pub header:DemandHeader,pub iterations:[DemandIteration;DEMAND_ITERATION_LIMIT] }
 impl Default for Demand { fn default()->Self { Self{header:DemandHeader::default(),iterations:[DemandIteration::default();DEMAND_ITERATION_LIMIT]} } }
 impl Demand {
     fn write(&self,w:&mut impl Write)->io::Result<()> {
@@ -36,14 +34,12 @@ impl Demand {
             write!(w,"{{\"r\":{},\"e\":{},\"n\":{},\"scale\":{},\"samples\":{},\"empirical\":{},\"iid\":{},\"selected\":{},\"next_r\":{},\"flags\":{}}}",t.r,t.e,t.n,if present{(2u64<<t.scale).to_string()}else{"null".into()},if present{t.samples.to_string()}else{"null".into()},if present{t.empirical.to_string()}else{"null".into()},t.iid,t.selected,t.next_r,t.flags)?;
         }
         write!(w,"]}}") } }
-#[derive(Debug, Clone, Copy)]
-pub struct Connection { pub handshake: [u8; 64], pub local_key: [u8;32], pub peer_key: [u8;32] }
+#[derive(Debug, Clone, Copy)] pub struct Connection { pub handshake: [u8; 64], pub local_key: [u8;32], pub peer_key: [u8;32] }
 #[derive(Debug, Clone, Copy)] pub struct Symbol { pub conn: usize, pub seq: u64, pub ordinal: u64, pub ns: u64,
     pub package: u64, pub root: u64, pub len: usize, pub width: usize, pub symbol: u32,
     pub group: usize, pub k: usize, pub source: bool, pub outcome: u8 }
 #[derive(Debug, Clone, Copy)] pub struct Feedback { pub conn: usize, pub seq: u64, pub ns: u64, pub kind: u8 }
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Layout { pub conn: usize, pub generation: u64, pub package: u64, pub root: u64,
+#[derive(Debug, Clone, Copy, Default)] pub struct Layout { pub conn: usize, pub generation: u64, pub package: u64, pub root: u64,
     pub len: usize, pub width: usize, pub k: usize, pub groups: usize, pub limit: Option<u32>,
     pub planned: u32, pub assembled: u32, pub phase: Option<u8>, pub app_id: Option<u32>, pub ns: u64, pub event: u8 }
 #[derive(Debug)] pub struct Capture {
@@ -90,8 +86,7 @@ impl Capture {
         fn symbols(w: &mut impl Write, records: &[Symbol]) -> io::Result<()> {
             for (i, s) in records.iter().enumerate() { if i != 0 { write!(w, ",")?; }
                 write!(w, "[{},{},{},{},{},{},{},{},{},{},{},{},{}]", s.conn,s.seq,s.ordinal,s.ns,s.package,s.root,s.len,s.width,s.symbol,s.group,s.k,s.source,s.outcome)?; } Ok(()) }
-        symbols(&mut w, &self.tx)?; write!(w, "],\"rx\":[")?; symbols(&mut w, &self.rx)?;
-        write!(w, "],\"feedback\":[")?;
+        symbols(&mut w, &self.tx)?; write!(w, "],\"rx\":[")?; symbols(&mut w, &self.rx)?; write!(w, "],\"feedback\":[")?;
         for (i, f) in self.feedback.iter().enumerate() { if i != 0 { write!(w, ",")?; } write!(w,"[{},{},{},{}]",f.conn,f.seq,f.ns,f.kind)?; }
         write!(w, "],\"layouts\":[")?;
         for (i, l) in self.layouts.iter().enumerate() { if i != 0 { write!(w, ",")?; }
@@ -168,8 +163,7 @@ pub fn layout_start(mut l: Layout) -> Layout { with(|s| {
     s.generation = s.generation.checked_add(1).unwrap_or_else(|| { s.cap.overflow = true; u64::MAX });
     l.conn = s.context; l.generation = s.generation;
     {s.latest_ns=s.latest_ns.max(l.ns);}
-    push(&mut s.cap.layouts,l,LAYOUT_LIMIT,&mut s.cap.overflow);
-}); l }
+    push(&mut s.cap.layouts,l,LAYOUT_LIMIT,&mut s.cap.overflow); }); l }
 pub fn layout_event(mut l: Layout, planned: u32, assembled: u32, ns: u64, event: u8) { with(|s| {
     {s.latest_ns=s.latest_ns.max(ns);}
     l.conn=s.context; l.planned=planned; l.assembled=assembled; l.ns=ns; l.event=event;
@@ -183,8 +177,7 @@ fn symbol(frame: &crate::stp::WireFrame<'_>, conn: usize, seq: u64, ordinal:u64,
 pub fn tx(seq:u64,ns:u64,payload:&[u8]) { if !active() { return; } with(|s| {
     {s.latest_ns=s.latest_ns.max(ns);}
     let proof=std::mem::replace(&mut s.proof,3);
-    s.ordinal=s.ordinal.checked_add(1).unwrap_or_else(||{s.cap.overflow=true;u64::MAX});
-    let mut rest=payload; let mut any=false;
+    s.ordinal=s.ordinal.checked_add(1).unwrap_or_else(||{s.cap.overflow=true;u64::MAX}); let mut rest=payload; let mut any=false;
     while let Some((frame,n))=crate::stp::read_frame(rest) { rest=&rest[n..];
         if let Some(r)=symbol(&frame,s.context,seq,s.ordinal,ns,proof) { any=true;push(&mut s.cap.tx,r,PACKET_LIMIT,&mut s.cap.overflow); } }
     if !any { push(&mut s.cap.tx,Symbol {conn:s.context,seq,ordinal:s.ordinal,ns,package:u64::MAX,root:u64::MAX,len:0,width:0,symbol:0,group:0,k:0,source:false,outcome:proof},PACKET_LIMIT,&mut s.cap.overflow); }
