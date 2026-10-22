@@ -28,13 +28,15 @@ cargo run --release --example lockfree_thread
 cargo run --release --example lockfree_game
 ```
 
-Building requires Rust with edition 2024 support. STP is a single crate with
-**zero Cargo dependencies**, including build and development dependencies, and
-no build script or C++ compiler requirement. Wirehair, the cryptographic
-primitives, address encoding and platform bindings are in-crate Rust modules.
-The standard library and operating-system APIs are still required. Wirehair's
-BSD-3-Clause license is in `src/wirehair/LICENSE`; upstream cryptographic notices
-and licenses are beside the implementations in `src/crypto/`. STP itself is MIT.
+Building requires Rust with edition 2024 support. STP remains a single library
+crate, with Wirehair, address encoding and platform bindings implemented in Rust.
+Cryptography uses crates.io dependencies: `shielded_labs_snow` (imported as
+`snow`), `curve25519-dalek`, `chacha20poly1305`, `blake2` and `blake3`; some are
+provided transitively through Snow. BLAKE3 uses its pure-Rust build feature.
+STP has no build script or C++ compiler requirement. The standard library and
+operating-system APIs are still required. Wirehair's BSD-3-Clause license is in
+`src/wirehair/LICENSE`; notices for retained local RNG code are beside its source
+in `src/crypto/`. STP itself is MIT.
 
 For an Actually Portable Executable, use the separate
 [Cargo Cosmo](https://github.com/ShieldedLabs/cargo_cosmo) **10.0.0** toolchain,
@@ -62,10 +64,10 @@ substitutes a clock, deterministic seed, or uninitialized `/dev/urandom` fallbac
 
 ## Compatibility
 
-The **unreleased 1.0.0** source internalizes Wirehair and the former crate
-dependencies. Package versions advance by majors only. This migration keeps
-the wire profile, congestion control, repair policy and application rings of
-main `1e00403`; low-level third-party types are no longer part of the crate API.
+The **unreleased 1.0.0** source internalizes Wirehair, address encoding and
+platform bindings, while using external cryptography crates. Package versions
+advance by majors only. This migration keeps the wire profile, congestion
+control, repair policy and application rings of main `1e00403`.
 The published **0.3.0** introduced the caller-driven pump and three SPSC rings,
 replacing the 0.2 application API. The library does not start network or FEC
 threads. Move the pump to an application-owned thread if desired.

@@ -1,4 +1,4 @@
-//! Dependency-free native/APE smoke: cold connect, small request, one 20 MB reply.
+//! Native/APE smoke: cold connect, small request, one 20 MB reply.
 //! Run with `cargo run --release --example portable_smoke` (both IP families).
 //! Optional argument `4` or `6` selects a single family.
 use shielded_transport_pigeon::{pump::Event, stp::*};
