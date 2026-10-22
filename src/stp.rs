@@ -413,15 +413,10 @@ struct EventSink { planned: std::sync::atomic::AtomicU64, ids_overflow: std::syn
 impl EventRepairInfo {
     pub fn merge(&mut self, o: EventRepairInfo) { let mut of = self.counter_overflow.max(o.counter_overflow);
         let mut add = |a: &mut u64, b: u64| { *a = a.checked_add(b).unwrap_or_else(|| { of = 1; u64::MAX }); };
-        add(&mut self.accepted_early, o.accepted_early); add(&mut self.accepted_timeout, o.accepted_timeout);
-        add(&mut self.accepted_ce, o.accepted_ce); add(&mut self.accepted_dropped, o.accepted_dropped);
-        add(&mut self.skip_closed, o.skip_closed); add(&mut self.skip_latched, o.skip_latched);
-        add(&mut self.skip_unexposed, o.skip_unexposed); add(&mut self.roots_granted, o.roots_granted);
-        add(&mut self.slots_granted, o.slots_granted); add(&mut self.slots_unqualified, o.slots_unqualified);
-        add(&mut self.grant_symbols, o.grant_symbols); add(&mut self.planned, o.planned); add(&mut self.emitted, o.emitted);
-        add(&mut self.marks_abandoned, o.marks_abandoned); add(&mut self.ids_overflow, o.ids_overflow);
-        add(&mut self.ready_added, o.ready_added); add(&mut self.repairs_emitted, o.repairs_emitted);
-        add(&mut self.missing_anchor, o.missing_anchor);
+        macro_rules! add { ($($f:ident),*) => { $(add(&mut self.$f, o.$f);)* }; }
+        add!(accepted_early, accepted_timeout, accepted_ce, accepted_dropped, skip_closed, skip_latched, skip_unexposed,
+            roots_granted, slots_granted, slots_unqualified, grant_symbols, planned, emitted, marks_abandoned, ids_overflow,
+            ready_added, repairs_emitted, missing_anchor);
         self.counter_overflow = of; } }
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)] pub struct BudgetBaseInfo {
     pub roots: u64, pub source_symbols: u64, pub repair_limit: u64, pub demand_repairs: u64, pub planned_repairs: u64,

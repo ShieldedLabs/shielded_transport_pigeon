@@ -118,21 +118,16 @@ impl RxReport {
     fn from_words(w: &[u64]) -> Option<RxReport> {
         if w.len() < 37 { return None; }
         let mut st = ConnectionStats { rx_packets: w[0], rx_seq_span: w[1], rx_lost: w[2], rx_reordered: w[3], rx_late_beyond_window: w[4], rx_duplicates: w[5], rx_bursts: w[6], ..Default::default() };
-        st.rx_burst_hist.copy_from_slice(&w[7..14]); st.fec_decode_last_tail_ns = w.get(28).copied().unwrap_or(0);
-        st.fec_decode_max_tail_ns = w.get(29).copied().unwrap_or(0);
-        st.fec_ingress_dropped_blocks = w.get(30).copied().unwrap_or(0);
-        st.udp_payload_tu = w.get(31).copied().unwrap_or(0);
+        st.rx_burst_hist.copy_from_slice(&w[7..14]);
         (st.rx_messages_completed, st.rx_partial_evicted, st.rx_partial_evicted_bytes, st.rx_insert_failures, st.rx_stale_fragments) = (w[23], w[24], w[25], w[26], w[27]);
         let th = NetworkThreadStats { kernel_rx_drops: if w[14] == u64::MAX { None } else { Some(w[14]) }, max_loop_gap_ns: w[15], loop_gaps_over_1ms: w[16],
             loop_gaps_over_10ms: w[17], loop_gaps_over_100ms: w[18], loop_iterations: w[19], recv_queue_dropped_messages: w[20] };
         (st.ack_packets_sent, st.ack_bytes_sent, st.ack_packets_received, st.ack_delay_us_max, st.rtt_samples) = (w[32], w[33], w[34], w[35] as u32, w[36]);
-        st.fec_decode_admission_refusals = w.get(37).copied().unwrap_or(0);
-        st.fec_decode_timeouts = w.get(38).copied().unwrap_or(0);
-        st.fec_decode_preemptions = w.get(39).copied().unwrap_or(0);
-        st.fec_worker_limit_events = w.get(40).copied().unwrap_or(0);
-        st.fec_decode_peak_workers = w.get(41).copied().unwrap_or(0);
-        st.rx_plain_admission_refusals = w.get(42).copied().unwrap_or(0);
-        st.rx_stale_identity_frames = w.get(43).copied().unwrap_or(0);
+        for (f, i) in [(&mut st.fec_decode_last_tail_ns, 28), (&mut st.fec_decode_max_tail_ns, 29),
+            (&mut st.fec_ingress_dropped_blocks, 30), (&mut st.udp_payload_tu, 31), (&mut st.fec_decode_admission_refusals, 37),
+            (&mut st.fec_decode_timeouts, 38), (&mut st.fec_decode_preemptions, 39), (&mut st.fec_worker_limit_events, 40),
+            (&mut st.fec_decode_peak_workers, 41), (&mut st.rx_plain_admission_refusals, 42), (&mut st.rx_stale_identity_frames, 43)]
+        { *f = w.get(i).copied().unwrap_or(0); }
         Some(RxReport { st, th, cpu_user_us: w[21], cpu_sys_us: w[22] }) } }
 #[allow(non_camel_case_types, dead_code)] mod libc {
     use std::os::raw::{c_int, c_long}; pub const STDOUT_FILENO: c_int = 1; pub const RUSAGE_SELF: c_int = 0;
