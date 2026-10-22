@@ -292,7 +292,7 @@ dependencies = [
 
 [[package]]
 name = "shielded_transport_pigeon"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "blake3",
  "curve25519-dalek",

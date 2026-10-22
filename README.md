@@ -64,15 +64,18 @@ substitutes a clock, deterministic seed, or uninitialized `/dev/urandom` fallbac
 
 ## Compatibility
 
-Version **1.0.0** internalizes Wirehair, address encoding and
-platform bindings, while using external cryptography crates. Package versions
-advance by majors only. This source keeps the congestion control, repair policy
-and application rings of main `1e00403`, but changes the wire profile as described
-below.
+Version **2.0.0** includes the verified source reductions and freshly randomized
+Noise/plaintext `magic1` selectors and Crosslink `magic2` application ID. Both
+peers must upgrade and update configured addresses; 1.0.0 selectors are rejected.
+Congestion control, repair policy, packet layout and the public API are unchanged
+from 1.0.0. Package versions advance by majors only.
+
+Version **1.0.0** internalized Wirehair, address encoding and platform bindings,
+while using external cryptography crates, and introduced the profile below.
 The published **0.3.0** introduced the caller-driven pump and three SPSC rings,
 replacing the 0.2 application API. The library does not start network or FEC
 threads. Move the pump to an application-owned thread if desired.
-The package version and wire-profile version are separate. Version 1.0.0 uses
+The package version and wire-profile version are separate. Versions 1.0.0 and 2.0.0 use
 **wire profile 6**, incompatible with profiles 2 through 5,
 including the 0.3.0 version-2 profile.
 Both peers must be updated together: mismatched handshake
@@ -114,7 +117,6 @@ identity-helper semantics, not compact wire serialization. Receivers use
 magic1 is the dispatch boundary for a whole future handshake/address-material
 interpretation, not just a Noise hash; no generic handshake framework, PQ or
 hash-discovery implementation is introduced. See PROTOCOL.md for that boundary.
-This is not a new package release.
 
 ## Application API
 

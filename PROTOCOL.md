@@ -52,12 +52,13 @@ The crypto selector is a six-byte little-endian `magic1` with bit zero set:
 
 | Selector | Value | Crypto |
 |---|---|---|
-| Noise IK, BLAKE2b | `0xa8916e3c54d7` | `Noise_IK_25519_ChaChaPoly_BLAKE2b` |
-| Developer plaintext | `0x6d43b2f8091b` | test-only, no authentication |
+| Noise IK, BLAKE2b | `0xa91aaca6f0f9` | `Noise_IK_25519_ChaChaPoly_BLAKE2b` |
+| Developer plaintext | `0x1f34a6ae39ab` | test-only, no authentication |
 
-These are the final version-6 selectors. BLAKE2s is no longer an STP option;
-its old selectors, all earlier BLAKE2b/plaintext selectors, and the provisional
-compact-only selectors are unknown and MUST be rejected. The cryptographic
+These are freshly randomized selectors for package 2.0.0, retaining the version-6
+packet layout. Package 1.0.0 selectors, all earlier BLAKE2b/plaintext selectors,
+BLAKE2s selectors, and the provisional compact-only selectors are unknown and
+MUST be rejected. The cryptographic
 crates may still contain BLAKE2s internally; it is not a transport profile.
 
 The Noise prologue is the exact six-byte selector. The initiator knows the
@@ -72,7 +73,7 @@ plaintext developer variant validates application IDs but offers no security.
 Client application offer: one-byte count (1..32), then 32 u64 application IDs;
 unused IDs MUST be zero. This is exactly **257 bytes**. The server chooses the
 first offered ID it supports, preserving client order, or rejects the offer if
-none is supported. This implementation offers/supports `0x5d747212563144d9`
+none is supported. This implementation offers/supports `0x89444182b302528e`
 (Crosslink). The server payload is exactly its chosen u64 ID, **8 bytes**. A
 client rejects a choice it did not offer. Wrong lengths, zero/oversized counts,
 nonzero unused slots, and unsupported choices are rejected.

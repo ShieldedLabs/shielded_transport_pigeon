@@ -17,8 +17,8 @@ use std::collections::{HashMap, VecDeque};
 // must supply authenticated peer identity, transcript binding and directional packet protection satisfying the
 // full-nonce/rekey contract below. This is a design boundary, not an implemented handshake trait, PQ scheme or
 // discovery. Bit zero of each six-byte selector must be one for ClientHello dispatch.
-pub const CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b: u64 = 0xa891_6e3c_54d7;
-pub const CONNECT_MAGIC1_PLAIN_TEXT: u64 = 0x6d43_b2f8_091b;
+pub const CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b: u64 = 0xa91a_aca6_f0f9;
+pub const CONNECT_MAGIC1_PLAIN_TEXT: u64 = 0x1f34_a6ae_39ab;
 pub fn crypto_string_from_connect_magic1(magic: u64) -> Option<&'static str> {
     match magic {
         CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b => {
@@ -31,7 +31,7 @@ pub fn crypto_string_from_connect_magic1(magic: u64) -> Option<&'static str> {
 pub const PROTOCOL_VERSION: u16 = 6;
 pub const MAGIC2_BLOCK_SIZE: usize = 1 + 32 * 8;
 const SERVER_HELLO_PAYLOAD_LEN: usize = 8;
-pub const MAGIC2_APP_CROSSLINK: u64 = 0x5d747212563144d9;
+pub const MAGIC2_APP_CROSSLINK: u64 = 0x8944_4182_b302_528e;
 const SERVER_SUPPORTED_MAGIC2: &[u64] = &[MAGIC2_APP_CROSSLINK];
 pub fn build_magic2_client_block() -> [u8; MAGIC2_BLOCK_SIZE] {
     let mut block = [0u8; MAGIC2_BLOCK_SIZE];
