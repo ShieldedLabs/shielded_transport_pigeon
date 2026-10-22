@@ -1,30 +1,14 @@
-//! Bounded observation-only research capture. No payloads, locks, disk or clocks in hot hooks.
-//! Enabled explicitly on the network thread; only built with research_budget_diagnostic.
-use std::cell::RefCell;
-use std::io::{self, Write};
-pub const PACKET_LIMIT: usize = 65536;
-pub const FEEDBACK_LIMIT: usize = 131072;
-pub const LAYOUT_LIMIT: usize = 8192;
-pub const CONNECTION_LIMIT: usize = 8;
+use std::cell::RefCell; use std::io::{self, Write}; pub const PACKET_LIMIT: usize = 65536;
+pub const FEEDBACK_LIMIT: usize = 131072; pub const LAYOUT_LIMIT: usize = 8192; pub const CONNECTION_LIMIT: usize = 8;
 pub const SCHEMA: &str = "stp-budget-diagnostic-evidence/1";
 pub const BUDGET25_SCHEMA: &str = "stp-budget25-evidence/1";
-pub const EMPIRICAL_SCHEMA: &str = "stp-empirical-calibration-evidence/1";
-pub const DEMAND_LIMIT: usize = 4096;
-pub const DEMAND_ITERATION_LIMIT: usize = 64;
-pub const ADAPTIVE_GENERATION_LIMIT:usize=64;
-/// Lazy provenance for adaptive states which reach a tail query, not an exhaustive reset census.
+pub const EMPIRICAL_SCHEMA: &str = "stp-empirical-calibration-evidence/1"; pub const DEMAND_LIMIT: usize = 4096;
+pub const DEMAND_ITERATION_LIMIT: usize = 64; pub const ADAPTIVE_GENERATION_LIMIT:usize=64;
 #[derive(Debug,Clone,Copy,Default)]
 pub struct AdaptiveGeneration {pub generation:u64,pub conn:u32,pub created_ns:u64,pub first_observed_ns:u64}
-/// 64 bytes. flags: 1 empirical present, 2 converged, 4 want exceeded K, 8 model iteration limit.
-/// scale is the sketch index (0..15), serialized as the dyadic span (2..65536).
 #[derive(Debug,Clone,Copy,Default)]
 pub struct DemandIteration { pub r:u64,pub e:u64,pub n:u64,pub samples:u64,pub empirical:u64,pub iid:u64,pub selected:u64,pub next_r:u32,pub scale:u16,pub flags:u16 }
-/// Fixed-width header <=256 bytes. Counts are ASSEMBLED model inputs unless named committed/emitted.
-/// committed/emitted and original_k/limit belong to the immutable segment across TU layouts.
-/// flags: 1 anchor present, 2 invalid anchor, 4 want_exceeded_k, 8 model iteration limit,
-/// 16 incomplete capture, 32 source count unknown, 64 repair count unknown. reason: bit1 first post-source, bit2 changed demand, bit4 changed plan.
-#[derive(Debug,Clone,Copy,Default)]
-pub struct DemandHeader {
+#[derive(Debug,Clone,Copy,Default)] pub struct DemandHeader {
     pub index:u64,pub query_batch:u64,pub owner_generation:u64,pub query_now_ns:u64,pub ns:u64,pub generation:u64,pub package:u64,pub root:u64,pub adaptive_generation:u64,
     pub adaptive_created_ns:u64,pub anchor_generation:u64,pub anchor_a:u64,pub s:u64,pub f:u64,pub ug:u64,pub uc:u64,
     pub iid_p:f64,pub eps_e:f64,pub eps_i:f64,
@@ -32,15 +16,13 @@ pub struct DemandHeader {
     pub cap_percent:u32,pub limit:u32,pub sources_committed:u32,pub repairs_committed:u32,
     pub old_planned:u32,pub reserved:u32,pub emitted:u32,pub d:u32,pub own_finalized:u32,pub assembled:u32,
     pub rs:u32,pub start:u32,pub result_r:u32,pub requested:u32,pub plan_after:u32,pub segment_offset:u32,
-    pub flags:u32,pub reason:u8,pub iterations_count:u8,
-}
+    pub flags:u32,pub reason:u8,pub iterations_count:u8, }
 #[derive(Debug,Clone,Copy)]
 pub struct Demand { pub header:DemandHeader,pub iterations:[DemandIteration;DEMAND_ITERATION_LIMIT] }
 impl Default for Demand { fn default()->Self { Self{header:DemandHeader::default(),iterations:[DemandIteration::default();DEMAND_ITERATION_LIMIT]} } }
 impl Demand {
     fn write(&self,w:&mut impl Write)->io::Result<()> {
-        let h=&self.header;
-        write!(w,"{{")?;
+        let h=&self.header; write!(w,"{{")?;
         macro_rules! fields { ($($n:ident),*) => { $(write!(w,concat!("\"",stringify!($n),"\":{},"),h.$n)?;)* }; }
         fields!(index,query_batch,query_now_ns,conn,generation,package,root,adaptive_generation,adaptive_created_ns,ns,codec_index,codec_count,group_count,k,original_k,cap_percent,limit,old_planned,reserved,d,own_finalized,assembled,rs,s,f,ug,uc,start,result_r,requested,plan_after,segment_offset,reason,eps_e,eps_i,iid_p);
         let opt=|value:u64,valid:bool|if valid {value.to_string()}else{"null".into()};
@@ -53,69 +35,48 @@ impl Demand {
             let present=t.flags&1!=0;
             write!(w,"{{\"r\":{},\"e\":{},\"n\":{},\"scale\":{},\"samples\":{},\"empirical\":{},\"iid\":{},\"selected\":{},\"next_r\":{},\"flags\":{}}}",t.r,t.e,t.n,if present{(2u64<<t.scale).to_string()}else{"null".into()},if present{t.samples.to_string()}else{"null".into()},if present{t.empirical.to_string()}else{"null".into()},t.iid,t.selected,t.next_r,t.flags)?;
         }
-        write!(w,"]}}")
-    }
-}
+        write!(w,"]}}") } }
 #[derive(Debug, Clone, Copy)]
 pub struct Connection { pub handshake: [u8; 64], pub local_key: [u8;32], pub peer_key: [u8;32] }
-/// A frame of one actual DATA commit. ordinal counts DATA packets, not frames or probes.
-#[derive(Debug, Clone, Copy)]
-pub struct Symbol { pub conn: usize, pub seq: u64, pub ordinal: u64, pub ns: u64,
+#[derive(Debug, Clone, Copy)] pub struct Symbol { pub conn: usize, pub seq: u64, pub ordinal: u64, pub ns: u64,
     pub package: u64, pub root: u64, pub len: usize, pub width: usize, pub symbol: u32,
     pub group: usize, pub k: usize, pub source: bool, pub outcome: u8 }
-#[derive(Debug, Clone, Copy)]
-pub struct Feedback { pub conn: usize, pub seq: u64, pub ns: u64, pub kind: u8 }
-/// Event 0 admission, 1 changed plan, 2 source assembled, 3 slot sealed/assembled.
-/// emitted is NOT asserted here: actual emissions come only from TX records.
+#[derive(Debug, Clone, Copy)] pub struct Feedback { pub conn: usize, pub seq: u64, pub ns: u64, pub kind: u8 }
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Layout { pub conn: usize, pub generation: u64, pub package: u64, pub root: u64,
     pub len: usize, pub width: usize, pub k: usize, pub groups: usize, pub limit: Option<u32>,
     pub planned: u32, pub assembled: u32, pub phase: Option<u8>, pub app_id: Option<u32>, pub ns: u64, pub event: u8 }
-#[derive(Debug)]
-pub struct Capture {
-    pub demands: Vec<Demand>,
-    pub demand_overflow: bool,
-    pub adaptive_generations: [AdaptiveGeneration;ADAPTIVE_GENERATION_LIMIT],
-    pub adaptive_generations_count:usize,
+#[derive(Debug)] pub struct Capture {
+    pub demands: Vec<Demand>, pub demand_overflow: bool,
+    pub adaptive_generations: [AdaptiveGeneration;ADAPTIVE_GENERATION_LIMIT], pub adaptive_generations_count:usize,
     pub connections: Vec<Connection>, pub tx: Vec<Symbol>, pub rx: Vec<Symbol>,
     pub feedback: Vec<Feedback>, pub layouts: Vec<Layout>, pub overflow: bool, pub unknown_identity: bool,
     pub start_ordinal: u64, pub end_ordinal: u64, pub drain_ns: u64 }
 impl Capture {
     fn new(ordinal: u64) -> Self { Self {
-        demands: Vec::new(),
-        demand_overflow: false,
-        adaptive_generations:[AdaptiveGeneration::default();ADAPTIVE_GENERATION_LIMIT],
-        adaptive_generations_count:0,
+        demands: Vec::new(), demand_overflow: false,
+        adaptive_generations:[AdaptiveGeneration::default();ADAPTIVE_GENERATION_LIMIT], adaptive_generations_count:0,
         connections: Vec::with_capacity(CONNECTION_LIMIT),
         tx: Vec::with_capacity(PACKET_LIMIT), rx: Vec::with_capacity(PACKET_LIMIT),
         feedback: Vec::with_capacity(FEEDBACK_LIMIT), layouts: Vec::with_capacity(LAYOUT_LIMIT),
         overflow: false, unknown_identity: false, start_ordinal: ordinal, end_ordinal: ordinal, drain_ns: 0 } }
-    /// Application thread only; create_new is deliberately not hidden behind atomic replacement.
     pub fn write_new(&self, path: &std::path::Path, source_tree: &str, diff: &str, role: &str, phase: usize) -> io::Result<()> {
-        self.write_capture(path, source_tree, diff, role, phase, None)
-    }
-    /// Application-thread serializer for the matched ceiling experiment; no runtime hot-hook I/O.
+        self.write_capture(path, source_tree, diff, role, phase, None) }
     pub fn write_new_budget25(&self, path: &std::path::Path, source_tree: &str, diagnostic_diff: &str, budget25_diff: &str, role: &str, phase: usize, cap_percent: u32) -> io::Result<()> {
         if ![15, 25].contains(&cap_percent) || cap_percent != crate::fec_adapt::research_p4_repair_cap_percent() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "cap_percent must match initialized policy (15 or 25)"));
-        }
-        self.write_capture(path, source_tree, diagnostic_diff, role, phase, Some((budget25_diff, cap_percent)))
-    }
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "cap_percent must match initialized policy (15 or 25)")); }
+        self.write_capture(path, source_tree, diagnostic_diff, role, phase, Some((budget25_diff, cap_percent))) }
     fn write_capture(&self, path: &std::path::Path, source_tree: &str, diff: &str, role: &str, phase: usize, budget25: Option<(&str, u32)>) -> io::Result<()> {
-        self.write_capture_inner(path,source_tree,diff,role,phase,budget25,None)
-    }
+        self.write_capture_inner(path,source_tree,diff,role,phase,budget25,None) }
     pub fn write_new_empirical_calibration(&self,path:&std::path::Path,source_tree:&str,diagnostic_diff:&str,budget25_diff:&str,empirical_diff:&str,role:&str,phase:usize,cap_percent:u32,empirical_tail_calibration:u32)->io::Result<()> {
         if cap_percent!=25 || cap_percent!=crate::fec_adapt::research_p4_repair_cap_percent() || empirical_tail_calibration>1 || empirical_tail_calibration!=crate::fec_adapt::research_p4_empirical_tail_calibration() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput,"empirical arm must match initialized cap25 policy"));
-        }
+            return Err(io::Error::new(io::ErrorKind::InvalidInput,"empirical arm must match initialized cap25 policy")); }
         if self.demands.len()>DEMAND_LIMIT || self.demands.iter().any(|d|d.header.iterations_count as usize>DEMAND_ITERATION_LIMIT) || self.adaptive_generations_count>ADAPTIVE_GENERATION_LIMIT {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput,"malformed demand capture dimensions"));
-        }
+            return Err(io::Error::new(io::ErrorKind::InvalidInput,"malformed demand capture dimensions")); }
         self.write_capture_inner(path,source_tree,diagnostic_diff,role,phase,Some((budget25_diff,cap_percent)),Some((empirical_diff,empirical_tail_calibration)))
     }
     fn write_capture_inner(&self,path:&std::path::Path,source_tree:&str,diff:&str,role:&str,phase:usize,budget25:Option<(&str,u32)>,empirical:Option<(&str,u32)>)->io::Result<()> {
-        let f = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
-        let mut w = io::BufWriter::new(f);
+        let f = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?; let mut w = io::BufWriter::new(f);
         let schema = if empirical.is_some() { "stp-empirical-calibration-evidence/1" } else if budget25.is_some() { BUDGET25_SCHEMA } else { SCHEMA };
         let extra = budget25.map_or(String::new(), |(diff, cap)| format!(",\"budget25_diff_sha256\":\"{diff}\",\"cap_percent\":{cap}"));
         let extra=extra+&empirical.map_or(String::new(),|(diff,q)|format!(",\"empirical_calibration_diff_sha256\":\"{diff}\",\"empirical_tail_calibration\":{q}"));
@@ -146,58 +107,41 @@ impl Capture {
                 if i>0{write!(w,",")?;}
                 write!(w,"{{\"generation\":{},\"conn\":{},\"created_ns\":{},\"first_observed_ns\":{}}}",g.generation,g.conn,g.created_ns,g.first_observed_ns)?;
             }
-            write!(w,"]")?;
-        }
-        writeln!(w,"}}")?; w.flush()
-    }
-}
+            write!(w,"]")?; }
+        writeln!(w,"}}")?; w.flush() } }
 struct State {
-    demand_count: u64,
-    latest_ns:u64,
+    demand_count: u64, latest_ns:u64,
     cap: Capture, context: usize, ordinal: u64, generation: u64, proof: u8, rx_current: Option<usize> }
 thread_local! { static STATE: RefCell<Option<State>> = const { RefCell::new(None) }; }
 thread_local! {
-    // Survive an explicit enable(false)/enable(true): reopening diagnostics cannot renew the
-    // owning-thread capture allowance. This single-network-thread research endpoint enables once.
     static DEMANDS_USED:std::cell::Cell<u64>=const {std::cell::Cell::new(0)};
-    static DEMANDS_INVALID:std::cell::Cell<bool>=const {std::cell::Cell::new(false)};
-}
+    static DEMANDS_INVALID:std::cell::Cell<bool>=const {std::cell::Cell::new(false)}; }
 pub fn enable(on: bool) { STATE.with(|s| {
     let mut b=s.borrow_mut();
     if let Some(old)=b.as_ref() {
         DEMANDS_USED.with(|n|n.set(old.demand_count+old.cap.demands.len()as u64));
-        DEMANDS_INVALID.with(|v|v.set(v.get()||old.cap.demand_overflow));
-    }
+        DEMANDS_INVALID.with(|v|v.set(v.get()||old.cap.demand_overflow)); }
     *b=on.then(|| State {
-        demand_count:DEMANDS_USED.with(|n|n.get()),
-        latest_ns:0,
+        demand_count:DEMANDS_USED.with(|n|n.get()), latest_ns:0,
         cap: {let c=Capture::new(0);
             let c={let mut c=c;
                 let used=DEMANDS_USED.with(|n|n.get());c.demands=Vec::with_capacity(DEMAND_LIMIT.saturating_sub(used as usize));
-                // Re-enable loses old layout/connection context. Do not certify that discontinuity.
                 c.demand_overflow=DEMANDS_INVALID.with(|v|v.get())||used>0;c};c},
-        context:usize::MAX,ordinal:0,generation:0,proof:3,rx_current:None
-    });
-}); }
+        context:usize::MAX,ordinal:0,generation:0,proof:3,rx_current:None }); }); }
 pub fn active() -> bool { STATE.with(|s| s.borrow().is_some()) }
 fn with(f: impl FnOnce(&mut State)) { STATE.with(|s| { if let Some(s) = &mut *s.borrow_mut() { f(s); } }); }
 fn push<T>(v: &mut Vec<T>, x: T, limit: usize, overflow: &mut bool) -> Option<usize> {
-    if v.len() == limit { *overflow = true; None } else { let i = v.len(); v.push(x); Some(i) }
-}
-/// First/changed refreshes only. Temporary records are discarded when the aggregate request/plan
-/// did not change. Record bound is per owning network thread/TLS, not reset by take(), and includes warmup.
+    if v.len() == limit { *overflow = true; None } else { let i = v.len(); v.push(x); Some(i) } }
 pub(crate) fn demand_checkpoint()->usize { STATE.with(|s|s.borrow().as_ref().map_or(0,|s|s.cap.demands.len())) }
 pub(crate) fn demand_push(mut d:Demand) { with(|s| {
-    d.header.conn=s.context as u32;
-    d.header.ns=d.header.ns.max(s.latest_ns);
+    d.header.conn=s.context as u32; d.header.ns=d.header.ns.max(s.latest_ns);
     if !s.cap.adaptive_generations[..s.cap.adaptive_generations_count].iter().any(|g|g.generation==d.header.adaptive_generation&&g.conn==d.header.conn) {
         if s.cap.adaptive_generations_count==ADAPTIVE_GENERATION_LIMIT {s.cap.demand_overflow=true;}
         else {s.cap.adaptive_generations[s.cap.adaptive_generations_count]=AdaptiveGeneration {generation:d.header.adaptive_generation,conn:d.header.conn,created_ns:d.header.adaptive_created_ns,first_observed_ns:d.header.ns};s.cap.adaptive_generations_count+=1;}
     }
     if s.demand_count.saturating_add(s.cap.demands.len() as u64)>=DEMAND_LIMIT as u64 {s.cap.demand_overflow=true;return;}
     if d.header.flags&16!=0 {s.cap.demand_overflow=true;}
-    s.cap.demands.push(d);
-}); }
+    s.cap.demands.push(d); }); }
 pub(crate) fn demand_finish(checkpoint:usize,reason:u8,requested:u32,plan_after:u32,owner_generation:u64,original_k:u32,limit:u32,reserved:u32,emitted:u64,sources_committed:u64,source_counter_overflow:bool) { with(|s| {
     if reason==0 {s.cap.demands.truncate(checkpoint);return;}
     for d in &mut s.cap.demands[checkpoint..] {
@@ -206,15 +150,11 @@ pub(crate) fn demand_finish(checkpoint:usize,reason:u8,requested:u32,plan_after:
         if owner_generation==u64::MAX {h.flags|=16;s.cap.demand_overflow=true;}
         match u32::try_from(emitted) {
             Ok(value)=>{h.emitted=value;h.repairs_committed=value;},
-            Err(_)=>{h.flags|=16|64;s.cap.demand_overflow=true;}
-        }
+            Err(_)=>{h.flags|=16|64;s.cap.demand_overflow=true;} }
         match u32::try_from(sources_committed) {
             Ok(value) if !source_counter_overflow=>h.sources_committed=value,
-            _=>{h.flags|=16|32;s.cap.demand_overflow=true;}
-        }
-    }
-    for(i,d)in s.cap.demands.iter_mut().enumerate().skip(checkpoint) {d.header.index=s.demand_count+i as u64;}
-}); }
+            _=>{h.flags|=16|32;s.cap.demand_overflow=true;} } }
+    for(i,d)in s.cap.demands.iter_mut().enumerate().skip(checkpoint) {d.header.index=s.demand_count+i as u64;} }); }
 pub fn context(handshake: [u8;64], local: &[u8], peer: &[u8]) { with(|s| {
     let local_key=local.try_into().unwrap_or([0;32]);let peer_key=peer.try_into().unwrap_or([0;32]);
     let c = Connection { handshake, local_key, peer_key };
@@ -222,7 +162,6 @@ pub fn context(handshake: [u8;64], local: &[u8], peer: &[u8]) { with(|s| {
     else { push(&mut s.cap.connections, c, CONNECTION_LIMIT, &mut s.cap.overflow).unwrap_or(usize::MAX) };
     if handshake == [0;64] || local_key == [0;32] || peer_key == [0;32] || local_key == peer_key || s.context == usize::MAX { s.cap.unknown_identity = true; }
 }); }
-/// Called by exactly the existing native-attempt classifier, without re-consuming its token.
 pub fn commit_proof(kind: usize, proof: u8) { if kind == 1 { with(|s| s.proof = proof); } }
 pub fn feedback(seq: u64, ns: u64, kind: u8) { with(|s| { {s.latest_ns=s.latest_ns.max(ns);} push(&mut s.cap.feedback, Feedback { conn:s.context,seq,ns,kind }, FEEDBACK_LIMIT,&mut s.cap.overflow); }); }
 pub fn layout_start(mut l: Layout) -> Layout { with(|s| {
@@ -234,8 +173,7 @@ pub fn layout_start(mut l: Layout) -> Layout { with(|s| {
 pub fn layout_event(mut l: Layout, planned: u32, assembled: u32, ns: u64, event: u8) { with(|s| {
     {s.latest_ns=s.latest_ns.max(ns);}
     l.conn=s.context; l.planned=planned; l.assembled=assembled; l.ns=ns; l.event=event;
-    push(&mut s.cap.layouts,l,LAYOUT_LIMIT,&mut s.cap.overflow);
-}); }
+    push(&mut s.cap.layouts,l,LAYOUT_LIMIT,&mut s.cap.overflow); }); }
 fn symbol(frame: &crate::stp::WireFrame<'_>, conn: usize, seq: u64, ordinal:u64, ns:u64, outcome:u8) -> Option<Symbol> {
     let crate::stp::WireFrame::Fec { id,block_id,message_len,block_bytes,segment,.. } = frame else { return None; };
     let layout = crate::fec::MessageLayout::new(*message_len,*block_bytes);
@@ -248,39 +186,25 @@ pub fn tx(seq:u64,ns:u64,payload:&[u8]) { if !active() { return; } with(|s| {
     s.ordinal=s.ordinal.checked_add(1).unwrap_or_else(||{s.cap.overflow=true;u64::MAX});
     let mut rest=payload; let mut any=false;
     while let Some((frame,n))=crate::stp::read_frame(rest) { rest=&rest[n..];
-        if let Some(r)=symbol(&frame,s.context,seq,s.ordinal,ns,proof) { any=true;push(&mut s.cap.tx,r,PACKET_LIMIT,&mut s.cap.overflow); }
-    }
+        if let Some(r)=symbol(&frame,s.context,seq,s.ordinal,ns,proof) { any=true;push(&mut s.cap.tx,r,PACKET_LIMIT,&mut s.cap.overflow); } }
     if !any { push(&mut s.cap.tx,Symbol {conn:s.context,seq,ordinal:s.ordinal,ns,package:u64::MAX,root:u64::MAX,len:0,width:0,symbol:0,group:0,k:0,source:false,outcome:proof},PACKET_LIMIT,&mut s.cap.overflow); }
 }); }
-/// Appends arrival BEFORE any receiver admission. Default UNKNOWN (0) is deliberately not admitted.
 pub struct RxGuard { index: Option<usize> }
 impl RxGuard {
     pub(crate) fn new(frame:&crate::stp::WireFrame<'_>,seq:u64,ns:u64) -> Self {
         let mut index=None;with(|s| { if let Some(r)=symbol(frame,s.context,seq,0,ns,0) {index=push(&mut s.cap.rx,r,PACKET_LIMIT,&mut s.cap.overflow);s.rx_current=index;} });Self{index}
     }
-    pub fn outcome(&mut self, outcome:u8) { with(|s| { if let Some(i)=self.index { s.cap.rx[i].outcome=outcome; } }); }
-}
+    pub fn outcome(&mut self, outcome:u8) { with(|s| { if let Some(i)=self.index { s.cap.rx[i].outcome=outcome; } }); } }
 pub fn rx_status(outcome:u8) { with(|s| {if let Some(i)=s.rx_current {s.cap.rx[i].outcome=outcome;}}); }
 pub fn replay(seq:u64,ns:u64,payload:&[u8]) { if !active(){return;} let mut rest=payload;
-    while let Some((frame,n))=crate::stp::read_frame(rest) { rest=&rest[n..];let mut g=RxGuard::new(&frame,seq,ns);g.outcome(2); }
-}
-/// Swap only at service boundary. Fresh fixed-capacity buffers are allocated outside packet handling.
-/// Connections copied into the next chunk preserve context; ordinals/generations never reset.
+    while let Some((frame,n))=crate::stp::read_frame(rest) { rest=&rest[n..];let mut g=RxGuard::new(&frame,seq,ns);g.outcome(2); } }
 pub fn take(ns:u64) -> Option<Capture> { STATE.with(|state| { let mut b=state.borrow_mut();let s=b.as_mut()?;
     let mut next=Capture::new(s.ordinal);next.connections.extend_from_slice(&s.cap.connections);
     {
-        s.demand_count+=s.cap.demands.len() as u64;
-        DEMANDS_USED.with(|n|n.set(s.demand_count));
-        DEMANDS_INVALID.with(|v|v.set(v.get()||s.cap.demand_overflow));
-        // Service-boundary allocation only: shrink the returned chunk before splitting its remaining
-        // capacity. Combined live payload capacities never exceed the owning-thread 4096-record cap.
-        s.cap.demands.shrink_to_fit();
+        s.demand_count+=s.cap.demands.len() as u64; DEMANDS_USED.with(|n|n.set(s.demand_count));
+        DEMANDS_INVALID.with(|v|v.set(v.get()||s.cap.demand_overflow)); s.cap.demands.shrink_to_fit();
         next.demands=Vec::with_capacity(DEMAND_LIMIT.saturating_sub(s.demand_count as usize));
-        next.demand_overflow=s.cap.demand_overflow;
-        next.adaptive_generations=s.cap.adaptive_generations;
-        next.adaptive_generations_count=s.cap.adaptive_generations_count;
-    }
-    // Overflow/identity are session-latched, including across chunk boundaries.
+        next.demand_overflow=s.cap.demand_overflow; next.adaptive_generations=s.cap.adaptive_generations;
+        next.adaptive_generations_count=s.cap.adaptive_generations_count; }
     next.overflow=s.cap.overflow;next.unknown_identity=s.cap.unknown_identity;
-    s.rx_current=None; s.cap.end_ordinal=s.ordinal;s.cap.drain_ns=ns;Some(std::mem::replace(&mut s.cap,next))
-}) }
+    s.rx_current=None; s.cap.end_ordinal=s.ordinal;s.cap.drain_ns=ns;Some(std::mem::replace(&mut s.cap,next)) }) }
