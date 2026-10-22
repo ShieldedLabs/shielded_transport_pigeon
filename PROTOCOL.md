@@ -1,9 +1,9 @@
-# STP wire protocol, version 6 (research, unreleased)
+# STP wire protocol, version 6
 
 This document specifies the incompatible version-6 transport (compact connected
-counters and key phase) of `shielded_transport_pigeon`. It does not change the
-crate's package version. Status: unreleased research profile; validation is
-implementation evidence, not an independent interoperability or security audit.
+counters and key phase) shipped in `shielded_transport_pigeon` 1.0.0. Wire-profile
+and crate-package versions are independent. Validation is implementation
+evidence, not an independent interoperability or security audit.
 All STP framing integers are unsigned little-endian; offsets below are byte
 offsets. Public keys and Noise messages are byte strings with the encodings
 specified by Noise, not little-endian STP integers. One UDP payload is one STP

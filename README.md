@@ -64,7 +64,7 @@ substitutes a clock, deterministic seed, or uninitialized `/dev/urandom` fallbac
 
 ## Compatibility
 
-The **unreleased 1.0.0** source internalizes Wirehair, address encoding and
+Version **1.0.0** internalizes Wirehair, address encoding and
 platform bindings, while using external cryptography crates. Package versions
 advance by majors only. This source keeps the congestion control, repair policy
 and application rings of main `1e00403`, but changes the wire profile as described
@@ -72,10 +72,10 @@ below.
 The published **0.3.0** introduced the caller-driven pump and three SPSC rings,
 replacing the 0.2 application API. The library does not start network or FEC
 threads. Move the pump to an application-owned thread if desired.
-The package version and wire-profile version are separate. Current main uses
-**wire profile 6** (research, unreleased), incompatible with profiles 2 through 5,
-including the published 0.3.0 version-2 profile; no published package version
-contains it. Both peers must be updated together: mismatched handshake
+The package version and wire-profile version are separate. Version 1.0.0 uses
+**wire profile 6**, incompatible with profiles 2 through 5,
+including the 0.3.0 version-2 profile.
+Both peers must be updated together: mismatched handshake
 selectors are rejected. Profile 6 keeps profile 5's bitmap ACK and 445-byte
 minimum FEC symbol for 512-byte MTU recovery, and the
 exact sampled UDP payload size inside the unchanged 152-byte ACK; known size
