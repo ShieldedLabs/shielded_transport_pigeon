@@ -8107,17 +8107,11 @@ pub(crate) fn new_reference_pump_with_options(
                                                     &packet_memory_send
                                                         [0..6 + 32 + SERVER_HELLO_PAYLOAD_LEN],
                                                 );
-                                                let my_ip =
-                                                    if other_ip_addr.to_ipv4_mapped().is_some() {
-                                                        Ipv6Addr::UNSPECIFIED
-                                                    } else {
-                                                        Ipv6Addr::UNSPECIFIED
-                                                    };
                                                 connections_map.insert(connection_key,
                                                 ConnectionTrackingData {
                                                     receive_reservation,
                                                     receive_budget: crate::receive_memory::ReceiveMemoryBudget::connection_with_limit(&receive_memory, connection_receive_limit).with_worker_limit(receive_worker_limit(max_message_size, send_queue_count)),
-                                                    creation_time_ns: monotonic_clock_ns(), my_ip,
+                                                    creation_time_ns: monotonic_clock_ns(), my_ip: Ipv6Addr::UNSPECIFIED,
                                                     my_transport_identity_keypair: my_kp.clone(),
                                                     two_byte_send_prefix: load_u16(&my_kp.public[0..2]) << 1,
                                                     other_ip: other_ip_addr, other_port: other_port,
@@ -8214,18 +8208,11 @@ pub(crate) fn new_reference_pump_with_options(
                                                     let handshake_hash =
                                                         get_handshake_hash(&new_handshake);
                                                     let cipher = ConnectionCipherTriplet::new_from_old_init_only(new_handshake.into_stateless_transport_mode().expect("Cannot fail given assert above."));
-                                                    let my_ip =
-                                                        if other_ip_addr.to_ipv4_mapped().is_some()
-                                                        {
-                                                            Ipv6Addr::UNSPECIFIED
-                                                        } else {
-                                                            Ipv6Addr::UNSPECIFIED
-                                                        };
                                                     connections_map.insert(connection_key,
                                                     ConnectionTrackingData {
                                                         receive_reservation,
                                                         receive_budget: crate::receive_memory::ReceiveMemoryBudget::connection_with_limit(&receive_memory, connection_receive_limit).with_worker_limit(receive_worker_limit(max_message_size, send_queue_count)),
-                                                        creation_time_ns: monotonic_clock_ns(), my_ip,
+                                                        creation_time_ns: monotonic_clock_ns(), my_ip: Ipv6Addr::UNSPECIFIED,
                                                         my_transport_identity_keypair: my_kp.clone(),
                                                         two_byte_send_prefix: load_u16(&my_kp.public[0..2]) << 1,
                                                         other_ip: other_ip_addr, other_port: other_port,
