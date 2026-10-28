@@ -1329,6 +1329,21 @@ mod macos {
                     format_args!("Failed to set IPV6_DONTFRAG (required PMTU probing policy)"),
                 );
             }
+            // The default UDP send buffer is net.inet.udp.maxdgram (9216). A datagram that does not fit
+            // fails with EAGAIN every time, which the send path takes as backpressure, so a connection whose
+            // TU reaches 8192 never sends again. Buffers above kern.ipc.maxsockbuf are refused: halve until one fits.
+            for (opt, name) in [(sys::SO_RCVBUF, "SO_RCVBUF"), (sys::SO_SNDBUF, "SO_SNDBUF")] {
+                let mut want: sys::c_int = 16 << 20;
+                while want >= 64 << 10 && setsockopt_int(fd, sys::SOL_SOCKET, opt, want) != 0 {
+                    want /= 2;
+                }
+                if want < 64 << 10 {
+                    eprintln!(
+                        "Failed to raise {name}: {}",
+                        std::io::Error::last_os_error()
+                    );
+                }
+            }
         }
         Some(SockHandle(fd))
     }
