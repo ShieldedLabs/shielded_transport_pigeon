@@ -12,7 +12,6 @@ pub const KIND_NAMES: [&str; 5] = ["ack", "data", "keepalive", "mtu_probe", "out
 pub const KIND_DATA: usize = 1;
 const OUTCOME_NONE: u8 = 0;
 const OUTCOME_FULL: u8 = 1;
-const OUTCOME_BACKPRESSURE: u8 = 2;
 const OUTCOME_TOLERATED: u8 = 3;
 #[derive(Clone, Copy)]
 struct Attempt {
@@ -32,6 +31,7 @@ thread_local! { static UDP_SEND_FULL: Cell<u64> = const { Cell::new(0) };
 static UDP_SEND_FULL_BYTES: Cell<u64> = const { Cell::new(0) };
 static UDP_SEND_TOLERATED: [Cell<u64>; 7] = const { [Cell::new(0), Cell::new(0), Cell::new(0), Cell::new(0), Cell::new(0), Cell::new(0), Cell::new(0)] };
 static UDP_SEND_BACKPRESSURE: Cell<u64> = const { Cell::new(0) };
+static UDP_SEND_OTHER_ERRORS: Cell<u64> = const { Cell::new(0) };
 static NEXT_TOKEN: Cell<u64> = const { Cell::new(1) };
 static LAST_ATTEMPT: Cell<Attempt> = const { Cell::new(Attempt { token: 0, outcome: OUTCOME_NONE, errno: 0, len: 0, head: [0; 16] }) };
 static CONSUMED_TOKEN: Cell<u64> = const { Cell::new(0) };
@@ -73,14 +73,29 @@ pub fn udp_send_full(payload: &[u8]) {
     UDP_SEND_FULL_BYTES.with(|c| bump(c, payload.len() as u64));
     record(payload, OUTCOME_FULL, 0);
 }
-pub fn udp_send_tolerated(payload: &[u8], errno: i32) {
-    let i = tolerated_index(errno);
-    UDP_SEND_TOLERATED.with(|a| bump(&a[i], 1));
+/// All errors are consumed local drops. Keep the historical error buckets as
+/// diagnostics only; they no longer select send/retry behavior.
+pub fn udp_send_error(payload: &[u8], errno: i32) {
+    if let Some(i) = tolerated_index(errno) {
+        UDP_SEND_TOLERATED.with(|a| bump(&a[i], 1));
+    } else if buffer_refusal(errno) {
+        UDP_SEND_BACKPRESSURE.with(|c| bump(c, 1));
+    } else {
+        UDP_SEND_OTHER_ERRORS.with(|c| bump(c, 1));
+    }
     record(payload, OUTCOME_TOLERATED, errno);
 }
-pub fn udp_send_backpressure(payload: &[u8]) {
-    UDP_SEND_BACKPRESSURE.with(|c| bump(c, 1));
-    record(payload, OUTCOME_BACKPRESSURE, 0);
+fn buffer_refusal(errno: i32) -> bool {
+    #[cfg(windows)]
+    {
+        errno == crate::platform::sys::WSAEWOULDBLOCK || errno == crate::platform::sys::WSAENOBUFS
+    }
+    #[cfg(not(windows))]
+    {
+        errno == crate::platform::sys::EAGAIN
+            || errno == crate::platform::sys::EWOULDBLOCK
+            || errno == crate::platform::sys::ENOBUFS
+    }
 }
 pub fn observe_commit(kind: usize, bytes: &[u8]) {
     let kind = kind.min(4);
@@ -120,7 +135,7 @@ pub fn fec_repair_skipped(skipped: u64) {
     FEC_REPAIR_SKIP_EVENTS.with(|c| bump(c, 1));
     FEC_REPAIR_SKIPPED_SYMBOLS.with(|c| bump(c, skipped));
 }
-pub fn tolerated_index(errno: i32) -> usize {
+fn tolerated_index(errno: i32) -> Option<usize> {
     #[cfg(any(unix, windows))]
     {
         [
@@ -134,12 +149,11 @@ pub fn tolerated_index(errno: i32) -> usize {
         ]
         .iter()
         .position(|e| *e == errno)
-        .unwrap_or(6)
     }
     #[cfg(not(any(unix, windows)))]
     {
         let _ = errno;
-        6
+        None
     }
 }
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -148,7 +162,9 @@ pub struct ThreadSendCounters {
     pub udp_send_full: u64,
     pub udp_send_full_bytes: u64,
     pub udp_send_tolerated_by_errno: [u64; 7],
+    /// Historical name: counts consumed EAGAIN/EWOULDBLOCK/ENOBUFS drops, not retries.
     pub udp_send_backpressure: u64,
+    pub udp_send_other_errors: u64,
     pub commit_kernel_full: [u64; 5],
     pub commit_tolerated_error: [u64; 5],
     pub commit_unmatched: [u64; 5],
@@ -163,12 +179,13 @@ impl ThreadSendCounters {
             k.with(|a| std::array::from_fn(|i| a[i].get()))
         };
         Self {
-            udp_counters_supported: cfg!(target_os = "linux"),
+            udp_counters_supported: true,
             udp_send_full: UDP_SEND_FULL.with(|c| c.get()),
             udp_send_full_bytes: UDP_SEND_FULL_BYTES.with(|c| c.get()),
             udp_send_tolerated_by_errno: UDP_SEND_TOLERATED
                 .with(|a| std::array::from_fn(|i| a[i].get())),
             udp_send_backpressure: UDP_SEND_BACKPRESSURE.with(|c| c.get()),
+            udp_send_other_errors: UDP_SEND_OTHER_ERRORS.with(|c| c.get()),
             commit_kernel_full: arr5(&COMMIT_KERNEL_FULL),
             commit_tolerated_error: arr5(&COMMIT_TOLERATED_ERROR),
             commit_unmatched: arr5(&COMMIT_UNMATCHED),
@@ -221,9 +238,9 @@ impl QueueObservation {
 pub struct CohortObservation {
     pub connected: bool,
     pub handshake_prefix: u64,
+    /// Only an intentional whole-packet duplication copy can remain pending.
     pub pending_send: bool,
     pub pending_send_kind: Option<u8>,
-    pub locally_blocked: bool,
     pub send_sequence_number: u64,
     pub last_sent_data_packet: u64,
     pub test_dropped: u64,
@@ -236,5 +253,50 @@ pub struct CohortObservation {
 impl CohortObservation {
     pub fn all_idle(&self) -> bool {
         self.connected && !self.pending_send && self.queues.iter().all(|q| q.idle())
+    }
+}
+
+#[cfg(test)]
+mod send_tests {
+    use super::*;
+
+    #[test]
+    fn errors_keep_local_drop_proof_distinct_from_kernel_acceptance() {
+        let payload = [7; 512];
+        let before = ThreadSendCounters::read();
+        udp_send_error(&payload, i32::MAX);
+        observe_commit(KIND_DATA, &payload);
+        #[cfg(windows)]
+        let buffer_error = crate::platform::sys::WSAEWOULDBLOCK;
+        #[cfg(not(windows))]
+        let buffer_error = crate::platform::sys::EAGAIN;
+        udp_send_error(&payload, buffer_error);
+        observe_commit(KIND_DATA, &payload);
+        udp_send_full(&payload);
+        observe_commit(KIND_DATA, &payload);
+        let after = ThreadSendCounters::read();
+        assert!(after.udp_counters_supported);
+        assert_eq!(
+            after.udp_send_other_errors,
+            before.udp_send_other_errors + 1
+        );
+        assert_eq!(
+            after.udp_send_backpressure,
+            before.udp_send_backpressure + 1
+        );
+        assert_eq!(after.udp_send_full, before.udp_send_full + 1);
+        assert_eq!(
+            after.udp_send_tolerated_by_errno,
+            before.udp_send_tolerated_by_errno
+        );
+        assert_eq!(
+            after.commit_tolerated_error[KIND_DATA],
+            before.commit_tolerated_error[KIND_DATA] + 2
+        );
+        assert_eq!(
+            after.commit_kernel_full[KIND_DATA],
+            before.commit_kernel_full[KIND_DATA] + 1
+        );
+        assert_eq!(after.commit_unmatched, before.commit_unmatched);
     }
 }

@@ -112,6 +112,33 @@ impl Dscp {
         }
     }
 }
+/// Result of one UDP send attempt, not a delivery receipt. Connected senders
+/// consume the packet even on error; the timestamp feeds normal loss/recovery.
+#[derive(Debug, Clone, Copy)]
+pub struct SendAttempt {
+    pub attempted_at_ns: u64,
+    /// None only when the entire datagram was accepted locally. Zero denotes
+    /// an unexpected short send; other values are the platform's raw OS error.
+    pub error: Option<i32>,
+}
+impl SendAttempt {
+    fn completed(attempted_at_ns: u64, payload: &[u8], result: Result<usize, i32>) -> Self {
+        let error = match result {
+            Ok(n) if n == payload.len() => None,
+            Ok(_) => Some(0),
+            Err(error) => Some(error),
+        };
+        #[cfg(feature = "research_cohort_observer")]
+        match error {
+            None => crate::cohort_observe::udp_send_full(payload),
+            Some(error) => crate::cohort_observe::udp_send_error(payload, error),
+        }
+        Self {
+            attempted_at_ns,
+            error,
+        }
+    }
+}
 const PROBE_V4: [u8; 4] = [1, 1, 1, 1];
 const PROBE_V6: [u8; 16] = [
     0x26, 0x06, 0x47, 0x00, 0x47, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11, 0x11,
@@ -294,6 +321,12 @@ mod linux {
     #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
     pub struct SockHandle(sys::c_int, Option<Ipv6Addr>);
     impl SockHandle {
+        #[cfg(test)]
+        pub(crate) fn from_test_socket(socket: &std::net::UdpSocket) -> Self {
+            use std::os::fd::AsRawFd;
+            Self(socket.as_raw_fd(), None)
+        }
+
         pub(crate) fn wait_readable(self, wake: sys::c_int, timeout: std::time::Duration) {
             let mut fds = [
                 sys::pollfd {
@@ -556,7 +589,7 @@ mod linux {
         payload: &[u8],
         dscp: Dscp,
         ecn_signal: bool,
-    ) -> Option<u64> {
+    ) -> SendAttempt {
         let fd = udp_socket.0;
         let known_good_ipv6_address = udp_socket.1;
         let mut iov = sys::iovec {
@@ -630,56 +663,22 @@ mod linux {
                     (sys::IPPROTO_IP, sys::IP_TOS),
                     (sys::IPPROTO_IPV6, sys::IPV6_TCLASS),
                 ] {
-                    if setsockopt_int(fd, level, option, tclass_byte as sys::c_int) != 0 {
-                        let err = std::io::Error::last_os_error();
-                        if !matches!(err.raw_os_error(), Some(sys::EINVAL | sys::ENOPROTOOPT)) {
-                            panic!("UDP Socket error: {}", err);
-                        }
-                    }
+                    let _ = setsockopt_int(fd, level, option, tclass_byte as sys::c_int);
                 }
                 msg.msg_control = core::ptr::null_mut();
                 msg.msg_controllen = 0;
             }
             let timestamp_ns = monotonic_clock_ns();
             let n = sys::sendmsg(fd, &msg as *const _ as *mut _, 0);
-            if n < 0 {
-                let err = std::io::Error::last_os_error();
-                if err
-                    .raw_os_error()
-                    .is_some_and(|e| e == sys::EAGAIN || e == sys::EWOULDBLOCK || e == sys::ENOBUFS)
-                {
-                    #[cfg(feature = "research_cohort_observer")]
-                    crate::cohort_observe::udp_send_backpressure(payload);
-                    return None;
-                }
-                if matches!(
-                    err.raw_os_error(),
-                    Some(
-                        sys::EMSGSIZE
-                            | sys::ENETUNREACH
-                            | sys::EHOSTUNREACH
-                            | sys::ENETDOWN
-                            | sys::ECONNREFUSED
-                            | sys::EHOSTDOWN
-                            | sys::EAFNOSUPPORT
-                    )
-                ) {
-                    #[cfg(feature = "research_cohort_observer")]
-                    crate::cohort_observe::udp_send_tolerated(
-                        payload,
-                        err.raw_os_error().unwrap_or(0),
-                    );
-                    return Some(timestamp_ns);
-                }
-                panic!("UDP Socket error: {}", err);
-            }
-            let sent = n as usize;
-            if sent != payload.len() {
-                panic!("partial UDP send: {sent} of {}", payload.len());
-            }
-            #[cfg(feature = "research_cohort_observer")]
-            crate::cohort_observe::udp_send_full(payload);
-            Some(timestamp_ns)
+            SendAttempt::completed(
+                timestamp_ns,
+                payload,
+                if n < 0 {
+                    Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+                } else {
+                    Ok(n as usize)
+                },
+            )
         }
     }
     #[inline]
@@ -1009,19 +1008,14 @@ mod windows {
         payload: &[u8],
         dscp: Dscp,
         ecn_signal: bool,
-    ) -> Option<u64> {
+    ) -> SendAttempt {
         let sock = udp_socket.0;
         let tclass_i32 = tclass_byte(dscp, ecn_signal) as i32;
         for &(proto, opt) in &[
             (IPPROTO_IP as i32, IP_TOS as i32),
             (IPPROTO_IPV6 as i32, IPV6_TCLASS as i32),
         ] {
-            if setsockopt_val(sock, proto, opt, tclass_i32) == SOCKET_ERROR {
-                let e = unsafe { WSAGetLastError() };
-                if e != WSAEINVAL && e != WSAENOPROTOOPT {
-                    panic!("UDP Socket error: {}", std::io::Error::from_raw_os_error(e));
-                }
-            }
+            let _ = setsockopt_val(sock, proto, opt, tclass_i32);
         }
         let dst = SockAddrIn6Raw {
             sin6_family: AF_INET6 as u16,
@@ -1041,27 +1035,15 @@ mod windows {
                 size_of::<SockAddrIn6Raw>() as i32,
             )
         };
-        if n == SOCKET_ERROR {
-            let e = unsafe { WSAGetLastError() };
-            if e == WSAEWOULDBLOCK || e == WSAENOBUFS {
-                return None;
-            }
-            if e == WSAEMSGSIZE
-                || e == WSAENETUNREACH
-                || e == WSAEHOSTUNREACH
-                || e == WSAECONNREFUSED
-                || e == WSAECONNRESET
-                || e == WSAEINVAL
-                || e == WSAEHOSTDOWN
-            {
-                return Some(timestamp_ns);
-            }
-            panic!("UDP Socket error: {}", std::io::Error::from_raw_os_error(e));
-        }
-        if n as usize != payload.len() {
-            panic!("partial UDP send: {} of {}", n, payload.len());
-        }
-        Some(timestamp_ns)
+        SendAttempt::completed(
+            timestamp_ns,
+            payload,
+            if n == SOCKET_ERROR {
+                Err(unsafe { WSAGetLastError() })
+            } else {
+                Ok(n as usize)
+            },
+        )
     }
     #[inline]
     pub fn udp_recv_with_congestion_and_dscp(
@@ -1286,6 +1268,12 @@ mod macos {
     #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
     pub struct SockHandle(sys::c_int);
     impl SockHandle {
+        #[cfg(test)]
+        pub(crate) fn from_test_socket(socket: &std::net::UdpSocket) -> Self {
+            use std::os::fd::AsRawFd;
+            Self(socket.as_raw_fd())
+        }
+
         /// Caller must own the socket and never use any copy after this call.
         pub(crate) unsafe fn close(self) {
             unsafe {
@@ -1355,7 +1343,7 @@ mod macos {
         payload: &[u8],
         dscp: Dscp,
         ecn_signal: bool,
-    ) -> Option<u64> {
+    ) -> SendAttempt {
         const SO_NET_SERVICE_TYPE: sys::c_int = 0x1116;
         const NET_SERVICE_TYPE_BE: sys::c_int = 0;
         const NET_SERVICE_TYPE_BK: sys::c_int = 1;
@@ -1369,9 +1357,7 @@ mod macos {
                 Dscp::Af21 => NET_SERVICE_TYPE_SIG,
                 Dscp::Ef => NET_SERVICE_TYPE_VO,
             };
-            if setsockopt_int(fd, sys::SOL_SOCKET, SO_NET_SERVICE_TYPE, svc) != 0 {
-                panic!("UDP Socket error: {}", std::io::Error::last_os_error());
-            }
+            let _ = setsockopt_int(fd, sys::SOL_SOCKET, SO_NET_SERVICE_TYPE, svc);
         }
         let mut sin6 = sockaddr_in6(dst_ip6.octets(), dst_port);
         let mut iov = sys::iovec {
@@ -1402,33 +1388,15 @@ mod macos {
             msg.msg_controllen = sys::CMSG_SPACE(std::mem::size_of::<sys::c_int>() as _) as _;
             let timestamp_ns = monotonic_clock_ns();
             let n = sys::sendmsg(fd, &msg as *const _ as *mut _, 0);
-            if n < 0 {
-                let err = std::io::Error::last_os_error();
-                if err
-                    .raw_os_error()
-                    .is_some_and(|e| e == sys::EAGAIN || e == sys::EWOULDBLOCK || e == sys::ENOBUFS)
-                {
-                    return None;
-                }
-                if matches!(
-                    err.raw_os_error(),
-                    Some(
-                        sys::EMSGSIZE
-                            | sys::ENETUNREACH
-                            | sys::EHOSTUNREACH
-                            | sys::ENETDOWN
-                            | sys::ECONNREFUSED
-                            | sys::EHOSTDOWN
-                    )
-                ) {
-                    return Some(timestamp_ns);
-                }
-                panic!("UDP Socket error: {}", err);
-            }
-            if n as usize != payload.len() {
-                panic!("partial UDP send: {n} of {}", payload.len());
-            }
-            Some(timestamp_ns)
+            SendAttempt::completed(
+                timestamp_ns,
+                payload,
+                if n < 0 {
+                    Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+                } else {
+                    Ok(n as usize)
+                },
+            )
         }
     }
     #[inline]
@@ -1509,5 +1477,56 @@ mod macos {
         _udp_socket: SockHandle,
     ) -> (Option<Ipv6Addr>, Option<Ipv6Addr>) {
         (probe_v4_source(), probe_v6_source())
+    }
+}
+
+#[cfg(test)]
+mod send_tests {
+    use super::*;
+
+    #[test]
+    fn all_send_errors_and_short_sends_are_local_drops() {
+        for error in [0, 1, 11, 35, 55, 10035, i32::MAX] {
+            let attempt = SendAttempt::completed(123, &[1; 32], Err(error));
+            assert_eq!(attempt.attempted_at_ns, 123);
+            assert_eq!(attempt.error, Some(error));
+        }
+        assert_eq!(SendAttempt::completed(123, &[1; 32], Ok(31)).error, Some(0));
+        assert_eq!(SendAttempt::completed(123, &[1; 32], Ok(32)).error, None);
+    }
+
+    #[cfg(all(unix, not(cosmo)))]
+    #[test]
+    fn oversized_send_does_not_prevent_next_small_datagram() {
+        // No source-address discovery, external hosts or unbounded receive.
+        let sender = std::net::UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)).unwrap();
+        let receiver = std::net::UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)).unwrap();
+        receiver
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        let socket = SockHandle::from_test_socket(&sender);
+        let port = receiver.local_addr().unwrap().port();
+        let failed = udp_send_with_congestion_and_dscp(
+            socket,
+            Ipv6Addr::LOCALHOST,
+            port,
+            &[0; 65_536],
+            Dscp::BestEffort,
+            false,
+        );
+        assert!(failed.error.is_some());
+        let accepted = udp_send_with_congestion_and_dscp(
+            socket,
+            Ipv6Addr::LOCALHOST,
+            port,
+            &[0xff; 512],
+            Dscp::BestEffort,
+            false,
+        );
+        assert_eq!(accepted.error, None);
+        assert!(accepted.attempted_at_ns >= failed.attempted_at_ns);
+        let mut received = [0; 513];
+        assert_eq!(receiver.recv(&mut received).unwrap(), 512);
+        assert_eq!(&received[..512], &[0xff; 512]);
     }
 }

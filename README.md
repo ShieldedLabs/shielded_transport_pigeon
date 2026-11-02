@@ -160,9 +160,13 @@ handle are `Send`; the single-owner app handle is deliberately **not Sync**.
   the shared application bottleneck before a large message completes, using the
   existing sender congestion cut/guard; draining stops new overload marks.
   `ConnectionStats::rx_app_overload_ce_marks` counts synthetic packet marks,
-  not dropped messages; `ack_app_overload_ce_sent` counts successful ACK sends
-  requesting local overload CE, not proof of OS/path preservation. It also
-  refuses inbound handshakes: neither new hello
+  not dropped messages; `ack_app_overload_ce_sent` counts locally accepted ACK sends
+  requesting local overload CE, not proof of OS/path preservation. Connected
+  `packets_sent`/`ack_packets_sent` and byte totals count attempts, including
+  OS send errors; `local_send_drops`/`local_send_drop_bytes` and
+  `last_local_send_error` distinguish those local drops. Failed attempts consume
+  their nonce and queued work; they never block subsequent ACKs or recovery probes.
+  The pump also refuses inbound handshakes: neither new hello
   state nor handshake completion is admitted without a slot for `Connected`;
   frozen peer retry logic can retry once space returns. Must-deliver lifecycle
   events are held pump-side pending (bounded by live/pending associations),
@@ -238,9 +242,11 @@ independent interoperability or security audit. These historical results predate
 external validation of the current source is not an independent audit or a
 performance claim.
 
-This source tree ships no test suite: the unit and integration tests were
-removed to reduce source size, and validation was run externally against the
-baseline revision's tests.
+The historical unit and integration suite was removed to reduce source size;
+that validation was run externally against the baseline revision's tests.
+Focused in-tree regressions now cover consume-on-attempt UDP sending, local-drop
+telemetry, recovery/ACK progress, nonce uniqueness and handshake retry pacing.
+Run them with `cargo test` and `cargo test --all-features`.
 
 For 0.3.0, on a Ryzen 5 5500U Linux host using HPET, three interleaved loopback runs measured
 about **309,000 100-byte messages/s** with 8192 in flight and **246 MB/s** for

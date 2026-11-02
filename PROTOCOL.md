@@ -188,10 +188,11 @@ handshake; endpoints must not reinterpret a new hello as a connected rekey.
 
 Handshake retransmissions reuse the exact saved flight. This implementation
 expires a client attempt after 30 seconds from creation and a responder
-attempt after 15 seconds. Its first successful send is followed after about
-10 ms, then at 2.5-second intervals; local refusal does not advance that
-schedule. An interoperating peer MUST tolerate duplicate flights and provide
-confirmation within the responder lifetime. Precise retry pacing is local
+attempt after 15 seconds. Its first send attempt is followed after about
+10 ms, then at 2.5-second intervals. Every attempt advances this retry clock,
+including local send errors, so persistent refusal cannot create hot retries.
+An interoperating peer MUST tolerate duplicate flights and provide confirmation
+within the responder lifetime. Precise retry pacing is local
 policy, not a dependency of key or packet identity.
 
 ### Connected liveness and outage
@@ -212,10 +213,10 @@ of the first outstanding send and last progress). It stops application sends
 and MTU discovery but continues receive/ACK processing. It immediately sends
 an all-padding current-TU outage probe, then probes after 250 ms, 500 ms,
 1 s, 2 s, and at most every 4 s. Probes use fresh data nonces; ACKs/probes are
-subject to the same local-refusal and nonce-exhaustion rules as data.
+subject to the same consume-on-attempt and nonce-exhaustion rules as data.
 Only an authenticated ACK positively receipting a still-outstanding recorded
 outage probe younger than max(4 s, twice the pre-outage RTT) resumes sending.
-The sender retains 32 accepted outage/generic probe tuples in chronological
+The sender retains 32 attempted outage/generic probe tuples in chronological
 order, not nonce-modulo slots; generic traffic cannot overwrite a 2.5-second
 proof after only eight sends. Each new outage clears this ledger. A candidate
 must have been sent during the current outage, still be pending and at/after
@@ -294,9 +295,12 @@ outgoing nonces are zero for data and `2^63` for ACKs in each direction.
 The counters are independent, dense (ACKs do not leave data holes), monotone,
 and MUST NOT reset at rekey or low-bit wrap. A fresh handshake is required
 before actual nonce or u32 epoch exhaustion. A `(direction, key, nonce)` MUST
-NOT seal different plaintext or associated data. A locally blocked data
-packet retries its exact sealed bytes; a refused time-sensitive ACK burns
-its nonce and a later snapshot uses a fresh nonce.
+NOT seal different plaintext or associated data. Every established UDP send
+attempt consumes its packet and nonce, regardless of the OS result. A local
+send error is a dropped packet, not backpressure: no ciphertext is retained
+for retry and subsequent ACKs and recovery probes can proceed. Normal loss,
+MTU and outage machinery handles the missing receipt; this does not change
+socket-initialization or receive-error handling.
 
 Before decryption, infer the nonce space from **exact received UDP payload
 length**: encrypted ACK = `6 + 152 + 16 = 174` bytes, developer plaintext ACK =
@@ -336,8 +340,8 @@ recovers an ambiguous gap. Keys/epochs and replay do not reset to recover it;
 close/reconnect with fresh handshake keys if necessary. At 1 million allocated
 counters/s, `2^30` positions span about 1074 seconds. Each space has its own
 horizon: healthy data cannot resynchronize ACKs. Missing packets include loss,
-reordering and **locally burned ACK nonces on socket refusal**, not only emitted
-UDP packets. Ten-minute rotation does not restore missing counter bits. A
+reordering and **locally consumed data and ACK nonces on socket errors**, not
+only emitted UDP packets. Ten-minute rotation does not restore missing counter bits. A
 restart/new association uses fresh Noise keys and initial counters, never a
 counter reset under old keys.
 
@@ -351,15 +355,13 @@ keepalives fill exactly the current transmission unit (TU); upward MTU probes fi
 exactly their probed TU. Periodic reachability probes alternate 512 UDP bytes
 and the current TU.
 Handshakes are the explicitly separate exception.
-TU is the effective sender transmission unit: if an MTU-probe ACK arrives
-while a locally refused current-TU ciphertext is pending, its discovered
-larger TU is recorded but promotion is deferred until that immutable datagram
-is accepted. Downshift is also deferred across a pending whole-duplication copy:
-accepting its original cannot shrink the TU before the planned copy is accepted.
-Apply the deferred TU before framing any subsequent packet, including within a
-multi-packet send pass; run normal pacing finalization when the prepared width
-becomes stale. Never reseal changed plaintext under the pending nonce. Explicit
-probe-size exceptions are preserved verbatim through local-refusal retries.
+TU is the effective sender transmission unit. Local send errors never defer
+TU changes. Downshift is deferred only across an intentional pending whole-
+duplication copy: attempting its original cannot shrink the TU before the
+planned copy is attempted. Each copy uses its own fresh nonce. Apply the
+deferred TU before framing any subsequent packet, including within a multi-
+packet send pass; run normal pacing finalization when the prepared width
+becomes stale. Never seal changed plaintext under a used nonce.
 
 ### Receive admission and rejection order
 
@@ -906,7 +908,7 @@ from **1452, 1472, 2048, 4096, 8192, 9216**, identically for both IP families.
 A failed candidate above current TU establishes a temporary exclusive upper
 bound (the smaller of it and any live bound), expiring 30 seconds after that
 failure. While the gap exceeds eight bytes, search tries the integer midpoint
-between confirmed TU and the bound, with a **500 ms accepted-attempt floor**.
+between confirmed TU and the bound, with a **500 ms send-attempt floor**.
 Success moves only the confirmed floor; it does not erase a useful upper bound.
 Further interior failures renew the 30-second bound. When an outcome first
 settles the gap to at most eight bytes, an independent clock schedules a recheck
@@ -918,19 +920,19 @@ attempts increment this separate counter: low-RTT waits are initially 5 s, then
 an already armed clock nor increment its counter. An expired settled upper stays
 a revalidation target, not fresh evidence or a promotion/hold exception. Fresh
 authenticated success at that exact upper clears it only upon effective TU
-promotion, allowing normal coarse discovery after the accepted-attempt floor;
+promotion, allowing normal coarse discovery after the send-attempt floor;
 a partial path increase is therefore not trapped below the old boundary. With
 an unsettled expired bound, coarse search retains
 `max(500 ms, min(30 s, failures² * 250 ms))` backoff; it never slows interior
 refinement. These are issuance deadlines once locally eligible, not ACK-arrival
 guarantees. Both issuance and pump wakeups use the same candidate/deadline plan,
 independent of CC/application occupancy. Outside the one-time startup exception
-specified below, success never bypasses the last accepted attempt's 500 ms floor.
+specified below, success never bypasses the last send attempt's 500 ms floor.
 Only an **effective** shrink resets the failure count and seeds a bound from
 the old effective TU, not from an unrelated upward probe. During the ten-second
 post-recovery hold, strictly interior candidates below that live failed-size
 bound may issue and promote; candidates at or above it remain excluded. An
-obsolete pre-shrink attempt retains its exact size, nonce and pending ciphertext,
+obsolete pre-shrink attempt retains its exact size and nonce in send history,
 but its later ACK or failure cannot undo the reset search. A valid loss declaration
 may narrow the bracket even if its ordinary loss timer exceeds B+1 seconds;
 only positive promotion proof is subject to that freshness limit.
@@ -940,17 +942,17 @@ Default-on local size-recovery policy:
 - Alternate generic **512-byte and current-TU BE** all-padding data-space probes
   on **250 ms** slots when locally able: two probes per second of each size,
   with no increase in the total four-probe-per-second schedule. At TU 512 every
-  slot sends a small probe. The schedule depends on time and accepted generic
-  attempts, never on application availability, queue occupancy or message length;
-  ordinary 512-byte data does not move this clock. A pending ciphertext or
-  whole-packet copy takes priority; send-ring capacity still applies. Pump wake
-  deadlines include the generic probe and the upward hold. No thread is created.
+  slot sends a small probe. The schedule depends on time and generic send
+  attempts (including local drops), never on application availability, queue
+  occupancy or message length; ordinary 512-byte data does not move this clock.
+  Only an intentional whole-packet copy takes priority; send-ring capacity still
+  applies. Pump wake deadlines include the generic probe and the upward hold. No thread is created.
 - Feed only native authenticated, exact first-positive receipts into a bounded
   4096-entry nonce/size/send-time allocation: 3840 nonce-indexed metadata entries
   and a protected chronological 256-generic-probe ledger (64 seconds at four
   probes/s). Ordinary-send churn cannot erase recent generic evidence. Exact
   first-positive generic receipts train a separate raw RTT EWMA from their full
-  accepted send times, before freshness/classification; ordinary and upward
+  send-attempt times, before freshness/classification; ordinary and upward
   probes do not train it. First sample initializes SRTT=raw and variance=raw/2;
   subsequent samples use 1/8 SRTT and 1/4 absolute-error variance updates.
   Define `B = min(30 s, max(1 s, SRTT + 4*variance, 2*SRTT + ACK_delay_cap))`.
@@ -975,10 +977,10 @@ Default-on local size-recovery policy:
   A downshift clears both history rings, their cursor and valid count, while
   retaining the independently learned raw RTT estimate.
 - Hold discovery/promotion at or above the failed TU for ten seconds after a
-  decision; strictly interior bracket refinement is allowed as above. Pending
-  ciphertext and planned duplication copies retain their exact bytes and nonce;
-  effective shrink waits for their acceptance. Restart a still-active FEC unit
-  from its full shared source under a fresh unit ID if its symbol no longer fits;
+  decision; strictly interior bracket refinement is allowed as above. Planned
+  duplication copies retain their exact plaintext and use a fresh nonce;
+  effective shrink waits for their attempt, not local acceptance. Restart a
+  still-active FEC unit from its full shared source under a fresh unit ID if its symbol no longer fits;
   preserve segmented root/offset, and never reopen a sealed root or mutate an
   existing unit's layout. Already-forgotten messages are not made reliable.
 - Startup trial and initial unit assessment (profile-5 sender policy; nothing
@@ -987,12 +989,12 @@ Default-on local size-recovery policy:
   no extra delay (startup state Candidate, then Issued when that attempt is
   issued). Only a fresh, accepted success of that exact 1204 attempt that is
   promoted allows **one** prompt 1452 attempt once 1204 is effective; it bypasses
-  only the 500 ms accepted-attempt floor (hold, failed-size bounds and every
+  only the 500 ms send-attempt floor (hold, failed-size bounds and every
   other eligibility rule still apply). Afterwards, and in every other case,
   ordinary coarse search applies. The initial *assessment* is **unresolved**
   while the state is Candidate or Issued. It settles once, when the 1204 trial
   reaches an outcome and any promotion it caused is effective (no larger TU still
-  deferred behind a pending ciphertext or duplication copy); a failed trial, a
+  deferred behind a planned duplication copy); a failed trial, a
   cancellation, outage entry, or an effective shrink also ends it. Nothing
   re-arms the assessment for the connection.
 - During outage, either generic probe class also records an outage probe, so its

@@ -2194,8 +2194,6 @@ fn send_age_ns(now: u64, sent: u64) -> u64 {
 }
 fn needs_active_retry(state: &ConnectionStateConnected, has_unsent_data: bool) -> bool {
     has_unsent_data
-        || state.pending_send.is_some()
-        || state.locally_blocked
         || state.packets_waiting_ack_tail < state.active_send_frontier
         || state.outage.since_ns.is_some()
         || (state.ack_timer != u64::MAX && state.active_ack_feedback)
@@ -5323,8 +5321,8 @@ impl Drop for ConnectionCipherTriplet {
         self.new.rekey_manually(Some(&[0; 32]), Some(&[0; 32]));
     }
 }
-/// Encrypt once, then retain the exact result across local WouldBlock retries. None closes the connection before actual
-/// nonce or epoch exhaustion.
+/// Seal once per nonce. Every send attempt consumes it, including local drops.
+/// None closes the connection before actual nonce or epoch exhaustion.
 fn seal_connected_packet(
     cipher: &mut Option<ConnectionCipherTriplet>,
     prefix: u16,
@@ -5384,7 +5382,7 @@ pub enum ConnectionState {
     Connected(ConnectionStateConnected),
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PendingSendKind {
+enum ConnectedSendKind {
     Ack,
     Data,
     Keepalive,
@@ -5393,25 +5391,14 @@ enum PendingSendKind {
     Reachability,
     ReachabilityCurrent,
 }
-impl PendingSendKind {
+impl ConnectedSendKind {
     fn is_generic(self) -> bool {
         matches!(self, Self::Reachability | Self::ReachabilityCurrent)
     }
 }
-/// At most one refused datagram per connection. Nothing else may use its nonce until these exact ciphertext bytes are
-/// accepted. Allocation is failure-only.
-#[derive(Debug)]
-struct PendingSend {
-    kind: PendingSendKind,
-    bytes: Vec<u8>,
-    plaintext: Vec<u8>,
-    dscp: Dscp,
-}
 #[derive(Debug)]
 pub struct ConnectionStateConnected {
     target_state: crate::target_validation::RiskState,
-    pending_send: Option<PendingSend>,
-    locally_blocked: bool,
     pub cipher: Option<ConnectionCipherTriplet>,
     pub magic1: u64,
     pub magic2: u64,
@@ -5493,8 +5480,6 @@ pub fn new_connection_state_connected(
 ) -> ConnectionState {
     ConnectionState::Connected(ConnectionStateConnected {
         target_state: Default::default(),
-        pending_send: None,
-        locally_blocked: false,
         cipher,
         magic1,
         magic2,
@@ -5677,10 +5662,16 @@ pub struct ConnectionStats {
     pub network_cpu_user_us: u64,
     pub network_cpu_sys_us: u64,
     pub pacing_commanded_packets: u64,
+    /// Connected packet attempts, including local drops; not delivery receipts.
     pub packets_sent: u64,
     pub bytes_sent: u64,
+    /// ACK attempts, including local drops.
     pub ack_packets_sent: u64,
     pub ack_bytes_sent: u64,
+    /// All connected datagrams refused locally (data, ACK and probe attempts).
+    pub local_send_drops: u64,
+    pub local_send_drop_bytes: u64,
+    pub last_local_send_error: Option<i32>,
     pub ack_app_overload_ce_sent: u64,
     pub ack_packets_received: u64,
     pub ack_delay_us_max: u32,
@@ -5921,20 +5912,7 @@ impl ConnectionStateConnected {
         Some(nonce)
     }
     fn promote_tu(&mut self, tu: u64, now: u64) {
-        if self.pending_send.as_ref().is_some_and(|p| {
-            matches!(
-                p.kind,
-                PendingSendKind::Data
-                    | PendingSendKind::Keepalive
-                    | PendingSendKind::Outage
-                    | PendingSendKind::Reachability
-                    | PendingSendKind::ReachabilityCurrent
-            )
-        }) {
-            self.deferred_tu = Some(tu);
-        } else {
-            self.apply_effective_tu(tu, now);
-        }
+        self.apply_effective_tu(tu, now);
     }
     fn apply_effective_tu(&mut self, tu: u64, now: u64) {
         if tu < self.current_tu {
@@ -9617,61 +9595,6 @@ pub(crate) fn new_reference_pump_with_options(
                                         &mut connection_tracking_data.unreliable_send_buffer,
                                         current_time_now_ns,
                                     );
-                                    if let Some(pending) = state.pending_send.take() {
-                                        freeze_local_send(state, current_time_now_ns);
-                                        if let Some(t) = &mut loss_trace {
-                                            t.set_cc(
-                                                connection_tracking_data.two_byte_send_prefix,
-                                                cc_trace_context(
-                                                    state,
-                                                    current_time_now_ns,
-                                                    &cc,
-                                                    max_pps,
-                                                ),
-                                            );
-                                        }
-                                        let ack_overload = pending.kind == PendingSendKind::Ack
-                                            && application_receive_full(&thread_inner);
-                                        let sent = udp_send_with_congestion_and_dscp(
-                                            socket,
-                                            connection_tracking_data.other_ip,
-                                            connection_tracking_data.other_port,
-                                            &pending.bytes,
-                                            pending.dscp,
-                                            ack_overload,
-                                        );
-                                        if let Some(sent) = sent {
-                                            if ack_overload {
-                                                state.stats.ack_app_overload_ce_sent += 1;
-                                            }
-                                            #[cfg(feature = "research_cohort_observer")]
-                                            crate::cohort_observe::observe_commit(
-                                                pending.kind as usize,
-                                                &pending.bytes,
-                                            );
-                                            commit_connected_send(
-                                                state,
-                                                &mut connection_tracking_data
-                                                    .unreliable_send_buffer,
-                                                pending.kind,
-                                                sent,
-                                                pending.bytes.len(),
-                                                &pending.plaintext,
-                                                connection_tracking_data.two_byte_send_prefix,
-                                                loss_trace.as_mut(),
-                                            );
-                                            update_app_limit(
-                                                state,
-                                                current_time_now_ns,
-                                                connection_tracking_data
-                                                    .unreliable_send_buffer
-                                                    .has_unsent_data(),
-                                            );
-                                        } else {
-                                            state.pending_send = Some(pending);
-                                        }
-                                        return true;
-                                    }
                                     if current_time_now_ns > state.ack_timer {
                                         {
                                             let Some(virtual_nonce) = state.reserve_ack_nonce()
@@ -9702,24 +9625,21 @@ pub(crate) fn new_reference_pump_with_options(
                                                 Dscp::Af21,
                                                 ack_overload,
                                             );
-                                            if sent.is_some() && ack_overload {
+                                            if sent.error.is_none() && ack_overload {
                                                 state.stats.ack_app_overload_ce_sent += 1;
                                             }
-                                            if !finish_connected_send(
+                                            finish_connected_send(
                                                 state,
                                                 &mut connection_tracking_data
                                                     .unreliable_send_buffer,
-                                                PendingSendKind::Ack,
+                                                ConnectedSendKind::Ack,
                                                 sent,
                                                 current_time_now_ns,
                                                 &packet_memory_send[..o],
                                                 &[],
-                                                Dscp::Af21,
                                                 connection_tracking_data.two_byte_send_prefix,
                                                 loss_trace.as_mut(),
-                                            ) {
-                                                return true;
-                                            }
+                                            );
                                             state.update_feedback_deadline(current_time_now_ns);
                                         }
                                     }
@@ -9734,9 +9654,9 @@ pub(crate) fn new_reference_pump_with_options(
                                         let probe_size =
                                             state.recovery.probe_size(state.current_tu);
                                         let kind = if probe_size == crate::mtu_recovery::SMALL {
-                                            PendingSendKind::Reachability
+                                            ConnectedSendKind::Reachability
                                         } else {
-                                            PendingSendKind::ReachabilityCurrent
+                                            ConnectedSendKind::ReachabilityCurrent
                                         };
                                         let payload_len = probe_size as usize
                                 - total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(state.magic1).unwrap();
@@ -9759,7 +9679,7 @@ pub(crate) fn new_reference_pump_with_options(
                                             Dscp::BestEffort,
                                             false,
                                         );
-                                        if !finish_connected_send(
+                                        finish_connected_send(
                                             state,
                                             &mut connection_tracking_data.unreliable_send_buffer,
                                             kind,
@@ -9767,12 +9687,9 @@ pub(crate) fn new_reference_pump_with_options(
                                             current_time_now_ns,
                                             &packet_memory_encrypted[..packet_len],
                                             &[],
-                                            Dscp::BestEffort,
                                             connection_tracking_data.two_byte_send_prefix,
                                             loss_trace.as_mut(),
-                                        ) {
-                                            return true;
-                                        }
+                                        );
                                     }
                                     if state.outage.since_ns.is_none()
                                         && state.send_sequence_number
@@ -9838,12 +9755,11 @@ pub(crate) fn new_reference_pump_with_options(
                                                 state,
                                                 &mut connection_tracking_data
                                                     .unreliable_send_buffer,
-                                                PendingSendKind::Outage,
+                                                ConnectedSendKind::Outage,
                                                 send_time,
                                                 current_time_now_ns,
                                                 &packet_memory_encrypted[..packet_len],
                                                 &packet_memory_send[..probe_payload_len],
-                                                probe_dscp,
                                                 connection_tracking_data.two_byte_send_prefix,
                                                 loss_trace.as_mut(),
                                             );
@@ -10246,9 +10162,9 @@ pub(crate) fn new_reference_pump_with_options(
                             let Some(packet_len) = seal_connected_packet(&mut state.cipher, connection_tracking_data.two_byte_send_prefix,
                                 virtual_nonce, &null_bytes[..payload_size], &mut packet_memory_encrypted[..], current_time_now_ns) else { return false; };
                             let send_time_ns = udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..packet_len], Dscp::BestEffort, false);
-                            if !finish_connected_send(state, &mut connection_tracking_data.unreliable_send_buffer,
-                                PendingSendKind::MtuProbe, send_time_ns, current_time_now_ns, &packet_memory_encrypted[..packet_len],
-                                &[], Dscp::BestEffort, connection_tracking_data.two_byte_send_prefix, loss_trace.as_mut()) { return true; } }
+                            finish_connected_send(state, &mut connection_tracking_data.unreliable_send_buffer,
+                                ConnectedSendKind::MtuProbe, send_time_ns, current_time_now_ns, &packet_memory_encrypted[..packet_len],
+                                &[], connection_tracking_data.two_byte_send_prefix, loss_trace.as_mut()); }
                                     let payload_size = state.current_tu as usize - total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(state.magic1).unwrap();
                                     if !connection_tracking_data
                                         .unreliable_send_buffer
@@ -10279,20 +10195,17 @@ pub(crate) fn new_reference_pump_with_options(
                                             Dscp::Af21,
                                             false,
                                         );
-                                        if !finish_connected_send(
+                                        finish_connected_send(
                                             state,
                                             &mut connection_tracking_data.unreliable_send_buffer,
-                                            PendingSendKind::Keepalive,
+                                            ConnectedSendKind::Keepalive,
                                             send_time_ns,
                                             current_time_now_ns,
                                             &packet_memory_encrypted[..packet_len],
                                             &[],
-                                            Dscp::Af21,
                                             connection_tracking_data.two_byte_send_prefix,
                                             loss_trace.as_mut(),
-                                        ) {
-                                            return true;
-                                        }
+                                        );
                                         packet_send_allowance_now =
                                             packet_send_allowance_now.saturating_sub(1);
                                     }
@@ -10355,14 +10268,14 @@ pub(crate) fn new_reference_pump_with_options(
                                     test_drop_rng % 1_000_000 < test_drop_ppm / test_drop_burst
                                 } && { test_drop_burst_left = test_drop_burst - 1; true } };
                             if test_drop { state.stats.test_dropped += 1; }
-                            let send_time_ns = if test_drop { Some(monotonic_clock_ns()) }
+                            let send_time_ns = if test_drop { SendAttempt { attempted_at_ns: monotonic_clock_ns(), error: None } }
                             else { udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..packet_len], connection_tracking_data.unreliable_send_buffer.last_dscp, false) };
-                            if let Some(now) = send_time_ns { budget.sampled(now); }
-                            budget.progressed(); let dscp = connection_tracking_data.unreliable_send_buffer.last_dscp;
-                            if !finish_connected_send(state, &mut connection_tracking_data.unreliable_send_buffer,
-                                PendingSendKind::Data, send_time_ns, current_time_now_ns, &packet_memory_encrypted[..packet_len],
-                                &packet_memory_send[..payload_size], dscp, connection_tracking_data.two_byte_send_prefix,
-                                loss_trace.as_mut()) { return true; }
+                            budget.sampled(send_time_ns.attempted_at_ns);
+                            budget.progressed();
+                            finish_connected_send(state, &mut connection_tracking_data.unreliable_send_buffer,
+                                ConnectedSendKind::Data, send_time_ns, current_time_now_ns, &packet_memory_encrypted[..packet_len],
+                                &packet_memory_send[..payload_size], connection_tracking_data.two_byte_send_prefix,
+                                loss_trace.as_mut());
                             packet_send_allowance_now = packet_send_allowance_now.saturating_sub(1); }
                                     let pacing_burst =
                                         state.send_sequence_number - pacing_first_sequence;
@@ -10492,8 +10405,7 @@ pub(crate) fn new_reference_pump_with_options(
                                         include(parked_send_deadline(c, now, &cc));
                                     }
                                     include(c.ack_timer.saturating_add(1));
-                                    if c.pending_send.is_none()
-                                        && !conn.unreliable_send_buffer.target_copy_pending()
+                                    if !conn.unreliable_send_buffer.target_copy_pending()
                                         && c.send_sequence_number - c.packets_waiting_ack_tail
                                             < PACKETS_WAITING_ACK_CAPACITY - 1
                                     {
@@ -10507,7 +10419,7 @@ pub(crate) fn new_reference_pump_with_options(
                                         c.last_ack_received_time
                                     };
                                     include(last_activity.saturating_add(OUTAGE_TIMEOUT_NS));
-                                    if c.pending_send.is_none() && !conn.unreliable_send_buffer.target_copy_pending()
+                                    if !conn.unreliable_send_buffer.target_copy_pending()
                                     && c.send_sequence_number - c.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY - 1
                                     && c.current_tu != ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE as u64
                                     && c.tu_probe_sequence_number == u64::MAX {
@@ -10918,12 +10830,15 @@ fn retry_handshake(
     last_sent: &mut u64,
     now: u64,
     lifetime: u64,
-    send: impl FnOnce() -> Option<u64>,
+    send: impl FnOnce() -> SendAttempt,
 ) -> bool {
     if now.saturating_sub(created) > lifetime {
         return false;
     }
-    if last_sent.saturating_add(2_500_000_000) < now && send().is_some() {
+    if last_sent.saturating_add(2_500_000_000) < now {
+        // Retry the saved flight on schedule even when this attempt is dropped
+        // locally; a persistent socket error must not create a hot retry loop.
+        let _ = send();
         *last_sent = if *last_sent == 0 {
             now - 2_500_000_000 + 10_000_000
         } else {
@@ -10964,15 +10879,6 @@ fn prepare_connected_send_tick(
     buf.set_tu_unresolved(!state.tu_assessment_settled);
     let exposure = buf.exposure_snapshot(state.stats.cc_rate_upps, state.RTT_mean);
     buf.set_exposure(exposure);
-    if state.locally_blocked {
-        freeze_local_send(state, now);
-    }
-}
-fn freeze_local_send(state: &mut ConnectionStateConnected, now: u64) {
-    update_app_limit(state, now, false);
-    state.congestion_event_time_ns = now.saturating_sub(state.app_limit_time_offset);
-    state.last_sent_could_have_sent_data_packet = now;
-    state.send_pacer_acc_ns = 0;
 }
 #[cfg(feature = "research_cohort_observer")]
 fn cohort_observation_of(
@@ -11028,12 +10934,11 @@ fn cohort_observation_parts(
     };
     if let Some(c) = connected {
         o.connected = true;
-        o.pending_send = c.pending_send.is_some() || buf.target_copy_pending();
-        o.pending_send_kind = c.pending_send.as_ref().map(|p| p.kind as u8).or_else(|| {
-            buf.target_copy_pending()
-                .then_some(PendingSendKind::Data as u8)
-        });
-        o.locally_blocked = c.locally_blocked;
+        // Only an intentional whole-packet duplication copy can remain pending.
+        o.pending_send = buf.target_copy_pending();
+        o.pending_send_kind = buf
+            .target_copy_pending()
+            .then_some(ConnectedSendKind::Data as u8);
         o.send_sequence_number = c.send_sequence_number;
         o.last_sent_data_packet = c.last_sent_data_packet;
         o.test_dropped = c.stats.test_dropped;
@@ -11043,48 +10948,38 @@ fn cohort_observation_parts(
     o.observed_ns = monotonic_clock_ns();
     o
 }
+/// Commit every connected attempt exactly once. A local error is packet loss,
+/// not a reason to retain ciphertext, freeze pacing or block ACK/recovery work.
 fn finish_connected_send(
     state: &mut ConnectionStateConnected,
     buf: &mut SendQueues,
-    kind: PendingSendKind,
-    sent: Option<u64>,
+    kind: ConnectedSendKind,
+    attempt: SendAttempt,
     now: u64,
     bytes: &[u8],
     plaintext: &[u8],
-    dscp: Dscp,
     prefix: u16,
     trace: Option<&mut crate::loss_trace::LossTrace>,
-) -> bool {
-    if let Some(sent) = sent {
-        #[cfg(feature = "research_cohort_observer")]
-        crate::cohort_observe::observe_commit(kind as usize, bytes);
-        commit_connected_send(
-            state,
-            buf,
-            kind,
-            sent,
-            bytes.len(),
-            plaintext,
-            prefix,
-            trace,
-        );
-        if kind == PendingSendKind::Ack {
-            update_app_limit(state, now, buf.has_unsent_data());
-        }
-        true
-    } else {
-        debug_assert!(state.pending_send.is_none());
-        if kind != PendingSendKind::Ack {
-            state.pending_send = Some(PendingSend {
-                kind,
-                bytes: bytes.to_vec(),
-                plaintext: plaintext.to_vec(),
-                dscp,
-            });
-        }
-        state.locally_blocked = true;
-        freeze_local_send(state, now);
-        false
+) {
+    if let Some(error) = attempt.error {
+        state.stats.local_send_drops += 1;
+        state.stats.local_send_drop_bytes += bytes.len() as u64;
+        state.stats.last_local_send_error = Some(error);
+    }
+    #[cfg(feature = "research_cohort_observer")]
+    crate::cohort_observe::observe_commit(kind as usize, bytes);
+    commit_connected_send(
+        state,
+        buf,
+        kind,
+        attempt.attempted_at_ns,
+        bytes.len(),
+        plaintext,
+        prefix,
+        trace,
+    );
+    if kind == ConnectedSendKind::Ack {
+        update_app_limit(state, now, buf.has_unsent_data());
     }
 }
 fn rand_finalize_packet(state: &mut ConnectionStateConnected, seq: u64, lost: bool) {
@@ -11100,15 +10995,14 @@ fn rand_finalize_packet(state: &mut ConnectionStateConnected, seq: u64, lost: bo
 fn commit_connected_send(
     state: &mut ConnectionStateConnected,
     buf: &mut SendQueues,
-    kind: PendingSendKind,
+    kind: ConnectedSendKind,
     sent: u64,
     len: usize,
     plaintext: &[u8],
     prefix: u16,
     trace: Option<&mut crate::loss_trace::LossTrace>,
 ) {
-    state.locally_blocked = false;
-    if kind == PendingSendKind::Ack {
+    if kind == ConnectedSendKind::Ack {
         state.ack_receiver.sent(sent);
         state.stats.ack_packets_sent += 1;
         state.stats.ack_bytes_sent += len as u64;
@@ -11116,7 +11010,7 @@ fn commit_connected_send(
     }
     let seq = state.send_sequence_number;
     if crate::target_validation::rand_enabled() {
-        let background = kind == PendingSendKind::Data
+        let background = kind == ConnectedSendKind::Data
             && crate::target_validation::rand_background(
                 &state.target_state,
                 state.outage.since_ns.is_some(),
@@ -11136,12 +11030,12 @@ fn commit_connected_send(
             state.stats.dup_datagrams += 1;
             state.stats.dup_bytes += len as u64;
             state.stats.dup_messages += target_dup_counts(plaintext).0;
-            if kind != PendingSendKind::Data {
+            if kind != ConnectedSendKind::Data {
                 buf.queued_commit(seq);
             }
         }
     }
-    if kind != PendingSendKind::Data {
+    if kind != ConnectedSendKind::Data {
         buf.fec_prepare_packet(seq);
     }
     let active_frontier = state.active_send_frontier;
@@ -11153,19 +11047,19 @@ fn commit_connected_send(
         seq,
         len as u64,
         sent,
-        kind == PendingSendKind::Data,
+        kind == ConnectedSendKind::Data,
         kind.is_generic(),
     );
     if kind.is_generic() {
         state.recovery.scheduled_probe_sent(sent, len as u64);
     }
     state.packet_since_last_print += 1;
-    if kind == PendingSendKind::MtuProbe {
+    if kind == ConnectedSendKind::MtuProbe {
         state.tu_probe_sequence_number = seq;
         state.last_sent_tu_probe_time_ns = sent;
         return;
     }
-    if kind == PendingSendKind::Data {
+    if kind == ConnectedSendKind::Data {
         #[cfg(feature = "research_budget_diagnostic")]
         diag::tx(seq, sent, plaintext);
         buf.fec_on_data_committed(seq, sent);
@@ -11173,13 +11067,13 @@ fn commit_connected_send(
             a.on_data_sent(seq);
         }
     }
-    if kind == PendingSendKind::Outage || (kind.is_generic() && state.outage.since_ns.is_some()) {
+    if kind == ConnectedSendKind::Outage || (kind.is_generic() && state.outage.since_ns.is_some()) {
         state.outage.record_probe(seq, sent);
-        if kind == PendingSendKind::Outage {
+        if kind == ConnectedSendKind::Outage {
             state.outage.probe_sent(sent);
         }
     }
-    if matches!(kind, PendingSendKind::Data | PendingSendKind::Outage) {
+    if matches!(kind, ConnectedSendKind::Data | ConnectedSendKind::Outage) {
         if let Some(t) = trace {
             t.sent(prefix, seq, sent, plaintext);
         }
@@ -12463,5 +12357,342 @@ impl LossEpisodes {
             b.packets += 1;
             b.lost += u64::from(lost);
         }
+    }
+}
+
+#[cfg(test)]
+mod send_error_tests {
+    use super::*;
+
+    fn connected() -> ConnectionStateConnected {
+        let ConnectionState::Connected(state) =
+            new_connection_state_connected(None, CONNECT_MAGIC1_PLAIN_TEXT, 1, 1)
+        else {
+            unreachable!()
+        };
+        state
+    }
+
+    fn attempt(time: u64, error: Option<i32>) -> SendAttempt {
+        SendAttempt {
+            attempted_at_ns: time,
+            error,
+        }
+    }
+
+    fn send(
+        state: &mut ConnectionStateConnected,
+        buf: &mut SendQueues,
+        kind: ConnectedSendKind,
+        time: u64,
+        error: Option<i32>,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let nonce = if kind == ConnectedSendKind::Ack {
+            state.reserve_ack_nonce().unwrap()
+        } else {
+            state.send_sequence_number
+        };
+        let mut bytes = vec![0; payload.len() + 22];
+        let len =
+            seal_connected_packet(&mut state.cipher, 2, nonce, payload, &mut bytes, time).unwrap();
+        bytes.truncate(len);
+        finish_connected_send(
+            state,
+            buf,
+            kind,
+            attempt(time, error),
+            time,
+            &bytes,
+            payload,
+            2,
+            None,
+        );
+        bytes
+    }
+
+    #[test]
+    fn persistently_failed_handshake_attempts_keep_retry_clock_and_deadline() {
+        let created = 3_000_000_000;
+        let mut last = 0;
+        let mut calls = 0;
+        let mut retry = |now, last: &mut u64| {
+            retry_handshake(created, last, now, 30_000_000_000, || {
+                calls += 1;
+                attempt(now, Some(12345))
+            })
+        };
+        assert!(retry(created, &mut last));
+        assert_eq!(last, 510_000_000); // First retry remains due after 10 ms.
+        for now in created + 1..created + 100 {
+            assert!(retry(now, &mut last));
+            assert_eq!(last, 510_000_000);
+        }
+        assert!(retry(created + 10_000_001, &mut last));
+        assert_eq!(last, created + 10_000_001);
+        assert!(retry(created + 100_000_000, &mut last));
+        assert_eq!(last, created + 10_000_001);
+        assert!(retry(created + 2_510_000_002, &mut last));
+        assert_eq!(last, created + 2_510_000_002);
+        assert!(!retry(created + 30_000_000_001, &mut last));
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn every_packet_kind_consumes_failed_attempts_without_freezing_pacing() {
+        let mut state = connected();
+        let mut buf = SendQueues::new(1, (100_000, 4096, 65536));
+        state.send_pacer_acc_ns = 789;
+        for (i, kind) in [
+            ConnectedSendKind::Data,
+            ConnectedSendKind::MtuProbe,
+            ConnectedSendKind::Keepalive,
+            ConnectedSendKind::Reachability,
+            ConnectedSendKind::ReachabilityCurrent,
+            ConnectedSendKind::Outage,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let time = (10 + i as u64) * 0x400000;
+            // Include a non-whitelisted value; the state transition must not
+            // depend on whether an OS error is temporary, path-related or novel.
+            send(
+                &mut state,
+                &mut buf,
+                kind,
+                time,
+                Some(12345 + i as i32),
+                &[0xff; 506],
+            );
+            assert_eq!(state.send_sequence_number, i as u64 + 1);
+            assert_eq!(state.send_time(i as u64), time);
+            assert_eq!(state.recovery.sent_bytes(i as u64), Some(512));
+            assert_eq!(state.stats.local_send_drops, i as u64 + 1);
+            assert_eq!(state.send_pacer_acc_ns, 789);
+        }
+        send(
+            &mut state,
+            &mut buf,
+            ConnectedSendKind::Ack,
+            20_000,
+            Some(123),
+            &[0; 152],
+        );
+        assert_eq!(
+            state.send_ack_sequence_number,
+            crate::sequence::ACK_SPACE + 1
+        );
+        assert_eq!(state.send_sequence_number, 6);
+        assert_eq!(state.stats.ack_packets_sent, 1);
+        assert_eq!(state.stats.local_send_drops, 7);
+        assert_eq!(state.stats.local_send_drop_bytes, 6 * 512 + 158);
+        assert_eq!(state.stats.last_local_send_error, Some(123));
+        assert_eq!(state.stats.packets_sent, 5); // MTU probes retain separate accounting.
+        assert_eq!(state.tu_probe_sequence_number, 1);
+        assert_eq!(state.last_sent_tu_probe_time_ns, 11 * 0x400000);
+    }
+
+    #[test]
+    fn failed_queued_data_allows_fresh_ack_and_smaller_recovery_probe() {
+        let mut state = connected();
+        state.current_tu = 1452;
+        let mut buf = SendQueues::new(1, (100_000, 4096, 65536));
+        assert!(buf.submit_messages(0, vec![vec![7; 24]]).is_empty());
+        let mut payload = [0; 1446];
+        buf.fec_prepare_packet(0);
+        assert_eq!(buf.fill_packet_with_dup(&mut payload, false), payload.len());
+        send(
+            &mut state,
+            &mut buf,
+            ConnectedSendKind::Data,
+            10,
+            Some(55),
+            &payload,
+        );
+        assert!(!buf.has_unsent_data());
+        assert_eq!(buf.queues[0].queued_ledger.committed, Some(0));
+        assert_eq!(state.send_sequence_number, 1);
+        // A failure cannot defer TU promotion or hold immutable ciphertext.
+        state.promote_tu(2048, 11);
+        assert_eq!(state.current_tu, 2048);
+        assert_eq!(state.deferred_tu, None);
+        send(
+            &mut state,
+            &mut buf,
+            ConnectedSendKind::Ack,
+            12,
+            None,
+            &[0; 152],
+        );
+        assert_eq!(
+            state.send_ack_sequence_number,
+            crate::sequence::ACK_SPACE + 1
+        );
+        assert_eq!(state.recovery.probe_size(state.current_tu), 512);
+        send(
+            &mut state,
+            &mut buf,
+            ConnectedSendKind::Reachability,
+            13,
+            None,
+            &[0xff; 506],
+        );
+        assert_eq!(state.send_sequence_number, 2);
+        assert_eq!(state.recovery.sent_bytes(0), Some(1452));
+        assert_eq!(state.recovery.sent_bytes(1), Some(512));
+        assert_eq!(state.recovery.next_probe, 13 + crate::mtu_recovery::PERIOD);
+        assert_eq!(state.stats.local_send_drops, 1);
+    }
+
+    #[test]
+    fn failed_large_probes_remain_loss_evidence_while_small_receipts_recover() {
+        let mut state = connected();
+        state.current_tu = 1452;
+        let mut buf = SendQueues::new(1, (100_000, 4096, 65536));
+        for (time, kind, bytes, error) in [
+            (
+                1_000_000_000,
+                ConnectedSendKind::ReachabilityCurrent,
+                1452,
+                Some(55),
+            ),
+            (1_250_000_000, ConnectedSendKind::Reachability, 512, None),
+            (
+                1_500_000_000,
+                ConnectedSendKind::ReachabilityCurrent,
+                1452,
+                Some(55),
+            ),
+            (1_750_000_000, ConnectedSendKind::Reachability, 512, None),
+        ] {
+            let seq = state.send_sequence_number;
+            send(
+                &mut state,
+                &mut buf,
+                kind,
+                time,
+                error,
+                &vec![0xff; bytes - 6],
+            );
+            if error.is_none() {
+                assert!(state.take_positive_receipt(seq).is_some());
+                state.on_positive_receipt(seq, time + 20_000_000);
+            }
+        }
+        let now = 2_700_000_000;
+        assert_eq!(state.send_sequence_number, 4);
+        assert_eq!(state.stats.local_send_drops, 2);
+        assert!(state.recovery.ready(now, state.current_tu));
+        state.downshift_for_recovery(buf.target_copy_pending(), now);
+        assert_eq!(state.current_tu, 512);
+        assert_eq!(state.deferred_tu, None);
+    }
+
+    #[test]
+    fn failed_original_and_copy_keep_duplication_order_and_deferred_shrink() {
+        let mut state = connected();
+        state.current_tu = 1452;
+        let mut buf = SendQueues::new(1, (100_000, 4096, 65536));
+        assert!(buf.submit_messages(0, vec![vec![7; 24]]).is_empty());
+        let mut payload = [0; 1446];
+        buf.fec_prepare_packet(0);
+        assert_eq!(buf.fill_packet_with_dup(&mut payload, true), payload.len());
+        assert!(buf.target_copy_pending());
+        state.downshift_for_recovery(true, 9);
+        send(
+            &mut state,
+            &mut buf,
+            ConnectedSendKind::Data,
+            10,
+            Some(55),
+            &payload,
+        );
+        assert_eq!(state.current_tu, 1452);
+        assert_eq!(state.send_sequence_number, 1);
+        buf.fec_prepare_packet(1);
+        assert_eq!(buf.fill_packet(&mut payload), payload.len());
+        assert!(target_is_copy(&payload));
+        assert!(!buf.target_copy_pending());
+        send(
+            &mut state,
+            &mut buf,
+            ConnectedSendKind::Data,
+            11,
+            Some(55),
+            &payload,
+        );
+        assert_eq!(state.send_sequence_number, 2);
+        assert_eq!(state.current_tu, 512);
+        assert_eq!(state.deferred_tu, None);
+        assert_eq!(buf.queues[0].queued_ledger.committed, Some(1));
+        assert_eq!(state.stats.dup_datagrams, 1);
+        assert!(!buf.has_unsent_data());
+    }
+
+    #[test]
+    fn encrypted_local_drop_never_reuses_nonce_for_different_content() {
+        let protocol = "Noise_IK_25519_ChaChaPoly_BLAKE2b";
+        let a = [1; 32];
+        let b = [2; 32];
+        let public_b =
+            curve25519_dalek::montgomery::MontgomeryPoint::mul_base_clamped(b).to_bytes();
+        let mut initiator = crate::helpers::noise_initiator(protocol, &[], &a, &public_b).unwrap();
+        let mut responder = crate::helpers::noise_responder(protocol, &[], &b).unwrap();
+        let mut flight = [0; 512];
+        let mut opened = [0; 512];
+        let n = initiator.write_message(&[], &mut flight).unwrap();
+        responder.read_message(&flight[..n], &mut opened).unwrap();
+        let n = responder.write_message(&[], &mut flight).unwrap();
+        initiator.read_message(&flight[..n], &mut opened).unwrap();
+        let mut state = connected();
+        state.cipher = Some(ConnectionCipherTriplet::new_from_old_init_only(
+            initiator.into_stateless_transport_mode().unwrap(),
+        ));
+        let mut peer = ConnectionCipherTriplet::new_from_old_init_only(
+            responder.into_stateless_transport_mode().unwrap(),
+        );
+        let mut buf = SendQueues::new(1, (100_000, 4096, 65536));
+        let dropped = send(
+            &mut state,
+            &mut buf,
+            ConnectedSendKind::Data,
+            10,
+            Some(55),
+            &[7; 490],
+        );
+        let delivered = send(
+            &mut state,
+            &mut buf,
+            ConnectedSendKind::Reachability,
+            11,
+            None,
+            &[0xff; 490],
+        );
+        assert_eq!(state.send_sequence_number, 2);
+        assert_ne!(
+            &dropped[..CONNECTED_HEADER_SIZE],
+            &delivered[..CONNECTED_HEADER_SIZE]
+        );
+        let n = peer
+            .current
+            .read_message_with_additional_data(
+                1,
+                &delivered[..CONNECTED_HEADER_SIZE],
+                &delivered[CONNECTED_HEADER_SIZE..],
+                &mut opened,
+            )
+            .unwrap();
+        assert_eq!(&opened[..n], &[0xff; 490]);
+        assert!(
+            peer.current
+                .read_message_with_additional_data(
+                    0,
+                    &delivered[..CONNECTED_HEADER_SIZE],
+                    &delivered[CONNECTED_HEADER_SIZE..],
+                    &mut opened
+                )
+                .is_err()
+        );
     }
 }
