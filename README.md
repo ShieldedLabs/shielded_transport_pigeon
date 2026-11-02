@@ -151,8 +151,17 @@ handle are `Send`; the single-owner app handle is deliberately **not Sync**.
   `Connected` precedes a peer's messages; a disconnected association produces
   one `Disconnected`, with no later messages from that association. A new
   association can reconnect under the same peer key and produces a new
-  `Connected`. Every processed connect has one outcome, including duplicate,
-  invalid and cancelled requests. Frozen handshake timeout is 30 seconds.
+  `Connected`. An encrypted peer restarting with the same key and IP/port may
+  establish a parallel fresh handshake while the old session stays live. Only
+  authenticated new-session transport confirms replacement, emitting
+  `Disconnected { reason: Replaced }` then `Connected` before any new messages.
+  Unconfirmed candidates expire silently after 15 seconds; captured historical
+  hellos can delay reconnect until that bounded slot expires. Old admitted send
+  queues and all session state are discarded, not transferred. Send-ring entries
+  not yet admitted target the current association. See PROTOCOL.md for limits.
+  `DisconnectReason::Replaced` is a public enum addition: downstream exhaustive
+  matches must handle it. Every processed connect has one outcome, including
+  duplicate, invalid and cancelled requests. Frozen handshake timeout is 30 seconds.
 - A full receive ring drops/counts **data**, so a stalled app cannot prevent
   ACK/socket servicing. While full, every outgoing ACK requests IP ECN CE
   (best-effort OS/path support), and each newly admitted data-class packet adds

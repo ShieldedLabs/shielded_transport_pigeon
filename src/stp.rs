@@ -5012,6 +5012,15 @@ impl ReceiveQueue {
         self.peak_bytes = self.peak_bytes.max(self.bytes);
         self.peak_messages = self.peak_messages.max(self.messages.len());
     }
+    fn discard_peer(&mut self, peer: ConnectionKey) {
+        for index in (0..self.messages.len()).rev() {
+            if self.messages[index].0 == peer {
+                let (_, message) = self.messages.remove(index).unwrap();
+                self.reservations.remove(index);
+                self.bytes -= Self::entry_bytes(&message);
+            }
+        }
+    }
     pub fn take(&mut self) -> VecDeque<(ConnectionKey, Vec<u8>)> {
         self.bytes = 0;
         self.reservations.clear();
@@ -5116,6 +5125,10 @@ const RECEIVE_CONNECTION_BYTES: usize = (512 << 10) + crate::mtu_recovery::HISTO
 pub struct ConnectionTrackingData {
     receive_reservation: crate::receive_memory::Reservation,
     receive_budget: std::sync::Arc<crate::receive_memory::ReceiveMemoryBudget>,
+    // Full fresh association, charged independently; never modifies the live transport.
+    replacement: Option<Box<ConnectionTrackingData>>,
+    peer_hello_digest: Option<[u8; 32]>,
+    last_hello_work_ns: u64,
     pub creation_time_ns: u64,
     pub my_ip: Ipv6Addr,
     pub my_transport_identity_keypair: IdentityKeyPair,
@@ -5142,6 +5155,187 @@ impl ConnectionTrackingData {
     pub fn is_connected(&self) -> bool {
         self.connection_state.is_connected()
     }
+}
+const REPLACEMENT_LIFETIME_NS: u64 = 15_000_000_000;
+const MAX_REPLACEMENTS: usize = 32;
+#[derive(Default)]
+struct ReplacementRate {
+    start: u64,
+    used: u32,
+}
+impl ReplacementRate {
+    fn admit(&mut self, now: u64) -> bool {
+        if now.saturating_sub(self.start) >= 1_000_000_000 {
+            self.start = now;
+            self.used = 0;
+        }
+        if self.used == 64 {
+            return false;
+        }
+        self.used += 1;
+        true
+    }
+}
+impl ConnectionTrackingData {
+    fn replacement_expired(&self, now: u64) -> bool {
+        now.saturating_sub(self.creation_time_ns) > REPLACEMENT_LIFETIME_NS
+    }
+    fn admit_replacement_work(
+        &mut self,
+        digest: [u8; 32],
+        count: usize,
+        now: u64,
+        rate: &mut ReplacementRate,
+    ) -> bool {
+        if self
+            .replacement
+            .as_ref()
+            .is_some_and(|r| r.replacement_expired(now))
+        {
+            self.replacement = None;
+        }
+        if self.peer_hello_digest == Some(digest)
+            || self.replacement.is_some()
+            || count >= MAX_REPLACEMENTS
+            || now.saturating_sub(self.last_hello_work_ns) < 250_000_000
+        {
+            return false;
+        }
+        self.last_hello_work_ns = now;
+        rate.admit(now)
+    }
+    fn service_replacement(
+        &mut self,
+        now: u64,
+        responses: &mut ReplacementRate,
+        send: impl FnOnce(Ipv6Addr, u16, &[u8]) -> SendAttempt,
+    ) {
+        let Some(candidate) = &mut self.replacement else {
+            return;
+        };
+        let ConnectionState::SendingServerHello {
+            last_sent_time_ns,
+            hello_packet_payload,
+            ..
+        } = &mut candidate.connection_state
+        else {
+            unreachable!();
+        };
+        let keep = retry_handshake(
+            candidate.creation_time_ns,
+            last_sent_time_ns,
+            now,
+            REPLACEMENT_LIFETIME_NS,
+            || {
+                if responses.admit(now) {
+                    send(
+                        candidate.other_ip,
+                        candidate.other_port,
+                        hello_packet_payload,
+                    )
+                } else {
+                    // A budget-refused response is a dropped flight, not a hot retry.
+                    SendAttempt {
+                        attempted_at_ns: now,
+                        error: None,
+                    }
+                }
+            },
+        );
+        if !keep {
+            self.replacement = None;
+        }
+    }
+    fn prepare_replacement(
+        &mut self,
+        mut handshake: snow::HandshakeState,
+        digest: [u8; 32],
+        magic2: u64,
+        now: u64,
+        budget: &std::sync::Arc<crate::receive_memory::ReceiveMemoryBudget>,
+        connection_receive_limit: usize,
+        max_message_size: usize,
+        send_queue_count: usize,
+        send_buffer_params: (u32, u32, u32),
+    ) {
+        let ConnectionState::Connected(live) = &self.connection_state else {
+            return;
+        };
+        if live.cipher.is_none()
+            || live.magic2 != magic2
+            || self.replacement.is_some()
+            || self.peer_hello_digest == Some(digest)
+        {
+            return;
+        }
+        let Some(receive_reservation) = budget.reserve(RECEIVE_CONNECTION_BYTES) else {
+            return;
+        };
+        let mut hello_packet_payload = vec![0; 1024];
+        store_u48(
+            &mut hello_packet_payload[..6],
+            0xffff_ffff_0000 | self.two_byte_send_prefix as u64,
+        );
+        let n = handshake
+            .write_message(&magic2.to_le_bytes(), &mut hello_packet_payload[6..])
+            .unwrap();
+        hello_packet_payload.truncate(6 + n);
+        hello_packet_payload.shrink_to_fit();
+        let handshake_hash = get_handshake_hash(&handshake);
+        let cipher = ConnectionCipherTriplet::new_from_old_init_only(
+            handshake.into_stateless_transport_mode().unwrap(),
+        );
+        self.replacement = Some(Box::new(Self {
+            replacement: None,
+            peer_hello_digest: Some(digest),
+            last_hello_work_ns: 0,
+            receive_reservation,
+            receive_budget: crate::receive_memory::ReceiveMemoryBudget::connection_with_limit(
+                budget,
+                connection_receive_limit,
+            )
+            .with_worker_limit(receive_worker_limit(max_message_size, send_queue_count)),
+            creation_time_ns: now,
+            my_ip: self.my_ip,
+            my_transport_identity_keypair: self.my_transport_identity_keypair.clone(),
+            two_byte_send_prefix: self.two_byte_send_prefix,
+            other_ip: self.other_ip,
+            other_port: self.other_port,
+            other_transport_identity: self.other_transport_identity.clone(),
+            connection_state: ConnectionState::SendingServerHello {
+                cipher,
+                magic1: live.magic1,
+                magic2,
+                last_sent_time_ns: 0,
+                hello_packet_payload,
+            },
+            handshake_hash,
+            unreliable_send_buffer: SendQueues::new(send_queue_count, send_buffer_params),
+            receive_index: ReceiveIndex::default(),
+            unreliable_reassembly: ReassemblySlot::new_ring(1024),
+            unreliable_fec: FecRecvSlot::new_ring(1024),
+        }));
+    }
+}
+// Keep the original ciphertext intact and reconstruct independently for each association.
+fn open_live_packet(
+    state: &mut ConnectionStateConnected,
+    packet: &[u8],
+    out: &mut [u8],
+    now: u64,
+) -> Result<(u64, usize), snow::Error> {
+    let wire = load_u32(&packet[2..6]);
+    let ack = packet.len() == CONNECTED_HEADER_SIZE + crate::ack::ACK_PAYLOAD_LEN + 16;
+    let nonce = state.receive_sequences.compact_candidate(wire, ack);
+    let n = state.cipher.as_mut().ok_or(snow::Error::Decrypt)?.open(
+        nonce,
+        wire >> 31,
+        &packet[..CONNECTED_HEADER_SIZE],
+        &packet[CONNECTED_HEADER_SIZE..],
+        out,
+        now,
+    )?;
+    Ok((nonce, n))
 }
 #[derive(Debug, Clone)]
 pub struct ConnectionCipherTriplet {
@@ -6226,6 +6420,9 @@ pub fn connect_to_endpoint(
     connections_map.insert(
         ConnectionKey::from(endpoint),
         ConnectionTrackingData {
+            replacement: None,
+            peer_hello_digest: None,
+            last_hello_work_ns: 0,
             receive_reservation,
             receive_budget: crate::receive_memory::ReceiveMemoryBudget::connection_with_limit(
                 budget,
@@ -7276,6 +7473,31 @@ impl RingState {
         self.connects.remove(&peer);
         true
     }
+    fn replaced(&mut self, port: &Port, address: STPAddress, hash: [u8; 64]) -> bool {
+        let Some(n) = port.native.get() else {
+            return true;
+        };
+        // Reserve bounded lifecycle ownership before the old association can be discarded.
+        // A capacity-one ring is supported; Connected may wait pump-side behind Disconnected.
+        if !self.pending.is_empty() || !n.events.has_space() || self.pending.try_reserve(2).is_err()
+        {
+            return false;
+        }
+        let peer = address.connection_key();
+        self.pending.push_back(RingEvent::Disconnected {
+            peer,
+            reason: DisconnectReason::Replaced,
+        });
+        self.pending.push_back(RingEvent::Connected {
+            peer,
+            address,
+            handshake_hash: hash,
+        });
+        self.peers.insert(peer, hash);
+        self.connects.remove(&peer);
+        self.flush(port);
+        true
+    }
     fn disconnected(&mut self, peer: ConnectionKey, reason: DisconnectReason) {
         if self.peers.remove(&peer).is_some() {
             self.pending
@@ -7297,8 +7519,12 @@ impl RingState {
         if !self.peers.contains_key(&peer) {
             return;
         }
-        if n.emit(&port.ready, RingEvent::Message { peer, data })
-            .is_err()
+        if self
+            .pending
+            .iter()
+            .any(|event| matches!(event, RingEvent::Connected { peer: p, .. } if *p == peer))
+            || n.emit(&port.ready, RingEvent::Message { peer, data })
+                .is_err()
         {
             n.counters
                 .receive_dropped_full
@@ -7540,6 +7766,8 @@ pub(crate) fn new_reference_pump_with_options(
         let mut connections_map = HashMap::<ConnectionKey, ConnectionTrackingData>::new();
         let mut ready_peers = HashMap::new();
         let mut ring_state = RingState::default();
+        let mut replacement_work = ReplacementRate::default();
+        let mut replacement_responses = ReplacementRate::default();
         let mut receive_notified = false;
         let mut ready_used = 0usize;
         let mut receive_round = 0usize;
@@ -8081,6 +8309,7 @@ pub(crate) fn new_reference_pump_with_options(
                                                 );
                                                 connections_map.insert(connection_key,
                                                 ConnectionTrackingData {
+                                                    replacement: None, peer_hello_digest: None, last_hello_work_ns: 0,
                                                     receive_reservation,
                                                     receive_budget: crate::receive_memory::ReceiveMemoryBudget::connection_with_limit(&receive_memory, connection_receive_limit).with_worker_limit(receive_worker_limit(max_message_size, send_queue_count)),
                                                     creation_time_ns: monotonic_clock_ns(), my_ip: Ipv6Addr::UNSPECIFIED,
@@ -8104,6 +8333,35 @@ pub(crate) fn new_reference_pump_with_options(
                                 for key_i in 0..my_keypairs.len() {
                                     let my_kp = &my_keypairs[key_i];
                                     if my_kp.magic1 == magic1 {
+                                        if buf_len != 359 {
+                                            continue;
+                                        }
+                                        let hello_digest =
+                                            *blake3::hash(&packet_memory_encrypted[..buf_len])
+                                                .as_bytes();
+                                        let candidate_count = connections_map
+                                            .values()
+                                            .filter(|c| c.replacement.is_some())
+                                            .count();
+                                        // The encrypted static key is not available until DH. Source/local profile
+                                        // only selects a cheap work gate, never authorizes replacement.
+                                        let mut blocked = false;
+                                        for c in connections_map.values_mut().filter(|c| {
+                                            c.is_connected()
+                                                && c.other_ip == other_ip_addr
+                                                && c.other_port == other_port
+                                                && c.my_transport_identity_keypair == *my_kp
+                                        }) {
+                                            blocked |= !c.admit_replacement_work(
+                                                hello_digest,
+                                                candidate_count,
+                                                timestamp_ns,
+                                                &mut replacement_work,
+                                            );
+                                        }
+                                        if blocked {
+                                            continue;
+                                        }
                                         let mut new_handshake = noise_responder(
                                             crypto_string,
                                             &packet_memory_encrypted[0..6],
@@ -8138,6 +8396,28 @@ pub(crate) fn new_reference_pump_with_options(
                                                             .other_transport_identity
                                                             == client_key
                                                     {
+                                                        if existing_connection.is_connected() {
+                                                            existing_connection
+                                                                .prepare_replacement(
+                                                                    new_handshake,
+                                                                    hello_digest,
+                                                                    chosen_magic2,
+                                                                    timestamp_ns,
+                                                                    &receive_memory,
+                                                                    connection_receive_limit,
+                                                                    max_message_size,
+                                                                    send_queue_count,
+                                                                    send_buffer_params,
+                                                                );
+                                                            break;
+                                                        }
+                                                        if matches!(
+                                                            existing_connection.connection_state,
+                                                            ConnectionState::SendingClientHello { .. }
+                                                        ) {
+                                                            existing_connection.peer_hello_digest =
+                                                                Some(hello_digest);
+                                                        }
                                                         if let ConnectionState::SendingClientHello { magic1, last_sent_time_ns, hello_packet_payload, handshake } = &mut existing_connection.connection_state {
                                                         if *client_key < *my_kp.public {
                                                             let chosen_magic2_bytes = chosen_magic2.to_le_bytes();
@@ -8182,6 +8462,7 @@ pub(crate) fn new_reference_pump_with_options(
                                                     let cipher = ConnectionCipherTriplet::new_from_old_init_only(new_handshake.into_stateless_transport_mode().expect("Cannot fail given assert above."));
                                                     connections_map.insert(connection_key,
                                                     ConnectionTrackingData {
+                                                        replacement: None, peer_hello_digest: Some(hello_digest), last_hello_work_ns: 0,
                                                         receive_reservation,
                                                         receive_budget: crate::receive_memory::ReceiveMemoryBudget::connection_with_limit(&receive_memory, connection_receive_limit).with_worker_limit(receive_worker_limit(max_message_size, send_queue_count)),
                                                         creation_time_ns: monotonic_clock_ns(), my_ip: Ipv6Addr::UNSPECIFIED,
@@ -8226,6 +8507,93 @@ pub(crate) fn new_reference_pump_with_options(
                                         .inbound_refused_full
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     break 'conn;
+                                }
+                                let mut preopened = None;
+                                if let ConnectionState::Connected(live) =
+                                    &mut existing_connection.connection_state
+                                {
+                                    if live.cipher.is_some() {
+                                        match open_live_packet(
+                                            live,
+                                            &packet_memory_encrypted[..buf_len],
+                                            &mut packet_memory_recv[..],
+                                            timestamp_ns,
+                                        ) {
+                                            Ok(opened) => preopened = Some(opened),
+                                            Err(_) => {
+                                                if existing_connection
+                                                    .replacement
+                                                    .as_ref()
+                                                    .is_some_and(|r| {
+                                                        r.replacement_expired(timestamp_ns)
+                                                    })
+                                                {
+                                                    existing_connection.replacement = None;
+                                                }
+                                                let Some(candidate) =
+                                                    existing_connection.replacement.as_mut()
+                                                else {
+                                                    break 'conn;
+                                                };
+                                                // Admission capacity is checked before any confirmation state is committed.
+                                                if thread_inner.native.get().is_some_and(|n| {
+                                                    !n.events.has_space()
+                                                        || !ring_state.pending.is_empty()
+                                                }) {
+                                                    break 'conn;
+                                                }
+                                                let ConnectionState::SendingServerHello {
+                                                    cipher,
+                                                    magic1,
+                                                    magic2,
+                                                    ..
+                                                } = &mut candidate.connection_state
+                                                else {
+                                                    unreachable!();
+                                                };
+                                                let wire = load_u32(&packet_memory_encrypted[2..6]);
+                                                let ack = buf_len
+                                                    == CONNECTED_HEADER_SIZE
+                                                        + crate::ack::ACK_PAYLOAD_LEN
+                                                        + 16;
+                                                let nonce =
+                                                    crate::sequence::reconstruct(wire, None, ack);
+                                                let Ok(n) = cipher.open(
+                                                    nonce,
+                                                    wire >> 31,
+                                                    &packet_memory_encrypted
+                                                        [..CONNECTED_HEADER_SIZE],
+                                                    &packet_memory_encrypted
+                                                        [CONNECTED_HEADER_SIZE..buf_len],
+                                                    &mut packet_memory_recv[..],
+                                                    timestamp_ns,
+                                                ) else {
+                                                    break 'conn;
+                                                };
+                                                let new_state = new_connection_state_connected(
+                                                    Some(cipher.clone()),
+                                                    *magic1,
+                                                    *magic2,
+                                                    timestamp_ns,
+                                                );
+                                                if !ring_state.replaced(
+                                                    &thread_inner,
+                                                    candidate.address(),
+                                                    candidate.handshake_hash,
+                                                ) {
+                                                    break 'conn;
+                                                }
+                                                candidate.connection_state = new_state;
+                                                // Every old session-owned queue, replay/ACK/CC/MTU/FEC object and budget
+                                                // dies here. Worker completions carry the old budget Arc and cannot match.
+                                                let replacement =
+                                                    existing_connection.replacement.take().unwrap();
+                                                *existing_connection = *replacement;
+                                                receive_queue.discard_peer(connection_key);
+                                                preopened = Some((nonce, n));
+                                            }
+                                        }
+                                    }
                                 }
                                 match &mut existing_connection.connection_state {
                                     ConnectionState::SendingClientHelloPlaintext {
@@ -8373,20 +8741,18 @@ pub(crate) fn new_reference_pump_with_options(
                                         let nonce =
                                             crate::sequence::reconstruct(wire, None, is_ack);
                                         let epoch = wire >> 31;
-                                        if cipher
-                                            .open(
-                                                nonce,
-                                                epoch,
-                                                &packet_memory_encrypted[..CONNECTED_HEADER_SIZE],
-                                                &packet_memory_encrypted
-                                                    [CONNECTED_HEADER_SIZE..buf_len],
-                                                &mut packet_memory_recv[..],
-                                                timestamp_ns,
-                                            )
-                                            .is_err()
-                                        {
+                                        let Ok(n) = cipher.open(
+                                            nonce,
+                                            epoch,
+                                            &packet_memory_encrypted[..CONNECTED_HEADER_SIZE],
+                                            &packet_memory_encrypted
+                                                [CONNECTED_HEADER_SIZE..buf_len],
+                                            &mut packet_memory_recv[..],
+                                            timestamp_ns,
+                                        ) else {
                                             break 'conn;
-                                        }
+                                        };
+                                        preopened = Some((nonce, n));
                                         if VERBOSE {
                                             println!(
                                                 "Connected to new client {:?}",
@@ -8427,7 +8793,10 @@ pub(crate) fn new_reference_pump_with_options(
                                         .compact_candidate(wire, wire_is_ack);
                                     let epoch = wire >> 31;
                                     let payload;
-                                    if let Some(cipher) = &mut state.cipher {
+                                    if let Some((opened_nonce, n)) = preopened {
+                                        debug_assert_eq!(opened_nonce, nonce);
+                                        payload = &packet_memory_recv[..n];
+                                    } else if let Some(cipher) = &mut state.cipher {
                                         let Ok(n) = cipher.open(
                                             nonce,
                                             epoch,
@@ -9460,6 +9829,20 @@ pub(crate) fn new_reference_pump_with_options(
                         else {
                             continue;
                         };
+                        connection_tracking_data.service_replacement(
+                            current_time_now_ns,
+                            &mut replacement_responses,
+                            |ip, port, flight| {
+                                udp_send_with_congestion_and_dscp(
+                                    socket,
+                                    ip,
+                                    port,
+                                    flight,
+                                    Dscp::Af21,
+                                    false,
+                                )
+                            },
+                        );
                         let connection_key = &connection_key;
                         let keep = (|| {
                             match &mut connection_tracking_data.connection_state {
@@ -10385,6 +10768,20 @@ pub(crate) fn new_reference_pump_with_options(
                         include(fec_sweep_ns.saturating_add(100_000_000));
                         let mut active_retry = false;
                         for conn in connections_map.values() {
+                            if let Some(candidate) = &conn.replacement {
+                                if let ConnectionState::SendingServerHello {
+                                    last_sent_time_ns,
+                                    ..
+                                } = &candidate.connection_state
+                                {
+                                    include(last_sent_time_ns.saturating_add(2_500_000_001));
+                                    include(
+                                        candidate
+                                            .creation_time_ns
+                                            .saturating_add(REPLACEMENT_LIFETIME_NS + 1),
+                                    );
+                                }
+                            }
                             let cipher = match &conn.connection_state {
                                 ConnectionState::Connected(c) => c.cipher.as_ref(),
                                 ConnectionState::SendingServerHello { cipher, .. } => Some(cipher),
@@ -12359,6 +12756,10 @@ impl LossEpisodes {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "replacement_tests.rs"]
+mod replacement_tests;
 
 #[cfg(test)]
 mod send_error_tests {

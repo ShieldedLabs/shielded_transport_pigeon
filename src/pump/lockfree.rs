@@ -61,6 +61,8 @@ pub enum Control {
 pub enum DisconnectReason {
     Local,
     TimedOut,
+    /// A confirmed fresh handshake replaced this association at the same endpoint.
+    Replaced,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectFailure {

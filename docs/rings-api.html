@@ -369,9 +369,10 @@ worker.<span class="f">join</span>().<span class="f">unwrap</span>();</code></pr
     Message       { peer: <span class="t">ConnectionKey</span>, data: <span class="t">Vec</span>&lt;<span class="t">u8</span>&gt; },
 }
 <span class="k">pub enum</span> <span class="t">ConnectFailure</span>   { TimedOut, AlreadyConnected, InvalidAddress, Cancelled }
-<span class="k">pub enum</span> <span class="t">DisconnectReason</span> { Local, TimedOut }</code></pre>
+<span class="k">pub enum</span> <span class="t">DisconnectReason</span> { Local, TimedOut, Replaced }</code></pre>
 <p><code>Connected</code> is emitted for both outgoing and incoming associations. An incoming peer appears for the first time as <code>Connected</code>. <code>handshake_hash</code> is the Noise handshake hash, which you can use for channel binding.</p>
 
+<p>An encrypted peer restarting with the same static key and source IP/port can complete a parallel fresh handshake while the old association remains live. Only new-key transport AEAD confirms replacement. The stream then contains <code>Disconnected { reason: Replaced }</code>, <code>Connected</code> with a fresh handshake hash, then new messages. A capacity-one receive ring holds the second lifecycle event pump-side; new payload is dropped/counts as ordinary overflow until it is published. Unconfirmed candidates expire silently after 15 seconds. Old admitted outgoing queues, encoded work, reassembly and decoder state are discarded, not transferred; unadmitted send-ring entries target the current association. Candidate admission is bounded and replay can delay it (see PROTOCOL.md). <code>Replaced</code> is a new public enum variant, so downstream exhaustive matches must be updated.</p>
 <h3 id="ordering">Ordering guarantees</h3>
 <div class="callout ok">
 <div class="title">Guarantees (each was covered by a test in the baseline revision&rsquo;s <code>tests/lockfree.rs</code>, which is no longer shipped)</div>
@@ -592,7 +593,7 @@ worker.<span class="f">join</span>().<span class="f">unwrap</span>();</code></pr
   <tr><td><code>Control</code></td><td class="sig"><code>enum { Connect(STPAddress), Disconnect(ConnectionKey) }</code></td><td></td></tr>
   <tr><td><code>Event</code></td><td class="sig"><code>enum { Connected { peer, address, handshake_hash: [u8; 64] }, ConnectFailed { address, reason }, Disconnected { peer, reason }, Message { peer, data: Vec&lt;u8&gt; } }</code></td><td></td></tr>
   <tr><td><code>ConnectFailure</code></td><td class="sig"><code>enum { TimedOut, AlreadyConnected, InvalidAddress, Cancelled }</code></td><td></td></tr>
-  <tr><td><code>DisconnectReason</code></td><td class="sig"><code>enum { Local, TimedOut }</code></td><td></td></tr>
+  <tr><td><code>DisconnectReason</code></td><td class="sig"><code>enum { Local, TimedOut, Replaced }</code></td><td></td></tr>
   <tr><td><code>Stats</code></td><td class="sig"><code>struct { sent, received, send_dropped_unknown, send_dropped_oversized, send_dropped_invalid_queue, receive_dropped_full, inbound_refused_full, send_head_blocked }</code></td><td>All <code>u64</code></td></tr>
   <tr><td><code>Ready</code></td><td class="sig"><code>fn wait(&amp;self, observed: &amp;mut u64)</code></td><td>Futex on Linux</td></tr>
 </table>

@@ -1,0 +1,849 @@
+use super::*;
+use std::net::{SocketAddr, UdpSocket};
+use std::time::{Duration, Instant};
+
+const MAGIC: u64 = CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b;
+const APP: u64 = 0x89444182b302528e;
+fn key(byte: u8) -> IdentityKeyPair {
+    IdentityKeyPair {
+        magic1: MAGIC,
+        private: vec![byte; 32],
+        public: curve25519_dalek::montgomery::MontgomeryPoint::mul_base_clamped([byte; 32])
+            .to_bytes()
+            .to_vec(),
+    }
+}
+fn socket() -> UdpSocket {
+    let s = UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)).unwrap();
+    s.set_nonblocking(true).unwrap();
+    s
+}
+fn free_port() -> u16 {
+    socket().local_addr().unwrap().port()
+}
+fn address(k: &IdentityKeyPair, port: u16) -> STPAddress {
+    STPAddress {
+        ip: Ipv6Addr::LOCALHOST,
+        port,
+        magic1: k.magic1,
+        key: k.public.clone(),
+    }
+}
+fn pump(k: &IdentityKeyPair, port: u16, receive: usize) -> (Pump, LockfreeEndpoint) {
+    new_pump_with_options(
+        vec![k.clone()],
+        port,
+        None,
+        (100_000, 4096, 65536),
+        4096,
+        NetworkThreadOptions {
+            rings: RingConfig {
+                send: 16,
+                control: 16,
+                receive,
+            },
+            ..Default::default()
+        },
+    )
+}
+fn drive(pump: &mut Pump, ms: u64) {
+    pump.run_for(Duration::from_millis(ms));
+}
+fn drain(app: &mut LockfreeEndpoint) -> Vec<RingEvent> {
+    let mut events = Vec::new();
+    while let Some(e) = app.try_recv() {
+        events.push(e);
+    }
+    events
+}
+fn hello(
+    k: &IdentityKeyPair,
+    server: &IdentityKeyPair,
+    offer: &[u8],
+) -> (snow::HandshakeState, Vec<u8>) {
+    let prologue = MAGIC.to_le_bytes();
+    let mut h = noise_initiator(
+        crypto_string_from_connect_magic1(MAGIC).unwrap(),
+        &prologue[..6],
+        &k.private,
+        &server.public,
+    )
+    .unwrap();
+    let mut flight = vec![0; 1024];
+    flight[..6].copy_from_slice(&prologue[..6]);
+    let n = h.write_message(offer, &mut flight[6..]).unwrap();
+    flight.truncate(6 + n);
+    (h, flight)
+}
+fn response(s: &UdpSocket, pump: &mut Pump) -> Vec<u8> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut buf = [0; 10000];
+    while Instant::now() < deadline {
+        drive(pump, 2);
+        while let Ok((n, _)) = s.recv_from(&mut buf) {
+            if n == 62 && load_u48(&buf[..6]) >> 16 == 0xffff_ffff {
+                return buf[..n].to_vec();
+            }
+        }
+    }
+    panic!("no ServerHello");
+}
+fn finish(mut h: snow::HandshakeState, flight: &[u8]) -> (ConnectionCipherTriplet, [u8; 64]) {
+    let mut out = [0; 512];
+    assert_eq!(h.read_message(&flight[6..], &mut out).unwrap(), 8);
+    assert_eq!(load_u64(&out[..8]), APP);
+    let hash = get_handshake_hash(&h);
+    (
+        ConnectionCipherTriplet::new_from_old_init_only(h.into_stateless_transport_mode().unwrap()),
+        hash,
+    )
+}
+fn packet(
+    cipher: &mut ConnectionCipherTriplet,
+    k: &IdentityKeyPair,
+    nonce: u64,
+    message: &[u8],
+) -> Vec<u8> {
+    let mut plaintext = vec![0xff; 490];
+    if !message.is_empty() {
+        plaintext[0] = 1;
+        store_u16(&mut plaintext[1..3], message.len() as u16);
+        plaintext[3..3 + message.len()].copy_from_slice(message);
+    }
+    let mut output = vec![0; 512];
+    let mut c = Some(cipher.clone());
+    let n = seal_connected_packet(
+        &mut c,
+        load_u16(&k.public[..2]) << 1,
+        nonce,
+        &plaintext,
+        &mut output,
+        monotonic_clock_ns(),
+    )
+    .unwrap();
+    *cipher = c.unwrap();
+    output.truncate(n);
+    output
+}
+struct Server {
+    pump: Pump,
+    app: LockfreeEndpoint,
+    key: IdentityKeyPair,
+    addr: SocketAddr,
+    raw: UdpSocket,
+    client: IdentityKeyPair,
+    original: Vec<u8>,
+    old: ConnectionCipherTriplet,
+    hash: [u8; 64],
+}
+impl Server {
+    fn new(capacity: usize) -> Self {
+        Self::with_client(capacity, key(19))
+    }
+    fn with_client(capacity: usize, client: IdentityKeyPair) -> Self {
+        let server = key(41);
+        let port = free_port();
+        let (mut p, mut app) = pump(&server, port, capacity);
+        let addr = SocketAddr::from((Ipv6Addr::LOCALHOST, port));
+        let raw = socket();
+        let (h, original) = hello(&client, &server, &build_magic2_client_block());
+        raw.send_to(&original, addr).unwrap();
+        let flight = response(&raw, &mut p);
+        let (mut old, hash) = finish(h, &flight);
+        let confirm = packet(&mut old, &client, 0, b"initial");
+        raw.send_to(&confirm, addr).unwrap();
+        drive(&mut p, 10);
+        let events = drain(&mut app);
+        assert!(
+            matches!(events.first(), Some(RingEvent::Connected { handshake_hash, .. }) if *handshake_hash == hash)
+        );
+        if capacity > 1 {
+            assert!(
+                matches!(events.get(1), Some(RingEvent::Message { data, .. }) if data == b"initial")
+            );
+        }
+        Self {
+            pump: p,
+            app,
+            key: server,
+            addr,
+            raw,
+            client,
+            original,
+            old,
+            hash,
+        }
+    }
+    fn candidate(&mut self) -> (ConnectionCipherTriplet, Vec<u8>, Vec<u8>, [u8; 64]) {
+        let (h, hello) = hello(&self.client, &self.key, &build_magic2_client_block());
+        self.raw.send_to(&hello, self.addr).unwrap();
+        let flight = response(&self.raw, &mut self.pump);
+        let (cipher, hash) = finish(h, &flight);
+        (cipher, hello, flight, hash)
+    }
+    fn send(&mut self, bytes: &[u8]) {
+        self.raw.send_to(bytes, self.addr).unwrap();
+        drive(&mut self.pump, 5);
+    }
+}
+
+#[test]
+fn replacement_initial_confirmation_processes_packet_once() {
+    let _ = Server::new(16);
+}
+
+#[test]
+fn replacement_old_live_replays_and_invalid_packets_cannot_promote() {
+    let mut s = Server::new(16);
+    let (_new, _, _, _) = s.candidate();
+    assert!(drain(&mut s.app).is_empty());
+    let old = packet(&mut s.old, &s.client, 1, b"still old");
+    s.send(&old);
+    let events = drain(&mut s.app);
+    assert!(matches!(&events[..], [RingEvent::Message { data, .. }] if data == b"still old"));
+    s.send(&old); // old AEAD success, replay failure must not try/promote candidate.
+    let mut invalid = old.clone();
+    invalid[20] ^= 1;
+    s.send(&invalid);
+    assert!(drain(&mut s.app).is_empty());
+    let old2 = packet(&mut s.old, &s.client, 2, b"old survives");
+    s.send(&old2);
+    assert!(
+        matches!(&drain(&mut s.app)[..], [RingEvent::Message { data, .. }] if data == b"old survives")
+    );
+}
+
+#[test]
+fn replacement_confirmation_orders_events_rejects_old_and_delivers_once() {
+    let mut s = Server::new(16);
+    let (mut new, _, _, hash) = s.candidate();
+    assert_ne!(s.hash, hash);
+    let confirming = packet(&mut new, &s.client, 0, b"new");
+    s.send(&confirming);
+    let events = drain(&mut s.app);
+    assert!(
+        matches!(&events[..], [RingEvent::Disconnected { reason: DisconnectReason::Replaced, .. },
+        RingEvent::Connected { handshake_hash, .. }, RingEvent::Message { data, .. }] if *handshake_hash == hash && data == b"new")
+    );
+    s.send(&confirming);
+    let delayed_old = packet(&mut s.old, &s.client, 2, b"must not leak");
+    s.send(&delayed_old);
+    assert!(drain(&mut s.app).is_empty());
+    let next = packet(&mut new, &s.client, 1, b"next");
+    s.send(&next);
+    assert!(matches!(&drain(&mut s.app)[..], [RingEvent::Message { data, .. }] if data == b"next"));
+}
+
+#[test]
+fn replacement_duplicate_original_hello_is_ignored() {
+    let mut s = Server::new(16);
+    let original = s.original.clone();
+    s.send(&original);
+    drive(&mut s.pump, 35);
+    let mut buf = [0; 10000];
+    while let Ok((n, _)) = s.raw.recv_from(&mut buf) {
+        assert_ne!(n, 62, "original hello must not start another responder");
+    }
+    assert!(drain(&mut s.app).is_empty());
+}
+
+#[test]
+fn replacement_duplicate_flight_is_immutable_and_first_wins() {
+    let mut s = Server::new(16);
+    let (_cipher, hello, flight, _) = s.candidate();
+    s.send(&hello);
+    assert_eq!(response(&s.raw, &mut s.pump), flight);
+    let (_, second) = hello_for(&s.client, &s.key);
+    s.send(&second);
+    // An unrelated authenticated hello cannot evict the first candidate.
+    assert_eq!(response(&s.raw, &mut s.pump), flight);
+    assert!(drain(&mut s.app).is_empty());
+}
+fn hello_for(k: &IdentityKeyPair, server: &IdentityKeyPair) -> (snow::HandshakeState, Vec<u8>) {
+    hello(k, server, &build_magic2_client_block())
+}
+
+#[test]
+fn replacement_capacity_one_and_full_ring_keep_boundary() {
+    let mut s = Server::new(1);
+    let (mut new, _, _, hash) = s.candidate();
+    let fill = packet(&mut s.old, &s.client, 1, b"occupy");
+    s.send(&fill);
+    let confirm = packet(&mut new, &s.client, 0, b"drop under ordinary ring pressure");
+    s.send(&confirm);
+    assert!(matches!(s.app.try_recv(), Some(RingEvent::Message { data, .. }) if data == b"occupy"));
+    assert!(s.app.try_recv().is_none()); // Full ring did not retire old.
+    s.send(&confirm);
+    assert!(matches!(
+        s.app.try_recv(),
+        Some(RingEvent::Disconnected {
+            reason: DisconnectReason::Replaced,
+            ..
+        })
+    ));
+    drive(&mut s.pump, 5);
+    assert!(
+        matches!(s.app.try_recv(), Some(RingEvent::Connected { handshake_hash, .. }) if handshake_hash == hash)
+    );
+    assert!(s.app.try_recv().is_none());
+    assert!(s.app.stats().receive_dropped_full >= 1);
+    let data = packet(&mut new, &s.client, 1, b"after boundary");
+    s.send(&data);
+    assert!(
+        matches!(s.app.try_recv(), Some(RingEvent::Message { data, .. }) if data == b"after boundary")
+    );
+}
+
+#[test]
+fn replacement_same_port_restart_is_automatically_confirmed_while_idle() {
+    let a = key(11);
+    let b = key(12);
+    let ap = free_port();
+    let bp = free_port();
+    let (mut server, mut se) = pump(&b, bp, 16);
+    let (mut client, mut ce) = pump(&a, ap, 16);
+    assert!(ce.try_connect(address(&b, bp)));
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut old_hash = None;
+    while Instant::now() < deadline && old_hash.is_none() {
+        drive(&mut client, 2);
+        drive(&mut server, 2);
+        for e in drain(&mut se) {
+            if let RingEvent::Connected { handshake_hash, .. } = e {
+                old_hash = Some(handshake_hash);
+            }
+        }
+        drain(&mut ce);
+    }
+    assert!(
+        old_hash.is_some(),
+        "fresh idle initiator must confirm without app sends"
+    );
+    drop(ce);
+    drop(client);
+    let (mut client, mut ce) = pump(&a, ap, 16);
+    assert!(ce.try_connect(address(&b, bp)));
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut events = Vec::new();
+    while Instant::now() < deadline && events.len() < 2 {
+        drive(&mut client, 2);
+        drive(&mut server, 2);
+        events.extend(drain(&mut se));
+        drain(&mut ce);
+    }
+    assert!(
+        matches!(&events[..], [RingEvent::Disconnected { reason: DisconnectReason::Replaced, .. },
+        RingEvent::Connected { handshake_hash, .. }] if Some(*handshake_hash) != old_hash)
+    );
+}
+
+#[test]
+fn replacement_wrong_identity_application_plaintext_and_source_cannot_replace() {
+    let mut s = Server::new(16);
+    // A distinct key at the same source must never replace the live identity.
+    let wrong = key(88);
+    let (_, flight) = hello_for(&wrong, &s.key);
+    s.send(&flight);
+    drive(&mut s.pump, 260); // Exercise application rejection, not the cheap work gate.
+    let mut bad_offer = build_magic2_client_block();
+    bad_offer[1..9].fill(0);
+    let (_, flight) = hello(&s.client, &s.key, &bad_offer);
+    s.send(&flight);
+    let mut plain = vec![0; 6 + 32 + MAGIC2_BLOCK_SIZE];
+    store_u48(&mut plain[..6], CONNECT_MAGIC1_PLAIN_TEXT);
+    plain[6..38].copy_from_slice(&s.client.public);
+    plain[38..].copy_from_slice(&build_magic2_client_block());
+    s.send(&plain);
+    drive(&mut s.pump, 260); // Wrong local-key authentication must also reach Noise.
+    let (_, flight) = hello_for(&s.client, &key(99));
+    s.send(&flight);
+    // A captured hello at a different port is not an eviction instruction.
+    let elsewhere = socket();
+    elsewhere.send_to(&s.original, s.addr).unwrap();
+    drive(&mut s.pump, 10);
+    let data = packet(&mut s.old, &s.client, 1, b"unchanged");
+    elsewhere.send_to(&data, s.addr).unwrap();
+    drive(&mut s.pump, 5);
+    assert!(drain(&mut s.app).is_empty());
+    s.send(&data);
+    assert!(
+        matches!(&drain(&mut s.app)[..], [RingEvent::Message { data, .. }] if data == b"unchanged")
+    );
+}
+
+#[test]
+fn replacement_rate_window_and_expiry_are_fixed() {
+    let mut rate = ReplacementRate::default();
+    for _ in 0..64 {
+        assert!(rate.admit(5_000_000_000));
+    }
+    assert!(!rate.admit(5_999_999_999));
+    assert!(rate.admit(6_000_000_000));
+    let budget = crate::receive_memory::ReceiveMemoryBudget::new(64 << 20);
+    let mut map = HashMap::new();
+    let a = key(1);
+    let b = key(2);
+    connect_to_endpoint(
+        &mut map,
+        &b,
+        &address(&a, 42),
+        (100_000, 4096, 65536),
+        1,
+        &budget,
+        32 << 20,
+        4096,
+    );
+    let c = map.values_mut().next().unwrap();
+    c.connection_state = new_connection_state_connected(None, MAGIC, APP, 100);
+    // Expiry is anchored to creation, including the exact inclusive deadline.
+    c.creation_time_ns = 100;
+    assert!(!c.replacement_expired(100 + REPLACEMENT_LIFETIME_NS));
+    assert!(c.replacement_expired(101 + REPLACEMENT_LIFETIME_NS));
+    drop(map);
+    assert_eq!(budget.used(), 0);
+}
+
+fn responder(flight: &[u8], server: &IdentityKeyPair) -> snow::HandshakeState {
+    let mut h = noise_responder(
+        crypto_string_from_connect_magic1(MAGIC).unwrap(),
+        &flight[..6],
+        &server.private,
+    )
+    .unwrap();
+    h.read_message(&flight[6..], &mut [0; 512]).unwrap();
+    h
+}
+fn live_tracking() -> (
+    ConnectionTrackingData,
+    std::sync::Arc<crate::receive_memory::ReceiveMemoryBudget>,
+    IdentityKeyPair,
+    IdentityKeyPair,
+) {
+    let a = key(1);
+    let b = key(2);
+    let budget = crate::receive_memory::ReceiveMemoryBudget::new(64 << 20);
+    let mut map = HashMap::new();
+    connect_to_endpoint(
+        &mut map,
+        &b,
+        &address(&a, 42),
+        (100_000, 4096, 65536),
+        1,
+        &budget,
+        32 << 20,
+        4096,
+    );
+    let mut c = map.remove(&address(&a, 42).connection_key()).unwrap();
+    let (_, first) = hello_for(&a, &b);
+    let mut h = responder(&first, &b);
+    h.write_message(&APP.to_le_bytes(), &mut [0; 512]).unwrap();
+    c.connection_state = new_connection_state_connected(
+        Some(ConnectionCipherTriplet::new_from_old_init_only(
+            h.into_stateless_transport_mode().unwrap(),
+        )),
+        MAGIC,
+        APP,
+        10_000_000_000,
+    );
+    c.peer_hello_digest = Some(*blake3::hash(&first).as_bytes());
+    (c, budget, a, b)
+}
+fn prepare(
+    c: &mut ConnectionTrackingData,
+    budget: &std::sync::Arc<crate::receive_memory::ReceiveMemoryBudget>,
+    a: &IdentityKeyPair,
+    b: &IdentityKeyPair,
+    now: u64,
+) -> Vec<u8> {
+    let (_, flight) = hello_for(a, b);
+    c.prepare_replacement(
+        responder(&flight, b),
+        *blake3::hash(&flight).as_bytes(),
+        APP,
+        now,
+        budget,
+        32 << 20,
+        4096,
+        1,
+        (100_000, 4096, 65536),
+    );
+    flight
+}
+fn saved(c: &ConnectionTrackingData) -> &[u8] {
+    let ConnectionState::SendingServerHello {
+        hello_packet_payload,
+        ..
+    } = &c.replacement.as_ref().unwrap().connection_state
+    else {
+        panic!();
+    };
+    hello_packet_payload
+}
+
+#[test]
+fn replacement_candidate_fixed_timeout_pacing_memory_and_fresh_ephemeral() {
+    let (mut c, budget, a, b) = live_tracking();
+    let now = 10_000_000_000;
+    let flight = prepare(&mut c, &budget, &a, &b, now);
+    let original = saved(&c).to_vec();
+    let digest = *blake3::hash(&flight).as_bytes();
+    let hash = c.handshake_hash;
+    let used = budget.used();
+    assert_eq!(used, 2 * RECEIVE_CONNECTION_BYTES);
+    assert!(!std::sync::Arc::ptr_eq(
+        &c.receive_budget,
+        &c.replacement.as_ref().unwrap().receive_budget
+    ));
+    // Duplicate cannot slide absolute expiry, swap response or reserve more memory.
+    c.prepare_replacement(
+        responder(&flight, &b),
+        digest,
+        APP,
+        now + 1_000_000_000,
+        &budget,
+        32 << 20,
+        4096,
+        1,
+        (100_000, 4096, 65536),
+    );
+    assert_eq!(c.replacement.as_ref().unwrap().creation_time_ns, now);
+    assert_eq!(saved(&c), original);
+    assert_eq!(budget.used(), used);
+    let mut sent = Vec::new();
+    let mut rate = ReplacementRate::default();
+    for t in [
+        now,
+        now + 1,
+        now + 10_000_001,
+        now + 10_000_002,
+        now + 2_510_000_002,
+    ] {
+        c.service_replacement(t, &mut rate, |_, _, p| {
+            sent.push(p.to_vec());
+            SendAttempt {
+                attempted_at_ns: t,
+                error: Some(55),
+            }
+        });
+    }
+    assert_eq!(sent.len(), 3);
+    assert!(sent.iter().all(|p| p == &original));
+    c.service_replacement(now + REPLACEMENT_LIFETIME_NS + 1, &mut rate, |_, _, _| {
+        panic!("expired response")
+    });
+    assert!(c.replacement.is_none());
+    assert!(c.is_connected());
+    assert_eq!(c.handshake_hash, hash);
+    assert_eq!(budget.used(), RECEIVE_CONNECTION_BYTES);
+    // Replayed historical hello gets a genuinely fresh responder ephemeral, not expired keys.
+    c.prepare_replacement(
+        responder(&flight, &b),
+        digest,
+        APP,
+        now + REPLACEMENT_LIFETIME_NS + 2,
+        &budget,
+        32 << 20,
+        4096,
+        1,
+        (100_000, 4096, 65536),
+    );
+    assert_ne!(&saved(&c)[6..38], &original[6..38]);
+    drop(c);
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
+fn replacement_admission_limits_and_failed_reservation_do_not_touch_live_state() {
+    let (mut c, budget, a, b) = live_tracking();
+    let now = 10_000_000_000;
+    let mut work = ReplacementRate::default();
+    assert!(!c.admit_replacement_work(c.peer_hello_digest.unwrap(), 0, now, &mut work));
+    assert_eq!(work.used, 0);
+    assert!(!c.admit_replacement_work([9; 32], MAX_REPLACEMENTS, now, &mut work));
+    assert_eq!(work.used, 0);
+    assert!(c.admit_replacement_work([9; 32], 0, now, &mut work));
+    assert!(!c.admit_replacement_work([8; 32], 0, now + 249_999_999, &mut work));
+    assert!(c.admit_replacement_work([8; 32], 0, now + 250_000_000, &mut work));
+    let full = budget.reserve(budget.limit() - budget.used()).unwrap();
+    prepare(&mut c, &budget, &a, &b, now);
+    assert!(c.replacement.is_none());
+    assert!(c.is_connected());
+    drop(full);
+    prepare(&mut c, &budget, &a, &b, now);
+    assert!(c.replacement.is_some());
+    assert!(!c.admit_replacement_work([7; 32], 0, now + 1_000_000_000, &mut work));
+    assert_eq!(c.replacement.as_ref().unwrap().creation_time_ns, now);
+    // Aggregate work and responses are independently bounded; denied responses are paced drops.
+    let mut responses = ReplacementRate::default();
+    for _ in 0..64 {
+        assert!(responses.admit(now));
+    }
+    c.service_replacement(now, &mut responses, |_, _, _| {
+        panic!("response budget bypass")
+    });
+    let ConnectionState::SendingServerHello {
+        last_sent_time_ns, ..
+    } = &c.replacement.as_ref().unwrap().connection_state
+    else {
+        panic!();
+    };
+    assert_ne!(*last_sent_time_ns, 0);
+    c.service_replacement(now + 1, &mut responses, |_, _, _| panic!("hot retry"));
+    drop(c);
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
+fn replacement_fresh_budget_rejects_old_worker_and_drops_queued_state() {
+    let (mut c, budget, a, b) = live_tracking();
+    assert!(
+        c.unreliable_send_buffer
+            .submit_messages(0, vec![vec![3; 2048]])
+            .is_empty()
+    );
+    let generation = std::sync::Arc::new(());
+    let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+    c.unreliable_fec[0].package_id = 17;
+    c.unreliable_fec[0].state = FecRecvState::Worker {
+        tx,
+        job: None,
+        message_len: 2048,
+        block_bytes: 445,
+        generation: generation.clone(),
+    };
+    let completion = FecCompletion {
+        connection_key: c.address().connection_key(),
+        package_id: 17,
+        message: vec![1; 2048],
+        reservation: c.receive_budget.reserve(2048).unwrap(),
+        decoder_generation: generation.clone(),
+        connection_generation: c.receive_budget.clone(),
+    };
+    assert!(completion.owns(&c.unreliable_fec[0], &c.receive_budget));
+    prepare(&mut c, &budget, &a, &b, 10_000_000_000);
+    let fresh = c.replacement.take().unwrap();
+    assert!(!fresh.unreliable_send_buffer.has_unsent_data());
+    assert!(
+        !completion.owns(&c.unreliable_fec[0], &fresh.receive_budget),
+        "even identical decoder identity cannot cross connection budget"
+    );
+    assert!(!completion.owns(&fresh.unreliable_fec[0], &fresh.receive_budget));
+    c = *fresh;
+    assert!(matches!(c.unreliable_fec[0].state, FecRecvState::Empty));
+    drop(c);
+    assert!(budget.used() > 0); // old completion still owns only its old lease.
+    drop(completion);
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
+fn replacement_captured_historical_hello_and_transport_cannot_confirm() {
+    let mut s = Server::new(16);
+    let historical = s.original.clone();
+    let captured = packet(&mut s.old, &s.client, 1, b"captured old");
+    let (mut current, _, _, _) = s.candidate();
+    let confirm = packet(&mut current, &s.client, 0, b"current");
+    s.send(&confirm);
+    drain(&mut s.app);
+    // Current digest is different: the historical hello can occupy a bounded slot,
+    // but its former transport keys cannot authenticate the new responder ephemeral.
+    s.send(&historical);
+    let _fresh_response = response(&s.raw, &mut s.pump);
+    s.send(&captured);
+    assert!(drain(&mut s.app).is_empty());
+    let live = packet(&mut current, &s.client, 1, b"live current");
+    s.send(&live);
+    assert!(
+        matches!(&drain(&mut s.app)[..],[RingEvent::Message{data,..}] if data==b"live current")
+    );
+}
+
+#[test]
+fn replacement_same_prefix_different_full_key_is_rejected() {
+    let mut prefixes = HashMap::new();
+    let mut pair = None;
+    for seed in 0u16..2048 {
+        let mut private = [17; 32];
+        private[..2].copy_from_slice(&seed.to_le_bytes());
+        let public = curve25519_dalek::montgomery::MontgomeryPoint::mul_base_clamped(private)
+            .to_bytes()
+            .to_vec();
+        let kp = IdentityKeyPair {
+            magic1: MAGIC,
+            private: private.to_vec(),
+            public,
+        };
+        let prefix = load_u16(&kp.public[..2]) << 1;
+        if let Some(previous) = prefixes.insert(prefix, kp.clone()) {
+            if previous.public != kp.public {
+                pair = Some((previous, kp));
+                break;
+            }
+        }
+    }
+    let (a, b) = pair.expect("deterministic birthday collision");
+    let mut s = Server::with_client(16, a);
+    let (_, flight) = hello_for(&b, &s.key);
+    s.send(&flight);
+    drive(&mut s.pump, 30);
+    let mut buf = [0; 10000];
+    while let Ok((n, _)) = s.raw.recv_from(&mut buf) {
+        assert_ne!(n, 62);
+    }
+    let live = packet(&mut s.old, &s.client, 1, b"full identity retained");
+    s.send(&live);
+    assert!(
+        matches!(&drain(&mut s.app)[..],[RingEvent::Message{data,..}] if data==b"full identity retained")
+    );
+}
+
+#[test]
+fn replacement_simultaneous_open_remains_one_shared_association() {
+    let a = key(71);
+    let b = key(72);
+    let ap = free_port();
+    let bp = free_port();
+    let (mut p, mut pe) = pump(&a, ap, 16);
+    let (mut q, mut qe) = pump(&b, bp, 16);
+    assert!(pe.try_connect(address(&b, bp)));
+    assert!(qe.try_connect(address(&a, ap)));
+    let until = Instant::now() + Duration::from_secs(3);
+    let mut ah = None;
+    let mut bh = None;
+    while Instant::now() < until && (ah.is_none() || bh.is_none()) {
+        drive(&mut p, 2);
+        drive(&mut q, 2);
+        for e in drain(&mut pe) {
+            match e {
+                RingEvent::Connected { handshake_hash, .. } => {
+                    assert!(ah.is_none());
+                    ah = Some(handshake_hash);
+                }
+                _ => panic!("unexpected lifecycle"),
+            }
+        }
+        for e in drain(&mut qe) {
+            match e {
+                RingEvent::Connected { handshake_hash, .. } => {
+                    assert!(bh.is_none());
+                    bh = Some(handshake_hash);
+                }
+                _ => panic!("unexpected lifecycle"),
+            }
+        }
+    }
+    assert!(ah.is_some());
+    assert_eq!(ah, bh);
+}
+
+#[test]
+fn replacement_pending_boundary_orders_local_disconnect_and_releases_candidate() {
+    let mut s = Server::new(1);
+    let (mut new, _, _, _) = s.candidate();
+    let peer = address(&s.client, s.raw.local_addr().unwrap().port()).connection_key();
+    let confirm = packet(&mut new, &s.client, 0, b"drop");
+    s.send(&confirm);
+    assert!(s.app.try_disconnect(peer));
+    drive(&mut s.pump, 5);
+    assert!(matches!(
+        s.app.try_recv(),
+        Some(RingEvent::Disconnected {
+            reason: DisconnectReason::Replaced,
+            ..
+        })
+    ));
+    drive(&mut s.pump, 5);
+    assert!(matches!(
+        s.app.try_recv(),
+        Some(RingEvent::Connected { .. })
+    ));
+    drive(&mut s.pump, 5);
+    assert!(matches!(
+        s.app.try_recv(),
+        Some(RingEvent::Disconnected {
+            reason: DisconnectReason::Local,
+            ..
+        })
+    ));
+    s.send(&confirm);
+    assert!(s.app.try_recv().is_none());
+}
+
+fn ack_packet(cipher: &mut ConnectionCipherTriplet, k: &IdentityKeyPair, nonce: u64) -> Vec<u8> {
+    let mut output = vec![0; 174];
+    let mut c = Some(cipher.clone());
+    // Authenticated but semantically invalid ACK: its replay/semantic failure must
+    // never cause a fallback from old keys; on fresh keys AEAD still confirms.
+    let n = seal_connected_packet(
+        &mut c,
+        load_u16(&k.public[..2]) << 1,
+        nonce,
+        &[0; 152],
+        &mut output,
+        monotonic_clock_ns(),
+    )
+    .unwrap();
+    *cipher = c.unwrap();
+    output.truncate(n);
+    output
+}
+#[test]
+fn replacement_ack_semantics_do_not_fall_through_but_fresh_aead_confirms() {
+    let mut s = Server::new(16);
+    let (mut new, _, _, hash) = s.candidate();
+    let old_ack = ack_packet(&mut s.old, &s.client, crate::sequence::ACK_SPACE);
+    s.send(&old_ack);
+    s.send(&old_ack);
+    assert!(drain(&mut s.app).is_empty());
+    let fresh_ack = ack_packet(&mut new, &s.client, crate::sequence::ACK_SPACE);
+    s.send(&fresh_ack);
+    assert!(
+        matches!(&drain(&mut s.app)[..],[RingEvent::Disconnected{reason:DisconnectReason::Replaced,..},RingEvent::Connected{handshake_hash,..}] if *handshake_hash==hash)
+    );
+    s.send(&fresh_ack);
+    assert!(drain(&mut s.app).is_empty());
+    let data = packet(&mut new, &s.client, 0, b"independent data counter");
+    s.send(&data);
+    assert!(
+        matches!(&drain(&mut s.app)[..],[RingEvent::Message{data,..}] if data==b"independent data counter")
+    );
+}
+#[test]
+fn replacement_local_disconnect_drops_unconfirmed_candidate_without_resurrection() {
+    let mut s = Server::new(16);
+    let (mut new, _, _, _) = s.candidate();
+    let peer = address(&s.client, s.raw.local_addr().unwrap().port()).connection_key();
+    assert!(s.app.try_disconnect(peer));
+    drive(&mut s.pump, 5);
+    assert!(matches!(
+        &drain(&mut s.app)[..],
+        [RingEvent::Disconnected {
+            reason: DisconnectReason::Local,
+            ..
+        }]
+    ));
+    let late = packet(&mut new, &s.client, 0, b"late candidate");
+    s.send(&late);
+    assert!(drain(&mut s.app).is_empty());
+}
+
+#[test]
+fn replacement_nonce_reconstruction_is_independent_after_old_low_counter_wrap() {
+    let mut s = Server::new(16);
+    // Legal compact gaps advance the old anchor across a low31 wrap.
+    for nonce in [(1 << 30) - 1, (1 << 31) - 2, 3 * (1 << 30) - 3] {
+        let bytes = packet(&mut s.old, &s.client, nonce, b"old high counter");
+        s.send(&bytes);
+        assert!(
+            matches!(&drain(&mut s.app)[..],[RingEvent::Message{data,..}] if data==b"old high counter")
+        );
+    }
+    let (mut new, _, _, hash) = s.candidate();
+    // New packet zero is deliberately lost: ordinary later data confirms just as well.
+    let bytes = packet(&mut new, &s.client, 1, b"new counter one");
+    s.send(&bytes);
+    assert!(
+        matches!(&drain(&mut s.app)[..],[RingEvent::Disconnected{reason:DisconnectReason::Replaced,..},
+        RingEvent::Connected{handshake_hash,..},RingEvent::Message{data,..}] if *handshake_hash==hash && data==b"new counter one")
+    );
+}

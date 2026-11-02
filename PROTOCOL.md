@@ -167,7 +167,10 @@ transition. In developer plaintext even this authentication gate is absent.
 | ServerHello-sending | timer: resend saved ServerHello | unchanged |
 | ServerHello-sending | ordinary packet with valid transport AEAD | Connected, then ordinary admission |
 | Connected | fresh admitted data or ACK | Connected; process as below |
-| Connected | ClientHello for the existing association | unchanged; do not reset |
+| Connected | authenticated fresh ClientHello matching full peer/local identity, source and application | keep live association; optionally prepare one parallel replacement |
+| Connected + replacement | old transport AEAD succeeds | process only old association; do not promote |
+| Connected + replacement | old transport fails, replacement AEAD succeeds and lifecycle capacity is reserved | discard entire old association; install fresh Connected, then ordinary admission |
+| Connected + replacement | candidate deadline | discard candidate only; no lifecycle event |
 | Any live state | local disconnect, deadline, or safety exhaustion | Closed (remove local association) |
 
 Closed is conceptual: there is **no close frame, reset packet, reliable stream
@@ -181,10 +184,72 @@ is unavailable; that refusal does not negotiate a different wire profile.
 If both peers initiate concurrently with the same identities and selector,
 compare the complete 32-byte static public keys lexicographically as byte
 strings: the smaller remains initiator; the larger abandons its pending client
-flight and answers as responder. Self-connections are not initiated. A hello
-for an existing Connected association does not reset it or its counters.
-A fresh association requires discarding the old state and a fresh Noise
-handshake; endpoints must not reinterpret a new hello as a connected rekey.
+flight and answers as responder. Self-connections are not initiated.
+
+### Confirmed parallel replacement (local policy, unchanged wire)
+
+An encrypted peer that restarts with the same static key and source IP/port
+can perform a fresh Noise handshake while the old Connected association stays
+fully live. The responder authenticates the full 32-byte remote static key,
+exact local keypair/profile and selected application ID; a 15-bit prefix match
+alone never authorizes replacement. Plaintext does not support replacement.
+There is no cross-address eviction or address migration. The association retains
+a 32-byte BLAKE3 digest of its peer's establishing ClientHello (including an
+observed simultaneous-initiation hello on the initiator side), so its delayed
+duplicates are ignored without DH work or another response.
+
+This implementation admits one **first-wins** candidate per live association,
+with an absolute 15-second lifetime and a process-pump ceiling of 32 candidates.
+A candidate owns a full, separately charged connection-bookkeeping reservation,
+fresh connection receive-budget identity and empty send/reassembly/FEC state.
+Before DH, matching source IP/port and local keypair select only a work gate:
+at most one replacement attempt per 250 ms per matching live association and
+64 such attempts per one-second window per pump. The full cryptographic checks
+still follow. Pending candidates, duplicate original hellos and exhausted
+candidate capacity refuse further work at this gate. Candidate responses reuse
+the exact saved ServerHello with the usual 10 ms/2.5-second retry pacing and an
+aggregate ceiling of 64 attempts per one-second window per pump. Budget-refused
+responses consume their scheduled attempt. Duplicate hellos never move creation,
+expiry or response deadlines, and never evict a candidate. Initial handshakes
+without a matching live source/local identity retain their existing policy.
+
+Each newly admitted candidate generates fresh responder ephemeral entropy,
+Noise Split keys and initial REKEY separation. Expiry discards it without events;
+a later admission starts a new Noise exchange, never resurrecting expired keys.
+A captured historical hello can occupy this one slot until its deadline, and
+repeated captures can delay reconnection. With no wire freshness challenge this
+policy does **not** guarantee replay-proof availability or unconditional one-RTT
+reconnection. A captured hello or old-session transport cannot confirm fresh
+candidate keys or tear down live state.
+
+Ordinary input tries the live association first, reconstructing its own nonce
+and preserving the original ciphertext. Old AEAD success is processed only as
+old traffic: replay or semantic rejection never falls through to the candidate.
+Only on old open failure is the candidate tried independently, with its fresh
+nonce reconstruction and isolated cipher state/output. Candidate AEAD success
+confirms before semantic checks, exactly like normal responder confirmation;
+that packet is authenticated and processed once, not reopened after promotion.
+While a candidate exists, failed old authentication can incur one additional
+candidate open (at most two AEAD verifications within that open) per received
+packet. This transport verification is not separately rate-limited; the existing
+packet/pump work budgets provide receive fairness. The handshake DH/response
+limits do not claim bounded total CPU or reconnect availability under an
+unbounded invalid-packet flood.
+
+Before retiring old state the pump reserves ownership of two ordered lifecycle
+notifications: `Disconnected(Replaced)`, then `Connected(new handshake_hash)`.
+A full receive ring defers promotion without disconnecting the old association.
+A capacity-one ring can hold the second event pump-side; new payload is dropped
+and counted under ordinary best-effort overflow policy until Connected is
+published, never delivered across that boundary. Already-published old messages
+remain ahead of Disconnected. Replacement discards **all** old transport, ACK,
+replay, CC/outage/MTU, reassembly/FEC and admitted outgoing work, including
+untouched messages in old core queues, partially encoded packets and repairs.
+Send-ring entries not yet admitted are key-addressed submissions to the current
+association, as with an ordinary disconnect/reconnect. Old asynchronous decoder
+completions cannot match the new receive-budget identity. Local disconnect,
+old expiry or safety closure removes its candidate too. This is a fresh
+association, not an in-place rekey or a reset of old counters.
 
 Handshake retransmissions reuse the exact saved flight. This implementation
 expires a client attempt after 30 seconds from creation and a responder
@@ -1055,14 +1120,15 @@ unchanged; the compact field is never used as a message or duplicate identity.
 ClientHello authentication requires Noise IK DH work before return routability
 is known. Anyone knowing the responder's public key can generate a valid
 hello, and matching-selector garbage still incurs responder DH attempts.
-Half-open state is memory-bounded and expires after 15 seconds, but CPU cost
-is not rate-limited. The initial 359-byte request/62-byte response is not
-large-response reflection; retransmitted responses before confirmation can
-exceed the original request cumulatively. Stateless return-routability retry
-cookies and an aggregate pre-confirmation response budget are **not** part of
-versions 4 through 6. No current anti-spoofing/strict anti-amplification guarantee is
-claimed; adding such a handshake exchange requires a separately specified
-compatible mechanism or a new profile/version.
+Half-open state is memory-bounded and expires after 15 seconds. Replacement
+work/responses have the bounded local gates above; initial handshakes from
+sources without matching live associations remain CPU-unlimited. The initial
+359-byte request/62-byte response is not large-response reflection; retransmitted
+responses before confirmation can exceed the request cumulatively. Stateless
+return-routability retry cookies and a universal aggregate pre-confirmation
+response budget are **not** part of versions 4 through 6. No anti-spoofing/strict
+anti-amplification guarantee is claimed; adding such an exchange requires a
+separately specified compatible mechanism or a new profile/version.
 
 Uniform current-TU padding hides application message sizes, fragment shape
 and packing boundaries, not all metadata. The clear low counter reveals counts
