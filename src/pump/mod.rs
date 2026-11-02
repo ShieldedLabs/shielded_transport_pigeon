@@ -15,17 +15,19 @@ use std::time::{Duration, Instant};
 /// work proportional to connections/queues. Dropping Pump closes the UDP socket and publishes endpoint termination.
 ///
 /// Forward progress: a `run_until` call entered before its deadline admits one eligible pending command and completes
-/// one unit (one received datagram, one data send, one FEC completion/sweep entry, one connection send step or eight
-/// bookkeeping units; an idle pass counts), even if the deadline passes during calibration/preemption. The cooperative
+/// one unit (one received datagram, one data send, one FEC completion/sweep entry, one fresh reconnect handshake,
+/// one connection send step or eight bookkeeping units; an idle pass counts), even if the deadline passes during calibration/preemption. The cooperative
 /// overshoot bound is one admission plus one such unit. An unfinished 150 us active retry quantum is never shortened:
 /// only the owed command may be admitted inside it, and the owed unit waits for a call after it ends. Calls entered
-/// at/after their deadline return immediately without work.
+/// at/after their deadline still observe local addresses and schedule connection refresh, but do no protocol work.
+/// Every run call pays for fresh OS route probes; address-change teardown also scales with the old associations.
 pub struct Pump {
     pub(crate) run: Box<dyn FnMut(Deadline) -> Option<Instant> + Send>,
     pub(crate) wakeup: Option<Instant>,
 }
 pub(crate) struct Deadline {
     pub(crate) instant: Instant,
+    pub(crate) work_allowed: bool,
     raw_ns: u64,
     now_ns: u64,
     unsampled: u8,
@@ -36,6 +38,7 @@ impl Deadline {
     fn new(instant: Instant, now: Instant, raw_now: u64) -> Self {
         Self {
             instant,
+            work_allowed: now < instant,
             raw_ns: raw_now.saturating_add(
                 instant
                     .saturating_duration_since(now)
@@ -80,10 +83,8 @@ impl Deadline {
 impl Pump {
     pub fn run_until(&mut self, deadline: Instant) {
         let now = Instant::now();
-        if now < deadline {
-            let raw_now = crate::native_sockets::monotonic_clock_ns();
-            self.wakeup = (self.run)(Deadline::new(deadline, now, raw_now));
-        }
+        let raw_now = crate::native_sockets::monotonic_clock_ns();
+        self.wakeup = (self.run)(Deadline::new(deadline, now, raw_now));
     }
     pub fn run_for(&mut self, duration: Duration) {
         self.run_until(Instant::now() + duration);

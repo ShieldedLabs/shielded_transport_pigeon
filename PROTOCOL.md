@@ -260,6 +260,44 @@ An interoperating peer MUST tolerate duplicate flights and provide confirmation
 within the responder lifetime. Precise retry pacing is local
 policy, not a dependency of key or packet identity.
 
+### Local source-address changes (implementation policy)
+
+At the beginning of each public pump service call, this implementation freshly
+probes IPv4 and IPv6 source selection using temporary UDP socket connect and
+getsockname, without sending a UDP payload. The first address pair establishes
+a baseline. Any subsequent pair change, including Some/None transitions,
+immediately retires **all** local associations and queues fresh handshakes to
+remembered live peers, including incoming peers, with their exact remote static
+key/IP/port, local identity and application configuration. No old cipher,
+counter, CC/pacing, candidate, admitted send, reassembly or decoder state is
+transferred. Old decoder completions cannot match the fresh receive generation.
+Published old events remain before the local `Disconnected(NetworkChanged)`;
+the new `Connected` follows only after a fresh handshake completes, including
+when a capacity-one/full receive ring delays lifecycle publication.
+
+Pending locally initiated/restarted handshakes are retried as the same logical
+request without a false disconnect/failure. Unsolicited incomplete incoming
+handshakes are discarded, not proactively reconnected. Repeated changes retain
+only one pending restart per remembered peer. An admitted local disconnect
+cancels restart; a queued Disconnect still follows normal admission ordering.
+Unadmitted send-ring submissions retain their current-association semantics.
+Expired/zero-budget calls still observe, retire and schedule, but do no protocol
+work, handshake construction or packet sends. The next positive-budget call
+starts fresh handshakes without waiting for the old liveness/outage timers.
+Probes and change teardown have unbudgeted OS/allocation/destruction cost, the
+latter proportional to retired state; wall-clock deadlines are not hard real time.
+
+Probe failure is represented as absence, including transient resource errors;
+there is no debounce. Linux also freshly selects its existing wildcard IPv6
+send-source workaround and observes that exact forced source instead of the
+route result when active, even if no IPv6 route was found. A fallback address
+is not evidence of routability. Explicit Linux binds remain bound, not migrated;
+other platforms continue to reject explicit binding. These observations do not
+detect NAT/external mapping changes or migrate a peer's remote address. The
+same-tuple encrypted reconnect uses confirmed replacement above; a genuinely
+changed source tuple is a different remote association, and plaintext has no
+confirmed same-tuple replacement. Wire format and outage/expiry policy are unchanged.
+
 ### Connected liveness and outage
 
 Every Connected endpoint, including an application-idle or ACK-only endpoint,

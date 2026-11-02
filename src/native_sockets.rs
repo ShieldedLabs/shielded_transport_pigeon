@@ -2,6 +2,20 @@
 #[allow(unused_imports)]
 use crate::platform::sys;
 pub use std::net::Ipv6Addr;
+pub(crate) fn effective_source_addresses(
+    routes: (Option<Ipv6Addr>, Option<Ipv6Addr>),
+    forced_v6: Option<Ipv6Addr>,
+) -> (Option<Ipv6Addr>, Option<Ipv6Addr>) {
+    (routes.0, forced_v6.or(routes.1))
+}
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn refresh_udp_send_source(
+    _socket: &mut SockHandle,
+    _bind_ip: Option<std::net::IpAddr>,
+    routes: (Option<Ipv6Addr>, Option<Ipv6Addr>),
+) -> (Option<Ipv6Addr>, Option<Ipv6Addr>) {
+    routes
+}
 #[derive(Debug)]
 pub(crate) struct NetworkWake {
     #[cfg(target_os = "linux")]
@@ -243,35 +257,25 @@ mod posix {
         unsafe {
             let fd = sys::socket(family, sys::SOCK_DGRAM, sys::IPPROTO_UDP);
             if fd < 0 {
-                panic!("socket() failed: {}", std::io::Error::last_os_error());
+                return None;
             }
             let len = std::mem::size_of::<T>() as sys::socklen_t;
             let ret = if sys::connect(fd, dst as *const T as *const sys::sockaddr, len) != 0 {
-                let err = std::io::Error::last_os_error();
-                match err.raw_os_error() {
-                    Some(sys::ENETUNREACH) | Some(sys::EHOSTUNREACH) | Some(sys::EADDRNOTAVAIL) => {
-                        None
-                    }
-                    _ => panic!("{ip} probe connect() failed: {}", err),
-                }
+                None
             } else {
                 let mut local: T = std::mem::zeroed();
                 let mut local_len = len;
-                if sys::getsockname(
+                (sys::getsockname(
                     fd,
                     &mut local as *mut T as *mut sys::sockaddr,
                     &mut local_len,
-                ) != 0
-                {
-                    panic!(
-                        "{ip} probe getsockname() failed: {}",
-                        std::io::Error::last_os_error()
-                    );
-                }
-                Some(local)
+                ) == 0
+                    && local_len == len)
+                    .then_some(local)
             };
+            // Do not retry close: after EINTR its descriptor may already have been reused.
             if sys::close(fd) != 0 {
-                panic!("close() failed: {}", std::io::Error::last_os_error());
+                return None;
             }
             ret
         }
@@ -292,6 +296,16 @@ mod posix {
         let dst = sockaddr_in6(PROBE_V6, 53);
         let local = unsafe { probe_local(sys::AF_INET6, &dst, "ipv6") }?;
         usable_probed_v6(Ipv6Addr::from(local.sin6_addr.s6_addr))
+    }
+    #[test]
+    fn source_probe_failures_are_absence_not_panics() {
+        let dst = sockaddr_in6(PROBE_V6, 53);
+        assert!(unsafe { probe_local(-1, &dst, "invalid family") }.is_none());
+        // A destination-family mismatch fails after creating the descriptor;
+        // exercise that cleanup path repeatedly without sending any payload.
+        for _ in 0..64 {
+            assert!(unsafe { probe_local(sys::AF_INET, &dst, "family mismatch") }.is_none());
+        }
     }
 }
 #[cfg(target_os = "linux")]
@@ -399,7 +413,7 @@ mod linux {
         unsafe {
             let mut ifap: *mut sys::ifaddrs = std::ptr::null_mut();
             if sys::getifaddrs(&mut ifap) != 0 {
-                panic!("getifaddrs failed: {}", std::io::Error::last_os_error());
+                return None;
             }
             let mut index = 0;
             let mut first_is_loopback = false;
@@ -434,10 +448,6 @@ mod linux {
                     if index == 2 && first_is_loopback {
                         return None;
                     }
-                    eprintln!(
-                        "[WARNING] This linux machine has incorrectly configured it's ipv6 addresses causing a bug when sending ipv6 packets. We will be overriding the sender ip field with '{}' in order to try and work around this issue.",
-                        addr
-                    );
                     return Some(addr);
                 }
                 cur = (*cur).ifa_next;
@@ -765,14 +775,68 @@ mod linux {
     }
     #[inline]
     pub fn udp_probe_source_addresses(
-        udp_socket: SockHandle,
+        _udp_socket: SockHandle,
     ) -> (Option<Ipv6Addr>, Option<Ipv6Addr>) {
-        let ipv4 = probe_v4_source();
-        let known_good_ipv6_address = udp_socket.1;
-        if known_good_ipv6_address.is_some() {
-            return (ipv4, known_good_ipv6_address);
+        // Observe today's routes, never the startup send-source workaround cache.
+        (probe_v4_source(), probe_v6_source())
+    }
+    pub(crate) fn refresh_udp_send_source(
+        socket: &mut SockHandle,
+        bind_ip: Option<std::net::IpAddr>,
+        routes: (Option<Ipv6Addr>, Option<Ipv6Addr>),
+    ) -> (Option<Ipv6Addr>, Option<Ipv6Addr>) {
+        // Select the workaround once from current interfaces. The same selection
+        // drives both sends and change detection, even without an IPv6 route.
+        // An explicitly bound endpoint is never overridden or rebound.
+        socket.1 = if bind_ip.is_none() {
+            first_usable_ipv6()
+        } else {
+            None
+        };
+        effective_source_addresses(routes, socket.1)
+    }
+    #[cfg(all(test, not(cosmo)))]
+    #[test]
+    fn source_probe_ignores_startup_cache_and_explicit_bind_never_forces_a_new_source() {
+        let udp = std::net::UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)).unwrap();
+        let mut handle = SockHandle::from_test_socket(&udp);
+        let stale: Ipv6Addr = "2001:db8::bad".parse().unwrap();
+        handle.1 = Some(stale);
+        let observed = udp_probe_source_addresses(handle);
+        assert_ne!(observed.1, Some(stale));
+        assert_eq!(observed, (probe_v4_source(), probe_v6_source()));
+        assert_eq!(
+            refresh_udp_send_source(
+                &mut handle,
+                Some(std::net::IpAddr::V6(Ipv6Addr::LOCALHOST)),
+                observed
+            ),
+            observed
+        );
+        assert_eq!(handle.1, None);
+        assert_eq!(
+            udp.local_addr().unwrap().ip(),
+            std::net::IpAddr::V6(Ipv6Addr::LOCALHOST)
+        );
+        handle.1 = Some(stale);
+        let effective = refresh_udp_send_source(&mut handle, None, observed);
+        assert_eq!(effective, effective_source_addresses(observed, handle.1));
+        assert_eq!(handle.1, first_usable_ipv6());
+        assert_ne!(handle.1, Some(stale));
+        // Startup and subsequent service entries use exactly the same VPS
+        // workaround selector, including its original interface-order guard.
+        let mut startup = setup_and_bind_udp_socket(0).unwrap();
+        let startup_source = startup.1;
+        let routes = udp_probe_source_addresses(startup);
+        let effective = refresh_udp_send_source(&mut startup, None, routes);
+        assert_eq!(startup.1, startup_source);
+        assert_eq!(
+            effective,
+            effective_source_addresses(routes, startup_source)
+        );
+        unsafe {
+            startup.close();
         }
-        (ipv4, probe_v6_source())
     }
 }
 #[cfg(not(target_os = "linux"))]
@@ -1181,12 +1245,7 @@ mod windows {
         unsafe {
             let probe_sock = socket(family as i32, SOCK_DGRAM as i32, IPPROTO_UDP as i32);
             if probe_sock == INVALID_SOCKET {
-                let af = if family == AF_INET as u16 {
-                    "AF_INET"
-                } else {
-                    "AF_INET6"
-                };
-                panic!("socket({af}) failed: {}", wsa_last_error());
+                return None;
             }
             let ret = if connect(
                 probe_sock,
@@ -1194,28 +1253,20 @@ mod windows {
                 size_of::<T>() as i32,
             ) == SOCKET_ERROR
             {
-                match WSAGetLastError() {
-                    WSAENETUNREACH | WSAEHOSTUNREACH | WSAEADDRNOTAVAIL => None,
-                    e => panic!(
-                        "{ip} probe connect() failed: {}",
-                        std::io::Error::from_raw_os_error(e)
-                    ),
-                }
+                None
             } else {
                 let mut local: T = zeroed();
                 let mut local_len = size_of::<T>() as i32;
-                if getsockname(
+                (getsockname(
                     probe_sock,
                     &mut local as *mut T as *mut SOCKADDR,
                     &mut local_len as *mut _,
-                ) == SOCKET_ERROR
-                {
-                    panic!("{ip} probe getsockname() failed: {}", wsa_last_error());
-                }
-                Some(local)
+                ) != SOCKET_ERROR
+                    && local_len == size_of::<T>() as i32)
+                    .then_some(local)
             };
             if closesocket(probe_sock) == SOCKET_ERROR {
-                panic!("closesocket() failed: {}", wsa_last_error());
+                return None;
             }
             ret
         }
@@ -1483,6 +1534,15 @@ mod macos {
 #[cfg(test)]
 mod send_tests {
     use super::*;
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn explicit_bind_remains_unsupported_rather_than_silently_migrating() {
+        assert!(
+            setup_and_bind_udp_socket_on(0, Some(std::net::IpAddr::V6(Ipv6Addr::LOCALHOST)),)
+                .is_none()
+        );
+    }
 
     #[test]
     fn all_send_errors_and_short_sends_are_local_drops() {

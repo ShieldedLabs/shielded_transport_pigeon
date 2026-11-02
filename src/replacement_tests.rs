@@ -847,3 +847,453 @@ fn replacement_nonce_reconstruction_is_independent_after_old_low_counter_wrap() 
         RingEvent::Connected{handshake_hash,..},RingEvent::Message{data,..}] if *handshake_hash==hash && data==b"new counter one")
     );
 }
+
+// Deterministic per-test-thread observations at the real pump service boundary.
+struct Probe(u16);
+impl Probe {
+    fn new(port: u16, pair: SourceAddresses) -> Self {
+        SOURCE_PROBES.with(|p| {
+            assert!(p.borrow_mut().insert(port, (pair, 0)).is_none());
+        });
+        Self(port)
+    }
+    fn set(&self, pair: SourceAddresses) {
+        SOURCE_PROBES.with(|p| p.borrow_mut().get_mut(&self.0).unwrap().0 = pair);
+    }
+    fn calls(&self) -> usize {
+        SOURCE_PROBES.with(|p| p.borrow()[&self.0].1)
+    }
+}
+impl Drop for Probe {
+    fn drop(&mut self) {
+        SOURCE_PROBES.with(|p| {
+            p.borrow_mut().remove(&self.0);
+        });
+    }
+}
+fn sources(v4: u8, v6: u16) -> SourceAddresses {
+    (
+        if v4 == 0 {
+            None
+        } else {
+            Some(std::net::Ipv4Addr::new(192, 0, 2, v4).to_ipv6_mapped())
+        },
+        if v6 == 0 {
+            None
+        } else {
+            Some(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, v6))
+        },
+    )
+}
+fn shared_connection(
+    p: &mut Pump,
+    pe: &mut LockfreeEndpoint,
+    q: &mut Pump,
+    qe: &mut LockfreeEndpoint,
+) -> [u8; 64] {
+    let until = Instant::now() + Duration::from_secs(3);
+    let mut a = None;
+    let mut b = None;
+    while Instant::now() < until && (a.is_none() || b.is_none()) {
+        drive(p, 2);
+        drive(q, 2);
+        for e in drain(pe) {
+            if let RingEvent::Connected { handshake_hash, .. } = e {
+                assert!(a.replace(handshake_hash).is_none());
+            } else {
+                panic!("unexpected event before Connected");
+            }
+        }
+        for e in drain(qe) {
+            match e {
+                RingEvent::Connected { handshake_hash, .. } => {
+                    assert!(b.replace(handshake_hash).is_none());
+                }
+                RingEvent::Disconnected {
+                    reason: DisconnectReason::Replaced,
+                    ..
+                } => assert!(b.is_none()),
+                _ => panic!("unexpected remote event"),
+            }
+        }
+    }
+    assert!(a.is_some(), "local reconnection did not complete");
+    assert_eq!(
+        a, b,
+        "idle confirmation must replace the unchanged remote association"
+    );
+    a.unwrap()
+}
+
+#[test]
+fn address_change_exactly_one_probe_per_public_call_even_expired() {
+    let port = free_port();
+    let (mut p, _pe) = pump(&key(81), port, 16);
+    let probe = Probe::new(port, sources(1, 1));
+    p.run_until(Instant::now() - Duration::from_secs(1));
+    assert_eq!(probe.calls(), 1);
+    p.run_for(Duration::ZERO);
+    assert_eq!(probe.calls(), 2);
+    drive(&mut p, 15);
+    assert_eq!(probe.calls(), 3);
+    p.next_wakeup();
+    assert_eq!(probe.calls(), 3);
+}
+
+#[test]
+fn address_change_each_family_and_availability_reconnects_without_payload_or_timeout() {
+    let a = key(82);
+    let b = key(83);
+    let ap = free_port();
+    let bp = free_port();
+    let (mut p, mut pe) = pump(&a, ap, 16);
+    let (mut q, mut qe) = pump(&b, bp, 16);
+    let probe = Probe::new(ap, sources(1, 1));
+    let _server_probe = Probe::new(bp, sources(9, 9));
+    assert!(pe.try_connect(address(&b, bp)));
+    let mut previous = shared_connection(&mut p, &mut pe, &mut q, &mut qe);
+    for pair in [
+        sources(2, 1),
+        sources(2, 2),
+        sources(0, 2),
+        sources(2, 2),
+        sources(2, 0),
+        sources(2, 2),
+    ] {
+        probe.set(pair);
+        p.run_for(Duration::ZERO);
+        assert!(matches!(
+            &drain(&mut pe)[..],
+            [RingEvent::Disconnected {
+                reason: DisconnectReason::NetworkChanged,
+                ..
+            }]
+        ));
+        assert!(p.next_wakeup().unwrap() <= Instant::now());
+        let fresh = shared_connection(&mut p, &mut pe, &mut q, &mut qe);
+        assert_ne!(fresh, previous);
+        previous = fresh;
+        drive(&mut p, 5);
+        drive(&mut q, 5);
+        assert!(drain(&mut pe).is_empty());
+        assert!(drain(&mut qe).is_empty());
+    }
+}
+
+#[test]
+fn address_change_remembers_live_incoming_identity_and_admitted_disconnect_stays_cancelled() {
+    let a = key(84);
+    let b = key(85);
+    let ap = free_port();
+    let bp = free_port();
+    let (mut p, mut pe) = pump(&a, ap, 16);
+    let (mut q, mut qe) = pump(&b, bp, 16);
+    let probe = Probe::new(ap, sources(1, 1));
+    let _server_probe = Probe::new(bp, sources(9, 9));
+    assert!(qe.try_connect(address(&a, ap)));
+    let old = shared_connection(&mut p, &mut pe, &mut q, &mut qe);
+    probe.set(sources(2, 1));
+    p.run_for(Duration::ZERO);
+    assert!(matches!(
+        &drain(&mut pe)[..],
+        [RingEvent::Disconnected {
+            reason: DisconnectReason::NetworkChanged,
+            ..
+        }]
+    ));
+    let fresh = shared_connection(&mut p, &mut pe, &mut q, &mut qe);
+    assert_ne!(old, fresh);
+    assert!(pe.try_disconnect(address(&b, bp).connection_key()));
+    drive(&mut p, 5);
+    assert!(matches!(
+        &drain(&mut pe)[..],
+        [RingEvent::Disconnected {
+            reason: DisconnectReason::Local,
+            ..
+        }]
+    ));
+    probe.set(sources(3, 1));
+    drive(&mut p, 10);
+    drive(&mut q, 10);
+    assert!(drain(&mut pe).is_empty());
+    assert!(drain(&mut qe).is_empty());
+}
+
+#[test]
+fn address_change_full_capacity_one_ring_preserves_boundary_and_queued_cancellation() {
+    let server = key(41);
+    let client = key(19);
+    let port = free_port();
+    let (mut p, mut app) = pump(&server, port, 1);
+    let probe = Probe::new(port, sources(1, 1));
+    let addr = SocketAddr::from((Ipv6Addr::LOCALHOST, port));
+    let raw = socket();
+    let (h, original) = hello_for(&client, &server);
+    raw.send_to(&original, addr).unwrap();
+    let flight = response(&raw, &mut p);
+    let (mut old, hash) = finish(h, &flight);
+    raw.send_to(&packet(&mut old, &client, 0, b""), addr)
+        .unwrap();
+    drive(&mut p, 5);
+    assert!(matches!(
+        &drain(&mut app)[..],
+        [RingEvent::Connected { .. }]
+    ));
+    let mut s = Server {
+        pump: p,
+        app,
+        key: server,
+        addr,
+        raw,
+        client,
+        original,
+        old,
+        hash,
+    };
+    let fill = packet(&mut s.old, &s.client, 1, b"before boundary");
+    s.send(&fill);
+    probe.set(sources(2, 1));
+    s.pump.run_for(Duration::ZERO);
+    for n in 3..20 {
+        probe.set(sources(n, 1));
+        s.pump.run_for(Duration::ZERO);
+    }
+    let peer = address(&s.client, s.raw.local_addr().unwrap().port()).connection_key();
+    assert!(s.app.try_disconnect(peer));
+    assert!(
+        matches!(s.app.try_recv(), Some(RingEvent::Message { data, .. }) if data == b"before boundary")
+    );
+    drive(&mut s.pump, 3);
+    assert!(matches!(
+        s.app.try_recv(),
+        Some(RingEvent::Disconnected {
+            reason: DisconnectReason::NetworkChanged,
+            ..
+        })
+    ));
+    drive(&mut s.pump, 3); // queued cancellation now admitted
+    probe.set(sources(30, 1));
+    drive(&mut s.pump, 5);
+    assert!(drain(&mut s.app).is_empty());
+    let mut buf = [0; 10000];
+    let mut hellos = 0;
+    while let Ok((n, _)) = s.raw.recv_from(&mut buf) {
+        hellos += usize::from(n > 6 && load_u48(&buf[..6]) == MAGIC);
+    }
+    drive(&mut s.pump, 20);
+    while let Ok((n, _)) = s.raw.recv_from(&mut buf) {
+        assert!(
+            n <= 6 || load_u48(&buf[..6]) != MAGIC,
+            "cancelled peer restarted again"
+        );
+    }
+    assert!(hellos <= 1);
+}
+
+#[test]
+fn address_change_retries_pending_handshake_with_fresh_ephemeral_and_no_false_lifecycle() {
+    let a = key(86);
+    let b = key(87);
+    let ap = free_port();
+    let raw = socket();
+    let bp = raw.local_addr().unwrap().port();
+    let (mut p, mut pe) = pump(&a, ap, 16);
+    let probe = Probe::new(ap, sources(1, 1));
+    assert!(pe.try_connect(address(&b, bp)));
+    let mut previous = Vec::new();
+    let mut buf = [0; 10000];
+    for n in 1..7 {
+        probe.set(sources(n, 1));
+        drive(&mut p, 3);
+        let (len, _) = raw.recv_from(&mut buf).unwrap();
+        assert_eq!(load_u48(&buf[..6]), MAGIC);
+        assert_ne!(&buf[6..38], previous.as_slice());
+        previous = buf[6..38].to_vec();
+        assert!(
+            drain(&mut pe).is_empty(),
+            "retried logical connect must not fail or disconnect"
+        );
+        while raw.recv_from(&mut buf).is_ok() {}
+        assert!(len > 38);
+    }
+    drop(raw);
+    let (mut q, mut qe) = pump(&b, bp, 16);
+    let _server_probe = Probe::new(bp, sources(9, 9));
+    probe.set(sources(8, 1));
+    shared_connection(&mut p, &mut pe, &mut q, &mut qe);
+}
+
+#[test]
+fn address_change_discards_candidates_queues_and_worker_generations() {
+    let (mut c, budget, a, b) = live_tracking();
+    c.unreliable_send_buffer
+        .submit_messages(0, vec![vec![3; 2048]]);
+    prepare(&mut c, &budget, &a, &b, 10_000_000_000);
+    let generation = std::sync::Arc::new(());
+    let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+    c.unreliable_fec[0].package_id = 17;
+    c.unreliable_fec[0].state = FecRecvState::Worker {
+        tx,
+        job: None,
+        message_len: 2048,
+        block_bytes: 445,
+        generation: generation.clone(),
+    };
+    let completion = FecCompletion {
+        connection_key: c.address().connection_key(),
+        package_id: 17,
+        message: vec![1; 2048],
+        reservation: c.receive_budget.reserve(2048).unwrap(),
+        decoder_generation: generation,
+        connection_generation: c.receive_budget.clone(),
+    };
+    let peer = c.address().connection_key();
+    let mut map = HashMap::from([(peer, c)]);
+    let mut rings = RingState::default();
+    rings.peers.insert(peer, [7; 64]);
+    let mut refresh = LocalAddressRefresh::default();
+    assert!(!refresh.observe(sources(1, 1), &mut map, &mut rings));
+    assert_eq!(map.len(), 1);
+    assert!(rings.pending.is_empty());
+    assert!(!refresh.observe(sources(1, 1), &mut map, &mut rings));
+    assert!(map[&peer].replacement.is_some());
+    assert!(refresh.observe(sources(2, 1), &mut map, &mut rings));
+    assert!(map.is_empty());
+    assert_eq!(rings.pending.len(), 1);
+    let (address, identity) = &refresh.waiting[&peer];
+    assert_eq!(*identity, b);
+    connect_to_endpoint(
+        &mut map,
+        identity,
+        address,
+        (100_000, 4096, 65536),
+        1,
+        &budget,
+        32 << 20,
+        4096,
+    );
+    let fresh = &map[&peer];
+    assert_eq!(fresh.handshake_hash, [0; 64]);
+    assert!(matches!(
+        fresh.connection_state,
+        ConnectionState::SendingClientHello {
+            last_sent_time_ns: 0,
+            ..
+        }
+    ));
+    assert!(fresh.replacement.is_none());
+    assert!(!fresh.unreliable_send_buffer.has_unsent_data());
+    assert!(matches!(fresh.unreliable_fec[0].state, FecRecvState::Empty));
+    assert!(!completion.owns(&fresh.unreliable_fec[0], &fresh.receive_budget));
+    assert!(budget.used() < 2 * RECEIVE_CONNECTION_BYTES);
+    drop(map);
+    drop(completion);
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
+fn address_change_resets_every_known_peer_but_not_unsolicited_half_handshakes() {
+    let (c, budget, a, b) = live_tracking();
+    let first = c.address().connection_key();
+    let mut map = HashMap::from([(first, c)]);
+    let mut rings = RingState::default();
+    rings.peers.insert(first, [1; 64]);
+    for port in [43, 44, 45] {
+        connect_to_endpoint(
+            &mut map,
+            &b,
+            &address(&a, port),
+            (100_000, 4096, 65536),
+            1,
+            &budget,
+            32 << 20,
+            4096,
+        );
+    }
+    let live = address(&a, 43).connection_key();
+    map.get_mut(&live).unwrap().connection_state =
+        new_connection_state_connected(None, MAGIC, APP, 1);
+    rings.peers.insert(live, [2; 64]);
+    let requested = address(&a, 44).connection_key();
+    rings.connects.insert(requested, address(&a, 44));
+    let half = address(&a, 45).connection_key();
+    let mut refresh = LocalAddressRefresh::default();
+    assert!(!refresh.observe((None, None), &mut map, &mut rings));
+    assert!(refresh.observe(sources(1, 0), &mut map, &mut rings));
+    assert!(map.is_empty());
+    assert_eq!(refresh.waiting.len(), 3);
+    assert!(!refresh.waiting.contains_key(&half));
+    assert_eq!(rings.pending.len(), 2);
+    assert_eq!(rings.connects.len(), 1);
+    assert_eq!(budget.used(), 0);
+    // Changing again before any work merely replaces the observation, not the
+    // remembered set or its bounded lifecycle notification count.
+    assert!(refresh.observe(sources(2, 1), &mut map, &mut rings));
+    assert_eq!(refresh.waiting.len(), 3);
+    assert_eq!(rings.pending.len(), 2);
+    refresh.cancel(&requested);
+    assert!(refresh.observe(sources(3, 1), &mut map, &mut rings));
+    assert!(!refresh.waiting.contains_key(&requested));
+}
+
+#[test]
+fn address_change_capacity_one_reconnects_after_full_disconnect_boundary_drains() {
+    let a = key(88);
+    let b = key(89);
+    let ap = free_port();
+    let bp = free_port();
+    let (mut p, mut pe) = pump(&a, ap, 1);
+    let (mut q, mut qe) = pump(&b, bp, 16);
+    let probe = Probe::new(ap, sources(1, 1));
+    let _server_probe = Probe::new(bp, sources(9, 9));
+    assert!(pe.try_connect(address(&b, bp)));
+    let old = shared_connection(&mut p, &mut pe, &mut q, &mut qe);
+    probe.set(sources(2, 1));
+    p.run_for(Duration::ZERO); // occupies sole slot with Disconnected
+    for _ in 0..3 {
+        drive(&mut p, 2);
+        drive(&mut q, 2);
+    }
+    assert!(matches!(
+        pe.try_recv(),
+        Some(RingEvent::Disconnected {
+            reason: DisconnectReason::NetworkChanged,
+            ..
+        })
+    ));
+    let fresh = shared_connection(&mut p, &mut pe, &mut q, &mut qe);
+    assert_ne!(old, fresh);
+}
+
+#[test]
+fn address_change_selected_fallback_is_observed_even_without_a_v6_route() {
+    let (c, _budget, _, _) = live_tracking();
+    let peer = c.address().connection_key();
+    let mut map = HashMap::from([(peer, c)]);
+    let mut rings = RingState::default();
+    rings.peers.insert(peer, [1; 64]);
+    let mut refresh = LocalAddressRefresh::default();
+    let routes = sources(1, 0);
+    let fallback = sources(0, 1).1;
+    let selected = effective_source_addresses(routes, fallback);
+    assert_eq!(selected.1, fallback);
+    assert!(!refresh.observe(selected, &mut map, &mut rings));
+    assert!(!refresh.observe(
+        effective_source_addresses(routes, fallback),
+        &mut map,
+        &mut rings
+    ));
+    assert!(rings.pending.is_empty());
+    let changed = effective_source_addresses(routes, sources(0, 2).1);
+    assert!(refresh.observe(changed, &mut map, &mut rings));
+    assert_eq!(rings.pending.len(), 1);
+    assert!(map.is_empty());
+    assert!(!refresh.observe(changed, &mut map, &mut rings));
+    assert_eq!(rings.pending.len(), 1);
+    // Losing the fallback also changes effective availability.
+    assert!(refresh.observe(
+        effective_source_addresses(routes, None),
+        &mut map,
+        &mut rings
+    ));
+}

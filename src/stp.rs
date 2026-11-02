@@ -7434,6 +7434,76 @@ pub(crate) use crate::pump::port::Endpoint;
 use crate::pump::port::lockfree::{ConnectFailure, Control, DisconnectReason, Event as RingEvent};
 pub use crate::pump::port::lockfree::{LockfreeEndpoint, RingConfig};
 use crate::pump::port::{Port, Ready as CoreReady};
+type SourceAddresses = (Option<Ipv6Addr>, Option<Ipv6Addr>);
+#[cfg(test)]
+thread_local! {
+    static SOURCE_PROBES: std::cell::RefCell<HashMap<u16, (SourceAddresses, usize)>> = Default::default();
+}
+fn pump_source_addresses(
+    socket: &mut SockHandle,
+    port: u16,
+    bind_ip: Option<std::net::IpAddr>,
+) -> SourceAddresses {
+    #[cfg(test)]
+    if let Some(pair) = SOURCE_PROBES.with(|probes| {
+        probes.borrow_mut().get_mut(&port).map(|(pair, calls)| {
+            *calls += 1;
+            *pair
+        })
+    }) {
+        return pair;
+    }
+    let routes = udp_probe_source_addresses(*socket);
+    refresh_udp_send_source(socket, bind_ip, routes)
+}
+#[derive(Default)]
+struct LocalAddressRefresh {
+    observed: Option<SourceAddresses>,
+    waiting: HashMap<ConnectionKey, (STPAddress, IdentityKeyPair)>,
+    retrying: std::collections::HashSet<ConnectionKey>,
+}
+impl LocalAddressRefresh {
+    fn observe(
+        &mut self,
+        pair: SourceAddresses,
+        connections: &mut HashMap<ConnectionKey, ConnectionTrackingData>,
+        rings: &mut RingState,
+    ) -> bool {
+        let previous = self.observed.replace(pair);
+        if previous.is_none() || previous == Some(pair) {
+            return false;
+        }
+        // Save only live associations and locally requested/restarted attempts. An
+        // unsolicited incomplete incoming handshake is not a remembered peer.
+        for (peer, old) in connections.drain() {
+            if old.is_connected()
+                || rings.connects.contains_key(&peer)
+                || self.retrying.contains(&peer)
+            {
+                self.waiting.insert(
+                    peer,
+                    (old.address(), old.my_transport_identity_keypair.clone()),
+                );
+            }
+            // Dropping old also drops candidates, admitted sends, decoder ingress,
+            // receive reservations and all cipher/counter state.
+        }
+        self.retrying.clear();
+        for (peer, _) in rings.peers.drain() {
+            rings.pending.push_back(RingEvent::Disconnected {
+                peer,
+                reason: DisconnectReason::NetworkChanged,
+            });
+        }
+        // Keep pending outbound requests: changing interfaces retries the same
+        // logical connect, it is not a timeout or a cancellation.
+        true
+    }
+    fn cancel(&mut self, peer: &ConnectionKey) {
+        self.waiting.remove(peer);
+        self.retrying.remove(peer);
+    }
+}
 #[derive(Default)]
 struct RingState {
     peers: HashMap<ConnectionKey, [u8; 64]>,
@@ -7724,12 +7794,12 @@ pub(crate) fn new_reference_pump_with_options(
                 }
             }
         }
-        let socket_owner = SocketOwner(socket);
+        let mut socket_owner = SocketOwner(socket);
         let mut packet_memory_encrypted = new_packet_memory();
         let mut packet_memory_recv = new_packet_memory();
         let mut packet_memory_send = new_packet_memory();
         let mut receive_queue = ReceiveQueue::default();
-        let (fec_done_tx, fec_done_rx) = std::sync::mpsc::channel::<FecCompletion>();
+        let (mut fec_done_tx, mut fec_done_rx) = std::sync::mpsc::channel::<FecCompletion>();
         let fec_workers = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut fec_sweep_ns = 0;
         let mut idle_resume_ns = 0;
@@ -7778,9 +7848,42 @@ pub(crate) fn new_reference_pump_with_options(
         let mut active_wait = None::<std::time::Instant>;
         let mut wake_hint = Some(std::time::Instant::now());
         let mut pending_receive = None;
+        let mut refresh = LocalAddressRefresh::default();
         let run = move |mut budget: crate::pump::Deadline| {
+            // Exactly one fresh observation per public service call, never per loop
+            // iteration. Observation/retirement also happens with an expired budget.
+            let pair = pump_source_addresses(&mut socket_owner.0, my_port, bind_ip);
+            let socket = socket_owner.0;
             let caller_deadline = budget.instant;
             let _owners = (&exit, &socket_owner);
+            if refresh.observe(pair, &mut connections_map, &mut ring_state) {
+                receive_queue.messages.clear();
+                receive_queue.reservations.clear();
+                receive_queue.bytes = 0;
+                // Old jobs can finish against the abandoned channel, never against
+                // a fresh association. Their guards retain honest memory accounting.
+                (fec_done_tx, fec_done_rx) = std::sync::mpsc::channel();
+                pending_receive = None;
+                send_keys.clear();
+                fec_sweep_keys.clear();
+                fec_sweep_root_index = 0;
+                fec_sweep_ns = 0;
+                idle_resume_ns = 0;
+                active_wait = None;
+                wake_hint = Some(std::time::Instant::now());
+                receive_round = 0;
+                receiving = true;
+                receive_notified = false;
+                ready_peers.clear();
+                ready_used = 0;
+                thread_inner.transport_ready();
+                if thread_inner.native.get().is_some() {
+                    ring_state.flush(&thread_inner);
+                }
+            }
+            if !budget.work_allowed {
+                return wake_hint;
+            }
             #[cfg(feature = "research_budget_diagnostic")]
             diag::enable(diagnostic_enabled);
             loop {
@@ -7854,7 +7957,9 @@ pub(crate) fn new_reference_pump_with_options(
                                 match control {
                                     Control::Connect(address) => {
                                         let peer = address.connection_key();
-                                        if connections_map.contains_key(&peer) {
+                                        if connections_map.contains_key(&peer)
+                                            || refresh.waiting.contains_key(&peer)
+                                        {
                                             ring_state.pending.push_back(
                                                 RingEvent::ConnectFailed {
                                                     address,
@@ -7897,6 +8002,7 @@ pub(crate) fn new_reference_pump_with_options(
                                         }
                                     }
                                     Control::Disconnect(peer) => {
+                                        refresh.cancel(&peer);
                                         connections_map.remove(&peer);
                                         ring_state.disconnected(peer, DisconnectReason::Local);
                                     }
@@ -7974,6 +8080,7 @@ pub(crate) fn new_reference_pump_with_options(
                 if let Some((mut req, disconnect)) = thread_inner.take_request() {
                     budget.admitted();
                     if let Some(peer) = disconnect {
+                        refresh.cancel(&peer);
                         connections_map.remove(&peer);
                     }
                     let exchange_started = std::time::Instant::now();
@@ -7993,6 +8100,7 @@ pub(crate) fn new_reference_pump_with_options(
                                     "############################# KILLING CONNECTION {:?}",
                                     value
                                 );
+                                refresh.retrying.remove(key);
                                 return false;
                             }
                             true
@@ -8022,6 +8130,9 @@ pub(crate) fn new_reference_pump_with_options(
                                     connection_receive_limit,
                                     max_message_size,
                                 );
+                                if connections_map.contains_key(&key) {
+                                    refresh.retrying.insert(key);
+                                }
                                 break;
                             }
                         }
@@ -8201,6 +8312,31 @@ pub(crate) fn new_reference_pump_with_options(
                         exchange_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
                     thread_inner.publish(resp);
                 } else {
+                    if let Some((&peer, (address, identity))) = refresh.waiting.iter().next() {
+                        if budget.sampled(monotonic_clock_ns()) {
+                            return Some(std::time::Instant::now());
+                        }
+                        connect_to_endpoint(
+                            &mut connections_map,
+                            identity,
+                            address,
+                            send_buffer_params,
+                            send_queue_count,
+                            &receive_memory,
+                            connection_receive_limit,
+                            max_message_size,
+                        );
+                        budget.progressed();
+                        if connections_map.contains_key(&peer) {
+                            refresh.waiting.remove(&peer);
+                            refresh.retrying.insert(peer);
+                            // One fresh handshake construction is a cooperative unit.
+                            // Return through the normal deadline check before the next.
+                            continue;
+                        }
+                        // A still-accounted old decoder or another pump can temporarily
+                        // consume the process budget. Keep the remembered peer for retry.
+                    }
                     let mut should_sleep = true;
                     while receiving && receive_round < MAX_RECV_PACKETS_PER_TICK {
                         if budget.expired() {
@@ -9244,6 +9380,7 @@ pub(crate) fn new_reference_pump_with_options(
                                                         "Error, FEC message exceeds local max_message_size ({max_message_size}) from {connection_key:?}. Disconnecting..."
                                                     );
                                                 }
+                                                refresh.retrying.remove(&connection_key);
                                                 connections_map.remove(&connection_key);
                                                 ring_state.disconnected(
                                                     connection_key,
@@ -9521,6 +9658,7 @@ pub(crate) fn new_reference_pump_with_options(
                                         let frag_offset = offset as u64;
                                         let frag_len = frag_data.len() as u64;
                                         if frag_offset + frag_len > u32::MAX as u64 {
+                                            refresh.retrying.remove(&connection_key);
                                             connections_map.remove(&connection_key);
                                             ring_state.disconnected(
                                                 connection_key,
@@ -9535,6 +9673,7 @@ pub(crate) fn new_reference_pump_with_options(
                                                     frag_offset + frag_len
                                                 );
                                             }
+                                            refresh.retrying.remove(&connection_key);
                                             connections_map.remove(&connection_key);
                                             ring_state.disconnected(
                                                 connection_key,
@@ -10701,6 +10840,7 @@ pub(crate) fn new_reference_pump_with_options(
                         })();
                         budget.progressed();
                         if !keep {
+                            refresh.retrying.remove(connection_key);
                             connections_map.remove(connection_key);
                             ring_state.disconnected(*connection_key, DisconnectReason::TimedOut);
                         }
@@ -10713,7 +10853,9 @@ pub(crate) fn new_reference_pump_with_options(
                             .keys()
                             .chain(ring_state.connects.keys())
                             .copied()
-                            .filter(|k| !connections_map.contains_key(k))
+                            .filter(|k| {
+                                !connections_map.contains_key(k) && !refresh.waiting.contains_key(k)
+                            })
                             .collect();
                         for peer in gone {
                             ring_state.disconnected(peer, DisconnectReason::TimedOut);

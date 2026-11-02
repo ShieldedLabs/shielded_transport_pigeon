@@ -63,6 +63,8 @@ pub enum DisconnectReason {
     TimedOut,
     /// A confirmed fresh handshake replaced this association at the same endpoint.
     Replaced,
+    /// A local source-address observation changed; a fresh association is being attempted.
+    NetworkChanged,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectFailure {

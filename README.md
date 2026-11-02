@@ -135,6 +135,44 @@ Move the pump to your own thread and loop `run_for(Duration::from_millis(100))`,
 or drive it with `run_until(frame_deadline)` between frames. The pump and app
 handle are `Send`; the single-owner app handle is deliberately **not Sync**.
 
+Every `run_until`/`run_for` call first makes fresh IPv4 and IPv6 source-address
+probes (temporary UDP connect/getsockname, no UDP payload sent). The first pair
+is a baseline; a later change in either address, including becoming unavailable
+or available, immediately discards all old associations and schedules fresh
+handshakes to remembered live peers, incoming as well as outgoing. Connected
+associations emit `Disconnected { reason: NetworkChanged }`, followed by a new
+`Connected` only when a fresh handshake completes. This public enum addition
+requires updating downstream exhaustive matches. Pending outgoing attempts are
+retried without a false disconnect/failure; unsolicited incomplete incoming
+handshakes are discarded. Admitted local disconnects are never resurrected.
+A queued Disconnect still follows control/lifecycle ordering and cancels any
+restart when admitted. All old admitted send/FEC/receive state is discarded;
+unadmitted send-ring entries keep their ordinary current-association policy.
+
+Even an expired deadline or `run_for(Duration::ZERO)` observes addresses,
+retires old state and schedules reconnect, but admits no commands, constructs
+no handshake and sends no packets. The next positive-budget call starts that
+work, without waiting for an outage/expiry timer. Each call pays the probe cost;
+a change additionally costs teardown proportional to the old associations.
+A macOS 15.7.2 arm64 release route-probe helper benchmark (50,000 samples,
+IPv6 unavailable) measured 42.5 us p50, 52.3 us p95, 56.0 us p99 and 41.6 ms max.
+This excludes Linux getifaddrs/source refresh and full pump/reset cost; these
+macOS-only wall-clock observations are not hard real-time bounds.
+
+The probes observe the host's selected routes to fixed public probe addresses,
+not every interface, NAT/external mapping or a peer's remote-address migration.
+Probe errors/resource failures report absence and can cause an immediate
+reset/retry even if transient; there is no throttle or debounce. Linux refreshes
+its wildcard-socket IPv6 source-selection workaround from current interfaces,
+never from a stale startup cache. When active, that exact forced source is the
+observed IPv6 address even if the route probe failed; a change in the fallback
+also resets associations. The fallback does not prove a usable route.
+An explicitly bound Linux socket stays bound to that address; it is not rebound
+to a new interface, and may remain unable to send if its bound address vanishes.
+Other platforms still reject explicit binds. Remote-address migration and
+plaintext same-endpoint replacement remain unsupported; encrypted same-tuple
+peers can accept the new handshake via confirmed replacement below.
+
 - `try_send(peer, queue, class, &mut payload) -> bool` moves the Vec allocation
   on true; false (full or closed) leaves the caller's Vec untouched. No send
   admission/completion events exist. Core send-buffer pressure keeps the FIFO
