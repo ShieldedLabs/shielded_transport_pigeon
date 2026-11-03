@@ -136,12 +136,18 @@ or drive it with `run_until(frame_deadline)` between frames. The pump and app
 handle are `Send`; the single-owner app handle is deliberately **not Sync**.
 
 Every `run_until`/`run_for` call first makes fresh IPv4 and IPv6 source-address
-probes (temporary UDP connect/getsockname, no UDP payload sent). The first pair
-is a baseline; a later change in either address, including becoming unavailable
-or available, immediately discards all old associations and schedules fresh
-handshakes to remembered live peers, incoming as well as outgoing. Connected
+probes (temporary UDP connect/getsockname, no UDP payload sent). Each family
+independently latches its first successful address as a baseline without a reset.
+A failed lookup leaves that family's last known address unchanged. A later
+successful lookup returning a different address immediately discards all old
+associations, including loopback, and schedules fresh handshakes to remembered
+live peers, incoming as well as outgoing. Connected
 associations emit `Disconnected { reason: NetworkChanged }`, followed by a new
-`Connected` only when a fresh handshake completes. This public enum addition
+`Connected` only when a fresh handshake completes. An automatic restart has a
+30-second total deadline from scheduling, including time waiting for resources;
+repeated source changes do not extend it. Expiry emits
+`ConnectFailed { reason: TimedOut }`, not another disconnect. STP then stops
+trying until the application requests a connection. This public enum addition
 requires updating downstream exhaustive matches. Pending outgoing attempts are
 retried without a false disconnect/failure; unsolicited incomplete incoming
 handshakes are discarded. Admitted local disconnects are never resurrected.
@@ -161,8 +167,8 @@ macOS-only wall-clock observations are not hard real-time bounds.
 
 The probes observe the host's selected routes to fixed public probe addresses,
 not every interface, NAT/external mapping or a peer's remote-address migration.
-Probe errors/resource failures report absence and can cause an immediate
-reset/retry even if transient; there is no throttle or debounce. Linux refreshes
+Probe errors/resource failures report absence and leave the last known address
+unchanged; there is no throttle or debounce for successful address changes. Linux refreshes
 its wildcard-socket IPv6 source-selection workaround from current interfaces,
 never from a stale startup cache. When active, that exact forced source is the
 observed IPv6 address even if the route probe failed; a change in the fallback
@@ -181,8 +187,8 @@ peers can accept the new handshake via confirmed replacement below.
   peers are dropped and counted in `stats()`, not reported individually.
 - `try_connect(address) -> bool`, `try_disconnect(peer) -> bool`, and
   `try_control(Control) -> bool` use a separate control ring. Disconnect cancels
-  local state without flushing or sending a wire close. Connecting an already
-  present/handshaking peer produces `ConnectFailure::AlreadyConnected`.
+  local state without flushing or sending a wire close. Connect commands for an
+  already connected, handshaking or scheduled-to-restart peer are silent no-ops.
 - `try_recv() -> Option<Event>` drains one ordered receive stream:
   `Connected { peer, address, handshake_hash }`, `Message { peer, data }`,
   `ConnectFailed { address, reason }`, `Disconnected { peer, reason }`.
@@ -198,8 +204,12 @@ peers can accept the new handshake via confirmed replacement below.
   queues and all session state are discarded, not transferred. Send-ring entries
   not yet admitted target the current association. See PROTOCOL.md for limits.
   `DisconnectReason::Replaced` is a public enum addition: downstream exhaustive
-  matches must handle it. Every processed connect has one outcome, including
-  duplicate, invalid and cancelled requests. Frozen handshake timeout is 30 seconds.
+  matches must handle it. Uncancelled, non-duplicate connect attempts report
+  success or failure. Explicit cancellation before completion is silent for both
+  ordinary and automatic attempts; already committed success/failure events are
+  not retracted. Duplicate connect commands also produce no event. The removed
+  `ConnectFailure::AlreadyConnected` and `ConnectFailure::Cancelled` variants
+  must not be referenced by downstream code. Frozen handshake timeout is 30 seconds.
 - A full receive ring drops/counts **data**, so a stalled app cannot prevent
   ACK/socket servicing. While full, every outgoing ACK requests IP ECN CE
   (best-effort OS/path support), and each newly admitted data-class packet adds

@@ -264,22 +264,35 @@ policy, not a dependency of key or packet identity.
 
 At the beginning of each public pump service call, this implementation freshly
 probes IPv4 and IPv6 source selection using temporary UDP socket connect and
-getsockname, without sending a UDP payload. The first address pair establishes
-a baseline. Any subsequent pair change, including Some/None transitions,
-immediately retires **all** local associations and queues fresh handshakes to
+getsockname, without sending a UDP payload. Each family's stored address starts
+as None. Its first successful lookup establishes a Some baseline without a reset;
+a None result leaves the stored value unchanged. Only a successful lookup that
+differs from that family's previously stored Some value signals a change, without
+debounce. Such a change immediately retires **all** local associations, including
+loopback, and queues fresh handshakes to
 remembered live peers, including incoming peers, with their exact remote static
 key/IP/port, local identity and application configuration. No old cipher,
 counter, CC/pacing, candidate, admitted send, reassembly or decoder state is
 transferred. Old decoder completions cannot match the fresh receive generation.
 Published old events remain before the local `Disconnected(NetworkChanged)`;
 the new `Connected` follows only after a fresh handshake completes, including
-when a capacity-one/full receive ring delays lifecycle publication.
+when a capacity-one/full receive ring delays lifecycle publication. An automatic
+restart has a 30-second total deadline from scheduling, including resource waits;
+construction and repeated source changes do not extend the logical attempt's
+deadline. Expiry emits exactly one `ConnectFailed(TimedOut)`, not a second
+disconnect, even if no handshake could be constructed. STP does not retry
+indefinitely after this failure; a new application connect request is required.
+Timeout processing requires the caller to continue driving positive-budget pump
+service; event publication may wait for receive-ring space.
 
 Pending locally initiated/restarted handshakes are retried as the same logical
 request without a false disconnect/failure. Unsolicited incomplete incoming
 handshakes are discarded, not proactively reconnected. Repeated changes retain
 only one pending restart per remembered peer. An admitted local disconnect
 cancels restart; a queued Disconnect still follows normal admission ordering.
+Cancellation before handshake completion is silent for ordinary and automatic
+attempts. A success or genuine failure already committed before cancellation is
+not retracted; disconnecting an established session emits `Disconnected(Local)`.
 Unadmitted send-ring submissions retain their current-association semantics.
 Expired/zero-budget calls still observe, retire and schedule, but do no protocol
 work, handshake construction or packet sends. The next positive-budget call
@@ -287,8 +300,9 @@ starts fresh handshakes without waiting for the old liveness/outage timers.
 Probes and change teardown have unbudgeted OS/allocation/destruction cost, the
 latter proportional to retired state; wall-clock deadlines are not hard real time.
 
-Probe failure is represented as absence, including transient resource errors;
-there is no debounce. Linux also freshly selects its existing wildcard IPv6
+Probe failure is represented as absence, including transient resource errors,
+and does not change the stored address or trigger a reset. Successful address
+changes have no debounce. Linux also freshly selects its existing wildcard IPv6
 send-source workaround and observes that exact forced source instead of the
 route result when active, even if no IPv6 route was found. A fallback address
 is not evidence of routability. Explicit Linux binds remain bound, not migrated;

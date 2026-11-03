@@ -69,9 +69,7 @@ pub enum DisconnectReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectFailure {
     TimedOut,
-    AlreadyConnected,
     InvalidAddress,
-    Cancelled,
 }
 pub enum Event {
     Connected {

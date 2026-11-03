@@ -30,6 +30,14 @@ fn address(k: &IdentityKeyPair, port: u16) -> STPAddress {
     }
 }
 fn pump(k: &IdentityKeyPair, port: u16, receive: usize) -> (Pump, LockfreeEndpoint) {
+    pump_with_budget(k, port, receive, None)
+}
+fn pump_with_budget(
+    k: &IdentityKeyPair,
+    port: u16,
+    receive: usize,
+    receive_memory: Option<std::sync::Arc<crate::receive_memory::ReceiveMemoryBudget>>,
+) -> (Pump, LockfreeEndpoint) {
     new_pump_with_options(
         vec![k.clone()],
         port,
@@ -37,6 +45,7 @@ fn pump(k: &IdentityKeyPair, port: u16, receive: usize) -> (Pump, LockfreeEndpoi
         (100_000, 4096, 65536),
         4096,
         NetworkThreadOptions {
+            receive_memory,
             rings: RingConfig {
                 send: 16,
                 control: 16,
@@ -141,9 +150,18 @@ impl Server {
         Self::with_client(capacity, key(19))
     }
     fn with_client(capacity: usize, client: IdentityKeyPair) -> Self {
+        Self::at_port(capacity, client, free_port())
+    }
+    fn at_port(capacity: usize, client: IdentityKeyPair, port: u16) -> Self {
+        Self::with_pump(capacity, client, port, pump(&key(41), port, capacity))
+    }
+    fn with_pump(
+        capacity: usize,
+        client: IdentityKeyPair,
+        port: u16,
+        (mut p, mut app): (Pump, LockfreeEndpoint),
+    ) -> Self {
         let server = key(41);
-        let port = free_port();
-        let (mut p, mut app) = pump(&server, port, capacity);
         let addr = SocketAddr::from((Ipv6Addr::LOCALHOST, port));
         let raw = socket();
         let (h, original) = hello(&client, &server, &build_magic2_client_block());
@@ -926,6 +944,29 @@ fn shared_connection(
 }
 
 #[test]
+fn address_change_latches_last_success_independently_without_debounce() {
+    let mut refresh = LocalAddressRefresh::default();
+    let mut map = HashMap::new();
+    let mut rings = RingState::default();
+    for (pair, changed, stored) in [
+        (sources(0, 0), false, sources(0, 0)),
+        (sources(1, 0), false, sources(1, 0)),
+        (sources(0, 0), false, sources(1, 0)),
+        (sources(0, 1), false, sources(1, 1)),
+        (sources(1, 1), false, sources(1, 1)),
+        (sources(2, 2), true, sources(2, 2)),
+        (sources(2, 2), false, sources(2, 2)),
+        (sources(0, 0), false, sources(2, 2)),
+        (sources(2, 2), false, sources(2, 2)),
+        (sources(3, 0), true, sources(3, 2)),
+        (sources(0, 3), true, sources(3, 3)),
+    ] {
+        assert_eq!(refresh.observe(pair, &mut map, &mut rings), changed);
+        assert_eq!(refresh.observed, stored);
+    }
+}
+
+#[test]
 fn address_change_exactly_one_probe_per_public_call_even_expired() {
     let port = free_port();
     let (mut p, _pe) = pump(&key(81), port, 16);
@@ -941,7 +982,7 @@ fn address_change_exactly_one_probe_per_public_call_even_expired() {
 }
 
 #[test]
-fn address_change_each_family_and_availability_reconnects_without_payload_or_timeout() {
+fn address_change_each_family_reconnects_but_failed_probes_preserve_live_sessions() {
     let a = key(82);
     let b = key(83);
     let ap = free_port();
@@ -952,27 +993,36 @@ fn address_change_each_family_and_availability_reconnects_without_payload_or_tim
     let _server_probe = Probe::new(bp, sources(9, 9));
     assert!(pe.try_connect(address(&b, bp)));
     let mut previous = shared_connection(&mut p, &mut pe, &mut q, &mut qe);
-    for pair in [
-        sources(2, 1),
-        sources(2, 2),
-        sources(0, 2),
-        sources(2, 2),
-        sources(2, 0),
-        sources(2, 2),
+    for (pair, changed) in [
+        (sources(0, 1), false),
+        (sources(1, 1), false),
+        (sources(2, 1), true),
+        (sources(2, 2), true),
+        (sources(0, 2), false),
+        (sources(2, 2), false),
+        (sources(2, 0), false),
+        (sources(0, 0), false),
+        (sources(2, 2), false),
+        (sources(3, 3), true),
+        (sources(3, 3), false),
     ] {
         probe.set(pair);
         p.run_for(Duration::ZERO);
-        assert!(matches!(
-            &drain(&mut pe)[..],
-            [RingEvent::Disconnected {
-                reason: DisconnectReason::NetworkChanged,
-                ..
-            }]
-        ));
-        assert!(p.next_wakeup().unwrap() <= Instant::now());
-        let fresh = shared_connection(&mut p, &mut pe, &mut q, &mut qe);
-        assert_ne!(fresh, previous);
-        previous = fresh;
+        if changed {
+            assert!(matches!(
+                &drain(&mut pe)[..],
+                [RingEvent::Disconnected {
+                    reason: DisconnectReason::NetworkChanged,
+                    ..
+                }]
+            ));
+            assert!(p.next_wakeup().unwrap() <= Instant::now());
+            let fresh = shared_connection(&mut p, &mut pe, &mut q, &mut qe);
+            assert_ne!(fresh, previous);
+            previous = fresh;
+        } else {
+            assert!(drain(&mut pe).is_empty());
+        }
         drive(&mut p, 5);
         drive(&mut q, 5);
         assert!(drain(&mut pe).is_empty());
@@ -1152,15 +1202,33 @@ fn address_change_discards_candidates_queues_and_worker_generations() {
     let mut rings = RingState::default();
     rings.peers.insert(peer, [7; 64]);
     let mut refresh = LocalAddressRefresh::default();
-    assert!(!refresh.observe(sources(1, 1), &mut map, &mut rings));
-    assert_eq!(map.len(), 1);
-    assert!(rings.pending.is_empty());
-    assert!(!refresh.observe(sources(1, 1), &mut map, &mut rings));
-    assert!(map[&peer].replacement.is_some());
+    let used = budget.used();
+    let hash = map[&peer].handshake_hash;
+    for pair in [
+        sources(0, 0),
+        sources(1, 0),
+        sources(0, 0),
+        sources(0, 1),
+        sources(1, 1),
+        sources(0, 1),
+        sources(1, 0),
+    ] {
+        assert!(!refresh.observe(pair, &mut map, &mut rings));
+        assert_eq!(map.len(), 1);
+        assert!(rings.pending.is_empty());
+        assert_eq!(rings.peers.get(&peer), Some(&[7; 64]));
+        assert!(refresh.waiting.is_empty());
+        let retained = &map[&peer];
+        assert_eq!(retained.handshake_hash, hash);
+        assert!(retained.replacement.is_some());
+        assert!(retained.unreliable_send_buffer.has_unsent_data());
+        assert!(completion.owns(&retained.unreliable_fec[0], &retained.receive_budget));
+        assert_eq!(budget.used(), used);
+    }
     assert!(refresh.observe(sources(2, 1), &mut map, &mut rings));
     assert!(map.is_empty());
     assert_eq!(rings.pending.len(), 1);
-    let (address, identity) = &refresh.waiting[&peer];
+    let (address, identity, _) = &refresh.waiting[&peer];
     assert_eq!(*identity, b);
     connect_to_endpoint(
         &mut map,
@@ -1219,20 +1287,24 @@ fn address_change_resets_every_known_peer_but_not_unsolicited_half_handshakes() 
     let half = address(&a, 45).connection_key();
     let mut refresh = LocalAddressRefresh::default();
     assert!(!refresh.observe((None, None), &mut map, &mut rings));
-    assert!(refresh.observe(sources(1, 0), &mut map, &mut rings));
+    assert!(!refresh.observe(sources(1, 0), &mut map, &mut rings));
+    assert!(!refresh.observe(sources(0, 1), &mut map, &mut rings));
+    assert_eq!(map.len(), 4);
+    assert!(rings.pending.is_empty());
+    assert!(refresh.observe(sources(2, 0), &mut map, &mut rings));
     assert!(map.is_empty());
     assert_eq!(refresh.waiting.len(), 3);
     assert!(!refresh.waiting.contains_key(&half));
     assert_eq!(rings.pending.len(), 2);
-    assert_eq!(rings.connects.len(), 1);
+    assert_eq!(rings.connects.len(), 3);
     assert_eq!(budget.used(), 0);
     // Changing again before any work merely replaces the observation, not the
     // remembered set or its bounded lifecycle notification count.
-    assert!(refresh.observe(sources(2, 1), &mut map, &mut rings));
+    assert!(refresh.observe(sources(3, 1), &mut map, &mut rings));
     assert_eq!(refresh.waiting.len(), 3);
     assert_eq!(rings.pending.len(), 2);
     refresh.cancel(&requested);
-    assert!(refresh.observe(sources(3, 1), &mut map, &mut rings));
+    assert!(refresh.observe(sources(4, 1), &mut map, &mut rings));
     assert!(!refresh.waiting.contains_key(&requested));
 }
 
@@ -1290,10 +1362,684 @@ fn address_change_selected_fallback_is_observed_even_without_a_v6_route() {
     assert!(map.is_empty());
     assert!(!refresh.observe(changed, &mut map, &mut rings));
     assert_eq!(rings.pending.len(), 1);
-    // Losing the fallback also changes effective availability.
-    assert!(refresh.observe(
+    // Losing the fallback leaves the last successfully selected source latched.
+    assert!(!refresh.observe(
         effective_source_addresses(routes, None),
         &mut map,
         &mut rings
     ));
+    assert_eq!(refresh.observed, changed);
+    assert!(!refresh.observe(changed, &mut map, &mut rings));
+    assert_eq!(rings.pending.len(), 1);
+}
+
+#[test]
+fn duplicate_connect_established_is_silent_with_full_receive_and_control_rings() {
+    let mut s = Server::new(1);
+    let remote = address(&s.client, s.raw.local_addr().unwrap().port());
+    let peer = remote.connection_key();
+    let bytes = packet(&mut s.old, &s.client, 1, b"fills receive ring");
+    s.send(&bytes);
+    for _ in 0..16 {
+        assert!(s.app.try_connect(remote.clone()));
+    }
+    assert!(!s.app.try_connect(remote.clone())); // arm the full-input wakeup path
+    let mut outgoing = b"send behind ignored controls".to_vec();
+    assert!(s.app.try_send(peer, 0, Dscp::Af21, &mut outgoing));
+    drive(&mut s.pump, 10);
+    assert_eq!(
+        s.app.stats().sent,
+        1,
+        "ignored controls must not starve sends"
+    );
+    assert!(matches!(
+        &drain(&mut s.app)[..],
+        [RingEvent::Message { data, .. }] if data == b"fills receive ring"
+    ));
+    for _ in 0..16 {
+        assert!(
+            s.app.try_connect(remote.clone()),
+            "control space was not returned"
+        );
+    }
+    drive(&mut s.pump, 5);
+    assert!(drain(&mut s.app).is_empty());
+    let bytes = packet(&mut s.old, &s.client, 2, b"same association survives");
+    s.send(&bytes);
+    assert!(matches!(
+        &drain(&mut s.app)[..],
+        [RingEvent::Message { data, .. }] if data == b"same association survives"
+    ));
+    assert!(s.app.try_disconnect(peer));
+    drive(&mut s.pump, 5);
+    assert!(matches!(
+        &drain(&mut s.app)[..],
+        [RingEvent::Disconnected { peer: p, reason: DisconnectReason::Local }] if *p == peer
+    ));
+}
+
+#[test]
+fn duplicate_connect_pending_preserves_original_noise_handshake_and_one_success() {
+    let client = key(90);
+    let server = key(91);
+    let port = free_port();
+    let raw = socket();
+    let remote = address(&server, raw.local_addr().unwrap().port());
+    let (mut p, mut app) = pump(&client, port, 16);
+    let _probe = Probe::new(port, sources(1, 1));
+    assert!(app.try_connect(remote.clone()));
+    drive(&mut p, 20);
+    let mut buf = [0; 10000];
+    let (len, client_addr) = raw.recv_from(&mut buf).unwrap();
+    let original = buf[..len].to_vec();
+    for _ in 0..3 {
+        for _ in 0..16 {
+            assert!(app.try_connect(remote.clone()));
+        }
+        drive(&mut p, 5);
+        assert!(drain(&mut app).is_empty());
+        while let Ok((n, _)) = raw.recv_from(&mut buf) {
+            assert_eq!(
+                &buf[..n],
+                original,
+                "duplicate recreated the Noise ephemeral"
+            );
+        }
+    }
+    // Complete the originally captured hello, not a later/recreated handshake.
+    let mut h = noise_responder(
+        crypto_string_from_connect_magic1(MAGIC).unwrap(),
+        &original[..6],
+        &server.private,
+    )
+    .unwrap();
+    assert_eq!(
+        h.read_message(&original[6..], &mut buf).unwrap(),
+        MAGIC2_BLOCK_SIZE
+    );
+    let mut reply = [0; 1024];
+    store_u48(
+        &mut reply[..6],
+        0xffff_ffff_0000 | (load_u16(&server.public[..2]) << 1) as u64,
+    );
+    let n = h
+        .write_message(&APP.to_le_bytes(), &mut reply[6..])
+        .unwrap();
+    let hash = get_handshake_hash(&h);
+    raw.send_to(&reply[..6 + n], client_addr).unwrap();
+    drive(&mut p, 5);
+    assert!(matches!(
+        &drain(&mut app)[..],
+        [RingEvent::Connected { address, handshake_hash, .. }] if *address == remote && *handshake_hash == hash
+    ));
+    raw.send_to(&reply[..6 + n], client_addr).unwrap();
+    assert!(app.try_connect(remote));
+    drive(&mut p, 5);
+    assert!(drain(&mut app).is_empty());
+}
+
+#[test]
+fn duplicate_connect_pending_cancels_silently_and_preserves_invalid_outcome() {
+    let client = key(92);
+    let server = key(93);
+    let port = free_port();
+    let raw = socket();
+    let remote = address(&server, raw.local_addr().unwrap().port());
+    let (mut p, mut app) = pump(&client, port, 16);
+    let _probe = Probe::new(port, sources(1, 1));
+    assert!(app.try_connect(remote.clone()));
+    for _ in 0..15 {
+        let mut duplicate = remote.clone();
+        duplicate.magic1 = 0; // Same peer: ignore before validating a new attempt.
+        assert!(app.try_control(Control::Connect(duplicate)));
+    }
+    drive(&mut p, 5);
+    assert!(drain(&mut app).is_empty());
+    assert!(app.try_disconnect(remote.connection_key()));
+    let invalid = address(&client, remote.port);
+    assert!(app.try_connect(invalid.clone()));
+    drive(&mut p, 5);
+    assert!(matches!(
+        &drain(&mut app)[..],
+        [RingEvent::ConnectFailed { address, reason: ConnectFailure::InvalidAddress }]
+            if *address == invalid
+    ));
+    drive(&mut p, 5);
+    assert!(drain(&mut app).is_empty());
+}
+
+#[test]
+fn duplicate_connect_scheduled_restart_preserves_one_fresh_connection() {
+    let a = key(94);
+    let b = key(95);
+    let ap = free_port();
+    let bp = free_port();
+    let (mut p, mut pe) = pump(&a, ap, 16);
+    let (mut q, mut qe) = pump(&b, bp, 16);
+    let probe = Probe::new(ap, sources(1, 1));
+    let _server_probe = Probe::new(bp, sources(9, 9));
+    let remote = address(&b, bp);
+    assert!(pe.try_connect(remote.clone()));
+    let old = shared_connection(&mut p, &mut pe, &mut q, &mut qe);
+    probe.set(sources(2, 1));
+    p.run_for(Duration::ZERO); // Retired association is in refresh.waiting, not the map.
+    for _ in 0..16 {
+        assert!(pe.try_connect(remote.clone()));
+    }
+    assert!(matches!(
+        &drain(&mut pe)[..],
+        [RingEvent::Disconnected {
+            reason: DisconnectReason::NetworkChanged,
+            ..
+        }]
+    ));
+    let fresh = shared_connection(&mut p, &mut pe, &mut q, &mut qe);
+    assert_ne!(old, fresh);
+    drive(&mut p, 5);
+    drive(&mut q, 5);
+    assert!(drain(&mut pe).is_empty());
+    assert!(drain(&mut qe).is_empty());
+}
+
+#[test]
+fn duplicate_connect_scheduled_pending_restart_keeps_original_cancellation() {
+    let a = key(96);
+    let b = key(97);
+    let port = free_port();
+    let raw = socket();
+    let remote = address(&b, raw.local_addr().unwrap().port());
+    let (mut p, mut app) = pump(&a, port, 16);
+    let probe = Probe::new(port, sources(1, 1));
+    assert!(app.try_connect(remote.clone()));
+    drive(&mut p, 20);
+    let mut buf = [0; 10000];
+    assert!(raw.recv_from(&mut buf).is_ok());
+    while raw.recv_from(&mut buf).is_ok() {}
+    probe.set(sources(2, 1));
+    p.run_for(Duration::ZERO);
+    for _ in 0..15 {
+        assert!(app.try_connect(remote.clone()));
+    }
+    assert!(app.try_disconnect(remote.connection_key()));
+    drive(&mut p, 10);
+    assert!(drain(&mut app).is_empty());
+    assert!(
+        raw.recv_from(&mut buf).is_err(),
+        "cancelled restart constructed/sent a hello"
+    );
+    drive(&mut p, 5);
+    assert!(drain(&mut app).is_empty());
+}
+
+#[test]
+fn duplicate_connect_pending_does_not_extend_original_thirty_second_timeout() {
+    let a = key(98);
+    let b = key(99);
+    let port = free_port();
+    let raw = socket();
+    let remote = address(&b, raw.local_addr().unwrap().port());
+    let (mut p, mut app) = pump(&a, port, 16);
+    let _probe = Probe::new(port, sources(1, 1));
+    assert!(app.try_connect(remote.clone()));
+    drive(&mut p, 20);
+    let mut buf = [0; 10000];
+    let (n, _) = raw.recv_from(&mut buf).unwrap();
+    let original = buf[..n].to_vec();
+    while let Ok((n, _)) = raw.recv_from(&mut buf) {
+        assert_eq!(&buf[..n], original);
+    }
+    // No virtual protocol clock: put duplicates near the real frozen deadline.
+    // Resetting either creation time or ownership would defer failure to ~58 s.
+    std::thread::sleep(Duration::from_secs(28));
+    for _ in 0..16 {
+        assert!(app.try_connect(remote.clone()));
+    }
+    drive(&mut p, 3000);
+    assert!(matches!(
+        &drain(&mut app)[..],
+        [RingEvent::ConnectFailed { address, reason: ConnectFailure::TimedOut }] if *address == remote
+    ));
+    while let Ok((n, _)) = raw.recv_from(&mut buf) {
+        assert_eq!(
+            &buf[..n],
+            original,
+            "duplicate changed the pending handshake"
+        );
+    }
+    drive(&mut p, 5);
+    assert!(drain(&mut app).is_empty());
+}
+
+#[test]
+fn address_change_started_restart_timeout_has_one_terminal_outcome_under_backpressure() {
+    let server = key(41);
+    let client = key(19);
+    let port = free_port();
+    let (mut p, mut app) = pump(&server, port, 1);
+    let probe = Probe::new(port, sources(1, 1));
+    let addr = SocketAddr::from((Ipv6Addr::LOCALHOST, port));
+    let raw = socket();
+    let (h, original) = hello_for(&client, &server);
+    raw.send_to(&original, addr).unwrap();
+    let flight = response(&raw, &mut p);
+    let (mut old, hash) = finish(h, &flight);
+    raw.send_to(&packet(&mut old, &client, 0, b""), addr)
+        .unwrap();
+    drive(&mut p, 5);
+    assert!(matches!(app.try_recv(), Some(RingEvent::Connected { .. })));
+    let mut s = Server {
+        pump: p,
+        app,
+        key: server,
+        addr,
+        raw,
+        client,
+        original,
+        old,
+        hash,
+    };
+    let remote = address(&s.client, s.raw.local_addr().unwrap().port());
+    let fill = packet(&mut s.old, &s.client, 1, b"before reset");
+    s.send(&fill); // sole event slot is occupied by old-association data
+    probe.set(sources(2, 1));
+    s.pump.run_for(Duration::ZERO);
+    drive(&mut s.pump, 5); // automatic handshake starts behind pending Disconnected
+    let mut buf = [0; 10000];
+    let mut saw_restart = false;
+    while let Ok((n, _)) = s.raw.recv_from(&mut buf) {
+        saw_restart |= n > 6 && load_u48(&buf[..6]) == MAGIC;
+    }
+    assert!(saw_restart, "automatic handshake did not actually start");
+    assert!(
+        matches!(s.app.try_recv(), Some(RingEvent::Message { data, .. }) if data == b"before reset")
+    );
+    drive(&mut s.pump, 5); // Disconnected now occupies the sole slot
+
+    // An ordinary pending request must keep its existing owner, not acquire a
+    // second failure when its handshake is also restarted by a source change.
+    let pending_raw = socket();
+    let pending = address(&key(101), pending_raw.local_addr().unwrap().port());
+    assert!(s.app.try_connect(pending.clone()));
+    drive(&mut s.pump, 5);
+    assert!(pending_raw.recv_from(&mut buf).is_ok());
+    probe.set(sources(3, 1));
+    drive(&mut s.pump, 5); // restart both logical attempts without extending their deadlines
+    probe.set(sources(4, 1));
+    drive(&mut s.pump, 5); // repeated resets must retain ownership, not add events
+    while s.raw.recv_from(&mut buf).is_ok() {}
+    while pending_raw.recv_from(&mut buf).is_ok() {}
+
+    // A successful automatic restart must release the same terminal ownership;
+    // passing its old handshake deadline must not produce a stale failure.
+    let a = key(102);
+    let b = key(103);
+    let ap = free_port();
+    let bp = free_port();
+    let (mut p, mut pe) = pump(&a, ap, 16);
+    let (mut q, mut qe) = pump(&b, bp, 16);
+    let success_probe = Probe::new(ap, sources(1, 1));
+    let _remote_probe = Probe::new(bp, sources(9, 9));
+    assert!(pe.try_connect(address(&b, bp)));
+    let old_hash = shared_connection(&mut p, &mut pe, &mut q, &mut qe);
+    success_probe.set(sources(2, 1));
+    p.run_for(Duration::ZERO);
+    assert!(matches!(
+        pe.try_recv(),
+        Some(RingEvent::Disconnected {
+            reason: DisconnectReason::NetworkChanged,
+            ..
+        })
+    ));
+    let fresh_hash = shared_connection(&mut p, &mut pe, &mut q, &mut qe);
+    assert_ne!(old_hash, fresh_hash);
+
+    // No virtual protocol clock: let the unchanged frozen 30 s timeout elapse.
+    // Keep NetworkChanged in the full ring while both failures become pending.
+    std::thread::sleep(Duration::from_secs(31));
+    drive(&mut s.pump, 20);
+    assert!(s.app.try_disconnect(remote.connection_key()));
+    assert!(s.app.try_disconnect(pending.connection_key()));
+    drive(&mut s.pump, 5); // Already committed genuine timeouts cannot be withdrawn.
+    assert!(matches!(s.app.try_recv(), Some(RingEvent::Disconnected {
+        peer, reason: DisconnectReason::NetworkChanged
+    }) if peer == remote.connection_key()));
+    let mut failures = Vec::new();
+    for _ in 0..3 {
+        drive(&mut s.pump, 5);
+        failures.extend(drain(&mut s.app));
+    }
+    assert_eq!(
+        failures.len(),
+        2,
+        "one terminal event per started logical attempt"
+    );
+    for expected in [&remote, &pending] {
+        assert_eq!(
+            failures
+                .iter()
+                .filter(|e| matches!(e,
+            RingEvent::ConnectFailed { address, reason: ConnectFailure::TimedOut }
+            if address == expected))
+                .count(),
+            1
+        );
+    }
+    // Expiry is terminal: do not automatically restart again or emit a late
+    // Disconnected/ConnectFailed on later calls or another source change.
+    while s.raw.recv_from(&mut buf).is_ok() {}
+    while pending_raw.recv_from(&mut buf).is_ok() {}
+    probe.set(sources(5, 1));
+    drive(&mut s.pump, 20);
+    assert!(drain(&mut s.app).is_empty());
+    assert!(s.raw.recv_from(&mut buf).is_err());
+    assert!(pending_raw.recv_from(&mut buf).is_err());
+    drive(&mut p, 5);
+    drive(&mut q, 5);
+    assert!(drain(&mut pe).is_empty(), "successful restart failed late");
+    assert!(drain(&mut qe).is_empty());
+}
+
+struct RefreshClock(u16);
+impl RefreshClock {
+    fn new(port: u16, now: u64) -> Self {
+        REFRESH_CLOCKS.with(|clocks| {
+            assert!(clocks.borrow_mut().insert(port, now).is_none());
+        });
+        Self(port)
+    }
+    fn set(&self, now: u64) {
+        REFRESH_CLOCKS.with(|clocks| *clocks.borrow_mut().get_mut(&self.0).unwrap() = now);
+    }
+}
+impl Drop for RefreshClock {
+    fn drop(&mut self) {
+        REFRESH_CLOCKS.with(|clocks| clocks.borrow_mut().remove(&self.0));
+    }
+}
+
+fn cancel_started_automatic_restart(reschedule: bool) {
+    let port = free_port();
+    let probe = Probe::new(port, sources(1, 1));
+    let mut s = Server::at_port(1, key(19), port);
+    let started = monotonic_clock_ns();
+    let clock = RefreshClock::new(port, started);
+    let remote = address(&s.client, s.raw.local_addr().unwrap().port());
+    let fill = packet(&mut s.old, &s.client, 1, b"before cancellation");
+    s.send(&fill);
+    probe.set(sources(2, 1));
+    s.pump.run_for(Duration::ZERO);
+    drive(&mut s.pump, 5); // Start while NetworkChanged waits behind the full ring.
+    let mut buf = [0; 10000];
+    let mut saw_hello = false;
+    while let Ok((n, _)) = s.raw.recv_from(&mut buf) {
+        saw_hello |= n > 6 && load_u48(&buf[..6]) == MAGIC;
+    }
+    assert!(saw_hello, "automatic attempt must actually have started");
+    if reschedule {
+        clock.set(started + 10_000_000_000);
+        probe.set(sources(3, 1));
+        s.pump.run_for(Duration::ZERO); // Started attempt is waiting again.
+    }
+    for _ in 0..15 {
+        assert!(s.app.try_connect(remote.clone()));
+    }
+    assert!(s.app.try_disconnect(remote.connection_key()));
+    assert!(!s.app.try_disconnect(remote.connection_key())); // Full control ring.
+    drive(&mut s.pump, 5); // Pending boundary still blocks control admission.
+    assert!(
+        matches!(s.app.try_recv(), Some(RingEvent::Message { data, .. })
+        if data == b"before cancellation")
+    );
+    drive(&mut s.pump, 5);
+    assert!(matches!(s.app.try_recv(), Some(RingEvent::Disconnected {
+        peer, reason: DisconnectReason::NetworkChanged
+    }) if peer == remote.connection_key()));
+    drive(&mut s.pump, 5);
+    assert!(drain(&mut s.app).is_empty(), "cancellation must be silent");
+    while s.raw.recv_from(&mut buf).is_ok() {}
+    clock.set(started + 31_000_000_000);
+    for n in 4..7 {
+        probe.set(sources(n, 1));
+        drive(&mut s.pump, 5);
+        assert!(drain(&mut s.app).is_empty());
+        assert!(
+            s.raw.recv_from(&mut buf).is_err(),
+            "cancelled peer resurrected"
+        );
+    }
+}
+
+#[test]
+fn address_change_started_automatic_restart_cancels_silently() {
+    cancel_started_automatic_restart(false);
+}
+
+#[test]
+fn address_change_rescheduled_started_automatic_restart_cancels_silently() {
+    cancel_started_automatic_restart(true);
+}
+
+#[test]
+fn disconnect_after_success_preserves_connected_then_local_with_capacity_one() {
+    let a = key(104);
+    let b = key(105);
+    let ap = free_port();
+    let bp = free_port();
+    let (mut p, mut pe) = pump(&a, ap, 1);
+    let (mut q, mut qe) = pump(&b, bp, 16);
+    let probe = Probe::new(ap, sources(1, 1));
+    let _remote_probe = Probe::new(bp, sources(9, 9));
+    let remote = address(&b, bp);
+    assert!(pe.try_connect(remote.clone()));
+    let until = Instant::now() + Duration::from_secs(3);
+    let mut confirmed = false;
+    while Instant::now() < until {
+        drive(&mut p, 2);
+        drive(&mut q, 2);
+        confirmed |= drain(&mut qe)
+            .iter()
+            .any(|e| matches!(e, RingEvent::Connected { .. }));
+        if confirmed {
+            break;
+        }
+    }
+    assert!(
+        confirmed,
+        "handshake must succeed before processing Disconnect"
+    );
+    assert!(pe.try_disconnect(remote.connection_key()));
+    drive(&mut p, 5); // Connected occupies the sole slot; Local waits behind it.
+    assert!(
+        matches!(pe.try_recv(), Some(RingEvent::Connected { address, .. }) if address == remote)
+    );
+    drive(&mut p, 5);
+    assert!(matches!(pe.try_recv(), Some(RingEvent::Disconnected {
+        peer, reason: DisconnectReason::Local
+    }) if peer == remote.connection_key()));
+    probe.set(sources(2, 1));
+    drive(&mut p, 5);
+    assert!(drain(&mut pe).is_empty());
+}
+
+#[test]
+fn disconnect_does_not_withdraw_committed_invalid_failure_under_backpressure() {
+    let mut s = Server::new(1);
+    let fill = packet(&mut s.old, &s.client, 1, b"before failure");
+    s.send(&fill);
+    let invalid = address(&s.key, s.raw.local_addr().unwrap().port());
+    assert!(s.app.try_connect(invalid.clone()));
+    drive(&mut s.pump, 5); // Failure is committed pump-side behind Message.
+    assert!(s.app.try_disconnect(invalid.connection_key()));
+    drive(&mut s.pump, 5);
+    assert!(matches!(s.app.try_recv(), Some(RingEvent::Message { .. })));
+    drive(&mut s.pump, 5);
+    assert!(matches!(s.app.try_recv(), Some(RingEvent::ConnectFailed {
+        address, reason: ConnectFailure::InvalidAddress
+    }) if address == invalid));
+    drive(&mut s.pump, 5);
+    assert!(drain(&mut s.app).is_empty());
+}
+
+fn resource_stalled_restart_expiry(construct_before_expiry: bool) {
+    let port = free_port();
+    let probe = Probe::new(port, sources(1, 1));
+    let budget = crate::receive_memory::ReceiveMemoryBudget::new(128 << 20);
+    let pair = pump_with_budget(&key(41), port, 1, Some(budget.clone()));
+    let mut s = Server::with_pump(1, key(19), port, pair);
+    let started = monotonic_clock_ns();
+    let clock = RefreshClock::new(port, started);
+    let remote = address(&s.client, s.raw.local_addr().unwrap().port());
+    let fill = packet(&mut s.old, &s.client, 1, b"before stalled reset");
+    s.send(&fill);
+    probe.set(sources(2, 1));
+    s.pump.run_for(Duration::ZERO); // Retire first, then pin all process resources.
+    assert_eq!(budget.used(), 0);
+    let mut blocked = Some(budget.reserve(budget.limit()).unwrap());
+    let mut buf = [0; 10000];
+    while s.raw.recv_from(&mut buf).is_ok() {}
+    drive(&mut s.pump, 3);
+    assert!(
+        s.raw.recv_from(&mut buf).is_err(),
+        "resource-stalled handshake constructed"
+    );
+    assert!(
+        s.pump.next_wakeup().unwrap() > Instant::now(),
+        "stalled wait busy-spins"
+    );
+    clock.set(started + 29_000_000_000);
+    probe.set(sources(3, 1));
+    s.pump.run_for(Duration::ZERO); // Repeated change must not reset original start.
+    drive(&mut s.pump, 3);
+    if construct_before_expiry {
+        drop(blocked.take());
+        drive(&mut s.pump, 3); // Only one second remains; construction cannot reset it.
+        let mut saw_hello = false;
+        while let Ok((n, _)) = s.raw.recv_from(&mut buf) {
+            saw_hello |= n > 6 && load_u48(&buf[..6]) == MAGIC;
+        }
+        assert!(
+            saw_hello,
+            "released resources must allow the delayed handshake"
+        );
+        probe.set(sources(4, 1));
+        s.pump.run_for(Duration::ZERO); // Started and rescheduled: still the same deadline.
+    }
+    clock.set(started + 30_000_000_000);
+    s.pump.run_for(Duration::ZERO); // Expired/zero service still admits no work.
+    drive(&mut s.pump, 3); // Genuine failure commits behind pending NetworkChanged.
+    assert!(s.app.try_disconnect(remote.connection_key()));
+    drive(&mut s.pump, 3); // Cancellation must not withdraw the committed timeout.
+    assert!(matches!(s.app.try_recv(), Some(RingEvent::Message { .. })));
+    drive(&mut s.pump, 3);
+    assert!(matches!(
+        s.app.try_recv(),
+        Some(RingEvent::Disconnected {
+            reason: DisconnectReason::NetworkChanged,
+            ..
+        })
+    ));
+    drive(&mut s.pump, 3);
+    assert!(matches!(s.app.try_recv(), Some(RingEvent::ConnectFailed {
+        address, reason: ConnectFailure::TimedOut
+    }) if address == remote));
+    drop(blocked);
+    for n in 4..7 {
+        probe.set(sources(n, 1));
+        drive(&mut s.pump, 3);
+        assert!(drain(&mut s.app).is_empty());
+        assert!(
+            s.raw.recv_from(&mut buf).is_err(),
+            "expired schedule resurrected"
+        );
+    }
+}
+
+#[test]
+fn address_change_resource_stalled_schedule_expires_once_without_construction() {
+    resource_stalled_restart_expiry(false);
+}
+
+#[test]
+fn address_change_resource_delayed_construction_keeps_original_total_deadline() {
+    resource_stalled_restart_expiry(true);
+}
+
+#[test]
+fn address_change_reference_restart_expires_without_native_lifecycle_ownership() {
+    let (c, _budget, _, _) = live_tracking();
+    let peer = c.address().connection_key();
+    let mut map = HashMap::from([(peer, c)]);
+    let mut rings = RingState::default(); // Reference mode never owns native peer events.
+    let mut refresh = LocalAddressRefresh::default();
+    let scheduled = 100_000_000_000;
+    assert!(!refresh.observe_at(sources(1, 1), &mut map, &mut rings, scheduled));
+    assert!(refresh.observe_at(sources(2, 1), &mut map, &mut rings, scheduled));
+    assert_eq!(
+        refresh.waiting[&peer].2, scheduled,
+        "live peers start at schedule time"
+    );
+    assert!(refresh.observe_at(
+        sources(3, 1),
+        &mut map,
+        &mut rings,
+        scheduled + 29_000_000_000
+    ));
+    assert_eq!(
+        refresh.waiting[&peer].2, scheduled,
+        "repeat changes must not extend it"
+    );
+    refresh.expire(scheduled + 30_000_000_000, &mut map, &mut rings);
+    assert!(refresh.waiting.is_empty());
+    assert!(refresh.retrying.is_empty());
+    assert!(rings.connects.is_empty());
+    assert!(rings.pending.is_empty());
+}
+
+#[test]
+fn address_change_waiting_restart_refuses_competing_inbound_core_when_resources_free() {
+    let port = free_port();
+    let probe = Probe::new(port, sources(1, 1));
+    let budget = crate::receive_memory::ReceiveMemoryBudget::new(128 << 20);
+    let pair = pump_with_budget(&key(41), port, 16, Some(budget.clone()));
+    let mut s = Server::with_pump(16, key(19), port, pair);
+    let started = monotonic_clock_ns();
+    let clock = RefreshClock::new(port, started);
+    let remote = address(&s.client, s.raw.local_addr().unwrap().port());
+    probe.set(sources(2, 1));
+    s.pump.run_for(Duration::ZERO);
+    assert!(matches!(
+        s.app.try_recv(),
+        Some(RingEvent::Disconnected {
+            reason: DisconnectReason::NetworkChanged,
+            ..
+        })
+    ));
+    assert_eq!(budget.used(), 0);
+    let blocked = budget.reserve(budget.limit()).unwrap();
+    // The scheduled constructor fails first; free resources just before the
+    // receive batch so an incoming hello could otherwise create the same key.
+    REFRESH_RELEASES.with(|releases| {
+        assert!(releases.borrow_mut().insert(port, blocked).is_none());
+    });
+    let (_h, incoming) = hello_for(&s.client, &s.key);
+    s.raw.send_to(&incoming, s.addr).unwrap();
+    drive(&mut s.pump, 5);
+    assert!(REFRESH_RELEASES.with(|releases| !releases.borrow().contains_key(&port)));
+    let mut buf = [0; 10000];
+    let mut saw_outgoing = false;
+    while let Ok((n, _)) = s.raw.recv_from(&mut buf) {
+        assert_ne!(n, 62, "waiting peer admitted a competing incoming core");
+        saw_outgoing |= n > 6 && load_u48(&buf[..6]) == MAGIC;
+    }
+    assert!(
+        saw_outgoing,
+        "scheduled outgoing attempt did not construct after release"
+    );
+    assert!(drain(&mut s.app).is_empty());
+    clock.set(started + 30_000_000_000);
+    drive(&mut s.pump, 3);
+    assert!(matches!(s.app.try_recv(), Some(RingEvent::ConnectFailed {
+        address, reason: ConnectFailure::TimedOut
+    }) if address == remote));
+    assert!(drain(&mut s.app).is_empty());
 }

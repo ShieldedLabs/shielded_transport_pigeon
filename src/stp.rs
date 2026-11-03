@@ -7438,6 +7438,16 @@ type SourceAddresses = (Option<Ipv6Addr>, Option<Ipv6Addr>);
 #[cfg(test)]
 thread_local! {
     static SOURCE_PROBES: std::cell::RefCell<HashMap<u16, (SourceAddresses, usize)>> = Default::default();
+    // Narrow test hook for scheduled-restart expiry, not the protocol clock.
+    static REFRESH_CLOCKS: std::cell::RefCell<HashMap<u16, u64>> = Default::default();
+    static REFRESH_RELEASES: std::cell::RefCell<HashMap<u16, crate::receive_memory::Reservation>> = Default::default();
+}
+fn refresh_clock_ns(_port: u16) -> u64 {
+    #[cfg(test)]
+    if let Some(now) = REFRESH_CLOCKS.with(|clocks| clocks.borrow().get(&_port).copied()) {
+        return now;
+    }
+    monotonic_clock_ns()
 }
 fn pump_source_addresses(
     socket: &mut SockHandle,
@@ -7458,19 +7468,40 @@ fn pump_source_addresses(
 }
 #[derive(Default)]
 struct LocalAddressRefresh {
-    observed: Option<SourceAddresses>,
-    waiting: HashMap<ConnectionKey, (STPAddress, IdentityKeyPair)>,
+    observed: SourceAddresses,
+    waiting: HashMap<ConnectionKey, (STPAddress, IdentityKeyPair, u64)>,
     retrying: std::collections::HashSet<ConnectionKey>,
 }
 impl LocalAddressRefresh {
+    #[cfg(test)]
     fn observe(
         &mut self,
         pair: SourceAddresses,
         connections: &mut HashMap<ConnectionKey, ConnectionTrackingData>,
         rings: &mut RingState,
     ) -> bool {
-        let previous = self.observed.replace(pair);
-        if previous.is_none() || previous == Some(pair) {
+        self.observe_at(pair, connections, rings, monotonic_clock_ns())
+    }
+    fn observe_at(
+        &mut self,
+        pair: SourceAddresses,
+        connections: &mut HashMap<ConnectionKey, ConnectionTrackingData>,
+        rings: &mut RingState,
+        now: u64,
+    ) -> bool {
+        fn latch(stored: &mut Option<Ipv6Addr>, lookup: Option<Ipv6Addr>) -> bool {
+            let Some(address) = lookup else {
+                return false;
+            };
+            let changed = stored.is_some_and(|old| old != address);
+            *stored = Some(address);
+            changed
+        }
+        // Each family's first successful lookup establishes its own baseline.
+        // Failure is unknown, not evidence that the last successful source changed.
+        let v4_changed = latch(&mut self.observed.0, pair.0);
+        let v6_changed = latch(&mut self.observed.1, pair.1);
+        if !v4_changed && !v6_changed {
             return false;
         }
         // Save only live associations and locally requested/restarted attempts. An
@@ -7480,9 +7511,23 @@ impl LocalAddressRefresh {
                 || rings.connects.contains_key(&peer)
                 || self.retrying.contains(&peer)
             {
+                let address = old.address();
+                // Native established peers acquire lifecycle ownership at schedule
+                // time, including when resources prevent constructing a handshake.
+                if rings.peers.contains_key(&peer) {
+                    rings
+                        .connects
+                        .entry(peer)
+                        .or_insert_with(|| address.clone());
+                }
+                let started = if old.is_connected() {
+                    now
+                } else {
+                    old.creation_time_ns
+                };
                 self.waiting.insert(
                     peer,
-                    (old.address(), old.my_transport_identity_keypair.clone()),
+                    (address, old.my_transport_identity_keypair.clone(), started),
                 );
             }
             // Dropping old also drops candidates, admitted sends, decoder ingress,
@@ -7498,6 +7543,36 @@ impl LocalAddressRefresh {
         // Keep pending outbound requests: changing interfaces retries the same
         // logical connect, it is not a timeout or a cancellation.
         true
+    }
+    fn expire(
+        &mut self,
+        now: u64,
+        connections: &mut HashMap<ConnectionKey, ConnectionTrackingData>,
+        rings: &mut RingState,
+    ) {
+        // One logical 30-second attempt includes waiting for construction. Once
+        // constructed, the core creation time carries this same original start.
+        self.waiting.retain(|peer, (_, _, started)| {
+            if now < started.saturating_add(30_000_000_000) {
+                return true;
+            }
+            rings.disconnected(*peer, DisconnectReason::TimedOut);
+            false
+        });
+        self.retrying.retain(|peer| {
+            let Some(conn) = connections.get(peer) else {
+                return false;
+            };
+            if conn.is_connected() {
+                return false;
+            }
+            if now < conn.creation_time_ns.saturating_add(30_000_000_000) {
+                return true;
+            }
+            connections.remove(peer);
+            rings.disconnected(*peer, DisconnectReason::TimedOut);
+            false
+        });
     }
     fn cancel(&mut self, peer: &ConnectionKey) {
         self.waiting.remove(peer);
@@ -7574,14 +7649,14 @@ impl RingState {
                 .push_back(RingEvent::Disconnected { peer, reason });
         }
         if let Some(address) = self.connects.remove(&peer) {
-            self.pending.push_back(RingEvent::ConnectFailed {
-                address,
-                reason: if reason == DisconnectReason::Local {
-                    ConnectFailure::Cancelled
-                } else {
-                    ConnectFailure::TimedOut
-                },
-            });
+            // An explicit disconnect silently retires an unfinished attempt. Do
+            // not retract an outcome already committed to the ordered stream.
+            if reason != DisconnectReason::Local {
+                self.pending.push_back(RingEvent::ConnectFailed {
+                    address,
+                    reason: ConnectFailure::TimedOut,
+                });
+            }
         }
     }
     fn message(&self, port: &Port, peer: ConnectionKey, data: Vec<u8>) {
@@ -7856,7 +7931,12 @@ pub(crate) fn new_reference_pump_with_options(
             let socket = socket_owner.0;
             let caller_deadline = budget.instant;
             let _owners = (&exit, &socket_owner);
-            if refresh.observe(pair, &mut connections_map, &mut ring_state) {
+            if refresh.observe_at(
+                pair,
+                &mut connections_map,
+                &mut ring_state,
+                refresh_clock_ns(my_port),
+            ) {
                 receive_queue.messages.clear();
                 receive_queue.reservations.clear();
                 receive_queue.bytes = 0;
@@ -7960,12 +8040,9 @@ pub(crate) fn new_reference_pump_with_options(
                                         if connections_map.contains_key(&peer)
                                             || refresh.waiting.contains_key(&peer)
                                         {
-                                            ring_state.pending.push_back(
-                                                RingEvent::ConnectFailed {
-                                                    address,
-                                                    reason: ConnectFailure::AlreadyConnected,
-                                                },
-                                            );
+                                            // The existing association/restart owns its lifecycle
+                                            // and timers. Still account for this control admission
+                                            // through the shared tail below.
                                         } else if let Some(keypair) =
                                             my_keypairs.iter().find(|kp| {
                                                 kp.magic1 == address.magic1
@@ -8115,7 +8192,8 @@ pub(crate) fn new_reference_pump_with_options(
                             port: w.port,
                             key_15_bits: load_u16(&w.key[0..2]) << 1,
                         };
-                        if connections_map.contains_key(&key) {
+                        if connections_map.contains_key(&key) || refresh.waiting.contains_key(&key)
+                        {
                             continue;
                         }
                         for keypair in &my_keypairs {
@@ -8312,7 +8390,14 @@ pub(crate) fn new_reference_pump_with_options(
                         exchange_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
                     thread_inner.publish(resp);
                 } else {
-                    if let Some((&peer, (address, identity))) = refresh.waiting.iter().next() {
+                    refresh.expire(
+                        refresh_clock_ns(my_port),
+                        &mut connections_map,
+                        &mut ring_state,
+                    );
+                    if let Some((&peer, (address, identity, started))) =
+                        refresh.waiting.iter().next()
+                    {
                         if budget.sampled(monotonic_clock_ns()) {
                             return Some(std::time::Instant::now());
                         }
@@ -8327,7 +8412,10 @@ pub(crate) fn new_reference_pump_with_options(
                             max_message_size,
                         );
                         budget.progressed();
-                        if connections_map.contains_key(&peer) {
+                        if let Some(conn) = connections_map.get_mut(&peer) {
+                            // Timing metadata only: no old transport state crosses the reset.
+                            // Waiting or another source change cannot grant a fresh 30 seconds.
+                            conn.creation_time_ns = *started;
                             refresh.waiting.remove(&peer);
                             refresh.retrying.insert(peer);
                             // One fresh handshake construction is a cooperative unit.
@@ -8336,6 +8424,8 @@ pub(crate) fn new_reference_pump_with_options(
                         }
                         // A still-accounted old decoder or another pump can temporarily
                         // consume the process budget. Keep the remembered peer for retry.
+                        #[cfg(test)]
+                        REFRESH_RELEASES.with(|releases| releases.borrow_mut().remove(&my_port));
                     }
                     let mut should_sleep = true;
                     while receiving && receive_round < MAX_RECV_PACKETS_PER_TICK {
@@ -8422,6 +8512,11 @@ pub(crate) fn new_reference_pump_with_options(
                                                     } }
                                                 }
                                             } else {
+                                                // A scheduled outgoing attempt owns this peer until
+                                                // construction; do not admit a competing core.
+                                                if refresh.waiting.contains_key(&connection_key) {
+                                                    break;
+                                                }
                                                 let Some(receive_reservation) = receive_memory
                                                     .reserve(RECEIVE_CONNECTION_BYTES)
                                                 else {
@@ -8567,6 +8662,12 @@ pub(crate) fn new_reference_pump_with_options(
                                                         } }
                                                     }
                                                 } else {
+                                                    // Keep waiting/core ownership disjoint even if
+                                                    // resources free during this receive batch.
+                                                    if refresh.waiting.contains_key(&connection_key)
+                                                    {
+                                                        break;
+                                                    }
                                                     let Some(receive_reservation) = receive_memory
                                                         .reserve(RECEIVE_CONNECTION_BYTES)
                                                     else {
@@ -10908,6 +11009,9 @@ pub(crate) fn new_reference_pump_with_options(
                             deadline = deadline.min(next_service_deadline(now, due));
                         };
                         include(fec_sweep_ns.saturating_add(100_000_000));
+                        for (_, _, started) in refresh.waiting.values() {
+                            include(started.saturating_add(30_000_000_000));
+                        }
                         let mut active_retry = false;
                         for conn in connections_map.values() {
                             if let Some(candidate) = &conn.replacement {
