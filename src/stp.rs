@@ -7115,7 +7115,7 @@ impl FecCompletion {
 }
 struct FecDecodeJob {
     rx: std::sync::mpsc::Receiver<(u32, Vec<u8>)>,
-    decoder: crate::fec::MessageDecoder,
+    decoder: crate::fec::WorkerDecoder,
     reservation: Option<crate::receive_memory::Reservation>,
     _guard: FecWorkerGuard,
 }
@@ -7205,7 +7205,7 @@ fn fec_receive_block_waking(
             workers.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             let guard = FecWorkerGuard(workers.clone(), budget.clone(), None);
             let generation = std::sync::Arc::new(());
-            let Some(decoder) = MessageDecoder::with_layout(layout) else {
+            let Some(decoder) = crate::fec::WorkerDecoder::new(layout, block_id) else {
                 drop(guard);
                 slot.ingress_dropped += 1;
                 return None;
@@ -13006,6 +13006,10 @@ impl LossEpisodes {
 #[cfg(test)]
 #[path = "replacement_tests.rs"]
 mod replacement_tests;
+
+#[cfg(test)]
+#[path = "worker_originals_integration_tests.rs"]
+mod worker_originals_integration_tests;
 
 #[cfg(test)]
 mod send_error_tests {

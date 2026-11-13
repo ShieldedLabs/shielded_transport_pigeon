@@ -440,6 +440,104 @@ impl MessageDecoder {
         (self.remaining == 0).then(|| std::mem::take(&mut self.output))
     }
 }
+
+// Only the bounded wire-unit worker uses this representation. Its existing full
+// decoder reservation, ingress queue and worker guard remain owned by the job.
+// Generic MessageDecoder and the small SourceOnly path are deliberately unchanged.
+const WORKER_BITMAP_BYTES: usize = crate::stp::FEC_MAX_SOURCE_BLOCKS.div_ceil(8);
+pub(crate) enum WorkerDecoder {
+    Originals {
+        layout: MessageLayout,
+        output: Vec<u8>,
+        seen: [u8; WORKER_BITMAP_BYTES],
+        remaining: usize,
+    },
+    Native(MessageDecoder),
+    Failed,
+}
+impl WorkerDecoder {
+    pub(crate) fn new(layout: MessageLayout, first_id: u32) -> Option<Self> {
+        if layout.groups == 1
+            && layout.k > crate::stp::FEC_INLINE_MAX_BLOCKS
+            && layout.k <= crate::stp::FEC_MAX_SOURCE_BLOCKS
+            && (first_id as usize) < layout.k
+        {
+            Some(Self::Originals {
+                layout,
+                output: vec![0; layout.len],
+                seen: [0; WORKER_BITMAP_BYTES],
+                remaining: layout.k,
+            })
+        } else {
+            MessageDecoder::with_layout(layout).map(Self::Native)
+        }
+    }
+    pub(crate) fn add(&mut self, id: u32, data: &[u8]) -> Result<DecodeStatus, DecodeError> {
+        if let Self::Originals { layout, output, seen, remaining } = self {
+            if data.len() != block_len(layout.len, layout.block_bytes, id) {
+                return Err(DecodeError::BadBlock);
+            }
+            if *remaining == 0 {
+                return Ok(DecodeStatus::Done);
+            }
+            if (id as usize) < layout.k {
+                let id = id as usize;
+                let start = id * layout.block_bytes;
+                let target = &mut output[start..start + data.len()];
+                let mask = 1u8 << (id % 8);
+                if seen[id / 8] & mask != 0 {
+                    if target != data {
+                        return Err(DecodeError::BadBlock);
+                    }
+                    return Ok(DecodeStatus::NeedMore);
+                }
+                target.copy_from_slice(data);
+                seen[id / 8] |= mask;
+                *remaining -= 1;
+                return Ok(if *remaining == 0 { DecodeStatus::Done } else { DecodeStatus::NeedMore });
+            }
+            self.promote()?;
+        }
+        match self {
+            Self::Native(decoder) => decoder.add(id, data),
+            _ => Err(DecodeError::Failed(-1)),
+        }
+    }
+    fn promote(&mut self) -> Result<(), DecodeError> {
+        let Self::Originals { layout, output, seen, .. } = std::mem::replace(self, Self::Failed) else {
+            return Err(DecodeError::Failed(-1));
+        };
+        let mut decoder = Decoder::new(layout.len, layout.block_bytes)
+            .ok_or(DecodeError::Failed(-1))?;
+        // Synchronous replay: at most 4712 saved originals for a valid wire unit.
+        // This is finite, NOT an incremental Pump-budget or latency guarantee.
+        for id in 0..layout.k {
+            if seen[id / 8] & (1u8 << (id % 8)) != 0 {
+                let start = id * layout.block_bytes;
+                let end = (start + layout.block_bytes).min(layout.len);
+                decoder.add(id as u32, &output[start..end])?;
+            }
+        }
+        // Reuse the SAME output allocation. with_layout would allocate a second
+        // full message while the saved originals are still live. Publish Native
+        // before adding the triggering repair, so BadBlock retains the decoder.
+        *self = Self::Native(MessageDecoder {
+            layout,
+            decoders: vec![Some(decoder)],
+            complete: vec![false],
+            remaining: 1,
+            output,
+        });
+        Ok(())
+    }
+    pub(crate) fn recover(&mut self) -> Option<Vec<u8>> {
+        match self {
+            Self::Originals { output, remaining: 0, .. } => Some(std::mem::take(output)),
+            Self::Native(decoder) => decoder.recover(),
+            _ => None,
+        }
+    }
+}
 pub fn decode_message_blocks(
     layout: MessageLayout,
     rx: std::sync::mpsc::Receiver<(u32, Vec<u8>)>,
@@ -455,3 +553,7 @@ pub fn decode_message_blocks(
     }
     None
 }
+
+#[cfg(test)]
+#[path = "worker_originals_tests.rs"]
+mod worker_originals_tests;
