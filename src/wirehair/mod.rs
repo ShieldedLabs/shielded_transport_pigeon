@@ -3,6 +3,8 @@
 //! recovery bytes, same decoded output and the same result codes, including the vendored decoder's duplicate-packet
 //! identity table and memory-limit accounting.
 //!
+//! Wirehair FEC was created by Christopher A. Taylor: <https://wirehairfec.com>.
+//!
 //! Copyright (c) 2012-2018 Christopher A. Taylor. All rights reserved. BSD 3-clause license; see the full notice in
 //! codec.rs, gf256.rs and tools.rs.
 //!

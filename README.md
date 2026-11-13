@@ -34,9 +34,10 @@ Cryptography uses crates.io dependencies: `shielded_labs_snow` (imported as
 `snow`), `curve25519-dalek`, `chacha20poly1305`, `blake2` and `blake3`; some are
 provided transitively through Snow. BLAKE3 uses its pure-Rust build feature.
 STP has no build script or C++ compiler requirement. The standard library and
-operating-system APIs are still required. Wirehair's BSD-3-Clause license is in
-`src/wirehair/LICENSE`; notices for retained local RNG code are beside its source
-in `src/crypto/`. STP itself is MIT.
+operating-system APIs are still required. STP's FEC implementation is a Rust port
+of [Wirehair FEC](https://wirehairfec.com) by Christopher A. Taylor. Wirehair's
+BSD-3-Clause license is in `src/wirehair/LICENSE`; notices for retained local RNG
+code are beside its source in `src/crypto/`. STP itself is MIT.
 
 For an Actually Portable Executable, use the separate
 [Cargo Cosmo](https://github.com/ShieldedLabs/cargo_cosmo) **10.0.0** toolchain,
