@@ -1669,8 +1669,17 @@ fn address_change_started_restart_timeout_has_one_terminal_outcome_under_backpre
     let pending_raw = socket();
     let pending = address(&key(101), pending_raw.local_addr().unwrap().port());
     assert!(s.app.try_connect(pending.clone()));
-    drive(&mut s.pump, 5);
-    assert!(pending_raw.recv_from(&mut buf).is_ok());
+    let until = Instant::now() + Duration::from_secs(1);
+    loop {
+        drive(&mut s.pump, 5);
+        match pending_raw.recv_from(&mut buf) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(Instant::now() < until, "pending handshake was not sent");
+            }
+            Err(error) => panic!("receiving pending handshake: {error}"),
+        }
+    }
     probe.set(sources(3, 1));
     drive(&mut s.pump, 5); // restart both logical attempts without extending their deadlines
     probe.set(sources(4, 1));
@@ -1921,10 +1930,15 @@ fn resource_stalled_restart_expiry(construct_before_expiry: bool) {
     drive(&mut s.pump, 3);
     if construct_before_expiry {
         drop(blocked.take());
-        drive(&mut s.pump, 3); // Only one second remains; construction cannot reset it.
+        // The fake refresh clock stays at +29 s throughout this bounded I/O wait:
+        // only one protocol second remains, and construction cannot reset it.
+        let until = Instant::now() + Duration::from_secs(1);
         let mut saw_hello = false;
-        while let Ok((n, _)) = s.raw.recv_from(&mut buf) {
-            saw_hello |= n > 6 && load_u48(&buf[..6]) == MAGIC;
+        while !saw_hello && Instant::now() < until {
+            drive(&mut s.pump, 3);
+            while let Ok((n, _)) = s.raw.recv_from(&mut buf) {
+                saw_hello |= n > 6 && load_u48(&buf[..6]) == MAGIC;
+            }
         }
         assert!(
             saw_hello,
