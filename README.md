@@ -84,8 +84,8 @@ imply library-owned threads.
 - Backlog limits live in `NetworkThreadOptions.send_queue: SendQueueConfig`:
   `per_queue_bytes` (default max(4 MiB, max message)), `queue_bytes` (per-queue
   overrides, length at most the queue count), `global_bytes` (default max(64 MiB, 4x the largest per-queue cap)),
-  `max_active_queues` (default 1024, 1..=65,536; a lane's permit is held until
-  disconnect or replacement) and `max_queued_messages` (default 65,536, counting
+  `max_active_queues` (default 1024, 1..=65,536; idle lanes stay allocated until
+  teardown, and draining lifecycle events releases closed association handles) and `max_queued_messages` (default 65,536, counting
   messages already in the core). `RingConfig.send` is slots per lane.
 - `try_connect(address)`, `try_disconnect(peer)` and `try_control(Control)` use the
   control ring. Disconnect cancels local state without flushing or sending a wire

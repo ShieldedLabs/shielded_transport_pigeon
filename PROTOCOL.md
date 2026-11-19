@@ -241,8 +241,8 @@ published, never delivered across that boundary. Already-published old messages
 remain ahead of Disconnected. Replacement discards **all** old transport, ACK,
 replay, CC/outage/MTU, reassembly/FEC and admitted outgoing work, including
 untouched messages in old core queues, partially encoded packets and repairs.
-Send-ring entries not yet admitted are key-addressed submissions to the current
-association, as with an ordinary disconnect/reconnect. Old asynchronous decoder
+Entries not yet admitted from the old association's application send lanes are
+also cancelled; they cannot be transferred to a fresh association. Old asynchronous decoder
 completions cannot match the new receive-budget identity. Local disconnect,
 old expiry or safety closure removes its candidate too. This is a fresh
 association, not an in-place rekey or a reset of old counters.
@@ -289,7 +289,8 @@ cancels restart; a queued Disconnect still follows normal admission ordering.
 Cancellation before handshake completion is silent for ordinary and automatic
 attempts. A success or genuine failure already committed before cancellation is
 not retracted; disconnecting an established session emits `Disconnected(Local)`.
-Unadmitted send-ring submissions retain their current-association semantics.
+Unadmitted entries in the retired association's application send lanes are
+cancelled, not transferred to the restarted association.
 Expired/zero-budget calls still observe, retire and schedule, but do no protocol
 work, handshake construction or packet sends. The next positive-budget call
 starts fresh handshakes without waiting for the old liveness/outage timers.
