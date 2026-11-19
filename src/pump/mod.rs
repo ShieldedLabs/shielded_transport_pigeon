@@ -1,24 +1,26 @@
 pub mod port;
 pub(crate) use port::Endpoint;
 pub use port::lockfree::{
-    ConnectFailure, Control, DisconnectReason, Event, LockfreeEndpoint, RingConfig, Stats,
+    ConnectFailure, Control, DisconnectReason, Event, LockfreeEndpoint, RingConfig,
+    SendQueueConfig, Stats,
 };
 use std::time::{Duration, Instant};
 /// Exclusive socket/protocol owner. Move this value to a thread, or call it in frame slack. Application operations live
 /// on LockfreeEndpoint, never on Pump.
 ///
 /// Protocol clock samples remain at packet boundaries. Traversals with no fresh sample check every eight bookkeeping
-/// units. Native admissions form bursts of at most 32 commands per protocol pass, checking the caller deadline before
-/// each command except the first owed admission. HOL-blocked sends stay queued. A native Wirehair
+/// units. Native admissions inspect at most 32 lane/control candidates per protocol pass, checking the caller deadline
+/// before each candidate except the first owed scan. Blocked sends stay in their own lane; a persistent round-robin
+/// cursor advances even on empty or blocked lanes. A native Wirehair
 /// encode/decode/recovery call cannot be preempted. OS scheduling and allocator latency are not hard real-time bounded.
 /// Logical messages up to 1 GiB use native codec units no larger than 2 MiB. Explicit protocol telemetry also incurs
 /// work proportional to connections/queues. Dropping Pump closes the UDP socket and publishes endpoint termination.
 ///
-/// Forward progress: a `run_until` call entered before its deadline admits one eligible pending command and completes
+/// Forward progress: a `run_until` call entered before its deadline inspects one pending lane/control candidate and completes
 /// one unit (one received datagram, one data send, one FEC completion/sweep entry, one fresh reconnect handshake,
 /// one connection send step or eight bookkeeping units; an idle pass counts), even if the deadline passes during calibration/preemption. The cooperative
 /// overshoot bound is one admission plus one such unit. An unfinished 150 us active retry quantum is never shortened:
-/// only the owed command may be admitted inside it, and the owed unit waits for a call after it ends. Calls entered
+/// only the owed candidate may be inspected inside it, and the owed unit waits for a call after it ends. Calls entered
 /// at/after their deadline still observe local addresses and schedule connection refresh, but do no protocol work.
 /// Every run call pays for fresh OS route probes; address-change teardown also scales with the old associations.
 pub struct Pump {

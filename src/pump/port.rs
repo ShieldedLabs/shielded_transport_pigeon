@@ -6,7 +6,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 pub mod lockfree;
 #[path = "ring.rs"]
 mod ring;
-use lockfree::{Control, Counters, Event, LockfreeEndpoint, RingConfig, SendMessage};
+use lockfree::{
+    Control, Counters, Event, LockfreeEndpoint, NativeEvent, PeerSend, RingConfig, SendBudget,
+    SendQueueConfig,
+};
 use ring::Ring;
 #[derive(Debug)]
 pub struct Ready {
@@ -51,11 +54,11 @@ impl Ready {
     }
 }
 pub(crate) struct NativePort {
-    pub send: Ring<SendMessage>,
+    pub budget: Arc<SendBudget>,
+    pub send_slots: usize,
     pub control: Ring<Control>,
-    pub events: Ring<Event>,
+    pub events: Ring<NativeEvent>,
     pub counters: Counters,
-    pub send_full: AtomicBool,
     pub control_full: AtomicBool,
     pub stats_requested: AtomicBool,
     stats_active: AtomicBool,
@@ -64,17 +67,21 @@ pub(crate) struct NativePort {
 impl NativePort {
     pub(crate) fn input_drained(&self, ready: &Ready, control: bool) {
         std::sync::atomic::fence(Ordering::SeqCst);
-        let full = if control {
-            &self.control_full
-        } else {
-            &self.send_full
-        };
-        if full.load(Ordering::SeqCst) {
+        assert!(control);
+        if self.control_full.load(Ordering::SeqCst) {
             ready.notify();
         }
     }
     pub(crate) fn emit(&self, ready: &Ready, event: Event) -> Result<(), Event> {
-        unsafe { self.events.push(event) }?;
+        self.emit_association(ready, event, None)
+    }
+    pub(crate) fn emit_association(
+        &self,
+        ready: &Ready,
+        event: Event,
+        association: Option<Arc<PeerSend>>,
+    ) -> Result<(), Event> {
+        unsafe { self.events.push(NativeEvent { event, association }) }.map_err(|e| e.event)?;
         ready.notify();
         Ok(())
     }
@@ -149,7 +156,9 @@ impl Port {
     }
     pub(crate) fn has_request(&self) -> bool {
         if let Some(n) = self.native.get() {
-            n.send.has_value() || n.control.has_value() || n.stats_requested.load(Ordering::Acquire)
+            n.budget.pending.load(Ordering::Acquire) != 0
+                || n.control.has_value()
+                || n.stats_requested.load(Ordering::Acquire)
         } else {
             self.reference.get().is_some_and(|r| r.requests.has_value())
         }
@@ -201,17 +210,23 @@ impl Endpoint {
         self.inner.outstanding.store(false, Ordering::Release);
         Some(response)
     }
-    pub fn into_rings(self, config: RingConfig) -> LockfreeEndpoint {
+    pub fn into_rings(self, config: RingConfig, send: SendQueueConfig) -> LockfreeEndpoint {
+        assert!(config.send.is_power_of_two() && config.send <= 65536);
         assert!(!self.inner.outstanding.load(Ordering::Acquire));
         assert!(
             self.inner
                 .native
                 .set(NativePort {
-                    send: Ring::new(config.send),
+                    budget: SendBudget::new(
+                        send,
+                        self.inner.max_payload,
+                        self.inner.send_queues,
+                        self.inner.ready.clone()
+                    ),
+                    send_slots: config.send,
                     control: Ring::new(config.control),
                     events: Ring::new(config.receive),
                     counters: Counters::default(),
-                    send_full: AtomicBool::new(false),
                     control_full: AtomicBool::new(false),
                     stats_requested: AtomicBool::new(false),
                     stats_active: AtomicBool::new(false),
