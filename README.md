@@ -1,6 +1,6 @@
 # Shielded Transport Pigeon (STP)
 
-**Encrypted UDP messages, with scheduling owned by your application.**
+**Encrypted UDP messages, with scheduling owned by your application and isolated per-peer send lanes.**
 
 STP combines Noise IK authentication, ChaCha20-Poly1305 encryption, message
 packing and fragmentation, Wirehair forward error correction, and packet-rate
@@ -13,8 +13,11 @@ message once its planned send work is finished. Delivery is not guaranteed.
 
 - **No library threads.** You drive a `Pump` from a thread of your own
   (`run_for`) or between frames (`run_until`).
-- **Three bounded lock-free rings** (send, control, receive) connect the pump to a
-  single-owner `LockfreeEndpoint`. Sending moves the `Vec<u8>` allocation.
+- **Isolated send lanes.** Each (peer, logical queue) pair has its own bounded
+  lock-free send ring; the pump admits from lanes in fair round-robin order and
+  skips blocked ones, so one slow peer does not stall the rest. Shared control and
+  receive rings complete the connection to a single-owner `LockfreeEndpoint`.
+  Sending moves the `Vec<u8>` allocation.
 - **Pure Rust.** No build script, no C++ compiler. Wirehair is a Rust port.
 
 ## Quick start
@@ -23,10 +26,12 @@ message once its planned send work is finished. Delivery is not guaranteed.
 cargo add shielded_transport_pigeon
 cargo run --release --example lockfree_thread
 cargo run --release --example lockfree_game
+cargo run --release --example peer_isolation
 ```
 
-Requires Rust with edition 2024 support. The two examples show the supported
-driving styles; the [API guide](docs/rings-api.html) covers ownership,
+Requires Rust with edition 2024 support. The first two examples show the supported
+driving styles, and `peer_isolation` is the regression example that shows fast-peer
+delivery while another peer is slow; the [API guide](docs/rings-api.html) covers ownership,
 backpressure and configuration.
 
 ```rust
@@ -55,15 +60,33 @@ with helpers in `examples/support/lockfree_common.rs`.
 
 `stp::new_pump(...)` or `stp::new_pump_with_options(..., NetworkThreadOptions {
 rings: RingConfig { send: 128, control: 32, receive: 128 }, ..Default::default() })`
-returns `(Pump, LockfreeEndpoint)`. Each ring capacity is a power of two from 1 to
-65,536. The pump and endpoint are `Send`; the endpoint is deliberately not `Sync`.
+returns `(Pump, LockfreeEndpoint)`. Each ring capacity (`send` applies per lane) is a
+power of two from 1 to 65,536; queue counts stay 1..=64. The pump and endpoint are `Send`; the endpoint is deliberately not `Sync`.
 `NetworkThreadOptions` and `NetworkThreadStats` keep their names; they do not
 imply library-owned threads.
 
 - `try_send(peer, queue, class, &mut payload) -> bool` moves the allocation on
-  `true`; `false` (full or closed) leaves your `Vec` untouched. Oversized messages,
-  invalid queue indices and sends to unknown peers are dropped and counted in
-  `stats()`. A blocked peer at the head of the send ring blocks other peers.
+  `true`; `false` (lane slots, a byte cap, the global message or active-lane cap, a
+  cap smaller than the message, or closed) leaves your `Vec` untouched. Lanes are
+  created lazily per queue on the connected association; the first send to a queue
+  may allocate, and an ordinary push onto an established lane copies no payload.
+  Oversized messages, invalid queue indices and sends to unknown or
+  still-handshaking peers are accepted, then dropped and counted in `stats()`
+  synchronously, without allocating a lane. A peer without send credit blocks only
+  its own lanes; admission is fair round-robin, not a strict latency guarantee.
+  Shared global caps can still make `try_send` fail across lanes.
+- `queued_send_bytes(peer, queue)` reports accepted bytes (in the lane and the
+  protocol queue) until send work retires, meaning the last DATA attempt (a local
+  UDP send error counts) or a drop/disconnect. It is not a delivery acknowledgement
+  or total memory use: spare `Vec` capacity and FEC/parity buffers are excluded.
+  `try_send` enforces the byte caps, independent of the low-level
+  `send_buffer_params` credit, and `park_until_ready` wakes when capacity returns.
+- Backlog limits live in `NetworkThreadOptions.send_queue: SendQueueConfig`:
+  `per_queue_bytes` (default max(4 MiB, max message)), `queue_bytes` (per-queue
+  overrides), `global_bytes` (default max(64 MiB, 4x the per-queue default)),
+  `max_active_queues` (default 1024, 1..=65,536; a lane's permit is held until
+  disconnect or replacement) and `max_queued_messages` (default 65,536, counting
+  messages already in the core). `RingConfig.send` is slots per lane.
 - `try_connect(address)`, `try_disconnect(peer)` and `try_control(Control)` use the
   control ring. Disconnect cancels local state without flushing or sending a wire
   close. Duplicate connects are silent no-ops.
@@ -92,7 +115,8 @@ are never dropped: the pump holds them until the ring has room.
   30-second deadline; on expiry you get `ConnectFailed { reason: TimedOut }` and
   STP stops until you reconnect. Explicit disconnects are never resurrected.
 - **UDP send errors** are counted as dropped attempts (`local_send_drops`,
-  `last_local_send_error`), not backpressure; they never block ACKs or recovery.
+  `last_local_send_error`) and consume send attempts; they are not backpressure and
+  never block ACKs or recovery.
 
 ## Compatibility
 

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>STP Application API: Pump and three rings</title>
+<title>STP Application API: Pump, isolated send lanes and shared rings</title>
 <style>
 :root {
   --bg: #fbfaf7; --bg2: #f2f0ea; --fg: #1d1f24; --muted: #5d6370; --line: #dedad0;
@@ -128,13 +128,13 @@ footer { margin-top: 60px; padding-top: 18px; border-top: 1px solid var(--line);
 <div class="layout">
 
 <nav class="toc">
-  <div class="brand">STP <span>rings</span> API</div>
+  <div class="brand">STP <span>lanes</span> API</div>
   <div class="sub">shielded_transport_pigeon &middot; caller-driven pump</div>
   <ol>
     <li><a href="#overview">Overview</a></li>
     <li><a href="#quickstart">Quick start</a></li>
     <li><a href="#driving">Driving the pump</a></li>
-    <li><a href="#send">Send ring</a></li>
+    <li><a href="#send">Send lanes</a></li>
     <li><a href="#control">Control ring</a></li>
     <li><a href="#receive">Receive ring</a></li>
     <li class="sub2"><a href="#events">Event stream</a></li>
@@ -154,10 +154,10 @@ footer { margin-top: 60px; padding-top: 18px; border-top: 1px solid var(--line);
 
 <header class="hero" id="overview">
   <div class="eyebrow">Application API</div>
-  <h1>One pump, <em>three rings</em>, no hidden threads.</h1>
-  <p class="lead">STP is an encrypted UDP message transport: Noise IK handshakes, ChaCha20-Poly1305 sealed datagrams, Wirehair fountain-code parity for large messages, and rate-based congestion control in packets per second. The library starts <strong>no threads</strong>. All protocol work happens inside a <code>Pump</code>, and only while you call it. Your application talks to the pump through exactly three bounded, lock-free single-producer/single-consumer rings whose capacities you choose at setup: <strong>send</strong> and <strong>control</strong> carry work in, and <strong>receive</strong> carries one ordered stream of events out.</p>
+  <h1>One pump, <em>isolated send lanes</em>, no hidden threads.</h1>
+  <p class="lead">STP is an encrypted UDP message transport: Noise IK handshakes, ChaCha20-Poly1305 sealed datagrams, Wirehair fountain-code parity for large messages, and rate-based congestion control in packets per second. The library starts <strong>no threads</strong>. All protocol work happens inside a <code>Pump</code>, and only while you call it. Your application talks to the pump through bounded, lock-free single-producer/single-consumer rings. Every (peer, logical queue) pair gets its <strong>own isolated send lane</strong>, so a slow or blocked peer cannot hold up sends to others. A shared <strong>control</strong> ring carries commands in and a shared <strong>receive</strong> ring carries one ordered stream of events out. The pump admits from lanes in fair round-robin order and skips blocked lanes; this is fair admission, not a strict latency guarantee.</p>
   <div class="chips">
-    <span class="chip">no library threads</span><span class="chip">no locks on the ring path</span><span class="chip">no allocation in ring operations</span>
+    <span class="chip">no library threads</span><span class="chip">no locks on the ring path</span><span class="chip">per-(peer, queue) send isolation</span><span class="chip">bounded byte backpressure</span>
     <span class="chip">ownership transfer of <code>Vec&lt;u8&gt;</code></span><span class="chip">futex parking (Linux)</span>
   </div>
 </header>
@@ -165,7 +165,9 @@ footer { margin-top: 60px; padding-top: 18px; border-top: 1px solid var(--line);
 <div class="diagram" aria-label="Architecture diagram">
   <div class="box app"><div class="bt">Application</div><div class="bd"><code>LockfreeEndpoint</code><br>Send, not Sync<br>single owner</div></div>
   <div class="rings">
-    <div class="ring"><span class="lbl">SEND &middot; RingConfig.send</span><div class="lane"><span class="slot f"></span><span class="slot f"></span><span class="slot f"></span><span class="slot"></span><span class="slot"></span><span class="slot"></span></div><span class="arrow">&rarr;</span></div>
+    <div class="ring"><span class="lbl">SEND LANE &middot; peer A, queue 0</span><div class="lane"><span class="slot f"></span><span class="slot f"></span><span class="slot f"></span><span class="slot"></span><span class="slot"></span><span class="slot"></span></div><span class="arrow">&rarr;</span></div>
+    <div class="ring"><span class="lbl">SEND LANE &middot; peer B, queue 0</span><div class="lane"><span class="slot f"></span><span class="slot"></span><span class="slot"></span><span class="slot"></span><span class="slot"></span><span class="slot"></span></div><span class="arrow">&rarr;</span></div>
+    <div class="ring"><span class="lbl">SEND LANE &middot; peer B, queue 1</span><div class="lane"><span class="slot"></span><span class="slot"></span><span class="slot"></span><span class="slot"></span><span class="slot"></span><span class="slot"></span></div><span class="arrow">&rarr;</span></div>
     <div class="ring"><span class="lbl">CONTROL &middot; RingConfig.control</span><div class="lane"><span class="slot f"></span><span class="slot"></span><span class="slot"></span></div><span class="arrow">&rarr;</span></div>
     <div class="ring recv"><span class="arrow">&larr;</span><span class="lbl" style="left:30px">RECEIVE &middot; RingConfig.receive</span><div class="lane"><span class="slot f"></span><span class="slot f"></span><span class="slot"></span><span class="slot"></span><span class="slot"></span><span class="slot"></span></div></div>
   </div>
@@ -173,7 +175,7 @@ footer { margin-top: 60px; padding-top: 18px; border-top: 1px solid var(--line);
   <div class="wire"></div>
   <div class="box"><div class="bt">UDP socket</div><div class="bd">owned by the pump<br>closed on drop</div></div>
 </div>
-<p class="dcap">The application thread is the only producer of the send and control rings and the only consumer of the receive ring; the pump is the other end of each. Each ring operation is a constant-time ownership move with no retry loop, allocation or lock. The one exception is <code>try_send</code>&rsquo;s first send to a new (peer, queue) pair, which allocates that pair&rsquo;s <a href="#queued">queued-bytes</a> counter (amortized O(1)). Wakeups go through an eventfd (pump side) and a futex generation counter (application side).</p>
+<p class="dcap">The application thread is the only producer of every send lane and of the control ring, and the only consumer of the receive ring; the pump is the other end of each. A lane exists per (peer, logical queue) pair, so its fullness, its byte backlog and its protocol send credit never affect another lane. The pump admits from lanes in fair round-robin order and skips lanes that are blocked. Lanes are created lazily, per queue, on the connected association; the first <code>try_send</code> to a queue may allocate its lane, and an ordinary push onto an established lane moves the <code>Vec</code> without copying the payload. Lane slots, byte caps, a global byte cap, a global in-flight message cap and an active-lane cap all bound the backlog. Wakeups go through an eventfd (pump side) and a futex generation counter (application side).</p>
 
 <!-- ============================================================ -->
 <div class="callout warn"><div class="title">Update both peers together</div>
@@ -202,6 +204,7 @@ footer { margin-top: 60px; padding-top: 18px; border-top: 1px solid var(--line);
     <span class="n">2_000_000</span>,                                   <span class="c">// max_message_size (required, &lt;= 1 GiB)</span>
     <span class="t">NetworkThreadOptions</span> {
         rings: <span class="t">RingConfig</span> { send: <span class="n">128</span>, control: <span class="n">32</span>, receive: <span class="n">128</span> },
+        send_queue: <span class="t">SendQueueConfig</span> { per_queue_bytes: <span class="t">Some</span>(<span class="n">8</span> &lt;&lt; <span class="n">20</span>), max_active_queues: <span class="n">256</span>, ..<span class="t">Default</span>::<span class="f">default</span>() },
         ..<span class="t">Default</span>::<span class="f">default</span>()
     });
 
@@ -227,7 +230,7 @@ footer { margin-top: 60px; padding-top: 18px; border-top: 1px solid var(--line);
         <span class="k">match</span> event {
             <span class="t">Event</span>::Connected { peer: p, .. } <span class="k">if</span> p == peer =&gt; {
                 connected = <span class="k">true</span>;
-                outbox.<span class="f">push_back</span>(<span class="s">b"hello over three rings"</span>.<span class="f">to_vec</span>());
+                outbox.<span class="f">push_back</span>(<span class="s">b"hello over isolated lanes"</span>.<span class="f">to_vec</span>());
             }
             <span class="t">Event</span>::Message { peer, data } =&gt; <span class="m">println!</span>(<span class="s">"{peer:?}: {} bytes"</span>, data.<span class="f">len</span>()),
             <span class="t">Event</span>::ConnectFailed { address, reason } =&gt; <span class="m">eprintln!</span>(<span class="s">"connect {address:?}: {reason:?}"</span>),
@@ -282,7 +285,7 @@ worker.<span class="f">join</span>().<span class="f">unwrap</span>();</code></pr
     }
     std::thread::<span class="f">sleep</span>((frame + <span class="t">Duration</span>::<span class="f">from_millis</span>(<span class="n">16</span>)).<span class="f">saturating_duration_since</span>(<span class="t">Instant</span>::<span class="f">now</span>()));
 }</code></pre>
-<p>A game-loop pump only advances during its budget, so timers, ACKs and retransmissions run at frame granularity. Throughput is bounded by how much budget you give it. The measured numbers in <a href="#perf">Performance</a> are for a dedicated thread per pump.</p>
+<p>A game-loop pump only advances during its budget, so timers, ACKs and retransmissions run at frame granularity. Throughput is bounded by how much budget you give it. Measure on your own hardware with a dedicated thread per pump.</p>
 
 <h3>Deadlines and forward progress</h3>
 <div class="callout ok">
@@ -301,15 +304,15 @@ worker.<span class="f">join</span>().<span class="f">unwrap</span>();</code></pr
 </div>
 
 <!-- ============================================================ -->
-<h2 id="send"><span class="num">3</span>Send ring <span class="tag">app &rarr; pump</span></h2>
+<h2 id="send"><span class="num">3</span>Send lanes <span class="tag">app &rarr; pump</span></h2>
 <pre><code><span class="k">pub fn</span> <span class="f">try_send</span>(&amp;<span class="k">mut</span> <span class="k">self</span>, peer: <span class="t">ConnectionKey</span>, queue: <span class="t">usize</span>, class: <span class="t">Dscp</span>, payload: &amp;<span class="k">mut</span> <span class="t">Vec</span>&lt;<span class="t">u8</span>&gt;) -&gt; <span class="t">bool</span></code></pre>
 <table>
   <tr><th>Result</th><th>Meaning</th></tr>
-  <tr><td><code>true</code></td><td>Accepted. The allocation was moved into the ring with <code>std::mem::take</code>, so <code>payload</code> is now an empty <code>Vec</code>. You never hear about this message again: there is no admission or completion event.</td></tr>
-  <tr><td><code>false</code></td><td>The ring is full, <strong>or</strong> the endpoint is closed or finished. <code>payload</code> is untouched: same pointer, same bytes. Retry later, or park first.</td></tr>
+  <tr><td><code>true</code></td><td>Accepted. The allocation was moved with <code>std::mem::take</code>, so <code>payload</code> is now an empty <code>Vec</code>. You never hear about this message again: there is no admission or completion event. A valid send to a connected peer is pushed onto the lane for that (peer, queue); the first send to a queue may allocate its lane, and an ordinary push onto an established lane copies no payload. A send to an unknown or still-handshaking peer, an invalid queue or an oversized message is also accepted, but it is dropped and counted synchronously inside <code>try_send</code> (see below) and allocates no lane.</td></tr>
+  <tr><td><code>false</code></td><td>A valid send was refused: the lane is out of slots, the payload would exceed the queue&rsquo;s byte cap or the global byte cap, the global in-flight message cap or active-lane cap is reached, a cap is smaller than the message, <strong>or</strong> the endpoint is closed or finished. <code>payload</code> is untouched: same pointer, same bytes. Retry later, or park first. A full or capped lane does not make sends to other lanes fail, except through the shared global byte, message and active-lane caps.</td></tr>
 </table>
-<p>The pump takes messages from the head of the ring in FIFO order. It pops the head only when that peer&rsquo;s protocol send queue has room for it (byte credit for <code>queue</code>). Otherwise the head stays in the ring and <code>stats().send_head_blocked</code> is incremented. Nothing is lost inside the pump to backpressure.</p>
-<p>The head is popped and <strong>dropped and counted</strong> (no event) when:</p>
+<p>Each lane is FIFO, and the pump admits from lanes in fair round-robin order. A lane&rsquo;s head is popped only when that peer&rsquo;s protocol send queue has room for it (byte credit for <code>queue</code>); a lane whose head lacks credit is skipped, the head stays in place, and <code>stats().send_head_blocked</code> is incremented. Other lanes continue to be admitted. Fairness is between lanes at admission; it is not a strict latency or throughput guarantee. Nothing is lost inside the pump to backpressure.</p>
+<p>These sends return <code>true</code> but are <strong>dropped and counted</strong> synchronously (no event, no lane allocated, nothing queued):</p>
 <table>
   <tr><th>Condition</th><th>Counter</th></tr>
   <tr><td>Peer unknown, disconnected, or <em>still handshaking</em> (not yet <code>Connected</code>)</td><td><code>send_dropped_unknown</code></td></tr>
@@ -317,23 +320,24 @@ worker.<span class="f">join</span>().<span class="f">unwrap</span>();</code></pr
   <tr><td><code>queue &gt;= send_queue_count</code> for that connection</td><td><code>send_dropped_invalid_queue</code></td></tr>
   <tr><td>Admitted to the protocol send queue</td><td><code>sent</code></td></tr>
 </table>
-<p><code>queue</code> picks one of the connection&rsquo;s <code>send_queue_count</code> FIFO queues (default 1), which share bandwidth by equal-weight byte service. <code>class</code> is a <code>Dscp</code> traffic class (<code>BestEffort</code>, <code>Af11</code>, <code>Af21</code>, <code>Ef</code>). It never changes FIFO or round-robin scheduling, or congestion control.</p>
-<div class="callout warn"><div class="title">Wait for Connected</div><p>A send to a peer whose handshake has not completed is dropped as unknown. Start sending to a peer after you see its <code>Event::Connected</code>.</p></div>
+<p><code>queue</code> picks one of the connection&rsquo;s <code>send_queue_count</code> FIFO queues (default 1), which share bandwidth by equal-weight byte service. <code>class</code> is a <code>Dscp</code> traffic class (<code>BestEffort</code>, <code>Af11</code>, <code>Af21</code>, <code>Ef</code>). It never changes FIFO, lane or round-robin scheduling, or congestion control.</p>
+<div class="callout warn"><div class="title">Wait for Connected</div><p>A send to a peer whose handshake has not completed is accepted but dropped and counted as unknown. Start sending to a peer after you see its <code>Event::Connected</code>.</p></div>
 <h3 id="queued">Queued payload bytes</h3>
 <pre><code><span class="k">pub fn</span> <span class="f">queued_send_bytes</span>(&amp;<span class="k">self</span>, peer: <span class="t">ConnectionKey</span>, queue: <span class="t">usize</span>) -&gt; <span class="t">u64</span></code></pre>
-<p>Payload bytes you have handed to <code>try_send</code> for this peer and queue that are not yet transmitted. Use it to hold back your own sends before the shared send ring fills. It is one hash lookup and one atomic load, with no lock, no allocation and no pump round trip. Other peers and queues never affect it.</p>
+<p>Payload bytes accepted by <code>try_send</code> for this peer and queue, in the lane and in the protocol send queue, until its send work retires. This is the application backlog that the byte caps bound. Use it to hold back your own sends before a lane or cap rejects them. It is one hash lookup and one atomic load, with no lock and no pump round trip. Other peers and queues never affect it. It is not a delivery acknowledgement and not a measure of process memory: spare <code>Vec</code> capacity and FEC/parity buffers are excluded.</p>
 <table>
   <tr><th>Event</th><th>Effect on the count</th></tr>
   <tr><td><code>try_send</code> returns <code>true</code></td><td>Adds <code>payload.len()</code> immediately, before the pump can see the message. Empty payloads, payloads above <code>max_message_size</code> and <code>queue &gt;= send_queue_count</code> are never counted.</td></tr>
-  <tr><td><code>try_send</code> returns <code>false</code></td><td>No change.</td></tr>
+  <tr><td><code>try_send</code> returns <code>false</code></td><td>No change. This includes rejection by the lane slot limit, a byte cap, the global message or active-lane cap, or closure.</td></tr>
   <tr><td>Pump moves the message into the protocol send queue</td><td>No change. The bytes are neither dropped nor counted twice.</td></tr>
-  <tr><td>Pump drops it (unknown, disconnected or handshaking peer)</td><td>Subtracted.</td></tr>
-  <tr><td>The whole message has been framed and the UDP socket accepted the DATA datagram with its last bytes</td><td>Subtracted. A segmented message above the 2&nbsp;MiB codec unit leaves one coded extent at a time. Datagrams the socket refused stay counted until a retry is accepted.</td></tr>
-  <tr><td>Disconnect, liveness timeout or replacement of the connection</td><td>That connection&rsquo;s bytes are subtracted. Bytes still in the ring, or already queued on a new connection with the same <code>ConnectionKey</code>, stay counted.</td></tr>
+  <tr><td>Synchronous drop (unknown, handshaking, invalid queue, oversized)</td><td>Never counted.</td></tr>
+  <tr><td>Pump discards it (peer disconnected after acceptance)</td><td>Subtracted.</td></tr>
+  <tr><td>Send work retires: the last DATA attempt of the message has been made</td><td>Subtracted. A local UDP send error counts as an attempt and also retires the work. A segmented message above the 2&nbsp;MiB codec unit retires one coded extent at a time.</td></tr>
+  <tr><td>Disconnect, liveness timeout or replacement of the connection</td><td>That connection&rsquo;s admitted bytes are subtracted. Bytes still in the lane, or already queued on a new connection with the same <code>ConnectionKey</code>, stay counted.</td></tr>
   <tr><td><code>close()</code> requested, or the pump has exited</td><td>Returns 0: nothing more will be sent.</td></tr>
 </table>
-<p>It counts message bytes, not packet headers, FEC repair symbols or retransmissions, and a count of 0 does not mean the peer received anything. The core releases a finished message lazily, on that queue&rsquo;s next send pass, so the count can briefly stay above the true backlog. It never drops below it. A pair with nothing queued reads 0. Counters for idle pairs are pruned, so the table only holds pairs with traffic.</p>
-<p>No event or wakeup fires when the count falls. <code>park_until_ready</code> wakes for ring space after a failed <code>try_send</code>, not for a byte threshold. Check the count on your own tick and hold sends while it is above your limit:</p>
+<p>It counts accepted message bytes, not packet headers, FEC repair symbols or retransmissions, and a count of 0 does not mean the peer received anything. The core releases a finished message lazily, on that queue&rsquo;s next send pass, so the count can briefly stay above the true backlog. It never drops below it. A pair with nothing queued reads 0. Counters for idle pairs are pruned, so the table only holds pairs with traffic. The low-level <code>send_buffer_params</code> protocol credit remains a separate mechanism from these application backlog byte caps.</p>
+<p>No event or wakeup fires when the count falls. <code>park_until_ready</code> wakes when space appears after a failed <code>try_send</code>, whether the limit was lane slots or a byte cap. Check the count on your own tick and hold sends while it is above your limit (<code>try_send</code> also enforces the byte caps itself):</p>
 <pre><code><span class="k">if</span> ep.<span class="f">queued_send_bytes</span>(peer, <span class="n">0</span>) &lt; LIMIT { ep.<span class="f">try_send</span>(peer, <span class="n">0</span>, <span class="t">Dscp</span>::BestEffort, &amp;<span class="k">mut</span> msg); } <span class="c">// else: try again next tick</span></code></pre>
 
 <!-- ============================================================ -->
@@ -389,11 +393,11 @@ worker.<span class="f">join</span>().<span class="f">unwrap</span>();</code></pr
 <div class="callout warn"><div class="title">Not guaranteed after close</div><p><code>close()</code> or dropping either owner <em>cancels</em>. Queued work can be discarded. Queued connect requests and live associations are <strong>not</strong> promised a final <code>Connected</code>, <code>ConnectFailed</code> or <code>Disconnected</code>. Guarantees 2&ndash;4 apply only while the endpoint and the pump are both alive.</p></div>
 
 <!-- ============================================================ -->
-<h2 id="full"><span class="num">6</span>When a ring is full</h2>
-<p>The pump never waits for the application. The table shows what happens when each ring fills up.</p>
+<h2 id="full"><span class="num">6</span>When a lane or ring is full</h2>
+<p>The pump never waits for the application. The table shows what happens when each lane or ring fills up.</p>
 <table>
   <tr><th>Ring</th><th>Full means</th><th>Effect</th><th>Recovery</th></tr>
-  <tr><td><strong>Send</strong></td><td>App produced faster than the pump admits, or the FIFO head is blocked on protocol send credit</td><td><code>try_send</code> returns <code>false</code> and your <code>Vec</code> is untouched. Nothing is lost.</td><td>Retry. <code>park_until_ready</code> wakes when space appears after a failed attempt.</td></tr>
+  <tr><td><strong>Send lane</strong></td><td>That (peer, queue) lane is out of slots or at its byte cap, the global backlog byte cap is reached, or its head is blocked on protocol send credit</td><td><code>try_send</code> returns <code>false</code> and your <code>Vec</code> is untouched. Nothing is lost. Other lanes are unaffected, except through the global byte cap.</td><td>Retry. <code>park_until_ready</code> wakes when space appears after a failed attempt.</td></tr>
   <tr><td><strong>Control</strong></td><td>Pump has not admitted earlier commands yet (or is holding lifecycle events)</td><td><code>try_connect</code> / <code>try_disconnect</code> return <code>false</code></td><td>Retry. Parking wakes on control space.</td></tr>
   <tr><td><strong>Receive</strong>, data</td><td>App is not draining</td><td>Incoming <code>Message</code> is <strong>dropped</strong> and counted in <code>receive_dropped_full</code>. This keeps ACK and socket servicing going. While the shared ring is full, every ACK requests IP ECN CE (best effort) and fresh admitted data-class packets carry authenticated cumulative CE feedback, even before large messages complete. The existing sender congestion policy slows transmission; draining stops new overload marks.</td><td>Drain faster or size <code>receive</code> larger. Lost messages are not re-delivered.</td></tr>
   <tr><td><strong>Receive</strong>, inbound handshake</td><td>No slot for <code>Connected</code></td><td>The handshake is <strong>refused</strong>: neither new hello state nor completion is admitted. Counted in <code>inbound_refused_full</code>.</td><td>The remote peer&rsquo;s handshake retry succeeds once space returns (<code>inbound_handshake_waits_for_receive_space_then_retries</code>).</td></tr>
@@ -403,7 +407,7 @@ worker.<span class="f">join</span>().<span class="f">unwrap</span>();</code></pr
 <!-- ============================================================ -->
 <h2 id="parking"><span class="num">7</span>Parking &amp; readiness</h2>
 <pre><code><span class="k">pub fn</span> <span class="f">park_until_ready</span>(&amp;<span class="k">mut</span> <span class="k">self</span>) -&gt; <span class="t">bool</span></code></pre>
-<p>This blocks the application thread on a futex generation counter. It returns immediately if there is already a receive event, a finished telemetry snapshot, or space in a ring whose last <code>try_*</code> failed because it was full. Otherwise it sleeps until one of those happens or the endpoint closes. It returns <code>false</code> only when the endpoint is closed or finished <em>and</em> no events remain to drain. Spurious wakes are allowed, so always re-check with <code>try_*</code> after it returns.</p>
+<p>This blocks the application thread on a futex generation counter. It returns immediately if there is already a receive event, a finished telemetry snapshot, or room (ring slots or send byte capacity) where the last <code>try_*</code> failed because it was full. Otherwise it sleeps until one of those happens or the endpoint closes. It returns <code>false</code> only when the endpoint is closed or finished <em>and</em> no events remain to drain. Spurious wakes are allowed, so always re-check with <code>try_*</code> after it returns.</p>
 <pre><code><span class="c">// park_for_receive_and_close</span>
 <span class="k">loop</span> {
     <span class="k">if let</span> <span class="t">Some</span>(<span class="t">Event</span>::Message { data, .. }) = b.<span class="f">try_recv</span>() { <span class="m">assert_eq!</span>(data, <span class="s">b"park"</span>); <span class="k">break</span>; }
@@ -417,14 +421,14 @@ worker.<span class="f">join</span>().<span class="f">unwrap</span>();</code></pr
 <p>These are relaxed atomic loads of cumulative counters, with no lock and no allocation. Each counter is consistent on its own. The set is not an atomic snapshot taken together.</p>
 <table>
   <tr><th>Field</th><th>Counts</th></tr>
-  <tr><td><code>sent</code></td><td>Messages admitted from the send ring into a protocol send queue</td></tr>
+  <tr><td><code>sent</code></td><td>Messages admitted from send lanes into a protocol send queue</td></tr>
   <tr><td><code>received</code></td><td>Messages placed in the receive ring</td></tr>
-  <tr><td><code>send_dropped_unknown</code></td><td>Sends to an unknown, disconnected or still-handshaking peer</td></tr>
+  <tr><td><code>send_dropped_unknown</code></td><td>Accepted sends to an unknown, disconnected or still-handshaking peer</td></tr>
   <tr><td><code>send_dropped_oversized</code></td><td>Sends above the local configured maximum message size</td></tr>
   <tr><td><code>send_dropped_invalid_queue</code></td><td>Sends with <code>queue &gt;= send_queue_count</code></td></tr>
   <tr><td><code>receive_dropped_full</code></td><td>Incoming messages dropped because the receive ring was full</td></tr>
   <tr><td><code>inbound_refused_full</code></td><td>Handshake completions or hellos refused for lack of receive space</td></tr>
-  <tr><td><code>send_head_blocked</code></td><td>Admission attempts stopped by a FIFO head without send credit. This counts attempts, not distinct messages.</td></tr>
+  <tr><td><code>send_head_blocked</code></td><td>Lane-head admission attempts that found no send credit and were skipped. This counts attempts, not distinct messages.</td></tr>
 </table>
 <h3>Expensive: protocol telemetry</h3>
 <pre><code>ep.<span class="f">request_protocol_stats</span>();                 <span class="c">// coalesces; never blocks the app</span>
@@ -450,19 +454,24 @@ worker.<span class="f">join</span>().<span class="f">unwrap</span>();</code></pr
   <tr><td><code>keys</code> / <code>keypairs</code></td><td><code>Vec&lt;IdentityKeyPair&gt;</code></td><td>&mdash;</td><td>Local identities, one per <code>magic1</code> you accept or dial with</td></tr>
   <tr><td><code>port</code></td><td><code>u16</code></td><td>&mdash;</td><td>UDP port to bind (0 = ephemeral)</td></tr>
   <tr><td><code>max_pps</code></td><td><code>Option&lt;u64&gt;</code></td><td>&mdash;</td><td>Optional cap on the packet rate; <code>None</code> leaves congestion control alone</td></tr>
-  <tr><td><code>bounds</code> / <code>send_buffer_params</code></td><td><code>(u32, u32, u32)</code></td><td>&mdash;</td><td>Per-queue send buffer: (target queue time in &micro;s, min bytes, max bytes). This sets the protocol send credit that backpressures the send ring. Examples use <code>(1_000_000, 32 &lt;&lt; 20, 32 &lt;&lt; 20)</code>.</td></tr>
+  <tr><td><code>bounds</code> / <code>send_buffer_params</code></td><td><code>(u32, u32, u32)</code></td><td>&mdash;</td><td>Per-queue send buffer: (target queue time in &micro;s, min bytes, max bytes). This sets the low-level protocol send credit that gates lane admission; it is independent of the application backlog byte caps. Examples use <code>(1_000_000, 32 &lt;&lt; 20, 32 &lt;&lt; 20)</code>.</td></tr>
   <tr><td><code>maximum</code> / <code>max_message_size</code></td><td><code>usize</code></td><td>required</td><td>Largest message in either direction, clamped to 1&nbsp;GiB. There is no negotiation, so both sides should configure compatible limits.</td></tr>
-  <tr><td><code>options.rings.send</code></td><td><code>usize</code></td><td><code>128</code></td><td>Send ring capacity: power of two, 1..=65,536</td></tr>
+  <tr><td><code>options.rings.send</code></td><td><code>usize</code></td><td><code>128</code></td><td>Slot capacity of each send lane: power of two, 1..=65,536</td></tr>
   <tr><td><code>options.rings.control</code></td><td><code>usize</code></td><td><code>32</code></td><td>Control ring capacity: power of two, 1..=65,536</td></tr>
   <tr><td><code>options.rings.receive</code></td><td><code>usize</code></td><td><code>128</code></td><td>Receive ring capacity: power of two, 1..=65,536</td></tr>
-  <tr><td><code>options.send_queue_count</code></td><td><code>usize</code></td><td><code>1</code></td><td>FIFO queues per connection (1..=64), also sizing the peer receive cap</td></tr>
+  <tr><td><code>options.send_queue.per_queue_bytes</code></td><td><code>Option&lt;u64&gt;</code></td><td><code>None</code></td><td>Backlog byte cap per (peer, queue). <code>None</code> = max(4&nbsp;MiB, <code>max_message_size</code>)</td></tr>
+  <tr><td><code>options.send_queue.queue_bytes</code></td><td><code>Vec&lt;Option&lt;u64&gt;&gt;</code></td><td>empty</td><td>Per-logical-queue overrides of <code>per_queue_bytes</code>, indexed by queue; <code>None</code> keeps the default</td></tr>
+  <tr><td><code>options.send_queue.global_bytes</code></td><td><code>Option&lt;u64&gt;</code></td><td><code>None</code></td><td>Backlog byte cap across all peers and queues. <code>None</code> = max(64&nbsp;MiB, 4 &times; the default per-queue cap)</td></tr>
+  <tr><td><code>options.send_queue.max_active_queues</code></td><td><code>usize</code></td><td><code>1024</code></td><td>Maximum live lanes, 1..=65,536. A lane&rsquo;s permit is held until its connection is disconnected or replaced; idle lanes are not reclaimed</td></tr>
+  <tr><td><code>options.send_queue.max_queued_messages</code></td><td><code>usize</code></td><td><code>65536</code></td><td>Global cap on accepted messages in flight, including those already in the core</td></tr>
+  <tr><td><code>options.send_queue_count</code></td><td><code>usize</code></td><td><code>1</code></td><td>Logical queues per connection (1..=64), each with its own send lane per peer; also sizes the peer receive cap</td></tr>
   <tr><td><code>options.receive_memory</code></td><td><code>Option&lt;Arc&lt;ReceiveMemoryBudget&gt;&gt;</code></td><td><code>None</code></td><td>Receive allocation budget. Share one <code>Arc</code> across pumps for a global limit. <code>None</code> uses one process-wide 4&nbsp;GiB budget. Messages already handed to the app are not counted.</td></tr>
   <tr><td><code>options.bind_ip</code></td><td><code>Option&lt;IpAddr&gt;</code></td><td><code>None</code></td><td>Local IP to bind</td></tr>
   <tr><td><code>options.record_fec_messages</code></td><td><code>bool</code></td><td><code>false</code></td><td>Include per-message FEC progress in protocol telemetry</td></tr>
   <tr><td><code>options.record_loss_episodes</code></td><td><code>bool</code></td><td><code>false</code></td><td>Record loss-episode statistics (never changes CC)</td></tr>
   <tr><td><code>options.loss_trace</code></td><td><code>Option&lt;PathBuf&gt;</code></td><td><code>None</code></td><td>Write a sender packet/fragment/outcome CSV trace</td></tr>
 </table>
-<p>The three capacities are independent. They count <em>slots</em>, not bytes: a send or message slot holds a moved <code>Vec&lt;u8&gt;</code> of any size up to the maximum message, so there are no fixed byte slabs and no copies. Choosing ring sizes: <code>send</code> sets how many messages you can have in flight before <code>try_send</code> pushes back. The pipelined benchmarks used 8192 to keep a deep pipeline. <code>receive</code> should hold a burst of what you expect between two drains, because overflowing <em>data</em> is dropped. <code>control</code> rarely needs to be large.</p>
+<p>The capacities are independent. They count <em>slots</em>, not bytes: a lane slot holds a moved <code>Vec&lt;u8&gt;</code> of any size up to the maximum message, so there are no fixed byte slabs. Slots do not bound whole in-flight core messages. Backlog is bounded by the <code>send_queue</code> byte caps, message cap and active-lane cap that <code>try_send</code> enforces (see <a href="#queued">queued payload bytes</a>). A cap smaller than <code>max_message_size</code> means larger messages are always refused with <code>false</code>, leaving the <code>Vec</code> unchanged. <code>send</code> sets how many messages each lane can hold before <code>try_send</code> pushes back. <code>receive</code> should hold a burst of what you expect between two drains, because overflowing <em>data</em> is dropped. <code>control</code> rarely needs to be large.</p>
 
 <!-- ============================================================ -->
 <h2 id="threading"><span class="num">10</span>Threading &amp; ownership</h2>
@@ -471,7 +480,7 @@ worker.<span class="f">join</span>().<span class="f">unwrap</span>();</code></pr
   <div class="kpi"><div class="v">1 + 1</div><div class="l">owners: one <code>Pump</code> (any thread, one at a time) and one <code>LockfreeEndpoint</code> (any thread, one at a time).</div></div>
 </div>
 <ul>
-  <li><code>Pump</code> is <code>Send</code>. Move it to a worker thread, or keep it on the game thread. It is the only consumer of the send and control rings and the only producer of the receive ring.</li>
+  <li><code>Pump</code> is <code>Send</code>. Move it to a worker thread, or keep it on the game thread. It is the only consumer of the send lanes and the control ring and the only producer of the receive ring.</li>
   <li><code>LockfreeEndpoint</code> is <code>Send</code> but deliberately <strong>not <code>Sync</code></strong> (a <code>PhantomData&lt;Cell&lt;()&gt;&gt;</code> marker), and its mutating methods take <code>&amp;mut self</code>. That is what makes the SPSC contract sound. You can hand it to another thread (tests move it into a parker thread and back), but you cannot share it. If several threads need to send, put your own queue or <code>Mutex</code> in front of it. Checked by <code>handle_is_send_but_not_sync</code>.</li>
   <li>Each ring cursor has exactly one writer. Producers publish with Release, consumers observe with Acquire, and cursors are padded to their own 64-byte cache lines.</li>
 </ul>
@@ -488,16 +497,17 @@ worker.<span class="f">join</span>().<span class="f">unwrap</span>();</code></pr
 
 <!-- ============================================================ -->
 <h2 id="tradeoffs"><span class="num">12</span>Trade-offs &amp; limits</h2>
-<div class="callout warn">
-  <div class="title">Head-of-line blocking across peers</div>
-  <p>There is a single FIFO send ring. When the head message&rsquo;s peer has no protocol send credit, it stays at the head, and messages queued behind it for <em>other</em> peers wait until that peer drains or is disconnected. <code>stats().send_head_blocked</code> shows it happening. The test <code>fifo_credit_blocks_other_peer_until_head_disconnects</code> demonstrates it: peer B is rate-limited to 1&nbsp;pps with a 1-byte send buffer, a 1&nbsp;MB message to B blocks a message to C, and disconnecting B releases it. If you mix a slow bulk peer with latency-sensitive ones, gate sends to the slow peer in your app (for example, keep your own per-peer outbox and hold it while <a href="#queued"><code>queued_send_bytes</code></a> is above a limit), or run separate pumps.</p>
+<div class="callout ok">
+  <div class="title">Per-peer, per-queue isolation</div>
+  <p>Each (peer, logical queue) pair has its own send lane. A peer with no protocol send credit blocks only its own lanes; the pump skips them and keeps admitting from other lanes in fair round-robin order. <code>stats().send_head_blocked</code> counts the skipped attempts. This is fair admission, not a strict latency guarantee: delay for a ready lane still depends on scheduling, congestion control and the work already in flight. The default regression example <code>examples/peer_isolation.rs</code> shows a marker message reaching a fast peer while another peer is slow.</p>
 </div>
 <ul>
   <li><strong>No hard real-time bound.</strong> Overshoot is one admission plus one indivisible unit, and a native FEC unit (up to 2&nbsp;MiB) can take a few ms. OS scheduling and allocation are outside the bound.</li>
   <li><strong>Data can be dropped on receive</strong> if the app does not drain. That is intentional, so the transport keeps ACKing. Size <code>receive</code> to fit.</li>
+  <li><strong>Bounded backlog.</strong> <code>try_send</code> returns <code>false</code> rather than growing the backlog beyond the configured byte, message or active-lane caps; hold the message and retry. Lane permits are held until disconnect or replacement.</li>
   <li><strong>No per-message send feedback.</strong> An accepted message has no delivery or failure event. Drops are visible only as counters.</li>
   <li><strong>Disconnect is local</strong>, with no wire close. The remote side times out after 120&nbsp;s of no liveness.</li>
-  <li><strong>Linux-specific pieces:</strong> futex parking and eventfd pump wakeups. Other targets fall back to 1&nbsp;ms sleep polling in <code>Ready::wait</code>. The clock is <code>CLOCK_MONOTONIC_RAW</code>. All measurements here are Linux.</li>
+  <li><strong>Linux-specific pieces:</strong> futex parking and eventfd pump wakeups. Other targets fall back to 1&nbsp;ms sleep polling in <code>Ready::wait</code>. The clock is <code>CLOCK_MONOTONIC_RAW</code>.</li>
   <li><strong>Congestion policy and handshake timer are fixed internally</strong>: not configurable through this API.</li>
   <li><strong>Handshakes:</strong> Noise IK (X25519, ChaChaPoly, BLAKE2b) selected by <code>magic1</code>. Plaintext is for tests only.</li>
 </ul>
@@ -509,11 +519,12 @@ worker.<span class="f">join</span>().<span class="f">unwrap</span>();</code></pr
   <tr><th>Item</th><th>Signature</th><th>Notes</th></tr>
   <tr><td colspan="3"><strong>Construction</strong> (<code>stp</code>)</td></tr>
   <tr><td><code>new_pump</code></td><td class="sig"><code>fn(Vec&lt;IdentityKeyPair&gt;, u16, Option&lt;u64&gt;, (u32,u32,u32), usize) -&gt; (Pump, LockfreeEndpoint)</code></td><td>Default options</td></tr>
-  <tr><td><code>new_pump_with_options</code></td><td class="sig"><code>fn(..., NetworkThreadOptions) -&gt; (Pump, LockfreeEndpoint)</code></td><td>Ring sizes in <code>options.rings</code></td></tr>
+  <tr><td><code>new_pump_with_options</code></td><td class="sig"><code>fn(..., NetworkThreadOptions) -&gt; (Pump, LockfreeEndpoint)</code></td><td>Capacities in <code>options.rings</code></td></tr>
   <tr><td><code>new</code></td><td class="sig"><code>fn(PumpConfig) -&gt; (Pump, LockfreeEndpoint)</code></td><td>Named-field form</td></tr>
   <tr><td><code>PumpConfig</code></td><td class="sig"><code>struct { keypairs, port, max_pps, send_buffer_params, max_message_size, options }</code></td><td></td></tr>
-  <tr><td><code>NetworkThreadOptions</code></td><td class="sig"><code>struct { rings, send_queue_count, receive_memory, bind_ip, record_fec_messages, record_loss_episodes, loss_trace }</code></td><td><code>Default</code></td></tr>
-  <tr><td><code>RingConfig</code></td><td class="sig"><code>struct { send: usize, control: usize, receive: usize }</code></td><td>Default 128 / 32 / 128</td></tr>
+  <tr><td><code>NetworkThreadOptions</code></td><td class="sig"><code>struct { rings, send_queue_count, send_queue, receive_memory, bind_ip, record_fec_messages, record_loss_episodes, loss_trace }</code></td><td><code>Default</code></td></tr>
+  <tr><td><code>SendQueueConfig</code></td><td class="sig"><code>struct { per_queue_bytes: Option&lt;u64&gt;, queue_bytes: Vec&lt;Option&lt;u64&gt;&gt;, global_bytes: Option&lt;u64&gt;, max_active_queues: usize, max_queued_messages: usize }</code></td><td>Backlog caps; <code>Default</code></td></tr>
+  <tr><td><code>RingConfig</code></td><td class="sig"><code>struct { send: usize, control: usize, receive: usize }</code></td><td>Default 128 / 32 / 128 (send = per lane)</td></tr>
   <tr><td><code>new_keypair_from_connect_magic1</code></td><td class="sig"><code>fn(u64) -&gt; Option&lt;IdentityKeyPair&gt;</code></td><td>Also <code>_with_seed(u64, [u8; 32])</code></td></tr>
   <tr><td><code>CONNECT_MAGIC1_*</code></td><td class="sig"><code>Noise_IK_25519_ChaChaPoly_BLAKE2b</code>, <code>PLAIN_TEXT</code></td><td><code>u64</code> constants</td></tr>
   <tr><td><code>IdentityKeyPair</code></td><td class="sig"><code>struct { magic1: u64, private: Vec&lt;u8&gt;, public: Vec&lt;u8&gt; }</code></td><td></td></tr>
@@ -525,8 +536,8 @@ worker.<span class="f">join</span>().<span class="f">unwrap</span>();</code></pr
   <tr><td><code>run_for</code></td><td class="sig"><code>fn(&amp;mut self, duration: Duration)</code></td><td></td></tr>
   <tr><td><code>next_wakeup</code></td><td class="sig"><code>fn(&amp;self) -&gt; Option&lt;Instant&gt;</code></td><td><code>None</code> = stopped</td></tr>
   <tr><td colspan="3"><strong><code>LockfreeEndpoint</code></strong> (Send, !Sync)</td></tr>
-  <tr><td><code>try_send</code></td><td class="sig"><code>fn(&amp;mut self, ConnectionKey, usize, Dscp, &amp;mut Vec&lt;u8&gt;) -&gt; bool</code></td><td>Moves the Vec only on <code>true</code></td></tr>
-  <tr><td><code>queued_send_bytes</code></td><td class="sig"><code>fn(&amp;self, ConnectionKey, usize) -&gt; u64</code></td><td>Untransmitted payload bytes for that peer and queue; <a href="#queued">details</a></td></tr>
+  <tr><td><code>try_send</code></td><td class="sig"><code>fn(&amp;mut self, ConnectionKey, usize, Dscp, &amp;mut Vec&lt;u8&gt;) -&gt; bool</code></td><td>Moves the Vec only on <code>true</code>; <code>false</code> for lane slot/byte/message/active-lane cap or closure</td></tr>
+  <tr><td><code>queued_send_bytes</code></td><td class="sig"><code>fn(&amp;self, ConnectionKey, usize) -&gt; u64</code></td><td>Accepted backlog bytes for that peer and queue until send work retires; <a href="#queued">details</a></td></tr>
   <tr><td><code>try_control</code></td><td class="sig"><code>fn(&amp;mut self, Control) -&gt; bool</code></td><td></td></tr>
   <tr><td><code>try_connect</code></td><td class="sig"><code>fn(&amp;mut self, STPAddress) -&gt; bool</code></td><td></td></tr>
   <tr><td><code>try_disconnect</code></td><td class="sig"><code>fn(&amp;mut self, ConnectionKey) -&gt; bool</code></td><td></td></tr>
