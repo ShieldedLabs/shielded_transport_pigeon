@@ -1,26 +1,25 @@
-# STP wire protocol, version 6
+# STP wire protocol
 
-This document specifies the incompatible version-6 transport (compact connected
-counters and key phase) shipped in `shielded_transport_pigeon` 1.0.0. Wire-profile
-and crate-package versions are independent. Validation is implementation
-evidence, not an independent interoperability or security audit.
+This document specifies STP, the UDP transport implemented by
+`shielded_transport_pigeon`, including compact connected counters and key phase.
+Validation is implementation evidence, not an independent interoperability or
+security audit.
 All STP framing integers are unsigned little-endian; offsets below are byte
 offsets. Public keys and Noise messages are byte strings with the encodings
 specified by Noise, not little-endian STP integers. One UDP payload is one STP
-packet. There is no compatibility with versions 1 through 5.
+packet.
 
 The words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** specify
-requirements for this interoperable wire profile. Statements explicitly labelled
+requirements for this protocol. Statements explicitly labelled
 "this implementation", "local", or "sender policy" describe the shipped Rust
-implementation, not additional peer-negotiated requirements. Wire version 6 is
-independent of the crate version and application API. It retains the 445-byte
-minimum FEC symbol, bitmap ACK with sampled UDP size, whole-duplication framing,
-and version 5's immutable adaptive coded-unit extents. Version 6 replaces the
-full nonce and epoch on wire with 31 low counter bits and one epoch-parity bit,
-makes 600-second age the sole automatic rotation trigger, keeps only the
-BLAKE2b Noise suite, and removes the transport declaration. Its new selectors
-implicitly fix the complete wire profile and reject old peers before connected
-traffic; endpoints MUST NOT silently reinterpret an older profile.
+implementation, not additional peer-negotiated requirements. The protocol uses a
+445-byte minimum FEC symbol, bitmap ACK with sampled UDP size, whole-duplication
+framing, and immutable adaptive coded-unit extents. Connected headers carry
+31 low counter bits and one epoch-parity bit; 600-second age is the sole automatic
+key-rotation trigger. Only `Noise_IK_25519_ChaChaPoly_BLAKE2b` is supported for
+encrypted STP, and the handshake has no transport declaration. The selectors
+implicitly fix the complete wire interpretation; endpoints MUST NOT reinterpret
+an unknown selector as a supported selector.
 
 An independent implementation needs this document, the Noise specification for
 the selected suite, and the exact vendored Wirehair codec pinned below. No Rust
@@ -40,7 +39,7 @@ reassembly, decoder work, and very old packets may be erased when the fixed
 receive support or local resource budget is exceeded. Such erasure must never
 join different identities. Missing ACK bits are not declarations of loss.
 
-The ordinary-UDP/Noise record profile is specified here, not IPv6 jumbograms or
+The ordinary-UDP/Noise record format is specified here, not IPv6 jumbograms or
 GSO super-buffers. Each GSO segment would need its own complete packet, nonce,
 header, and authentication tag. Native implementation UDP payloads are capped
 at 9216 bytes. Noise ciphertext records are capped at 65535 bytes (plaintext
@@ -55,11 +54,7 @@ The crypto selector is a six-byte little-endian `magic1` with bit zero set:
 | Noise IK, BLAKE2b | `0xa91aaca6f0f9` | `Noise_IK_25519_ChaChaPoly_BLAKE2b` |
 | Developer plaintext | `0x1f34a6ae39ab` | test-only, no authentication |
 
-These are freshly randomized selectors for package 2.0.0, retaining the version-6
-packet layout. Package 1.0.0 selectors, all earlier BLAKE2b/plaintext selectors,
-BLAKE2s selectors, and the provisional compact-only selectors are unknown and
-MUST be rejected. The cryptographic
-crates may still contain BLAKE2s internally; it is not a transport profile.
+Unknown selectors MUST be rejected.
 
 The Noise prologue is the exact six-byte selector. The initiator knows the
 responder's static key; both use 32-byte X25519 static public keys. Noise IK's
@@ -67,7 +62,7 @@ first encrypted handshake payload is exactly the client application offer, and
 the second is exactly the server application choice. The selector, offered IDs
 and choice are thus bound to the authenticated handshake transcript. There is
 **no version field or transport-parameter declaration in either payload**:
-magic1 fixes the complete profile, not a negotiable set of local limits. The
+magic1 fixes the complete wire interpretation, not a negotiable set of local limits. The
 plaintext developer variant validates application IDs but offers no security.
 
 Client application offer: one-byte count (1..32), then 32 u64 application IDs;
@@ -94,7 +89,7 @@ classification. Retransmissions reuse original handshake bytes, not a new Noise
 transcript. Unknown selectors/associations, failed authentication, invalid
 application IDs or wrong payload lengths produce no wire error response.
 
-Complete encrypted-profile handshake layouts (ranges are half-open):
+Complete encrypted STP handshake layouts (ranges are half-open):
 
 | Datagram | Range | Contents |
 |---|---|---|
@@ -118,9 +113,9 @@ static key 6..38, then offer 38..295 or choice 38..46.
 ### magic1 dispatch boundary (future-design contract, not an implementation)
 
 magic1 selects the **whole handshake and address-material interpretation**, not
-just the hash in a fixed Noise template. Current code remains hardcoded to the
-two-flight Noise IK above (plus developer plaintext); it introduces no generic
-handshake trait/framework. In this profile the address material is a raw
+just the hash in a fixed Noise template. This implementation supports only the
+two-flight Noise IK above (plus developer plaintext); it has no generic
+handshake trait/framework. In STP the address material is a raw
 32-byte X25519 public key, not a hash. No PQ scheme, hash-based key discovery,
 Merkle key system, additional flight or handshake chunking is implemented.
 
@@ -141,7 +136,8 @@ profile. These requirements define a future boundary, not working support.
 
 The states in each endpoint are ClientHello-sending, ServerHello-sending
 (awaiting confirmation), Connected, and Closed. A valid ClientHello selects
-an application under the selected profile and creates the responder's ServerHello-sending state.
+an application under the selected handshake scheme and creates the responder's
+ServerHello-sending state.
 A valid ServerHello finishes the initiator's Noise IK exchange and enters
 Connected. Noise completion alone does **not** tell the responder that its
 reply arrived: the initiator MUST send an ordinary, authenticated data-class
@@ -179,19 +175,19 @@ transport state. Endpoint lookup is by source address/port plus the 15-bit
 prefix, not a cryptographic connection ID; this implementation does not support
 address migration or concurrent identities that collide in that lookup key.
 Admission may also refuse a handshake when lifecycle-event or memory capacity
-is unavailable; that refusal does not negotiate a different wire profile.
+is unavailable; that refusal does not negotiate a different wire interpretation.
 
 If both peers initiate concurrently with the same identities and selector,
 compare the complete 32-byte static public keys lexicographically as byte
 strings: the smaller remains initiator; the larger abandons its pending client
 flight and answers as responder. Self-connections are not initiated.
 
-### Confirmed parallel replacement (local policy, unchanged wire)
+### Confirmed parallel replacement (local policy)
 
 An encrypted peer that restarts with the same static key and source IP/port
 can perform a fresh Noise handshake while the old Connected association stays
 fully live. The responder authenticates the full 32-byte remote static key,
-exact local keypair/profile and selected application ID; a 15-bit prefix match
+exact local keypair/selector and selected application ID; a 15-bit prefix match
 alone never authorizes replacement. Plaintext does not support replacement.
 There is no cross-address eviction or address migration. The association retains
 a 32-byte BLAKE3 digest of its peer's establishing ClientHello (including an
@@ -310,7 +306,8 @@ other platforms continue to reject explicit binding. These observations do not
 detect NAT/external mapping changes or migrate a peer's remote address. The
 same-tuple encrypted reconnect uses confirmed replacement above; a genuinely
 changed source tuple is a different remote association, and plaintext has no
-confirmed same-tuple replacement. Wire format and outage/expiry policy are unchanged.
+confirmed same-tuple replacement. Source-address handling does not alter the
+wire format or outage/expiry policy.
 
 ### Connected liveness and outage
 
@@ -337,7 +334,7 @@ The sender retains 32 attempted outage/generic probe tuples in chronological
 order, not nonce-modulo slots; generic traffic cannot overwrite a 2.5-second
 proof after only eight sends. Each new outage clears this ledger. A candidate
 must have been sent during the current outage, still be pending and at/after
-the pending tail, and satisfy the unchanged age bound above. The lookup scans
+the pending tail, and satisfy the age bound above. The lookup scans
 at most 32 tuples and checks bitmap/sample membership, not every ACK bit per
 tuple. Retired, consumed, pre-outage or replayed proof cannot resume sending.
 Old withheld/replayed feedback cannot prove recovery. Outage resumption retains the
@@ -348,34 +345,34 @@ Local bounded FEC retention may pause over a real outage; it cannot resurrect
 already-expired sources or change identities. This is a recovery policy, not
 a reliability promise.
 
-Peer expiry (release candidate): the association closes when 120 seconds
+Peer expiry: the association closes when 120 seconds
 have elapsed since the later of (a) the last new positive ACK progress and
 (b) the last *fresh authenticated peer packet*, even if local sends have all
 been refused. (b) is refreshed by any inbound packet that has passed AEAD,
 nonce-space/type, replay and minimum-size admission: a well-formed fresh
 ACK (even one that receipts nothing new and cannot end an outage) or any
-data-class packet. Local sends never refresh it. This changes only
+data-class packet. Local sends never refresh it. This activity rule governs only
 connection expiry: congestion control, outage resumption and RTT sampling
-still require positive ACK progress as described above. The initial deadline
+require positive ACK progress as described above. The initial deadline
 is 120 s after the connection's start timestamp. A new association uses a
 fresh handshake, never reset transport keys/counters.
 Other implementations may choose different local outage pacing/timeouts;
 they MUST maintain periodic ACK-eliciting traffic and MUST NOT treat mere
 inbound traffic or ACK-of-ACK as round-trip confirmation.
 
-### Implicit profile bounds and local message limits
+### Implicit protocol bounds and local message limits
 
 There is no transport declaration. The selected magic1 fixes these interoperable
 bounds: maximum coded-unit size 2097152 bytes, grouped-codec maximum 32000 source
 blocks per group, minimum full repair symbol 445 bytes, maximum Noise ciphertext
 record 65535 bytes, scheduled ACK delay cap 10000 microseconds, previous-key
 retention ten seconds, and per-space replay/receipt support 262144 packets in
-this implementation. Version 6 is a documentation/API label, not a serialized
-u16. Changing incompatible wire interpretations requires a new selector.
+this implementation. No version field is serialized. Incompatible wire
+interpretations require distinct selectors.
 
-The format's application-message ceiling is 1 GiB. Each constructor still takes
+The format's application-message ceiling is 1 GiB. Each constructor takes
 a local maximum (1..1 GiB) and derives receive/decoder quotas from it; it also
-applies the existing local send-admission policy. **This value is not sent,
+applies the local send-admission policy. **This value is not sent,
 negotiated, or substituted as the peer's limit.** The sender does not know the
 peer's configured maximum and may send a locally admitted message that the peer
 cannot admit. Applications needing compatible message limits must coordinate
@@ -437,7 +434,7 @@ and values above the last legal counter are never wrapped or saturated into
 another nonce. Restore bit 63 only for ACKs. Initial and end-of-space cases use
 the same finite rule: an initial low value at/above `2^30` can still be chosen
 because there is no negative representative. Near exhaustion, the illegal next
-cycle is absent. No distance filter is added to this nearest-legal rule.
+cycle is absent. No distance filter applies to this nearest-legal rule.
 
 After authentication, epoch ordering and class validation, update H by max,
 **even if replay, ACK semantics, minimum-size, frames or resources later reject
@@ -466,8 +463,8 @@ ACK plaintext is recognized **only by its exact size, 152 bytes**. This
 classification must agree with the inferred nonce space; otherwise the packet is
 rejected. This implementation also rejects non-ACK plaintext shorter than
 490 bytes (= 512 minus the maximum 22-byte transport/AEAD overhead). Data/probe/keepalive
-plaintext must never be 152 bytes. No packet-type
-byte replaces the size test. Ordinary sender data packets and idle/outage
+plaintext must never be 152 bytes. There is no packet-type byte;
+size determines the packet class. Ordinary sender data packets and idle/outage
 keepalives fill exactly the current transmission unit (TU); upward MTU probes fill
 exactly their probed TU. Periodic reachability probes alternate 512 UDP bytes
 and the current TU.
@@ -524,7 +521,7 @@ reassembly admission and withholds the ACK. A kind 6 unit that violates the
 extent rules, or overlaps a different already-admitted extent of its root, is
 likewise refused before receipt and withholds the ACK. These choices are implementation
 error policy, not messages a peer must send. Compliant senders MUST respect
-all profile bounds and the consistency rules below.
+all protocol bounds and the consistency rules below.
 
 A positive STP ACK is therefore packet feedback, **not** a reliable application
 receipt. In particular the public receive ring may drop a completed message
@@ -533,8 +530,8 @@ whole-duplication suppression is rolled back on such an application-side drop.
 Application receive-ring fullness is also congestion evidence: this implementation
 samples the shared ring after processing each admitted data-class packet and
 counts it as CE while full, whether or not any message completed. Kernel CE and
-local overload contribute at most once per unique packet. Existing independent
-receive-memory/table/decoder admission refusals still withhold that packet's
+local overload contribute at most once per unique packet. Independent
+receive-memory/table/decoder admission refusals withhold that packet's
 receipt and cumulative CE contribution; application-ring drops do not.
 
 At every actual ACK send attempt it also samples current receive-ring fullness
@@ -545,9 +542,10 @@ path bleaching can remove it); the authenticated cumulative count supplies
 feedback independently on fresh admitted packets. Async FEC completion or a
 lifecycle event can fill the ring between receipt and ACK generation: the IP CE
 request reflects that current state without inventing or altering packet receipts.
-Draining stops new local marks, but cannot erase historical cumulative CE. No
-ACK-of-ACK or new timer is introduced, and the existing sender ECN cut and event
-guard remain unchanged; old feedback need not cause a fresh cut.
+Draining stops new local marks, but cannot erase historical cumulative CE.
+Receive-ring congestion feedback uses no ACK-of-ACK or additional timer; the
+sender applies the ECN cut and event guard described below, so old feedback
+need not cause a fresh cut.
 
 ## Frame stream
 
@@ -601,10 +599,9 @@ All remaining body bytes are data. A whole frame, even a zero-byte message, is
 one complete application message; its identity is its containing packet nonce
 and frame position. Packet replay admission suffices for its duplicate
 suppression, so whole messages carry **zero identity bytes**. In particular a
-16383-byte whole message is valid framing; the old `length=16383,id=65535`
-all-ones collision does not exist.
+16383-byte whole message is valid framing.
 
-#### Whole-message duplication flags (release candidate)
+#### Whole-message duplication flags
 
 The **first** frame-kind byte of a data-class plaintext MAY carry one
 duplication flag in its high nibble: `0x10` marks an *original* datagram,
@@ -619,9 +616,8 @@ Local duplication-selection policy (not required to match the peer): a sender
 may send no flagged pairs at all. The frozen sender does the following.
 
 - A datagram that carries at least one whole frame and is assembled while
-  the sender's duplication decision is high (see "Release candidate sender
-  policy") is sent twice. Every whole frame in it is protected; this is not
-  a random fraction. Packed wholes share one duplicated datagram, and a
+  the sender's duplication decision is high (see "Sender policy") is sent twice.
+  Every whole frame in it is protected; this is not a random fraction. Packed wholes share one duplicated datagram, and a
   high-risk small message is not split to fill the tail of a datagram.
 - A flagged copy MUST carry the same frames and application bytes as its
   original, apart from the first-kind flag nibble. If the sender's TU grows
@@ -660,9 +656,8 @@ Receiver rules:
   lost FEC symbol only when both copies are lost. Congestion control still
   sees every physical loss.
 
-Both peers must implement these flags. This is an incompatible framing
-extension introduced within version 2's frame-kind byte and retained in versions 4 through 6;
-it adds no header bytes.
+Both peers must implement these flags. The flags use the frame-kind byte and
+add no header bytes.
 
 Plain fragmented messages and coded units have connection-direction-scoped
 u64 identities, allocated from one nonwrapping namespace across all sender
@@ -698,7 +693,7 @@ small plain message is retransmitted/FEC-rescued by this rule. These sender
 choices do not limit a receiver to two fragments per message.
 
 For plain fragments, `offset + data_len` MUST fit u32, the receiver's local
-application maximum, and this profile's 2 MiB plain-reassembly bound. The final
+application maximum, and STP's 2 MiB plain-reassembly bound. The final
 fragment declares that sum as the total extent. A compliant sender MUST keep
 that total fixed and MUST send identical bytes in any overlapping ranges for
 the same ID. Completion requires coverage of `[0,total)` and a final fragment;
@@ -719,11 +714,11 @@ instead discard conflicting fragments or permanently erase that incomplete ID.
 
 ### Wirehair symbol and segmentation validation
 
-The normative codec/reference remains the historical `third_party/wirehair`
-source tree at STP commit `4bdea0bde6a8794ee0f7606bdb62f657bc2a36a9`, Git tree
-object `3d8e99a30a94ac1d0fd66762baef5eeb3d791a45`, available in Git history.
-The current implementation is the in-crate Rust module `src/wirehair/`, not a
-C++ build dependency; this language port does not select a new wire profile.
+The normative codec/reference is the `third_party/wirehair` source tree at STP
+commit `4bdea0bde6a8794ee0f7606bdb62f657bc2a36a9`, Git tree object
+`3d8e99a30a94ac1d0fd66762baef5eeb3d791a45`.
+This implementation uses the in-crate Rust module `src/wirehair/`, not a
+C++ build dependency.
 The reference's coefficient/seed generation,
 GF(256) arithmetic, peel/dense/heavy construction and repair-ID interpretation
 are part of the codec, not implementation-selected random choices. This pins
@@ -747,13 +742,13 @@ wrap to represent a different equation in the same unit. Repairs are full
 remaining source bytes. Invalid symbol lengths/IDs are discarded before
 creating any decoder or resource reservation.
 
-The receiving ordinary profile requires `block_bytes >= 445`, a unit at most
+The ordinary STP receiver requires `block_bytes >= 445`, a unit at most
 2 MiB, and a bounded source-block count (at most ceil(2 MiB/445) = 4713). Thus grouped
 kind 5 is structurally parseable and round-trip tested, but cannot be needed
-by a valid current-profile production unit; tiny-symbol or oversized-unit
+by a valid STP production unit; tiny-symbol or oversized-unit
 uses are rejected. Kind 5 is therefore rejected by the current transport's
 layout/kind check, not an alternate way to encode an ordinary unit. Kind 6
-requires the unit itself to have one codec. For this profile K MUST be in
+requires the unit itself to have one codec. In STP, K MUST be in
 2..4713 and `445 <= block_bytes <= 65535`, additionally constrained by the
 frame's u16 body length and the actual packet extent. All u32 block IDs are
 source or repair equation IDs according to the mapping; no separate repair
@@ -771,12 +766,9 @@ but cannot rebind a retained ID to another role/layout. Deferred completion is
 delivered only for its exact still-live decoder instance and connection
 generation, once; a Done slot is not live.
 
-Version 5 replaces version 4's balanced offset rule with immutable extents. The
-former requirement that kind 6 offsets be multiples of
-`unit_span = ceil(total / ceil(total / max_unit))` with
-`unit_len = min(unit_span, total - unit_offset)` is **no longer normative**, and
-a receiver MUST NOT enforce a global uniform span. A segmented root of `total`
-bytes (`total <= receiver maximum <= 1 GiB`) is covered by disjoint **extents**
+Kind 6 uses immutable extents; a receiver MUST NOT enforce a global uniform
+span. A segmented root of `total` bytes (`total <= receiver maximum <= 1 GiB`)
+is covered by disjoint **extents**
 `[offset, offset + len)`, one coded unit each; `unit_offset` is the offset and
 the unit's length `len` is its FEC message length. Every extent MUST satisfy
 (all arithmetic checked):
@@ -802,7 +794,7 @@ receiver keeps a per-root ledger of admitted extents:
   as above.
 - The ledger persists, completed extents included, until the root is done. It
   is charged to the receiver's existing memory accounting and grows only after
-  the larger charge is granted, within the unchanged hard caps; a refused
+  the larger charge is granted, within the hard caps; a refused
   charge binds nothing. The 446-byte minimum bounds the ledger to
   `floor(total / 446)` entries. This document specifies no exact maximum
   metadata size.
@@ -811,12 +803,12 @@ receiver keeps a per-root ledger of admitted extents:
   not redelivered.
 
 A sender's restarted unit uses a fresh unit ID, preserving its root, offset and
-length. Changing these extent rules is a new negotiated profile/version, not a
-local tuning change.
+length. These extent rules are part of the wire interpretation, not local
+tuning parameters.
 
 ## Fixed-size arbitrary-window ACK
 
-ACK plaintext remains **152 bytes**. The encrypted UDP size is therefore
+ACK plaintext is **152 bytes**. The encrypted UDP size is therefore
 **174 bytes** (6 header + 152 plaintext + 16 tag); the developer plaintext
 size is 158 bytes. No other connected traffic uses that size.
 
@@ -840,7 +832,7 @@ pending datagram cannot yet be receipted. `receipt_base` itself must be in data
 space even if its bitmap is empty; zero-bit positions need not be below the
 next emitted nonce. There is no "no sample" sentinel: sample_seq always
 positively receipts a packet, even with an empty bitmap. Additions are checked.
-Unknown ACK encodings (including the old encoding 0), nonzero reserved bytes,
+Unknown ACK encodings, nonzero reserved bytes,
 and a zero sampled size are rejected safely. The sample size is the exact
 received UDP payload length, including STP framing and any AEAD tag but excluding
 UDP/IP headers; it is not decrypted plaintext size or a largest-ever counter.
@@ -886,7 +878,7 @@ Epochs are directional u32 counters `0 .. 4294967295`, starting at zero.
 The last epoch remains usable, but a required update beyond it closes instead
 of wrapping. Epoch zero's keys are
 the Noise IK split transport keys after **one Noise REKEY** per direction
-(the pre-existing post-handshake key separation). Epoch n+1 is one additional
+for post-handshake key separation. Epoch n+1 is one additional
 Noise REKEY of epoch n's directional key. ACK and data share the directional
 key but have distinct, persistent nonce spaces.
 
@@ -903,7 +895,7 @@ ChaChaPoly, with the full unique 64-bit Noise nonce in its 96-bit nonce field.
 [RFC 8439 sections 2.8 and 4](https://www.rfc-editor.org/rfc/rfc8439#section-4)
 requires nonce uniqueness and limits each invocation to fewer than 2^32 64-byte
 blocks; STP's 65535-byte ciphertext record cap is far below this per-invocation
-limit. Removing volume guards is **not** a proof of arbitrarily safe aggregate
+limit. The absence of volume guards is **not** a proof of arbitrarily safe aggregate
 key usage. [RFC 9001 section 6.6](https://www.rfc-editor.org/rfc/rfc9001#section-6.6)
 documents a ChaCha20-Poly1305 confidentiality limit greater than 2^62 packets
 and an integrity limit of 2^36 failed verifications. STP enforces neither an
@@ -913,7 +905,7 @@ namespace alone is not a conservative aggregate AEAD security budget. Deployment
 must bound traffic and active-forger exposure to its threat model. A compact
 opposite-phase packet can cost two failed verifications. Global verification
 throttling/attempt accounting is unimplemented; invalid attempts are silent and
-do not trigger rekey or close. This profile claims no formal multi-user proof,
+do not trigger rekey or close. STP claims no formal multi-user proof,
 unlimited-forgery integrity, or 1 Tbit/s validation.
 
 ### Confirmed, loss-tolerant key updates
@@ -935,7 +927,7 @@ confirmation.
 Consequently loss of **all** e+1 packets cannot strand a conforming receiver
 at e with an endless stream of undecryptable e+2 packets: the sender continues
 e+1, receives confirmation, or closes at actual exhaustion/liveness expiry.
-No reliable key-update control flight, ACK-of-ACK, new wire field or unbounded
+No reliable key-update control flight, ACK-of-ACK, additional wire field or unbounded
 catch-up derivation is required. A malicious authenticated receiver can lie
 about receipts and harm its own association, as with ordinary ACK feedback.
 
@@ -1005,16 +997,16 @@ Invalid tags elicit neither ACKs nor frame allocation.
 ## Minimum TU and byte costs
 
 The minimum supported recovered UDP TU is **512 bytes**. Its largest symbol
-header leaves `512 - 6 - 16 - 37 = 453` bytes. The fixed repair minimum remains
+header leaves `512 - 6 - 16 - 37 = 453` bytes. The fixed repair minimum is
 445 bytes for receive/resource support. At TU 1204 the sender width is 1145
-bytes; a profile-6 sender starts at TU 512 (width 453). Receiver
+bytes; a sender starts at TU 512 (width 453). Receiver
 source-block and memory admission bounds derive from the 445-byte floor, not
 from the initial TU; the maximum 2 MiB unit has at most 4713 source blocks.
 
 TU is directional and measured in **UDP payload bytes**, excluding UDP/IP
-headers. A profile-6 sender starts at 512 (versions 2-4 started at 1204); there
-is no explicit MTU frame or negotiated common TU. All data receivers MUST accept valid current-profile packets independently
-of their own send TU. The implementation admits non-ACK plaintext down to 490
+headers. A sender starts at 512; there is no explicit MTU frame or negotiated
+common TU. All data receivers MUST accept valid STP packets independently of
+their own send TU. The implementation admits non-ACK plaintext down to 490
 bytes and never emits trimmed ordinary data. Local upward discovery searches up
 to 9216 bytes using best-effort (BE) all-`ff` padding probes. Only an exact new
 positive receipt of the recorded probe, at most `B + 1 s` old (B defined below),
@@ -1075,7 +1067,7 @@ Default-on local size-recovery policy:
   Define `B = min(30 s, max(1 s, SRTT + 4*variance, 2*SRTT + ACK_delay_cap))`.
   Samples older than the absolute 31-second supported freshness ceiling are
   marked received but cannot train the estimate or prove recovery. With unknown
-  RTT or a stable 20 ms path, B remains one second: original windows are unchanged.
+  RTT or a stable 20 ms path, B is one second.
   A fresh exact small receipt can lower the effective TU to 512 only after at
   least **B without fresh larger ordinary or exact-current-TU generic progress**,
   with **at least two unconfirmed exact-current-TU generic probes aged B to B+2 s**
@@ -1100,7 +1092,7 @@ Default-on local size-recovery policy:
   still-active FEC unit from its full shared source under a fresh unit ID if its symbol no longer fits;
   preserve segmented root/offset, and never reopen a sealed root or mutate an
   existing unit's layout. Already-forgotten messages are not made reliable.
-- Startup trial and initial unit assessment (profile-5 sender policy; nothing
+- Startup trial and initial unit assessment (local sender policy; nothing
   here is transmitted). A new connection starts at TU 512. Its first generic
   larger-size trial is 1204, issued at the ordinary first-issuance deadline with
   no extra delay (startup state Candidate, then Issued when that attempt is
@@ -1134,38 +1126,37 @@ history uses 96 KiB per connected peer on Linux x64, charged in the 608 KiB
 connection-bookkeeping reservation separately from the derived receive-data cap.
 The 32-entry outage ledger and generic RTT/count state add 416 inline bytes on
 Linux x64 within that existing reservation, with no extra history allocation.
-The upward bracket and independent boundary clock use another 32 inline bytes,
-replacing the old eight-byte additive-search step; history and reservation sizes
-are unchanged.
+The upward bracket and independent boundary clock use another 32 inline bytes
+within that reservation, with no additional history allocation.
 Adaptive classifier windows do not promise native 5–10-second RTT support: the
 ordinary compact send-time history still has an approximately 4.295-second
 horizon and the CC RTT mean is capped at 6.5535 seconds. Packet-rate congestion
-control and FEC planning policy are unchanged. These schedules/search limits
-are local sender policy, not additional wire fields.
+control and FEC planning follow the sender policy below. These schedules/search
+limits are local sender policy, not additional wire fields.
 
 The table excludes IP/UDP headers, padding and coding redundancy; these are
 encoding overhead bytes, not a claim about measured wire/app ratio. The
 packet overhead includes the AEAD tag. Whole headers are per packed message.
 
-| Item | Profiles 2-5 bytes | Profile 6 bytes | Change |
-|---|---:|---:|---:|
-| Data packet outer header + tag | 30 | 22 | -8 |
-| Whole message frame | 3 | 3 | 0 |
-| Plain fragment frame | 15 | 15 | 0 |
-| Ordinary/grouped FEC symbol frame | 21 | 21 | 0 |
-| Segmented FEC symbol frame | 37 | 37 | 0 |
-| One ordinary FEC symbol, packet + frame | 51 | 43 | -8 |
-| One segmented FEC symbol, packet + frame | 67 | 59 | -8 |
-| ACK plaintext | 152 | 152 | 0 |
-| ACK encrypted UDP | 182 | 174 | -8 |
-| ACK developer plaintext UDP | 166 | 158 | -8 |
+| Item | Bytes |
+|---|---:|
+| Data packet outer header + tag | 22 |
+| Whole message frame | 3 |
+| Plain fragment frame | 15 |
+| Ordinary/grouped FEC symbol frame | 21 |
+| Segmented FEC symbol frame | 37 |
+| One ordinary FEC symbol, packet + frame | 43 |
+| One segmented FEC symbol, packet + frame | 59 |
+| ACK plaintext | 152 |
+| ACK encrypted UDP | 174 |
+| ACK developer plaintext UDP | 158 |
 
 At TU1472, seventeen 80-byte whole messages fit: logical unpadded cost is
-`22 + 17*83 = 1433` bytes instead of 1441. The physical datagram remains padded
-to 1472 bytes. An isolated 1000-byte whole message has 25 bytes logical encoding
-overhead (22 packet + 3 frame), instead of 33, while ordinary packets remain
-uniformly TU padded. Fragmented/coded identities, flags and frame parsing are
-unchanged; the compact field is never used as a message or duplicate identity.
+`22 + 17*83 = 1433` bytes. The physical datagram is padded to 1472 bytes.
+An isolated 1000-byte whole message has 25 bytes logical encoding overhead
+(22 packet + 3 frame), while ordinary packets are uniformly TU padded.
+Fragmented/coded identities, flags and frame parsing follow the rules above;
+the compact field is never used as a message or duplicate identity.
 
 ## Security and traffic-analysis boundaries
 
@@ -1178,9 +1169,9 @@ sources without matching live associations remain CPU-unlimited. The initial
 359-byte request/62-byte response is not large-response reflection; retransmitted
 responses before confirmation can exceed the request cumulatively. Stateless
 return-routability retry cookies and a universal aggregate pre-confirmation
-response budget are **not** part of versions 4 through 6. No anti-spoofing/strict
-anti-amplification guarantee is claimed; adding such an exchange requires a
-separately specified compatible mechanism or a new profile/version.
+response budget are **not** part of STP. No anti-spoofing/strict
+anti-amplification guarantee is claimed; such an exchange requires a separately
+specified compatible mechanism or a distinct selector.
 
 Uniform current-TU padding hides application message sizes, fragment shape
 and packing boundaries, not all metadata. The clear low counter reveals counts
@@ -1189,14 +1180,14 @@ the 600-second target. The static-key-derived 15-bit sender prefix permits
 cross-address correlation and leaks those key bits. ACKs are intentionally
 identifiable by their fixed size, and their cadence exposes receive timing.
 Probe sizes, handshake sizes, DSCP, outage/idle timing and IP/UDP endpoints
-are also observable. Version 6 does not provide traffic-flow confidentiality,
+are also observable. STP does not provide traffic-flow confidentiality,
 constant-rate cover traffic, unlinkable connection identifiers or epoch-age
 jitter. These residual surfaces are deployment threat-model considerations,
 not removed by encrypting/padding message frames.
 
 ## Implementation and verification boundaries
 
-Receiver admission and assembly remain subject to the unchanged memory caps.
+Receiver admission and assembly are subject to the memory caps.
 An extent that cannot be charged is refused and its receipt withheld. Completed
 unit buffers transfer into root assembly together with their memory charges;
 assembly does not make a second unit copy. If a contiguous join cannot grow its
@@ -1211,8 +1202,8 @@ wall-clock latency bound is claimed.
 
 The receive budget counts charged allocations (decoders, unit buffers, root
 ledgers and part tables), not process RSS. Each connection's fixed 1024-slot
-reassembly ring is allocated outside that dynamic budget; profile 5's cached
-per-root part sums add about 16 KiB to it on 64-bit targets. Extent and part
+reassembly ring is allocated outside that dynamic budget; cached per-root part
+sums add about 16 KiB to it on 64-bit targets. Extent and part
 lookups are binary searches; finding and removing the next contiguous part is
 O(1), excluding the copy of its bytes. Inserting a unit in the middle of a
 root's ledger or part table shifts a vector. A peer that
@@ -1222,27 +1213,27 @@ sender's per-root unit plan is updated in O(log n) per unit.
 
 FEC job quotas, slot counts, sender retention, congestion/loss estimators,
 ACK batching cadence and native socket limits are implementation policies,
-not new identity widths or implicit wire generations. The selector fixes
+not identity widths or implicit wire generations. The selector fixes
 current wire interpretation; local resource limits are not peer-advertised. The library
 creates no worker threads: the caller drives a Pump; encoder construction and
-persistent decoder work run on that caller's thread. Historical internal
-"Worker" names and worker counters now denote admitted decoder jobs, not
-library-owned threads. Worker-capable connections may admit up to the unchanged
-process-wide ceiling of eight decoder jobs, subject to full per-job byte leases
-and the unchanged connection/process receive-memory caps; inline-only connections
-admit no worker jobs. The configured worst-case worker dimension still sizes the
-connection byte cap, not its runtime job count. Job generations prevent stale
+persistent decoder work run on that caller's thread. Internal "Worker" names
+and worker counters denote admitted decoder jobs, not library-owned threads.
+Worker-capable connections may admit up to the process-wide ceiling of eight
+decoder jobs, subject to full per-job byte leases and the connection/process
+receive-memory caps; inline-only connections admit no worker jobs. The
+configured worst-case worker dimension sizes the connection byte cap, not its
+runtime job count. Job generations prevent stale
 completions from reaching a different decoder or replacement association.
 
-### Release candidate sender policy (frozen)
+### Sender policy (frozen)
 
 Nothing in this section is transmitted except the duplication flags above;
 it is sender policy. Peers need not agree on it. Rates are in packets per
 second (pps); internally micro-packets/s. "RTT" below is the smoothed CC RTT
 unless stated. A *delay-corrected RTT sample* is raw ACK RTT minus the
 peer-reported ACK delay, floored at 0.1 ms. The *connection min RTT* is the
-minimum of all such samples. Legacy P0–P3 initialization is rejected by this
-candidate; those experiment arms remain in the research tree. The
+minimum of all such samples. The frozen sender rejects P0–P3 initialization;
+those experiment arms are research-only. The
 `research_target_validation` feature permits policy overrides, with
 `STP_POLICY_FROZEN=0` restoring raw environment-only research configuration
 (no frozen-value fallback); production builds ignore all these overrides.
@@ -1323,7 +1314,7 @@ Give-up and suspension (CUBIC coexistence). State: `ineffective`,
    beta_delay as above and `pending = now`. A delay event rejected by the
    guard adds no strike.
 
-#### Segmented unit selection (profile-5 sender policy)
+#### Segmented unit selection (sender policy)
 
 Local policy; the wire requires only the extent rules above. A root that fits
 the unit cap C is one ordinary kind 4 unit and is not segmented. Let W be the
@@ -1406,7 +1397,7 @@ admission sequence; it does not depend on timing or outcomes.
 The risk admission (p_eff, ε) is evaluated **once** at a logical root's first
 admission and frozen for all its groups, segments and replans.
 
-##### Segmented roots (profile 5)
+##### Segmented roots
 
 A root sent as several kind 6 units keeps the single frozen root risk admission
 and root draw. Each unit extent `[offset, offset + len)` of a root of `total`
@@ -1512,8 +1503,8 @@ root kt may exceed 32000. It is bounded by K_up at the 1 GiB maximum root,
 exposure kt, not chunked per codec, evaluated by a bounded-term CDF that expands
 outward from the mode and stops each direction when the omitted-mass bound falls
 below EPSILON/4 of the accumulated normalization. Floating-point error is
-additional, so this is not a formal probability certificate. The ordinary
-per-codec 32000 cap and admission planning are unchanged.
+additional, so this is not a formal probability certificate. For ordinary
+per-codec planning, the cap is 32000 and admission follows the rules above.
 
 #### Whole-message duplication
 
@@ -1539,10 +1530,7 @@ Constants: RAND_MULT = 2, RAND_HALF = 4000 packets, RAND_MAX = 0.05.
 - `p_base` is computed at each root admission and frozen with it. On a clean
   link it stays at P = 0.001.
 
-The baseline revision's tests (no longer shipped) covered every frame kind, unknown-kind skipping, the former all-ones
-padding collision, full nonces across enormous gaps (the former profile), arbitrary ACK bases and
-repeated deep-window feedback, former rekey budget boundaries/reordering, parameter
-mismatches, malformed-input bounds, and encrypted UDP size capture. Tests are
-implementation evidence, not a cryptographic proof or cross-implementation
-interoperability result. Performance at 1 Tbit/s is not claimed. This
-profile-6 document makes no independent interoperability, audit or performance claim.
+Tests are implementation evidence, not a cryptographic proof or
+cross-implementation interoperability result. Performance at 1 Tbit/s is not
+claimed. This document makes no independent interoperability, audit or
+performance claim.

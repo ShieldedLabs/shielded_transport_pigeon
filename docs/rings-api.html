@@ -146,7 +146,6 @@ footer { margin-top: 60px; padding-top: 18px; border-top: 1px solid var(--line);
     <li><a href="#threading">Threading &amp; ownership</a></li>
     <li><a href="#shutdown">Shutdown</a></li>
     <li><a href="#tradeoffs">Trade-offs &amp; limits</a></li>
-    <li><a href="#perf">Performance</a></li>
     <li><a href="#reference">API reference</a></li>
   </ol>
 </nav>
@@ -154,12 +153,12 @@ footer { margin-top: 60px; padding-top: 18px; border-top: 1px solid var(--line);
 <main>
 
 <header class="hero" id="overview">
-  <div class="eyebrow">Application API &middot; version <code>1.0.0</code></div>
+  <div class="eyebrow">Application API</div>
   <h1>One pump, <em>three rings</em>, no hidden threads.</h1>
   <p class="lead">STP is an encrypted UDP message transport: Noise IK handshakes, ChaCha20-Poly1305 sealed datagrams, Wirehair fountain-code parity for large messages, and rate-based congestion control in packets per second. The library starts <strong>no threads</strong>. All protocol work happens inside a <code>Pump</code>, and only while you call it. Your application talks to the pump through exactly three bounded, lock-free single-producer/single-consumer rings whose capacities you choose at setup: <strong>send</strong> and <strong>control</strong> carry work in, and <strong>receive</strong> carries one ordered stream of events out.</p>
   <div class="chips">
     <span class="chip">no library threads</span><span class="chip">no locks on the ring path</span><span class="chip">no allocation in ring operations</span>
-    <span class="chip">ownership transfer of <code>Vec&lt;u8&gt;</code></span><span class="chip">futex parking (Linux)</span><span class="chip">historical 0.3.0: ~250 MB/s per connection</span>
+    <span class="chip">ownership transfer of <code>Vec&lt;u8&gt;</code></span><span class="chip">futex parking (Linux)</span>
   </div>
 </header>
 
@@ -177,8 +176,8 @@ footer { margin-top: 60px; padding-top: 18px; border-top: 1px solid var(--line);
 <p class="dcap">The application thread is the only producer of the send and control rings and the only consumer of the receive ring; the pump is the other end of each. Each ring operation is a constant-time ownership move with no retry loop, allocation or lock. The one exception is <code>try_send</code>&rsquo;s first send to a new (peer, queue) pair, which allocates that pair&rsquo;s <a href="#queued">queued-bytes</a> counter (amortized O(1)). Wakeups go through an eventfd (pump side) and a futex generation counter (application side).</p>
 
 <!-- ============================================================ -->
-<div class="callout warn"><div class="title">Wire profile 6: update both peers together</div>
-<p>Version 1.0.0 implements Wirehair in Rust and uses crates.io cryptography (Snow, curve25519-dalek, chacha20poly1305, blake2 and blake3), without changing the application rings, congestion control or parity policy of main <code>1e00403</code>. It uses wire profile 6, incompatible with profiles 2 through 5, including the published 0.3.0 wire profile 2. Handshakes reject mismatched selectors. Only Noise IK with BLAKE2b remains encrypted; BLAKE2s STP support is removed. No transport declaration is sent: the client offer is 257 bytes, the server choice 8, and encrypted hellos are 359/62 bytes. The selector fixes the profile; constructor message limits are local and are not advertised as peer limits. The connected header is now six bytes (31 low counter bits plus key phase), with a 16-byte tag; encrypted ACKs are 174 UDP bytes. Full nonces and independent ACK/data spaces remain internal and never reset on wrap/rekey. Nearest reconstruction needs bounded per-space gaps (strictly less than 2^30 positions suffices); larger gaps, including burned refused ACKs, can fail closed. Rotation uses only 600-second age with confirmation gating, not packet/byte budgets. See PROTOCOL.md for exact rules and security limits. The minimum full FEC symbol remains 445 bytes (at most 4713 source blocks per 2&nbsp;MiB unit); receive admission and memory limits derive from this floor. The unchanged 152-byte bitmap ACK now reports the exact UDP payload size of its sampled nonce. Known emitted-size mismatches are rejected before receipt, congestion or MTU feedback is admitted; size alone never proves receipt.</p>
+<div class="callout warn"><div class="title">Update both peers together</div>
+<p>STP uses Wirehair FEC implemented in Rust and crates.io cryptography (Snow, curve25519-dalek, chacha20poly1305, blake2 and blake3). Handshakes reject unknown selectors, so both peers must run this protocol. Only Noise IK with BLAKE2b is supported for encrypted STP. The client offer is 257 bytes, the server choice 8, and encrypted hellos are 359/62 bytes. The selector fixes the complete wire format; constructor message limits are local and are not advertised as peer limits. The connected header is six bytes (31 low counter bits plus key phase) with a 16-byte tag; encrypted ACKs are 174 UDP bytes. Full nonces and independent ACK/data spaces never reset on wrap/rekey. Nearest reconstruction needs bounded per-space gaps (strictly less than 2^30 positions suffices); larger gaps, including burned refused ACKs, can fail closed. Rotation uses only 600-second age with confirmation gating, not packet/byte budgets. See PROTOCOL.md for exact rules and security limits. The minimum full FEC symbol is 445 bytes (at most 4713 source blocks per 2&nbsp;MiB unit); receive admission and memory limits derive from this floor. The 152-byte bitmap ACK reports the exact UDP payload size of its sampled nonce. Known emitted-size mismatches are rejected before receipt, congestion or MTU feedback is admitted; size alone never proves receipt.</p>
 <p>Transmission units start at 512 UDP bytes; the first larger trial is 1204. Default-on MTU recovery alternates generic 512-byte and current-TU best-effort padding probes on a 250&nbsp;ms schedule, independent of application message sizes or queued work (two probes per second of each size). At TU&nbsp;512 every slot sends a small probe. Recovery uses B = min(30&nbsp;s, max(1&nbsp;s, raw generic SRTT + 4 × variance, 2 × SRTT + ACK delay cap)), learned only from exact first-positive generic probes before classification. It requires at least two unconfirmed exact-current-TU probes aged B to B+2&nbsp;s, at least two positive generic small-packet receipts whose sends are no more than B+1&nbsp;s old, and at least B without fresh larger ordinary/current-TU progress. A stable 20&nbsp;ms path retains the original one/two/three-second windows; raw samples older than 31&nbsp;s cannot train the estimate. All evidence must follow the last such progress; a fresh exact small receipt triggers the decision. Old unconfirmed data alone cannot cause idle/drain fallback, and larger progress anywhere in the same ACK vetoes it. The complete decision is rechecked with the final budget after the whole ACK. The protected generic ledger holds 256 probes with logarithmic unknown-metadata lookup; outage proof uses 32 chronological entries, preserving pending/tail, age and replay checks. Upward discovery chooses coarse rungs 1452, 1472, 2048, 4096, 8192 and 9216 bytes, identically for both IP families. A failed candidate sets a temporary exclusive upper bound; search refines the midpoint above the confirmed TU at a 500&nbsp;ms accepted-attempt floor until the gap is at most eight bytes. Interior failures renew the 30&nbsp;s bound. On first settling within eight bytes, an independent clock rechecks the exact remembered failed upper after min(30&nbsp;s, max(5&nbsp;s, B)); only completed failures of accepted boundary attempts back off that clock (10, 20, then 30&nbsp;s on a low-RTT path). The RTT budget is snapshotted when arming; intermediate floor gains and interior failures do not restart an armed timer. An expired settled upper remains a target, not proof or a hold exception. Fresh authenticated success clears it only when promotion becomes effective, then coarse discovery resumes; partial path increases are not trapped below the old boundary. An unsettled expired bound returns to coarse search with capped quadratic backoff; interior refinement does not. These are issuance deadlines once locally eligible, not ACK-arrival guarantees. An effective shrink seeds the bound from the old effective TU, permitting strictly interior refinement during the ten-second hold at the failed size. Obsolete probe outcomes cannot undo the reset; a valid loss declaration can narrow a bracket even after positive-proof freshness has expired. Pending ciphertext and planned duplication copies are not rewritten. The bounded history adds 96&nbsp;KiB per connected peer on Linux x64. Recovery does not guarantee delivery or support paths below 512 bytes. Adaptive proof windows are not a native long-RTT guarantee: the ordinary compact send-time history still spans about 4.295&nbsp;s. The pump must be driven for probes and deadlines to run; there is no new option or library thread. See <code>PROTOCOL.md</code> for the exact policy.</p>
 </div>
 
@@ -377,7 +376,7 @@ worker.<span class="f">join</span>().<span class="f">unwrap</span>();</code></pr
 <p>Even zero/expired-budget calls observe, retire and schedule; only a positive-budget call constructs fresh handshakes and sends packets. There is no debounce or throttle: successful address differences trigger reset immediately, while absent probe results, including transient resource failures, are ignored. Linux refreshes its existing wildcard IPv6 source workaround once from current interfaces and observes that exact forced address when active, even without a route-probe result; this does not prove routability. Explicit Linux binds remain bound, not migrated (other platforms still reject them). Observation is not every-interface monitoring, NAT/external mapping detection or remote-address migration. Same-tuple encrypted peers can accept the fresh handshake through confirmed replacement; plaintext cannot. A changed source tuple is a separate association at the remote endpoint; its old tuple expires normally. Wire format and outage/expiry timers are unchanged.</p>
 <h3 id="ordering">Ordering guarantees</h3>
 <div class="callout ok">
-<div class="title">Guarantees (each was covered by a test in the baseline revision&rsquo;s <code>tests/lockfree.rs</code>, which is no longer shipped)</div>
+<div class="title">Guarantees</div>
 <table>
   <tr><th>#</th><th>Guarantee</th><th>Test</th></tr>
   <tr><td>1</td><td>A peer&rsquo;s <code>Connected</code> comes before any <code>Message</code> from it.</td><td><code>lifecycle_order_and_exactly_once_disconnect</code></td></tr>
@@ -405,7 +404,7 @@ worker.<span class="f">join</span>().<span class="f">unwrap</span>();</code></pr
 <h2 id="parking"><span class="num">7</span>Parking &amp; readiness</h2>
 <pre><code><span class="k">pub fn</span> <span class="f">park_until_ready</span>(&amp;<span class="k">mut</span> <span class="k">self</span>) -&gt; <span class="t">bool</span></code></pre>
 <p>This blocks the application thread on a futex generation counter. It returns immediately if there is already a receive event, a finished telemetry snapshot, or space in a ring whose last <code>try_*</code> failed because it was full. Otherwise it sleeps until one of those happens or the endpoint closes. It returns <code>false</code> only when the endpoint is closed or finished <em>and</em> no events remain to drain. Spurious wakes are allowed, so always re-check with <code>try_*</code> after it returns.</p>
-<pre><code><span class="c">// from the baseline test park_for_receive_and_close</span>
+<pre><code><span class="c">// park_for_receive_and_close</span>
 <span class="k">loop</span> {
     <span class="k">if let</span> <span class="t">Some</span>(<span class="t">Event</span>::Message { data, .. }) = b.<span class="f">try_recv</span>() { <span class="m">assert_eq!</span>(data, <span class="s">b"park"</span>); <span class="k">break</span>; }
     <span class="m">assert!</span>(b.<span class="f">park_until_ready</span>());
@@ -504,59 +503,7 @@ worker.<span class="f">join</span>().<span class="f">unwrap</span>();</code></pr
 </ul>
 
 <!-- ============================================================ -->
-<h2 id="perf"><span class="num">13</span>Performance</h2>
-<p>Loopback on a Ryzen 5 5500U with the HPET clocksource, each pump on its own thread, encrypted (historical Noise IK, BLAKE2s; this is not a profile-6 result). These are the median of 3 interleaved runs, with [min..max] where shown. The previous lock-free design (<code>e8319f2</code>) is compared with this rings design (<code>45224d0</code>). Every cell had <strong>zero lost, corrupt, duplicate or dropped</strong> messages. Harness: <code>examples/throughput_matrix.rs</code>, ring capacity 8192.</p>
-<div class="legend"><span><i style="background:var(--old)"></i>previous (e8319f2)</span><span><i style="background:var(--new)"></i>rings (45224d0)</span></div>
-
-<div class="chart">
-  <h4>Messages/s, deep pipeline (8192 in flight)</h4>
-  <div class="bargroup"><div class="name">16 B</div><div class="bar old" style="width:37.2%"><span>119.0k</span></div><div class="bar new" style="width:96.0%"><span>307.3k [300.0..314.8k]<b>2.58&times;</b></span></div></div>
-  <div class="bargroup"><div class="name">100 B</div><div class="bar old" style="width:37.1%"><span>118.6k</span></div><div class="bar new" style="width:96.6%"><span>309.1k [301.6..317.2k]<b>2.61&times;</b></span></div></div>
-  <div class="bargroup"><div class="name">1 KB</div><div class="bar old" style="width:24.4%"><span>78.2k</span></div><div class="bar new" style="width:40.0%"><span>127.9k [126.0..160.9k]<b>1.64&times;</b></span></div></div>
-</div>
-
-<div class="chart">
-  <h4>Messages/s, 32 in flight</h4>
-  <div class="bargroup"><div class="name">16 B</div><div class="bar old" style="width:57.1%"><span>57.1k</span></div><div class="bar new" style="width:83.3%"><span>83.3k<b>1.46&times;</b></span></div></div>
-  <div class="bargroup"><div class="name">100 B</div><div class="bar old" style="width:59.9%"><span>59.9k</span></div><div class="bar new" style="width:91.5%"><span>91.5k<b>1.53&times;</b></span></div></div>
-  <div class="bargroup"><div class="name">1 KB</div><div class="bar old" style="width:63.9%"><span>63.9k</span></div><div class="bar new" style="width:87.0%"><span>87.0k<b>1.36&times;</b></span></div></div>
-</div>
-
-<div class="chart">
-  <h4>Bulk throughput, MB/s (decimal)</h4>
-  <div class="bargroup"><div class="name">64 KiB pipelined</div><div class="bar old" style="width:65.0%"><span>169</span></div><div class="bar new" style="width:66.9%"><span>174</span></div></div>
-  <div class="bargroup"><div class="name">64 KiB one-at-a-time</div><div class="bar old" style="width:41.9%"><span>109</span></div><div class="bar new" style="width:45.8%"><span>119</span></div></div>
-  <div class="bargroup"><div class="name">1 MiB pipelined</div><div class="bar old" style="width:91.9%"><span>239</span></div><div class="bar new" style="width:94.6%"><span>246</span></div></div>
-  <div class="bargroup"><div class="name">1 MiB one-at-a-time</div><div class="bar old" style="width:89.6%"><span>233</span></div><div class="bar new" style="width:96.5%"><span>251</span></div></div>
-  <div class="bargroup"><div class="name">16 MiB pipelined</div><div class="bar old" style="width:81.2%"><span>211</span></div><div class="bar new" style="width:82.7%"><span>215</span></div></div>
-  <div class="bargroup"><div class="name">16 MiB one-at-a-time</div><div class="bar old" style="width:82.7%"><span>215</span></div><div class="bar new" style="width:85.4%"><span>222</span></div></div>
-</div>
-
-<div class="chart">
-  <h4>Post-idle delivery delay, &micro;s (lower is better)</h4>
-  <div class="bargroup"><div class="name">p50</div><div class="bar old" style="width:48.3%"><span>338</span></div><div class="bar new" style="width:42.6%"><span>298</span></div></div>
-  <div class="bargroup"><div class="name">p99</div><div class="bar old" style="width:88.0%"><span>616</span></div><div class="bar new" style="width:80.0%"><span>560</span></div></div>
-</div>
-
-<div class="grid2">
-  <div class="kpi"><div class="v">0.5% &rarr; 0.6%</div><div class="l">idle CPU, of one core (connected, no traffic)</div></div>
-  <div class="kpi"><div class="v">98.8 &rarr; 93.4 MB</div><div class="l">peak RSS</div></div>
-</div>
-
-<h3>Where the ceiling is</h3>
-<p>One connection tops out around <strong>250&nbsp;MB/s (~2&nbsp;Gbit/s)</strong>. The limit is the <em>sender</em> pump thread running at ~100% of one core. Congestion control was not the limit: its target rate was 1.2&ndash;2.3&times; what was achieved. Sender pump profile:</p>
-<div class="stack">
-  <div style="width:28%;background:#2f6fdf">crypto 28%</div>
-  <div style="width:27%;background:#0f8f72">sendmsg/datagram 27%</div>
-  <div style="width:19%;background:#8a3fbf">FEC 19%</div>
-  <div style="width:12%;background:#b8620b">clock 12%</div>
-  <div style="width:14%;background:#6b7280">other</div>
-</div>
-<p class="dcap">There is one <code>sendmsg</code> per datagram, and clock reads are expensive under HPET. In the small-message pump about 50% of the time goes to clock reads (HPET). For scale, plain TCP loopback with a single stream measured 23.4&nbsp;Gbit/s on the same machine, but that has no crypto, no FEC and uses 64&nbsp;KB segments, so it is a reference point rather than a like-for-like comparison.</p>
-<div class="callout"><div class="title">Test status at 45224d0</div><p>475 passed / 2 ignored (default build), 509 passed / 16 ignored (research build). The golden plan hash is unchanged.</p></div>
-
-<!-- ============================================================ -->
-<h2 id="reference"><span class="num">14</span>API reference</h2>
+<h2 id="reference"><span class="num">13</span>API reference</h2>
 <p>Paths: <code>shielded_transport_pigeon::stp</code> re-exports <code>Pump</code>, <code>LockfreeEndpoint</code> and <code>RingConfig</code>. <code>shielded_transport_pigeon::pump</code> exports <code>Pump</code>, <code>LockfreeEndpoint</code>, <code>RingConfig</code>, <code>Control</code>, <code>Event</code>, <code>Stats</code>, <code>ConnectFailure</code> and <code>DisconnectReason</code>. <code>Ready</code> lives at <code>pump::port::Ready</code>. The examples use <code>use shielded_transport_pigeon::{pump::port::lockfree::*, stp::*};</code>.</p>
 <table>
   <tr><th>Item</th><th>Signature</th><th>Notes</th></tr>
@@ -601,7 +548,7 @@ worker.<span class="f">join</span>().<span class="f">unwrap</span>();</code></pr
 </table>
 
 <footer>
-  Documents the application rings retained in <code>shielded_transport_pigeon 1.0.0</code>. The performance figures on this page are historical 0.3.0 measurements at baseline <code>45224d0</code>, not results for the current build. The authoritative sources are <code>src/pump/</code> (<code>mod.rs</code>, <code>lockfree.rs</code>, <code>port.rs</code>, <code>ring.rs</code>), the constructors in <code>src/stp.rs</code> and <code>examples/</code>. Protocol details, constants and wire formats are in <code>PROTOCOL.md</code> in the repository.
+  Documents the application rings of <code>shielded_transport_pigeon</code>. The authoritative sources are <code>src/pump/</code> (<code>mod.rs</code>, <code>lockfree.rs</code>, <code>port.rs</code>, <code>ring.rs</code>), the constructors in <code>src/stp.rs</code> and <code>examples/</code>. Protocol details, constants and wire formats are in <code>PROTOCOL.md</code> in the repository.
 </footer>
 </main>
 </div>
