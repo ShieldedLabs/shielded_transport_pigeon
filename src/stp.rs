@@ -919,10 +919,13 @@ fn source_owner_bytes(
 }
 #[derive(Debug, Default)]
 struct QueuedLedger {
-    cell: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    cell: Option<std::sync::Arc<crate::pump::port::lockfree::Account>>,
     owned: u64,
     unretired: u64,
     staged: u64,
+    owned_messages: usize,
+    unretired_messages: usize,
+    staged_messages: usize,
     staged_seq: u64,
     framed: Option<u64>,
     committed: Option<u64>,
@@ -930,48 +933,70 @@ struct QueuedLedger {
 impl QueuedLedger {
     fn admit(&mut self, charge: crate::pump::port::lockfree::Charge) {
         let (cell, bytes) = charge.transfer();
-        debug_assert!(
-            self.cell
-                .as_ref()
-                .is_none_or(|c| std::sync::Arc::ptr_eq(c, &cell))
-        );
-        self.cell.get_or_insert(cell);
+        if self.owned == 0 && self.owned_messages == 0 {
+            debug_assert_eq!(
+                (
+                    self.unretired,
+                    self.staged,
+                    self.unretired_messages,
+                    self.staged_messages
+                ),
+                (0, 0, 0, 0)
+            );
+            self.cell = Some(cell);
+        } else {
+            assert!(
+                self.cell
+                    .as_ref()
+                    .is_some_and(|c| std::sync::Arc::ptr_eq(c, &cell))
+            );
+        }
         self.owned += bytes;
         self.unretired += bytes;
+        self.owned_messages += 1;
+        self.unretired_messages += 1;
     }
-    fn retire(&mut self, len: usize) {
+    fn retire(&mut self, len: usize, message_finished: bool) {
         let bytes = (len as u64).min(self.unretired);
-        if bytes == 0 {
+        // Reference-mode core work has no charge. Segment retirement releases a message permit
+        // only for the final unit; rescue retransmissions never call retire.
+        let messages = usize::from(message_finished && self.unretired_messages != 0);
+        if bytes == 0 && messages == 0 {
             return;
         }
         self.unretired -= bytes;
+        self.unretired_messages -= messages;
         match self.framed {
             Some(seq) if self.committed.is_none_or(|c| c < seq) => {
                 self.staged += bytes;
+                self.staged_messages += messages;
                 self.staged_seq = self.staged_seq.max(seq);
             }
-            _ => self.release(bytes),
+            _ => self.release(bytes, messages),
         }
     }
     fn commit(&mut self, seq: u64) {
         self.committed = Some(seq);
-        if self.staged != 0 && seq >= self.staged_seq {
+        if (self.staged != 0 || self.staged_messages != 0) && seq >= self.staged_seq {
             let bytes = std::mem::take(&mut self.staged);
-            self.release(bytes);
+            let messages = std::mem::take(&mut self.staged_messages);
+            self.release(bytes, messages);
         }
     }
-    fn release(&mut self, bytes: u64) {
+    fn release(&mut self, bytes: u64, messages: usize) {
         self.owned -= bytes;
+        self.owned_messages -= messages;
         if let Some(cell) = &self.cell {
-            cell.fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
+            cell.release(bytes, messages);
+        }
+        if self.owned == 0 && self.owned_messages == 0 {
+            self.cell = None;
         }
     }
 }
 impl Drop for QueuedLedger {
     fn drop(&mut self) {
-        if self.owned != 0 {
-            self.release(self.owned);
-        }
+        self.release(self.owned, self.owned_messages);
     }
 }
 #[derive(Debug)]
@@ -3406,7 +3431,7 @@ impl UnreliableSendBuffer {
             if *start_byte as usize >= msg.len() {
                 let msg_len = msg.len();
                 self.queue_bytes_filled -= msg_len;
-                self.queued_ledger.retire(msg_len);
+                self.queued_ledger.retire(msg_len, true);
                 if self.slipstream {
                     self.slipstream_trace_event(
                         "end",
@@ -3433,7 +3458,12 @@ impl UnreliableSendBuffer {
                 let mut finished = self.fec_send_slot.take().unwrap();
                 if rescue.is_none() {
                     self.queue_bytes_filled -= message_len;
-                    self.queued_ledger.retire(message_len);
+                    self.queued_ledger.retire(
+                        message_len,
+                        finished.segment.is_none_or(|segment| {
+                            segment.offset as usize + message_len == segment.total as usize
+                        }),
+                    );
                     self.package_lease = None;
                     self.send_package_id = self
                         .send_package_id
@@ -7432,7 +7462,8 @@ pub struct NetworkThreadPull {
 pub use crate::pump::Pump;
 pub(crate) use crate::pump::port::Endpoint;
 use crate::pump::port::lockfree::{ConnectFailure, Control, DisconnectReason, Event as RingEvent};
-pub use crate::pump::port::lockfree::{LockfreeEndpoint, RingConfig};
+pub use crate::pump::port::lockfree::{LockfreeEndpoint, RingConfig, SendQueueConfig};
+use crate::pump::port::lockfree::{NativeEvent, PeerSend};
 use crate::pump::port::{Port, Ready as CoreReady};
 type SourceAddresses = (Option<Ipv6Addr>, Option<Ipv6Addr>);
 #[cfg(test)]
@@ -7534,10 +7565,15 @@ impl LocalAddressRefresh {
             // receive reservations and all cipher/counter state.
         }
         self.retrying.clear();
-        for (peer, _) in rings.peers.drain() {
-            rings.pending.push_back(RingEvent::Disconnected {
-                peer,
-                reason: DisconnectReason::NetworkChanged,
+        let old_peers: Vec<_> = rings.peers.drain().map(|(peer, _)| peer).collect();
+        for peer in old_peers {
+            let association = rings.close_peer(peer);
+            rings.pending.push_back(NativeEvent {
+                event: RingEvent::Disconnected {
+                    peer,
+                    reason: DisconnectReason::NetworkChanged,
+                },
+                association,
             });
         }
         // Keep pending outbound requests: changing interfaces retries the same
@@ -7583,12 +7619,39 @@ impl LocalAddressRefresh {
 struct RingState {
     peers: HashMap<ConnectionKey, [u8; 64]>,
     connects: HashMap<ConnectionKey, STPAddress>,
-    pending: VecDeque<RingEvent>,
+    pending: VecDeque<NativeEvent>,
+    send_peers: HashMap<ConnectionKey, std::sync::Arc<PeerSend>>,
+    scan: VecDeque<(ConnectionKey, std::sync::Arc<PeerSend>, usize)>,
+    control_turn: bool,
 }
 fn application_receive_full(port: &Port) -> bool {
     port.native.get().is_some_and(|n| !n.events.has_space())
 }
 impl RingState {
+    fn close_peer(&mut self, peer: ConnectionKey) -> Option<std::sync::Arc<PeerSend>> {
+        let association = self.send_peers.remove(&peer);
+        self.scan.retain(|(p, _, _)| *p != peer);
+        if let Some(association) = &association {
+            association.close();
+        }
+        association
+    }
+    fn new_peer(&mut self, port: &Port, peer: ConnectionKey) -> std::sync::Arc<PeerSend> {
+        let n = port.native.get().unwrap();
+        let association = PeerSend::new(n.budget.clone(), n.send_slots);
+        self.send_peers.insert(peer, association.clone());
+        self.scan.push_back((peer, association.clone(), 0));
+        association
+    }
+    fn next_send(&mut self) -> Option<(ConnectionKey, std::sync::Arc<PeerSend>, usize)> {
+        let (peer, association, queue) = self.scan.pop_front()?;
+        self.scan.push_back((
+            peer,
+            association.clone(),
+            (queue + 1) % association.queues.len(),
+        ));
+        Some((peer, association, queue))
+    }
     fn connected(&mut self, port: &Port, address: STPAddress, hash: [u8; 64]) -> bool {
         let Some(n) = port.native.get() else {
             return true;
@@ -7603,14 +7666,16 @@ impl RingState {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return false;
         }
+        let association = self.new_peer(port, peer);
         assert!(
-            n.emit(
+            n.emit_association(
                 &port.ready,
                 RingEvent::Connected {
                     peer,
                     address,
                     handshake_hash: hash
-                }
+                },
+                Some(association)
             )
             .is_ok()
         );
@@ -7629,14 +7694,22 @@ impl RingState {
             return false;
         }
         let peer = address.connection_key();
-        self.pending.push_back(RingEvent::Disconnected {
-            peer,
-            reason: DisconnectReason::Replaced,
+        let old = self.close_peer(peer);
+        let fresh = self.new_peer(port, peer);
+        self.pending.push_back(NativeEvent {
+            event: RingEvent::Disconnected {
+                peer,
+                reason: DisconnectReason::Replaced,
+            },
+            association: old,
         });
-        self.pending.push_back(RingEvent::Connected {
-            peer,
-            address,
-            handshake_hash: hash,
+        self.pending.push_back(NativeEvent {
+            event: RingEvent::Connected {
+                peer,
+                address,
+                handshake_hash: hash,
+            },
+            association: Some(fresh),
         });
         self.peers.insert(peer, hash);
         self.connects.remove(&peer);
@@ -7645,17 +7718,23 @@ impl RingState {
     }
     fn disconnected(&mut self, peer: ConnectionKey, reason: DisconnectReason) {
         if self.peers.remove(&peer).is_some() {
-            self.pending
-                .push_back(RingEvent::Disconnected { peer, reason });
+            let association = self.close_peer(peer);
+            self.pending.push_back(NativeEvent {
+                event: RingEvent::Disconnected { peer, reason },
+                association,
+            });
         }
         if let Some(address) = self.connects.remove(&peer) {
             // An explicit disconnect silently retires an unfinished attempt. Do
             // not retract an outcome already committed to the ordered stream.
             if reason != DisconnectReason::Local {
-                self.pending.push_back(RingEvent::ConnectFailed {
-                    address,
-                    reason: ConnectFailure::TimedOut,
-                });
+                self.pending.push_back(
+                    RingEvent::ConnectFailed {
+                        address,
+                        reason: ConnectFailure::TimedOut,
+                    }
+                    .into(),
+                );
             }
         }
     }
@@ -7667,7 +7746,7 @@ impl RingState {
         if self
             .pending
             .iter()
-            .any(|event| matches!(event, RingEvent::Connected { peer: p, .. } if *p == peer))
+            .any(|event| matches!(&event.event, RingEvent::Connected { peer: p, .. } if *p == peer))
             || n.emit(&port.ready, RingEvent::Message { peer, data })
                 .is_err()
         {
@@ -7689,7 +7768,17 @@ impl RingState {
             let Some(event) = self.pending.pop_front() else {
                 break;
             };
-            assert!(n.emit(&port.ready, event).is_ok());
+            assert!(
+                n.emit_association(&port.ready, event.event, event.association)
+                    .is_ok()
+            );
+        }
+    }
+}
+impl Drop for RingState {
+    fn drop(&mut self) {
+        for association in self.send_peers.values() {
+            association.close();
         }
     }
 }
@@ -7738,9 +7827,10 @@ pub fn new_pump_with_options(
     options: NetworkThreadOptions,
 ) -> (Pump, LockfreeEndpoint) {
     let rings = options.rings;
+    let send_queue = options.send_queue.clone();
     let (pump, endpoint) =
         new_reference_pump_with_options(keys, port, max_pps, bounds, maximum, options);
-    (pump, endpoint.into_rings(rings))
+    (pump, endpoint.into_rings(rings, send_queue))
 }
 pub(crate) fn new_reference_pump(
     my_keypairs: Vec<IdentityKeyPair>,
@@ -7781,6 +7871,7 @@ pub(crate) struct CongestionPolicy {
 #[derive(Debug, Clone)]
 pub struct NetworkThreadOptions {
     pub rings: RingConfig,
+    pub send_queue: SendQueueConfig,
     pub send_queue_count: usize,
     pub receive_memory: Option<std::sync::Arc<crate::receive_memory::ReceiveMemoryBudget>>,
     pub bind_ip: Option<std::net::IpAddr>,
@@ -7794,6 +7885,7 @@ impl Default for NetworkThreadOptions {
     fn default() -> Self {
         Self {
             rings: RingConfig::default(),
+            send_queue: SendQueueConfig::default(),
             send_queue_count: 1,
             receive_memory: None,
             bind_ip: None,
@@ -7991,6 +8083,10 @@ pub(crate) fn new_reference_pump_with_options(
                     return wake_hint;
                 }
                 if thread_inner.stop.load(std::sync::atomic::Ordering::Acquire) {
+                    connections_map.clear();
+                    for association in ring_state.send_peers.values() {
+                        association.close();
+                    }
                     return None;
                 }
                 {
@@ -8026,12 +8122,17 @@ pub(crate) fn new_reference_pump_with_options(
                 }
                 if let Some(n) = thread_inner.native.get() {
                     ring_state.flush(&thread_inner);
-                    for _ in 0..if active_wait.is_some() { 1 } else { 32 } {
-                        if !budget.command_owed() && std::time::Instant::now() >= caller_deadline {
+                    for scan_index in 0..if active_wait.is_some() { 1 } else { 32 } {
+                        if (scan_index != 0 || !budget.command_owed())
+                            && std::time::Instant::now() >= caller_deadline
+                        {
                             break;
                         }
                         let mut ring_admitted = false;
-                        if ring_state.pending.is_empty() {
+                        let prefer_control = ring_state.control_turn
+                            || n.budget.pending.load(std::sync::atomic::Ordering::Acquire) == 0;
+                        ring_state.control_turn = !ring_state.control_turn;
+                        if ring_state.pending.is_empty() && prefer_control {
                             if let Some(control) = unsafe { n.control.pop() } {
                                 n.input_drained(&thread_inner.ready, true);
                                 match control {
@@ -8066,7 +8167,8 @@ pub(crate) fn new_reference_pump_with_options(
                                                     RingEvent::ConnectFailed {
                                                         address,
                                                         reason: ConnectFailure::InvalidAddress,
-                                                    },
+                                                    }
+                                                    .into(),
                                                 );
                                             }
                                         } else {
@@ -8074,7 +8176,8 @@ pub(crate) fn new_reference_pump_with_options(
                                                 RingEvent::ConnectFailed {
                                                     address,
                                                     reason: ConnectFailure::InvalidAddress,
-                                                },
+                                                }
+                                                .into(),
                                             );
                                         }
                                     }
@@ -8087,66 +8190,58 @@ pub(crate) fn new_reference_pump_with_options(
                                 ring_admitted = true;
                             }
                         }
-                        if !ring_admitted {
-                            if let Some(message) = unsafe { n.send.peek() } {
-                                let mut drop_kind = 0;
-                                let mut fits = true;
-                                if message.payload.len() > max_message_size {
-                                    drop_kind = 2;
-                                } else if let Some(conn) = connections_map
-                                    .get_mut(&message.peer)
-                                    .filter(|c| c.is_connected())
-                                {
-                                    if message.queue >= conn.unreliable_send_buffer.queues.len() {
-                                        drop_kind = 3;
-                                    } else {
-                                        fits = message.payload.len() as u64
-                                            <= conn.unreliable_send_buffer.queues[message.queue]
-                                                .free_bytes();
-                                    }
-                                } else {
-                                    drop_kind = 1;
-                                }
-                                if fits {
-                                    let message = unsafe { n.send.pop() }.unwrap();
-                                    n.input_drained(&thread_inner.ready, false);
-                                    let counter = match drop_kind {
-                                        1 => &n.counters.send_dropped_unknown,
-                                        2 => &n.counters.send_dropped_oversized,
-                                        3 => &n.counters.send_dropped_invalid_queue,
-                                        _ => {
+                        if !ring_admitted
+                            && n.budget.pending.load(std::sync::atomic::Ordering::Acquire) != 0
+                        {
+                            if let Some((peer, association, queue)) = ring_state.next_send() {
+                                if let Some(lane) = association.queues[queue].get() {
+                                    if let Some(message) = unsafe { lane.ring.peek() } {
+                                        let fits = connections_map
+                                            .get_mut(&peer)
+                                            .filter(|c| c.is_connected())
+                                            .is_some_and(|conn| {
+                                                message.payload.len() as u64
+                                                    <= conn.unreliable_send_buffer.queues[queue]
+                                                        .free_bytes()
+                                            });
+                                        if fits {
+                                            let message = unsafe { lane.ring.pop() }.unwrap();
+                                            n.budget
+                                                .pending
+                                                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                                            n.budget.released();
                                             let buf = &mut connections_map
-                                                .get_mut(&message.peer)
+                                                .get_mut(&peer)
                                                 .unwrap()
                                                 .unreliable_send_buffer;
-                                            if let Some(charge) = message.charge {
-                                                buf.queues[message.queue]
-                                                    .queued_ledger
-                                                    .admit(charge);
-                                            }
+                                            buf.queues[queue].queued_ledger.admit(message.charge);
                                             let rejected = buf.submit_classified_messages(
-                                                message.queue,
+                                                queue,
                                                 vec![(message.class, message.payload)],
                                             );
                                             assert!(
                                                 rejected.is_empty(),
-                                                "peeked credit must admit the FIFO head"
+                                                "peeked credit must admit the lane head"
                                             );
-                                            &n.counters.sent
+                                            n.counters
+                                                .sent
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            ring_admitted = true;
+                                        } else {
+                                            n.counters
+                                                .send_head_blocked
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         }
-                                    };
-                                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    ring_admitted = true;
-                                } else {
-                                    n.counters
-                                        .send_head_blocked
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
                                 }
                             }
                         }
-                        if ring_admitted {
-                            budget.admitted();
-                        } else {
+                        // The cooperative allowance is one candidate scan, not one successful
+                        // admission: empty and credit-blocked lanes consume it too.
+                        budget.admitted();
+                        if !ring_admitted
+                            && n.budget.pending.load(std::sync::atomic::Ordering::Acquire) == 0
+                        {
                             break;
                         }
                     }
@@ -13006,6 +13101,9 @@ impl LossEpisodes {
 #[cfg(test)]
 #[path = "replacement_tests.rs"]
 mod replacement_tests;
+#[cfg(test)]
+#[path = "send_lane_tests.rs"]
+mod send_lane_tests;
 
 #[cfg(test)]
 #[path = "worker_originals_integration_tests.rs"]

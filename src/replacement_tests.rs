@@ -1154,8 +1154,17 @@ fn address_change_retries_pending_handshake_with_fresh_ephemeral_and_no_false_li
     let mut buf = [0; 10000];
     for n in 1..7 {
         probe.set(sources(n, 1));
-        drive(&mut p, 3);
-        let (len, _) = raw.recv_from(&mut buf).unwrap();
+        let until = Instant::now() + Duration::from_secs(1);
+        let len = loop {
+            drive(&mut p, 3);
+            match raw.recv_from(&mut buf) {
+                Ok((len, _)) => break len,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < until, "retried handshake was not sent");
+                }
+                Err(error) => panic!("receiving retried handshake: {error}"),
+            }
+        };
         assert_eq!(load_u48(&buf[..6]), MAGIC);
         assert_ne!(&buf[6..38], previous.as_slice());
         previous = buf[6..38].to_vec();
@@ -2023,14 +2032,17 @@ fn address_change_waiting_restart_refuses_competing_inbound_core_when_resources_
     });
     let (_h, incoming) = hello_for(&s.client, &s.key);
     s.raw.send_to(&incoming, s.addr).unwrap();
-    drive(&mut s.pump, 5);
-    assert!(REFRESH_RELEASES.with(|releases| !releases.borrow().contains_key(&port)));
     let mut buf = [0; 10000];
     let mut saw_outgoing = false;
-    while let Ok((n, _)) = s.raw.recv_from(&mut buf) {
-        assert_ne!(n, 62, "waiting peer admitted a competing incoming core");
-        saw_outgoing |= n > 6 && load_u48(&buf[..6]) == MAGIC;
+    let until = Instant::now() + Duration::from_secs(1);
+    while !saw_outgoing && Instant::now() < until {
+        drive(&mut s.pump, 5);
+        while let Ok((n, _)) = s.raw.recv_from(&mut buf) {
+            assert_ne!(n, 62, "waiting peer admitted a competing incoming core");
+            saw_outgoing |= n > 6 && load_u48(&buf[..6]) == MAGIC;
+        }
     }
+    assert!(REFRESH_RELEASES.with(|releases| !releases.borrow().contains_key(&port)));
     assert!(
         saw_outgoing,
         "scheduled outgoing attempt did not construct after release"
